@@ -59,10 +59,20 @@ SHAPES = {
     "80k enum options that are not options": spec_with(
         state='{"kind":"enum","key":"e","default":"a","options":[' + EMPTY_LISTS + "]}"
     ),
-    "20k fields that do not exist": PREAMBLE
+    "20k fields that do not exist (refused while parsing)": PREAMBLE
     + ","
     + ",".join(f'"u{i}":0' for i in range(20_000))
     + "}}",
+    "4,990 fields that do not exist, the widest object parsed": PREAMBLE
+    + ","
+    + ",".join(f'"u{i:04d}{"x" * 12}":0' for i in range(4_990))
+    + "}}",
+    "10k integers that canonical JSON writes for doubles, and a bad cell": spec_with(
+        state='{"kind":"table","key":"t","max_rows":10000,"default":{"columns":'
+        '[{"name":"a","type":"float"}],"rows":['
+        + ("[1152921504606847000]," * 9_999)
+        + '["not a number"]]}}'
+    ),
 }
 
 MEASURE = r"""

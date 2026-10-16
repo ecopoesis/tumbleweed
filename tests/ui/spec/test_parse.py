@@ -3,20 +3,23 @@
 import json
 import math
 import time
+import tracemalloc
 from collections.abc import Iterator
 from decimal import Decimal
+from enum import IntEnum, StrEnum
 from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
 from tests.ui.spec.support import Json, build, golden, golden_text, minimal
+from tumbleweed.ui.spec import parse
 from tumbleweed.ui.spec.errors import (
     MAX_PROBLEM_LENGTH,
     MAX_REPORTED_PROBLEMS,
     SpecError,
     SpecTooLargeError,
 )
-from tumbleweed.ui.spec.limits import MAX_SPEC_BYTES
+from tumbleweed.ui.spec.limits import MAX_OBJECT_MEMBERS, MAX_SPEC_BYTES
 from tumbleweed.ui.spec.parse import parse_ui_spec, validate_ui_spec
 from tumbleweed.ui.spec.spec import UiSpec
 
@@ -297,19 +300,32 @@ def base36(number: int) -> str:
 class TestRepeatedKeysAreFoundInOnePass:
     """The check is linear: finding which key repeats must not be quadratic."""
 
-    def test_a_big_object_whose_last_key_repeats_is_refused_fast(self) -> None:
+    def test_the_scan_itself_is_linear_in_the_number_of_members(self) -> None:
+        # Called directly, because the text path refuses a wide object before it gets here.
         keys = [base36(i) for i in range(30_000)]
-        members = ",".join(f'"{key}":0' for key in keys)
-        text = "{" + members + f',"{keys[-1]}":0' + "}"
-        assert len(text.encode()) <= MAX_SPEC_BYTES  # it gets past the size limit to the check
+        pairs: list[tuple[str, object]] = [(key, 0) for key in keys]
+        pairs.append((keys[-1], 0))
+
+        started = time.perf_counter()
+        with pytest.raises(ValueError, match="repeats the key") as raised:
+            parse._no_repeated_keys(pairs)  # noqa: SLF001 -- the function under test
+        elapsed = time.perf_counter() - started
+
+        assert keys[-1] in str(raised.value)
+        # The quadratic search for the repeated key took 6 to 9 seconds on this input.
+        assert elapsed < 1.0
+
+    def test_a_wide_object_whose_last_key_repeats_is_refused_fast_in_a_spec(self) -> None:
+        keys = [base36(i) for i in range(MAX_OBJECT_MEMBERS)]
+        members = ",".join(f'"{key}":0' for key in keys[:-1])
+        text = "{" + members + f',"{keys[-2]}":0' + "}"  # exactly the widest object allowed
 
         started = time.perf_counter()
         with pytest.raises(SpecError, match="repeats the key") as raised:
             parse_ui_spec(text)
         elapsed = time.perf_counter() - started
 
-        assert keys[-1] in str(raised.value)
-        # The quadratic search for the repeated key took 6 to 9 seconds on this input.
+        assert keys[-2] in str(raised.value)
         assert elapsed < 1.0
 
     def test_the_first_repeat_is_the_one_named(self) -> None:
@@ -317,8 +333,8 @@ class TestRepeatedKeysAreFoundInOnePass:
         with pytest.raises(SpecError, match="repeats the key 'c'"):
             parse_ui_spec('{"a": 1, "b": 2, "c": 3, "c": 4, "b": 5}')
 
-    def test_distinct_keys_of_any_number_are_fine(self) -> None:
-        keys = [base36(i) for i in range(30_000)]
+    def test_distinct_keys_up_to_the_widest_object_are_fine(self) -> None:
+        keys = [base36(i) for i in range(MAX_OBJECT_MEMBERS)]
         text = "{" + ",".join(f'"{key}":0' for key in keys) + "}"
 
         with pytest.raises(SpecError) as raised:  # not a spec, but not a repeated key either
@@ -339,6 +355,34 @@ def spec_dict_of_size(size: int) -> Json:
     assert 0 < missing + 1 <= 65_536
     state[3] = entry("d", 1 + missing)
     return build(state=state)
+
+
+class Colour(IntEnum):
+    RED = 1
+
+
+class Name(StrEnum):
+    A = "a"
+
+
+class SubInt(int):
+    pass
+
+
+class SubStr(str):
+    pass
+
+
+class SubDict(dict[str, object]):
+    pass
+
+
+class SubList(list[object]):
+    pass
+
+
+class SubFloat(float):
+    pass
 
 
 class TestParsedJsonTakesTheSameRoad:
@@ -364,20 +408,66 @@ class TestParsedJsonTakesTheSameRoad:
         with pytest.raises(SpecTooLargeError):
             validate_ui_spec(big)
 
-    def test_writing_it_out_stops_at_the_limit_and_does_not_walk_the_rest(self) -> None:
-        visited = 0
+    def test_a_list_that_cannot_fit_is_refused_without_being_unpacked(self) -> None:
+        huge = [0] * 5_000_000
+        tracemalloc.start()
+        try:
+            started = time.perf_counter()
+            with pytest.raises(SpecTooLargeError):
+                validate_ui_spec(loose(state=huge))
+            elapsed = time.perf_counter() - started
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
 
-        class Endless(list[int]):
-            def __iter__(self) -> Iterator[int]:
-                nonlocal visited
-                for _ in range(5_000_000):
-                    visited += 1
-                    yield 0
+        assert peak < 8_000_000  # unpacking five million items would take hundreds of megabytes
+        assert elapsed < 1.0
+
+    def test_an_object_that_cannot_fit_is_refused_without_being_unpacked(self) -> None:
+        huge = dict.fromkeys(map(str, range(MAX_SPEC_BYTES + 1)), 0)
+        tracemalloc.start()
+        try:
+            with pytest.raises(SpecTooLargeError):
+                validate_ui_spec(huge)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert peak < 2_000_000  # unpacking it would put 262,145 tuples on the stack
+
+    def test_a_structure_that_shares_parts_is_counted_as_it_would_be_written(self) -> None:
+        # 500 * 500 * 500 values once unfolded, from 1,500 objects in memory.
+        leaf = [0] * 500
+        middle = [leaf] * 500
+        top = [middle] * 500
+
+        started = time.perf_counter()
+        with pytest.raises(SpecTooLargeError):
+            validate_ui_spec(loose(state=top))
+
+        assert time.perf_counter() - started < 1.0
+
+    def test_writing_it_out_stops_at_the_limit_and_does_not_write_the_rest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 100,000 strings of 100 characters: few enough nodes to pass the first walk, and 10 MB
+        # of text. The writer must stop at the limit, a few thousand chunks in.
+        chunks = 0
+        real = json.JSONEncoder.iterencode
+
+        def counting(self: json.JSONEncoder, o: object, _one_shot: bool = False) -> Iterator[str]:
+            nonlocal chunks
+            for chunk in real(self, o, _one_shot):
+                chunks += 1
+                yield chunk
+
+        monkeypatch.setattr(json.JSONEncoder, "iterencode", counting)
+        data = loose(state=["x" * 100] * 100_000)
 
         with pytest.raises(SpecTooLargeError):
-            validate_ui_spec(loose(state=Endless([0])))
+            validate_ui_spec(data)
 
-        assert visited < 150_000  # 256 KiB of `0, ` and not five million
+        assert chunks < 20_000  # not the 200,000 of the whole structure
 
     def test_the_limit_counts_bytes_like_parse_ui_spec_does(self) -> None:
         # Written out as UTF-8, a character can be up to four bytes: the text is over the limit.
@@ -420,12 +510,30 @@ class TestParsedJsonTakesTheSameRoad:
     NOT_JSON: ClassVar[dict[str, dict[object, object]]] = {
         "bytes": loose(title=b"t"),
         "a set": loose(state={1, 2}),
+        "a frozenset": loose(state=frozenset({1})),
+        "a tuple": loose(state=({"kind": "bool", "key": "b", "default": True},)),
         "a model instance": loose(root=parse_ui_spec(MINIMAL_TEXT)),
         "NaN": loose(state=[{"kind": "float", "key": "x", "default": math.nan}]),
         "infinity": loose(state=[{"kind": "float", "key": "x", "default": math.inf}]),
         "a Decimal": loose(title=Decimal("1.5")),
         "a huge int": loose(title=10**5000),
+        "an int key": {**loose(), 1: 3},
+        "a float key": {**loose(), 1.5: 3},
+        "a bool key": {**loose(), True: 3},
+        "a None key": {**loose(), None: 3},
+        "a bytes key": {**loose(), b"k": 3},
         "a tuple key": {**loose(), (1, 2): 3},
+        "an int key in a nested object": loose(
+            state=[{"kind": "json", "key": "j", "default": {1: "a"}}]
+        ),
+        "an int enum member": loose(title=Colour.RED),
+        "a str enum member": loose(title=Name.A),
+        "a str enum member as a key": {**loose(), Name.A: 1},
+        "a bool-like int subclass": loose(title=SubInt(5)),
+        "a str subclass": loose(title=SubStr("truth")),
+        "a dict subclass": loose(root=SubDict(kind="box")),
+        "a list subclass": loose(state=SubList()),
+        "a float subclass": loose(state=[SubFloat(1.5)]),
     }
 
     @pytest.mark.parametrize("data", NOT_JSON.values(), ids=NOT_JSON)
@@ -433,32 +541,54 @@ class TestParsedJsonTakesTheSameRoad:
         with pytest.raises(SpecError, match="not JSON data"):
             validate_ui_spec(data)
 
+    def test_it_is_refused_not_converted_as_json_dumps_would_convert_it(self) -> None:
+        # `json.dumps({1: "a"})` is `{"1": "a"}` and a tuple is written as a list: these would
+        # have been accepted as a different spec from the one the caller holds.
+        assert json.dumps({"state": ()}) == '{"state": []}'
+        assert json.dumps({1: "a"}) == '{"1": "a"}'
+        with pytest.raises(SpecError, match="an object key is a int, not a str"):
+            validate_ui_spec({**loose(), 1: "a"})
+        with pytest.raises(SpecError, match="tuple is not a JSON type"):
+            validate_ui_spec(loose(state=()))
+
+    def test_the_names_of_odd_types_cannot_flood_the_message(self) -> None:
+        odd = type("X" * 5000, (), {})
+
+        with pytest.raises(SpecError) as raised:
+            validate_ui_spec({**minimal(), "title": odd()})
+
+        assert len(str(raised.value)) < 200
+
+    def test_what_json_loads_gives_is_accepted(self) -> None:
+        text = golden_text("tip_calculator")
+
+        assert validate_ui_spec(json.loads(text)) == parse_ui_spec(text)
+
     def test_a_cycle_and_a_very_deep_structure_are_spec_errors(self) -> None:
         cyclic: dict[str, object] = {}
         cyclic["root"] = cyclic
+        looping: list[object] = []
+        looping.append(looping)
         deep: object = []
         for _ in range(100_000):
             deep = [deep]
 
-        with pytest.raises(SpecError, match="not JSON data"):
-            validate_ui_spec(cyclic)
+        for data in (cyclic, looping, {**minimal(), "state": deep}):
+            with pytest.raises(SpecError, match="nested too deeply"):
+                validate_ui_spec(data)
+
+    def test_the_deepest_nesting_that_pydantic_parses_is_not_cut_short(self) -> None:
+        # The walk allows what the text path allows, and no more: 200 levels, the root included.
+        value: object = []
+        for _ in range(198):
+            value = [value]
+
+        with pytest.raises(
+            SpecError, match="Extra inputs are not permitted"
+        ):  # parsed, then refused
+            validate_ui_spec({**minimal(), "x": value})
         with pytest.raises(SpecError, match="nested too deeply"):
-            validate_ui_spec({**minimal(), "state": deep})
-
-    def test_an_int_key_that_collides_with_a_str_key_is_a_repeated_key(self) -> None:
-        with pytest.raises(SpecError, match="repeats the key '1'"):
-            validate_ui_spec({1: "a", "1": "b"})
-
-    def test_a_str_subclass_is_written_as_the_text_it_holds(self) -> None:
-        class Lying(str):
-            __slots__ = ()
-
-            def __str__(self) -> str:
-                return "lies"
-
-        spec = validate_ui_spec({**minimal(), "title": Lying("truth")})
-
-        assert spec.title == "truth"
+            validate_ui_spec({**minimal(), "x": [[value]]})
 
 
 class TestValidateParsedJson:

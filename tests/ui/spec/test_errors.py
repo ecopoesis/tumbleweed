@@ -3,7 +3,7 @@
 import copy
 import json
 import pickle
-from typing import Self
+from typing import Self, cast
 
 import pytest
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
@@ -18,12 +18,15 @@ from tumbleweed.ui.spec.errors import (
     MAX_PROBLEM_LENGTH,
     MAX_REPORTED_PROBLEMS,
     MORE_PROBLEMS,
+    SCAN_LIMIT,
     SpecError,
     SpecTooLargeError,
     printable,
     problems_of,
 )
+from tumbleweed.ui.spec.limits import MAX_OBJECT_MEMBERS
 from tumbleweed.ui.spec.parse import parse_ui_spec, validate_ui_spec
+from tumbleweed.ui.spec.spec import UiSpec
 
 # What must never come out of a SpecError as itself: it would move the cursor, start a line,
 # reorder text or end a line in a terminal, a log or the chat.
@@ -292,7 +295,7 @@ class TestBoundedWork:
             return real(text)
 
         monkeypatch.setattr(errors, "printable", counting)
-        fields = ",".join(f'"u{i}":0' for i in range(20_000))
+        fields = ",".join(f'"u{i}":0' for i in range(MAX_OBJECT_MEMBERS - 3))  # and 3 fixed ones
         text = '{"version":"tumbleweed.ui/1","title":"t","root":{"kind":"box"},' + fields + "}"
 
         with pytest.raises(SpecError) as raised:
@@ -300,7 +303,42 @@ class TestBoundedWork:
 
         assert len(raised.value.problems) == MAX_REPORTED_PROBLEMS + 1
         assert raised.value.problems[-1] == MORE_PROBLEMS
-        assert calls < 100  # not one per error: there were 20,000
+        assert calls < 100  # not one per error: there were thousands
+
+    def test_an_object_with_more_members_than_anything_allows_is_refused_while_parsing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No validator is asked to report on 20,000 unknown fields: pydantic is not even called.
+        def never(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("the text was handed to pydantic")
+
+        monkeypatch.setattr(UiSpec, "model_validate_json", never)
+        fields = ",".join(f'"u{i}":0' for i in range(20_000))
+        text = '{"version":"tumbleweed.ui/1","title":"t","root":{"kind":"box"},' + fields + "}"
+
+        with pytest.raises(SpecError, match="an object has more than 4999 members"):
+            parse_ui_spec(text)
+
+    def test_the_same_goes_for_an_object_of_parsed_data(self) -> None:
+        data = minimal()
+        data.update({f"u{i}": 0 for i in range(MAX_OBJECT_MEMBERS + 1)})
+
+        with pytest.raises(SpecError, match="an object has more than 4999 members"):
+            validate_ui_spec(data)
+
+    def test_an_object_of_exactly_that_many_members_is_still_looked_at(self) -> None:
+        data = minimal()
+        data.update({f"u{i}": 0 for i in range(MAX_OBJECT_MEMBERS - len(data))})
+
+        with pytest.raises(SpecError, match="Extra inputs are not permitted"):
+            validate_ui_spec(data)
+
+    def test_the_member_limit_holds_for_an_object_at_any_depth(self) -> None:
+        wide: JsonValue = {f"k{i}": 0 for i in range(MAX_OBJECT_MEMBERS + 1)}
+        data = build(state=[{"kind": "json", "key": "j", "default": {"deep": [{"x": wide}]}}])
+
+        with pytest.raises(SpecError, match="an object has more than 4999 members"):
+            validate_ui_spec(data)
 
     def test_the_report_is_cut_at_the_limit_with_a_note(self) -> None:
         fields: dict[str, JsonValue] = {f"u{i}": 0 for i in range(50)}
@@ -311,6 +349,41 @@ class TestBoundedWork:
             f"root.box.u{i}: Extra inputs are not permitted" for i in range(MAX_REPORTED_PROBLEMS)
         )
         assert error.problems[-1] == MORE_PROBLEMS
+
+
+class CountingError(dict[str, object]):
+    """A pydantic error as `errors()` gives it, which counts how often it is looked at."""
+
+    looked_at = 0
+
+    def __getitem__(self, key: str) -> object:
+        type(self).looked_at += 1
+        return super().__getitem__(key)
+
+
+class ManyErrors:
+    """What `problems_of` needs of a `ValidationError`: an `errors()` of 5,000 entries."""
+
+    def errors(self, **_options: bool) -> list[CountingError]:
+        return [
+            CountingError(
+                type="extra_forbidden", loc=(f"u{i}",), msg="Extra inputs are not permitted"
+            )
+            for i in range(5_000)
+        ]
+
+
+class TestTheScanIsBounded:
+    def test_problems_of_looks_at_no_more_errors_than_the_scan_limit(self) -> None:
+        CountingError.looked_at = 0
+        # Sound: `problems_of` calls only `errors()`, which `ManyErrors` has, on its argument.
+        stub = cast("ValidationError", ManyErrors())
+
+        problems = problems_of(stub)
+
+        assert len(problems) == MAX_REPORTED_PROBLEMS + 1
+        # Each examined error is read a few times (its type, loc and message), not 5,000 of them.
+        assert CountingError.looked_at <= SCAN_LIMIT * 4
 
 
 class Probe(BaseModel):

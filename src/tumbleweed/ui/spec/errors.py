@@ -12,8 +12,14 @@ itself (S12). Both directions need bounded, inert text:
   own messages quote none (the one that would, for an unknown `kind`, is rewritten); the
   location may name an unknown field, which is cut to `MAX_LOCATION_PART` characters.
 
-Building the report is bounded too: `problems_of` looks at the first `SCAN_LIMIT` errors and
-builds strings only until the report is full.
+Building the report is cheap, not free: pydantic itself collects every error of a validation and
+`ValidationError.errors()` turns all of them into dicts, which cannot be limited from outside. What
+bounds that work is the input: a spec is at most `MAX_SPEC_BYTES`, an object of more than
+`MAX_OBJECT_MEMBERS` members is refused while parsing (so no object yields thousands of
+unknown-field errors), and every sequence stops at its first error (`fail_fast`), so the number of
+errors is proportional to the size of the spec (`tests/ui/spec/test_resources.py` holds the memory
+and the time). From those, `problems_of` looks at the first `SCAN_LIMIT` errors and builds strings
+only until the report is full.
 """
 
 from collections.abc import Sequence
@@ -108,8 +114,9 @@ def _message(item_type: str, message: str) -> str:
 def problems_of(error: ValidationError) -> list[str]:
     """One line per validation problem: where it is and what is wrong, without the input.
 
-    At most `SCAN_LIMIT` errors are examined and strings are built only until there are more
-    problems than a `SpecError` reports. An error that only says a sequence was too short is
+    Pydantic has collected all the errors already (see the module docstring); of those, at most
+    `SCAN_LIMIT` are examined and strings are built only until there are more problems than a
+    `SpecError` reports. An error that only says a sequence was too short is
     dropped when something inside it already failed. A cross-reference check reports several
     problems at once as one multi-line message of this package's own making that already names
     where each is: only such a message, a `value_error` at the root, is split into lines. Any
