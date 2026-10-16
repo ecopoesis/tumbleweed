@@ -124,6 +124,9 @@ def test_a_secret_file_is_excluded_from_the_context(path: str) -> None:
         "tests/core/test_ids.py",
         "scripts/linux-checks",
         "docs/ARCHITECTURE.md",
+        ".gitignore",  # the tests of the context itself read these three
+        ".dockerignore",
+        "Dockerfile",
     ],
 )
 def test_what_the_image_needs_is_in_the_context(path: str) -> None:
@@ -201,6 +204,7 @@ def test_the_model_agrees_with_what_docker_really_sends(tmp_path: Path) -> None:
         target.write_text("x")
     (context / ".dockerignore").write_text((ROOT / ".dockerignore").read_text())
     (context / "Dockerfile").write_text("FROM scratch\nCOPY . /\n")
+    candidates |= {".dockerignore", "Dockerfile"}  # allowed, so copied; excluded, they would not be
     exported = tmp_path / "exported"
 
     subprocess.run(  # noqa: S603  (argv list, no shell)

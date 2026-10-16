@@ -13,6 +13,11 @@
 !scripts/
 !docs/
 
+# Read by tests/test_docker_context.py, which checks this very file inside the container too.
+!.gitignore
+!.dockerignore
+!Dockerfile
+
 # Allowed directories can still hold things that must not ship (the host's caches, a key file
 # somebody dropped into src/).
 **/__pycache__
