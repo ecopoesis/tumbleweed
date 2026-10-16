@@ -270,10 +270,13 @@ Each invariant names where it is enforced. Reviews check every change against th
 - **I5 — Trusted chrome is unspoofable.** Prompts, the picker and other chrome render in a
   reserved region the canvas cannot draw over, with styling generated specs cannot use. The
   region is a sibling of the canvas in the window's vertical layout (`tumbleweed.shell.window`),
-  never on an overlay; the canvas hosts its content in a scrolled window that clips what is drawn
-  and picked and does not pass the content's size on, so a hostile widget can neither paint over
-  the region nor push it out of the window (`tumbleweed.shell.canvas`; proven with real layout
-  and rendering in `tests/shell/test_chrome_isolation.py`).
+  never on an overlay; the canvas hosts its content in a scrolled window that clips what is
+  drawn and picked **on the window's own surface** and does not pass the content's size on, so a
+  hostile widget in the canvas can neither paint over the region, nor take clicks meant for it,
+  nor push it out of the window (`tumbleweed.shell.canvas`; proven with real layout and
+  rendering in `tests/shell/test_chrome_isolation.py`). Clipping does not reach other surfaces:
+  popovers, dialogs, tooltips and drag icons are separate windows, so the renderer must not
+  create them from a spec (tracked in #53, S10).
   **Every model-supplied string** shown in chrome (reasons, task titles, tool names and
   descriptions, spec titles) is plain, length-capped, and labelled as coming from the
   assistant. What is being granted is rendered from the structured capability. While a
@@ -292,7 +295,12 @@ Each invariant names where it is enforced. Reviews check every change against th
   code from its own store, never code supplied by the shell.
 - **I9 — Bounded resources.** Limits on spec size, IPC frame size, file reads, sandbox
   CPU/memory/pids/time/output, agent loop iterations and tokens per turn. At most one
-  sandbox handler run per tool instance in flight; slider-driven handlers are debounced.
+  sandbox handler run per tool instance in flight; slider-driven handlers are debounced. In the
+  shell: a size cap per transcript message and a cap on their number
+  (`tumbleweed.shell.viewmodel.transcript`), and a bound on what a message can cost to lay out:
+  text goes into labels through `tumbleweed.shell.viewmodel.display`, which breaks the grapheme
+  clusters and the unbroken runs that would make a label wider than the window or quadratic to
+  measure, and a long message is shown as a column of small labels.
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input.
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps

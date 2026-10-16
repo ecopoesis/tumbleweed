@@ -54,6 +54,7 @@ uv run python -c "import gi; gi.require_version('Gtk', '4.0'); from gi.repositor
 
 ```sh
 uv run tumbleweed-shell            # the same as: uv run python -m tumbleweed.shell
+uv run tumbleweed-shell --version  # answered at once, with no window and no GTK
 ```
 
 One window opens, with no desktop around it:
@@ -61,32 +62,44 @@ One window opens, with no desktop around it:
 - the **canvas** (left), where generated tools will render (S10); it shows a placeholder for now;
 - the **side panel** (right): the chat transcript, a multi-line input and a Send button. There is
   no model yet, so every message is answered with an echo, streamed in small pieces the way a real
-  reply will be (S03 brings the agent behind the same interface);
+  reply will be (S03 brings the agent behind the same interface). While a reply streams the Send
+  button waits, and the input stays editable;
 - the **status strip** (bottom) with the voice indicator, which reads "idle" until voice arrives (S06);
 - a **reserved strip for trusted prompts** along the top, outside the canvas, which is empty until S18.
 
 Enter sends, Shift+Enter inserts a newline. Ctrl+L focuses the input (and shows the side panel if it
 is hidden), F9 shows or hides the side panel, Ctrl+Q quits. (Ctrl, also on a Mac.) SIGTERM and Ctrl+C
-in the terminal quit the same way. Text from the chat is shown as plain text, never as markup.
+in the terminal quit the same way. Text from the chat is shown as plain text, never as markup, and
+very long or hostile text (a 5000-character grapheme cluster, 64 KiB with no spaces) cannot widen the
+window or freeze it: it is shown with zero-width spaces added, so copying from the transcript copies
+those too.
+
+The command takes no arguments but `--help` and `--version`; anything else, a file name included, is
+refused with a one-line error and exit status 2. It does not register on the session bus (a second
+`tumbleweed-shell` is a second shell), so it exports no actions there. Without a display (no
+`WAYLAND_DISPLAY` or `DISPLAY` that works) it says so in one line and exits with status 1.
 
 **On macOS** the command works from any shell, with or without the `DYLD_FALLBACK_LIBRARY_PATH` line
 above. Homebrew's libraries are not on dyld's search path, and the variable is read when a process
-starts, so `tumbleweed-shell` starts itself again once with `/opt/homebrew/lib` added to
-`DYLD_FALLBACK_LIBRARY_PATH` (dyld's default directories stay on it), and `/opt/homebrew/share` added
-to `XDG_DATA_DIRS` if that is set (a terminal that sets it without Homebrew's directory leaves GTK
-without its GSettings schemas). The relaunch is an `execve` of the same Python with the same arguments,
-so it also works when uv gives the console script a `/bin/sh` shebang, which macOS strips `DYLD_*`
-variables from. It happens only on macOS, only for Apple Silicon's `/opt/homebrew` (Intel Homebrew's
-`/usr/local/lib` is on dyld's path already), and only once (it sets `TUMBLEWEED_RELAUNCHED=1` for the
-new process). The directory is fixed in the code, not read from `HOMEBREW_PREFIX` or from `brew`. On
-Linux nothing of this runs: the process and its environment are left as they are. If GTK still cannot
-be loaded, the command says so in one line and exits with status 1.
+starts, so `tumbleweed-shell` starts itself again once with `/opt/homebrew/lib` first on
+`DYLD_FALLBACK_LIBRARY_PATH` (if the variable was unset it gets the default that `man dyld` documents
+for older binaries, `/usr/local/lib:/usr/lib`, because setting it replaces that; nothing derived from
+`$HOME` is ever added), and `/opt/homebrew/share` added to `XDG_DATA_DIRS` if that is set (a terminal
+that sets it without Homebrew's directory leaves GTK without its GSettings schemas). The relaunch is
+an `execve` of the same Python with the same arguments, so it also works when uv gives the console
+script a `/bin/sh` shebang, which macOS strips `DYLD_*` variables from. It happens only on macOS, only
+for Apple Silicon's `/opt/homebrew` (Intel Homebrew's `/usr/local/lib` is on dyld's path already),
+and only once. The directory is fixed in the code, not read from `HOMEBREW_PREFIX` or from `brew`.
+Once GTK is loaded the shell puts your two variables back into its environment as you had them, so
+programs it starts, and a `tumbleweed-shell` started from it, do not inherit ours. On Linux nothing of
+this runs: the process and its environment are left as they are. If GTK still cannot be loaded, the
+command says so in one line and exits with status 1.
 
 **In the container**, the Linux image has no screen, so the shell runs on its headless compositor
 and is for tests, not for looking at: `scripts/test-linux uv run pytest -m gtk -v` runs the GTK tests,
-which include starting the real `python -m tumbleweed.shell` there, waiting for its window, and stopping
-it with SIGTERM. To try the shell on a real Linux desktop, run `uv run tumbleweed-shell` in a session
-with GTK 4.14 and libadwaita 1.5 installed.
+which include starting the real `python -m tumbleweed.shell` there (also with warnings as errors),
+waiting for its window, and stopping it with SIGTERM and SIGINT. To try the shell on a real Linux
+desktop, run `uv run tumbleweed-shell` in a session with GTK 4.14 and libadwaita 1.5 installed.
 
 ### Checks
 

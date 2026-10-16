@@ -193,14 +193,18 @@ tracked chokepoint.
   - API key from env or a 0600 key file; looser permissions are refused.
 - Agent loop:
   - a typed tool registry (no real tools yet);
-  - per-turn iteration and token limits (I9);
+  - per-turn iteration, token and reply-timeout limits (I9); the token limit must fit
+    `MAX_ASSISTANT_BYTES` (64 KiB per transcript message), or that cap is revisited;
   - cancellation with Esc.
 - asyncio on the GLib main loop (`gi.events`). Fallback (D2): a worker-thread loop
   marshalled through `GLib.idle_add`.
 - Shell behaviour:
   - the agent loop implements S02's `Responder` protocol (`tumbleweed.agent.responder`: `start`,
     the `ReplyDelta`/`ReplyFinished`/`ReplyFailed` events, `cancel`; DECISIONS D9), replacing the
-    echo responder, and marshals its events onto the GTK main thread;
+    echo responder, and marshals its events onto the GTK main thread: with asyncio on the GLib loop
+    they already are, and in the worker-thread fallback the shell injects a main-thread dispatcher
+    built on `GLib.idle_add` (the agent never imports `gi`; the sink raises `WrongThreadError` from
+    any other thread);
   - streaming deltas render into the transcript;
   - errors (no key, network, rate limit) show in chat, and the shell never crashes.
 - The system prompt lives in a versioned resource file.
@@ -222,6 +226,8 @@ tracked chokepoint.
 - A typed repository layer for sessions and messages; messages carry `TaskId | None`, ready
   for task-scoped context (S19).
 - On start, restore the last session; a "new session" action starts a fresh one.
+  Restoring a session and "new session" respect `MAX_MESSAGES`, the transcript view-model's cap
+  of 1000 messages (S02).
 - The transcript sent to the model uses an explicit truncation strategy: it keeps the system
   prompt and the most recent turns within a token budget.
 

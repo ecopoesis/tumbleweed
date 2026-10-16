@@ -94,8 +94,14 @@ whose uv-written shebang is `/bin/sh`. A terminal that sets `XDG_DATA_DIRS` with
 `/opt/homebrew/share` likewise leaves GTK without its GSettings schemas (Homebrew's GLib defaults
 to that directory only while the variable is unset).
 **Decision.** On macOS, before importing GTK, the entry point `execve`s the same interpreter with
-the same arguments once, with `/opt/homebrew/lib` first on `DYLD_FALLBACK_LIBRARY_PATH` (dyld's
-default directories kept) and `/opt/homebrew/share` appended to `XDG_DATA_DIRS` if that is set.
+the same arguments once, with `/opt/homebrew/lib` first on `DYLD_FALLBACK_LIBRARY_PATH` (an unset
+variable gets the default `man dyld` documents for older binaries, `/usr/local/lib:/usr/lib`, since
+setting it replaces that; nothing derived from `$HOME` or the working directory is ever added) and
+`/opt/homebrew/share` appended to `XDG_DATA_DIRS` if that is set. Once GTK is loaded the relaunched
+process puts the user's two variables back into `os.environ` (carried through the relaunch by the
+marker), so the programs the shell starts, and a `tumbleweed-shell` started from it, see the user's
+environment; dyld has read its variable at launch and GLib's directories are pinned first, so
+nothing is lost by it.
 The prefix is the fixed Apple Silicon one, not read from the environment or from `brew`; a marker
 variable prevents a second relaunch; nothing is done on other platforms or when both variables are
 already right. Alternatives rejected: exporting the variable in the profile (fragile: lost through
@@ -105,8 +111,9 @@ SIP-protected shells), a launcher shell script (a second entry point beside the 
 GTK loaded by absolute path, the typelibs' leaf-name `dlopen` still fails), and documenting a specific
 Python build (we do not control the interpreter).
 **Consequences.** One extra `exec` on every macOS start (about 15 ms, measured). The relaunched process
-inherits the two variables, so code that starts subprocesses must keep passing an explicit,
-minimal environment (CLAUDE.md), which it must do anyway. Linux and the kiosk target are unaffected.
+no longer inherits the two variables (they are put back), and code that starts subprocesses must
+keep passing an explicit, minimal environment (CLAUDE.md) anyway. Linux and the kiosk target are
+unaffected.
 
 ## D9 — The shell talks to the agent through a callback `Responder` (2026-10-16, accepted)
 
@@ -123,4 +130,7 @@ reaches the transcript, and ignores events after a reply has ended.
 task or a worker thread without changing the shell. New kinds of event (tool calls) extend the union.
 Timeouts and per-turn limits stay the responder's job (I9). An `AsyncIterator`-returning interface was
 considered and rejected for S02: it would make the shell choose the asyncio integration S03 owns.
+Events must arrive on the thread that sent the message; the sink raises `WrongThreadError` from
+another one. In the worker-thread fallback of D2 the shell injects a main-thread dispatcher built
+on `GLib.idle_add` and the agent calls it; the agent never imports `gi`.
 
