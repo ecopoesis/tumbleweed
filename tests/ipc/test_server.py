@@ -5,9 +5,13 @@ The uid check is exercised here with a fake credentials provider, which runs on 
 """
 
 import asyncio
+import logging
 import os
 import socket
 import stat
+import time
+from datetime import timedelta
+from time import monotonic
 
 import pytest
 
@@ -18,18 +22,23 @@ from tests.ipc.helpers import (
     ScriptedHandler,
     connected,
     fake_server,
+    next_connection,
     raw_peer,
     replying,
     serving,
 )
+from tumbleweed.ipc import connection as connection_module
 from tumbleweed.ipc.client import connect
+from tumbleweed.ipc.connection import Connection
 from tumbleweed.ipc.errors import (
     AddressInUseError,
+    ConnectionClosedError,
     HandshakeError,
     PeerCredentialsError,
     PeerRejectedError,
     SocketError,
 )
+from tumbleweed.ipc.framing import CLOSE_TIMEOUT, close_writer
 from tumbleweed.ipc.messages import Echo, Echoed, Ping, Pong
 from tumbleweed.ipc.peercred import SupportsGetsockopt, Uid
 from tumbleweed.ipc.server import IpcServer
@@ -47,12 +56,12 @@ class TestLifecycle:
             server = IpcServer(sock_path, ScriptedHandler())
             await server.start()
             try:
-                info = sock_path.lstat()
+                info = sock_path.path.lstat()
                 assert stat.S_ISSOCK(info.st_mode)
                 assert stat.S_IMODE(info.st_mode) == 0o600
             finally:
                 await server.close()
-            assert not sock_path.exists()
+            assert not sock_path.path.exists()
 
         run(scenario)
 
@@ -118,22 +127,22 @@ class TestLifecycle:
     def test_a_server_does_not_start_over_a_file_that_is_not_a_stale_socket(
         self, sock_path: SocketPath
     ) -> None:
-        sock_path.write_text("precious")
+        sock_path.path.write_text("precious")
 
         async def scenario() -> None:
             await IpcServer(sock_path, ScriptedHandler()).start()
 
         with pytest.raises(SocketError, match="not a socket"):
             run(scenario)
-        assert sock_path.read_text() == "precious"
+        assert sock_path.path.read_text() == "precious"
 
     def test_a_failed_start_releases_the_claim(self, sock_path: SocketPath) -> None:
-        sock_path.write_text("in the way")
+        sock_path.path.write_text("in the way")
 
         async def scenario() -> None:
             with pytest.raises(SocketError):
                 await IpcServer(sock_path, ScriptedHandler()).start()
-            sock_path.unlink()
+            sock_path.path.unlink()
             async with serving(sock_path):  # the lock was not leaked by the failure
                 pass
 
@@ -144,7 +153,7 @@ class TestLifecycle:
         self, sock_path: SocketPath, bad: object
     ) -> None:
         with pytest.raises(ValueError, match="max_connections"):
-            IpcServer(sock_path, ScriptedHandler(), max_connections=bad)  # type: ignore[arg-type]
+            IpcServer(sock_path, ScriptedHandler(), max_connections=bad)  # type: ignore[arg-type]  # a bad cap on purpose: the server must refuse it at runtime
 
 
 class TestConnectionCap:
@@ -330,3 +339,244 @@ def test_a_server_serves_many_clients_at_once(sock_path: SocketPath) -> None:
                     await client.close()
 
     run(scenario, deadline=30)
+
+
+class TestClosing:
+    def test_a_connection_that_fails_to_close_does_not_keep_the_socket_file(
+        self,
+        sock_path: SocketPath,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        async def failing_close(self: Connection) -> None:
+            raise RuntimeError("a bug in teardown")
+
+        async def scenario() -> None:
+            server = IpcServer(sock_path, ScriptedHandler())
+            await server.start()
+            client = await connect(sock_path)
+            try:
+                with monkeypatch.context() as patch:
+                    patch.setattr(Connection, "close", failing_close)
+                    await server.close()  # the failure is logged, and does not stop the rest
+
+                assert not sock_path.path.exists()
+                assert "closing an IPC connection failed" in caplog.text
+            finally:
+                await client.close()
+
+        run(scenario)
+
+    def test_closers_that_arrive_while_a_close_is_under_way_wait_for_it(
+        self, sock_path: SocketPath, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            real_close = Connection.close
+
+            async def slow_close(self: Connection) -> None:
+                entered.set()
+                await release.wait()
+                await real_close(self)
+
+            server = IpcServer(sock_path, ScriptedHandler())
+            await server.start()
+            client = await connect(sock_path)
+            try:
+                with monkeypatch.context() as patch:
+                    patch.setattr(Connection, "close", slow_close)
+                    first = asyncio.create_task(server.close())
+                    await entered.wait()
+                    second = asyncio.create_task(server.close())
+
+                    done, _pending = await asyncio.wait({second}, timeout=0.3)
+                    assert not done  # it is waiting for the close that is under way
+                    assert sock_path.path.exists()  # which has not finished
+
+                    release.set()
+                    await asyncio.gather(first, second)
+                assert not sock_path.path.exists()
+            finally:
+                await client.close()
+
+        run(scenario)
+
+    def test_a_cancelled_closer_does_not_stop_the_close(
+        self, sock_path: SocketPath, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            entered = asyncio.Event()
+            release = asyncio.Event()
+            real_close = Connection.close
+
+            async def slow_close(self: Connection) -> None:
+                entered.set()
+                await release.wait()
+                await real_close(self)
+
+            server = IpcServer(sock_path, ScriptedHandler())
+            await server.start()
+            client = await connect(sock_path)
+            try:
+                with monkeypatch.context() as patch:
+                    patch.setattr(Connection, "close", slow_close)
+                    closer = asyncio.create_task(server.close())
+                    await entered.wait()
+                    closer.cancel()
+                    await asyncio.gather(closer, return_exceptions=True)
+
+                    release.set()
+                    await server.close()  # joins the close that carried on without its first caller
+                assert not sock_path.path.exists()
+            finally:
+                await client.close()
+
+        run(scenario)
+
+    def test_peers_in_their_handshake_are_dropped_when_the_server_closes(
+        self, sock_path: SocketPath
+    ) -> None:
+        async def scenario() -> None:
+            server = IpcServer(sock_path, ScriptedHandler())
+            await server.start()
+            silent = await RawPeer.connect(sock_path)  # mid-handshake: has a long time to go
+            served = await RawPeer.handshaken(sock_path)  # accepted after `silent`: so it was too
+            try:
+                started = monotonic()
+                await server.close()
+
+                assert (
+                    monotonic() - started < 1.5
+                )  # not the handshake timeout, nor the grace period
+                assert await silent.drain_until_closed() == []
+            finally:
+                await served.close()
+                await silent.close()
+
+        run(scenario)
+
+    def test_a_connection_that_arrives_while_the_server_is_closing_is_refused_and_closed(
+        self, sock_path: SocketPath
+    ) -> None:
+        async def scenario() -> None:
+            server = IpcServer(sock_path, ScriptedHandler())
+            await server.start()
+            await server.close()
+            ours, theirs = socket.socketpair()
+            reader, writer = await asyncio.open_unix_connection(sock=ours)
+            try:
+                started = monotonic()
+                # asyncio's own callback for an accepted connection. A connection can only be
+                # accepted after `close` began by a race that cannot be arranged from outside.
+                await server._on_connect(reader, writer)  # noqa: SLF001
+
+                assert monotonic() - started < 1  # refused at once, not left to a handshake
+                assert writer.is_closing()
+                assert not server.connections
+            finally:
+                theirs.close()
+
+        run(scenario)
+
+    def test_the_connection_cap_counts_a_connection_until_it_is_fully_closed(
+        self, sock_path: SocketPath, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            gate = asyncio.Event()
+            real = close_writer
+
+            async def slow(writer: asyncio.StreamWriter, within: timedelta = CLOSE_TIMEOUT) -> None:
+                await gate.wait()
+                await real(writer, within=within)
+
+            async with serving(sock_path, max_connections=1) as (server, _handler):
+                with monkeypatch.context() as patch:
+                    patch.setattr(connection_module, "close_writer", slow)
+                    first = await RawPeer.handshaken(sock_path)
+                    first_side = await next_connection(server)
+                    await first.close()
+                    while not first_side.is_closed:  # noqa: ASYNC110  (waits for the EOF to land)
+                        await asyncio.sleep(0.01)
+
+                    # It is closing but not gone: its slot is still taken.
+                    assert not first_side.is_finished
+                    with pytest.raises(HandshakeError):
+                        await connect(sock_path)
+
+                    gate.set()
+                    await first_side.wait_closed()
+                    again = await connect(sock_path)  # and once it is gone the slot is free
+                    await again.close()
+
+        run(scenario)
+
+    def test_a_handler_that_will_not_stop_is_named_in_a_warning_when_its_connection_closes(
+        self,
+        sock_path: SocketPath,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setattr(connection_module, "_HANDLER_UNWIND", timedelta(seconds=0.2))
+
+        async def scenario() -> None:
+            async with serving(sock_path) as (server, handler):
+                client = await connect(sock_path, answer_diagnostics=False)
+                try:
+                    waiting = asyncio.create_task(
+                        client.call(Echo(kind="echo", text="stubborn:x"), Echoed)
+                    )
+                    await handler.started["x"].wait()
+                    at_the_server = await next_connection(server)
+
+                    await at_the_server.close()  # the handler ignores the cancellation
+
+                    with pytest.raises(ConnectionClosedError):
+                        await waiting
+                finally:
+                    await client.close()
+
+        run(scenario)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("did not stop" in m and "ipc-request-req_" in m for m in warnings), warnings
+
+
+class TestKeepingTheSocketYoung:
+    def test_the_server_touches_its_socket_lock_and_directory_every_interval(
+        self, sock_path: SocketPath
+    ) -> None:
+        # What a purge of files nobody accessed for days would otherwise take from a long-running
+        # server, and with them its claim (macOS purges its per-user temporary directory).
+        async def scenario() -> None:
+            async with serving(sock_path, refresh_interval=timedelta(seconds=0.1)):
+                long_ago = time.time() - 4 * 24 * 3600
+                files = (sock_path.path, sock_path.lock_path, sock_path.path.parent)
+                for path in files:
+                    os.utime(path, (long_ago, long_ago))
+
+                while any(path.stat().st_mtime < long_ago + 3600 for path in files):  # noqa: ASYNC110
+                    await asyncio.sleep(0.05)
+
+                for path in files:
+                    assert path.stat().st_atime > long_ago + 3600
+
+        run(scenario)
+
+    def test_a_server_whose_socket_file_is_gone_says_so(
+        self, sock_path: SocketPath, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async def scenario() -> None:
+            async with serving(sock_path, refresh_interval=timedelta(seconds=0.1)):
+                sock_path.path.unlink()  # as a purge would
+
+                while "gone or was replaced" not in caplog.text:  # noqa: ASYNC110  (a log line)
+                    await asyncio.sleep(0.05)
+
+        run(scenario)
+
+    @pytest.mark.parametrize("bad", [timedelta(0), timedelta(seconds=-1), 5, None])
+    def test_a_refresh_interval_that_is_not_a_positive_timedelta_is_refused(
+        self, sock_path: SocketPath, bad: object
+    ) -> None:
+        with pytest.raises(ValueError, match="refresh_interval"):
+            IpcServer(sock_path, ScriptedHandler(), refresh_interval=bad)  # type: ignore[arg-type]  # a bad interval on purpose: the server must refuse it at runtime

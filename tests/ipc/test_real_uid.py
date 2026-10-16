@@ -23,8 +23,10 @@ import pytest
 
 from tests.ipc.bounded import run
 from tests.ipc.helpers import ScriptedHandler
+from tests.ipc.paths import unchecked_socket_path
 from tumbleweed.core.types import CanonicalPath
-from tumbleweed.ipc.errors import SocketError
+from tumbleweed.ipc.client import connect
+from tumbleweed.ipc.errors import PeerRejectedError, SocketError
 from tumbleweed.ipc.framing import encode_frame
 from tumbleweed.ipc.peercred import SupportsGetsockopt, SystemPeerCredentials, Uid
 from tumbleweed.ipc.server import IpcServer
@@ -58,6 +60,30 @@ else:
 """
 
 BIND = "import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])"
+
+# A server that is not ours: listens, lets anyone connect, and reports how many bytes it got.
+IMPOSTOR = """
+import os, socket, sys
+path = sys.argv[1]
+server = socket.socket(socket.AF_UNIX)
+server.bind(path)
+os.chmod(path, 0o666)
+server.listen(1)
+print("listening", flush=True)
+server.settimeout(30)
+connection, _ = server.accept()
+connection.settimeout(10)
+total = 0
+try:
+    while True:
+        data = connection.recv(4096)
+        if not data:
+            break
+        total += len(data)
+except OSError:
+    pass
+print("received", total, flush=True)
+"""
 
 
 @dataclass(frozen=True)
@@ -129,13 +155,13 @@ async def connect_as(user: SecondUser | None, path: SocketPath) -> list[str]:
 def test_a_real_second_user_is_closed_out_and_we_are_let_in_by_the_same_server(
     second_user: SecondUser, open_directory: Path
 ) -> None:
-    path = SocketPath(open_directory / "ipc.sock")
+    path = unchecked_socket_path(open_directory / "ipc.sock")
 
     async def scenario() -> None:
         handler = ScriptedHandler()
         provider = Recording()
         async with IpcServer(path, handler, credentials=provider) as server:
-            path.chmod(0o666)  # the second user may connect; only the uid check stops it
+            path.path.chmod(0o666)  # the second user may connect; only the uid check stops it
 
             ours = await connect_as(None, path)
             theirs = await connect_as(second_user, path)
@@ -161,7 +187,7 @@ def test_a_socket_of_another_user_is_never_removed_as_stale(
     assert info.st_uid == second_user.uid
 
     with pytest.raises(SocketError, match=f"socket of uid {second_user.uid}"):
-        claim_socket(SocketPath(path))
+        claim_socket(unchecked_socket_path(path))
 
     assert path.lstat().st_ino == info.st_ino  # still theirs
 
@@ -179,3 +205,30 @@ def test_a_runtime_directory_of_another_user_is_refused(
         SocketDirectory(CanonicalPath.resolve(base), create=True)
 
     assert not (base / "tumbleweed").exists()  # nothing was made in it
+
+
+def test_a_client_refuses_a_server_of_another_user_before_sending_it_a_byte(
+    second_user: SecondUser, open_directory: Path
+) -> None:
+    path = unchecked_socket_path(open_directory / "impostor.sock")
+    impostor = subprocess.Popen(  # noqa: S603  (argv list, no shell; a fixed script)
+        [*second_user.sudo, PYTHON, "-c", IMPOSTOR, str(path)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert impostor.stdout is not None
+        assert impostor.stdout.readline().strip() == "listening"
+
+        async def scenario() -> None:
+            with pytest.raises(PeerRejectedError, match=f"uid {second_user.uid}"):
+                await connect(path)
+
+        run(scenario, deadline=60)
+
+        output, _ = impostor.communicate(timeout=60)
+        # It accepted the connection, and saw the client leave without a word: no hello, nothing.
+        assert output.split() == ["received", "0"]
+    finally:
+        impostor.kill()
+        impostor.wait()

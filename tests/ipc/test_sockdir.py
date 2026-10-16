@@ -7,6 +7,7 @@ because everything is refused, and one fails the moment the check it is about is
 import os
 import socket
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from tumbleweed.ipc.peercred import Uid
 from tumbleweed.ipc.sockdir import (
     DIRECTORY_NAME,
     SocketDirectory,
+    SocketPath,
     _verify_leaf,
     runtime_base,
 )
@@ -141,6 +143,20 @@ class TestCreation:
             SocketDirectory(base, create=False)
 
         assert not (Path(str(base)) / DIRECTORY_NAME).exists()
+
+
+class TestSetgid:
+    def test_a_base_with_the_setgid_bit_still_gets_a_leaf_of_exactly_0700(
+        self, base: CanonicalPath
+    ) -> None:
+        # On Linux a new directory inside a setgid one is made setgid too (mode 2700), which the
+        # mode check would then refuse in the very directory we just made. It must be 0700.
+        Path(str(base)).chmod(0o2700)
+
+        directory = SocketDirectory(base, create=True)
+
+        assert mode_of(directory.path) == 0o700
+        SocketDirectory(base, create=False)  # and it passes the check again, as an existing one
 
 
 class TestRefusal:
@@ -291,8 +307,8 @@ class TestSocketPaths:
     ) -> None:
         path = socket_dir.socket_path(name)
 
-        assert path == socket_dir.path / f"{name}.sock"
-        assert isinstance(path, Path)
+        assert path.path == socket_dir.path / f"{name}.sock"
+        assert os.fspath(path) == str(path) == str(socket_dir.path / f"{name}.sock")
 
     @pytest.mark.parametrize(
         "name",
@@ -327,3 +343,86 @@ class TestSocketPaths:
 
         with socket.socket(socket.AF_UNIX) as sock, pytest.raises(OSError, match="too long"):
             sock.bind(str(directory.path / "brokerx.sock"))
+
+
+class TestSocketPath:
+    def test_a_socket_path_cannot_be_made_by_calling_the_class(self) -> None:
+        with pytest.raises(TypeError, match=r"comes from SocketDirectory\.socket_path"):
+            SocketPath(object(), Path("/anywhere/x.sock"))
+        with pytest.raises(TypeError):
+            SocketPath(Path("/anywhere/x.sock"))  # type: ignore[call-arg]  # wrong arity on purpose: only the directory can make one
+
+    def test_it_is_a_path_like_value_with_identity_by_path(
+        self, socket_dir: SocketDirectory
+    ) -> None:
+        first = socket_dir.socket_path("a")
+        again = socket_dir.socket_path("a")
+        other = socket_dir.socket_path("b")
+
+        assert first == again
+        assert hash(first) == hash(again)
+        assert first != other
+        assert first != str(first)  # not equal to the bare text, nor to a Path
+        assert first != first.path
+        assert os.fspath(first) == str(first) == str(first.path)
+        assert str(first.path) in repr(first)
+        assert type(first) is SocketPath  # not a Path, which it must not be taken for
+
+    def test_the_lock_path_sits_next_to_the_socket(self, socket_dir: SocketDirectory) -> None:
+        path = socket_dir.socket_path("broker")
+
+        assert path.lock_path == Path(f"{path.path}.lock")
+        assert path.lock_path.parent == path.path.parent
+
+    def test_it_cannot_be_changed(self, socket_dir: SocketDirectory) -> None:
+        path = socket_dir.socket_path("broker")
+
+        with pytest.raises(AttributeError):
+            path.extra = 1  # type: ignore[attr-defined]  # a slotted class refuses new attributes: that is the point
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="extended ACLs are macOS's own mechanism")
+class TestExtendedAcls:
+    """A mode of 0700 does not show an ACL entry such as `everyone allow search`."""
+
+    @staticmethod
+    def grant_everyone(path: Path) -> None:
+        subprocess.run(  # noqa: S603  (argv list, no shell; the system's chmod)
+            ["/bin/chmod", "+a", "everyone allow search", str(path)], check=True, timeout=30
+        )
+
+    @staticmethod
+    def revoke_all(path: Path) -> None:
+        subprocess.run(["/bin/chmod", "-N", str(path)], check=True, timeout=30)  # noqa: S603
+
+    def test_the_control_without_an_acl_both_are_accepted(self, base: CanonicalPath) -> None:
+        SocketDirectory(base, create=True)
+        SocketDirectory(base, create=False)
+
+    def test_a_base_with_an_acl_is_refused_and_nothing_is_made_in_it(
+        self, base: CanonicalPath
+    ) -> None:
+        self.grant_everyone(Path(str(base)))
+
+        for create in (True, False):
+            with pytest.raises(
+                SocketError, match=r"runtime directory .* has an access control list"
+            ):
+                SocketDirectory(base, create=create)
+
+        assert not (Path(str(base)) / DIRECTORY_NAME).exists()
+        self.revoke_all(Path(str(base)))
+        SocketDirectory(base, create=True)  # taking the ACL off is all it needed
+
+    def test_a_leaf_with_an_acl_is_refused(self, base: CanonicalPath) -> None:
+        leaf = SocketDirectory(base, create=True).path
+        self.grant_everyone(leaf)
+
+        for create in (True, False):
+            with pytest.raises(
+                SocketError, match=r"socket directory .* has an access control list"
+            ):
+                SocketDirectory(base, create=create)
+
+        self.revoke_all(leaf)
+        SocketDirectory(base, create=False)

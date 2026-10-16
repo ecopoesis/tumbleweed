@@ -24,7 +24,7 @@ from tumbleweed.ipc.errors import (
     IdleTimeoutError,
     TruncatedFrameError,
 )
-from tumbleweed.ipc.framing import HEADER_BYTES, encode_frame, read_frame
+from tumbleweed.ipc.framing import HEADER_BYTES, close_writer, encode_frame, read_frame
 from tumbleweed.ipc.limits import MAX_FRAME_BYTES, MIN_FRAME_BYTES
 
 PROPERTY = settings(derandomize=True, deadline=None, database=None, max_examples=200)
@@ -265,6 +265,41 @@ class TestProperties:
             run(scenario, deadline=5)
 
     @PROPERTY
+    @given(
+        payloads=st.lists(st.binary(min_size=1, max_size=200), min_size=1, max_size=6),
+        data=st.data(),
+    )
+    def test_a_stream_cut_inside_a_frame_gives_the_frames_before_it_then_truncation(
+        self, payloads: list[bytes], data: st.DataObject
+    ) -> None:
+        frames = [encode_frame(payload) for payload in payloads]
+        index = data.draw(st.integers(min_value=0, max_value=len(frames) - 1), label="frame")
+        start = sum(len(frame) for frame in frames[:index])
+        # Strictly inside the frame: after at least one of its bytes, before its last one. A frame
+        # is at least five bytes (four of header, one of payload), so there is always a place.
+        inside = data.draw(st.integers(min_value=1, max_value=len(frames[index]) - 1), label="cut")
+        stream = b"".join(frames)[: start + inside]
+
+        async def scenario() -> tuple[list[bytes], bool]:
+            reader = asyncio.StreamReader()
+            reader.feed_data(stream)
+            reader.feed_eof()
+            complete: list[bytes] = []
+            try:
+                while (
+                    payload := await read_frame(reader, max_bytes=LIMIT, frame_timeout=PATIENT)
+                ) is not None:
+                    complete.append(payload)
+            except TruncatedFrameError:
+                return complete, True
+            return complete, False
+
+        complete, truncated = run(scenario)
+
+        assert truncated  # the cut was inside a frame, so the end of the stream is no clean end
+        assert complete == payloads[:index]  # and every frame before it came out whole
+
+    @PROPERTY
     @given(payload=st.binary(min_size=1, max_size=500))
     def test_what_is_encoded_is_what_is_read(self, payload: bytes) -> None:
         async def scenario() -> list[bytes]:
@@ -274,3 +309,54 @@ class TestProperties:
             return await read_all(reader)
 
         assert run(scenario) == [payload]
+
+
+class StubTransport:
+    def __init__(self) -> None:
+        self.aborted = False
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
+class StubWriter:
+    """Stands in for a `StreamWriter` whose transport finishes closing as `closing` says."""
+
+    def __init__(self, closing: str) -> None:
+        self.transport = StubTransport()
+        self.closing = closing
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        if self.closing == "never":
+            await asyncio.Event().wait()
+        if self.closing == "fails":
+            raise ConnectionResetError("the peer reset the connection while closing")
+
+
+class TestClosingAWriter:
+    @pytest.mark.parametrize("closing", ["never", "fails"])
+    def test_a_transport_that_does_not_close_is_aborted(self, closing: str) -> None:
+        writer = StubWriter(closing)
+
+        async def scenario() -> None:
+            await close_writer(writer, within=timedelta(seconds=0.1))  # type: ignore[arg-type]  # a stand-in for a writer that will not close
+
+        run(scenario, deadline=5)
+
+        assert writer.closed
+        assert writer.transport.aborted
+
+    def test_a_transport_that_closes_is_not_aborted(self) -> None:
+        writer = StubWriter("promptly")
+
+        async def scenario() -> None:
+            await close_writer(writer, within=timedelta(seconds=5))  # type: ignore[arg-type]  # a stand-in for a writer that closes at once
+
+        run(scenario, deadline=5)
+
+        assert writer.closed
+        assert not writer.transport.aborted

@@ -378,7 +378,7 @@ class TestClientSide:
         assert not isinstance(raised.value, HandshakeError)
 
     def test_a_path_that_is_not_a_socket_is_a_connect_error(self, sock_path: SocketPath) -> None:
-        sock_path.write_text("not a socket")
+        sock_path.path.write_text("not a socket")
 
         async def scenario() -> None:
             await connect(sock_path)

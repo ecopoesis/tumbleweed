@@ -32,17 +32,23 @@ class IpcLimits:
     - `handshake_timeout`: the whole handshake, from connect to the peer's hello.
     - `frame_timeout`: how long one frame may take from its first byte to its last. This is what
       drops a peer that sends a frame a byte at a time (slowloris).
-    - `write_timeout`: how long one frame may take to be accepted by a peer that is not reading.
-    - `idle_timeout`: how long a connection may receive nothing at all between frames; `None`
-      means no limit. The default is `None` because the shell and the broker keep one connection
-      for the whole session, which is legitimately quiet. Every read in progress (the handshake,
-      the rest of a frame) is bounded regardless; this only bounds the wait for the next frame.
+    - `write_timeout`: how long a peer may take not one byte while data waits for it, before the
+      connection is dropped. The bound on what waits (twice `max_frame_bytes`) is not tunable.
+    - `idle_timeout`: how long a connection may receive nothing at all between frames while no
+      request of either peer is in progress (a window that ends with one in progress starts
+      again, so a connection closes between one and two timeouts after it falls quiet); `None`
+      means no limit. The default is `None`, the one documented exception to "every wait has a
+      timeout" (CLAUDE.md, #59): the shell and the broker keep one connection for the whole
+      session, which is legitimately quiet. Every read in progress (the handshake, the rest of
+      a frame) is bounded regardless; this only bounds the wait for the next frame.
     - `request_timeout`: the default for how long `Connection.call` waits for an answer.
     - `handler_timeout`: how long a request handler may run before the caller gets a `timeout`
-      error and the handler is cancelled.
+      error and the handler is cancelled. Shorter than `request_timeout` by default, so that
+      the caller is told by the callee before it gives up by itself.
     - `max_inflight_calls`: how many of our requests may await an answer at once.
-    - `max_inflight_handlers`: how many of the peer's requests may be in progress at once; more
-      are answered with `too_many_requests` without being run.
+    - `max_inflight_handlers`: how many of the peer's requests may be in progress at once, from
+      the start of its handler until its reply is written; more are answered with
+      `too_many_requests` without being run. The diagnostics (`ping`, `echo`) take no slot.
     """
 
     max_frame_bytes: ByteCount = MAX_FRAME_BYTES
@@ -51,7 +57,7 @@ class IpcLimits:
     write_timeout: timedelta = timedelta(seconds=10)
     idle_timeout: timedelta | None = None
     request_timeout: timedelta = timedelta(seconds=30)
-    handler_timeout: timedelta = timedelta(seconds=30)
+    handler_timeout: timedelta = timedelta(seconds=25)
     max_inflight_calls: int = 32
     max_inflight_handlers: int = 32
 

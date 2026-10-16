@@ -8,10 +8,12 @@ system provides, `confstr(_CS_DARWIN_USER_TEMP_DIR)` (`/var/folders/.../T/`, own
 0700, cleared at reboot, and the directory `$TMPDIR` normally names). Anywhere else an unset
 `XDG_RUNTIME_DIR` is an error: there is no place we know to be private.
 
-What is refused, never repaired. The base must be a directory of ours that group and others
-cannot enter. The `tumbleweed` directory in it is created 0700 if missing; if it exists it must
-be a real directory (not a symlink, even to a good one) owned by us with mode exactly 0700,
-otherwise `SocketError` says what is wrong and nothing is touched. Both are opened with
+What is refused, never repaired. The base must be a directory of ours with no group or other
+permission bit set at all (0740 is refused). The `tumbleweed` directory in it is created 0700 if
+missing; if it exists it must be a real directory (not a symlink, even to a good one) owned by
+us with mode exactly 0700. On macOS neither may have an extended ACL, which can let others in
+whatever the mode says. Otherwise `SocketError` says what is wrong and nothing is touched. Both
+are opened with
 `O_NOFOLLOW` and judged by `fstat` on the opened descriptor, so there is no gap between a `stat`
 and an `open` for anyone to slip a symlink into. (The socket itself is later bound and connected
 to by path. Nobody but the user can change a private directory of the user's; a process of the
@@ -23,9 +25,19 @@ that any socket file left at the path is stale: it is then removed, but only if 
 we own. A regular file, a directory, a symlink or somebody else's socket is never removed, and
 a second server fails with `AddressInUseError` without touching the first one's socket. The
 lock file itself stays: removing it would let two servers each lock a different file.
+
+Staying put. macOS's `dirhelper` empties `/var/folders/.../T` of files not accessed for three
+days, and neither a socket nor a lock file is accessed while a server idles, so a long-running
+server would lose both, and with them its claim: a second server could then start on the same
+path. `SocketClaim.touch`, which `IpcServer` calls every six hours by default, refreshes the
+timestamps of the socket, the lock file and the directory. That keeps a running server's files
+young; it cannot bring back files a purge took while the machine slept through the timer, in
+which case `touch` returns `False` and the server logs that clients can no longer reach it.
 """
 
 import contextlib
+import ctypes
+import errno
 import fcntl
 import os
 import re
@@ -34,7 +46,7 @@ import stat
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Final, NewType, Self, final
+from typing import Final, Self, final
 
 from tumbleweed.core.errors import excerpt
 from tumbleweed.core.types import CanonicalPath
@@ -50,9 +62,50 @@ _CS_DARWIN_USER_TEMP_DIR: Final = 65537  # <unistd.h>; Python has no name for it
 _MAX_SOCKET_PATH_BYTES: Final = 103
 _DIRECTORY_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
-SocketPath = NewType("SocketPath", Path)
-"""A path for a Unix socket, made only by `SocketDirectory.socket_path`: inside a verified
-directory, with a validated name, short enough for `sun_path`."""
+_ACL_TYPE_EXTENDED: Final = 0x100  # <sys/acl.h> on macOS
+_MINT: Final = object()  # what only this module holds, so that only it can make a SocketPath
+
+
+@final
+class SocketPath:
+    """The path of one Unix socket, made only by `SocketDirectory.socket_path`.
+
+    It is inside a verified private directory, has a validated name and is short enough for a
+    socket address, so code that is given one need not check any of that again. There is no
+    other way to get one: the constructor refuses. It is a path-like object (`os.fspath` and
+    `str` work); `path` is the `pathlib.Path`.
+    """
+
+    __slots__ = ("_path",)
+
+    def __init__(self, mint: object, path: Path) -> None:
+        if mint is not _MINT:
+            raise TypeError("a SocketPath comes from SocketDirectory.socket_path()")
+        self._path = path
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def lock_path(self) -> Path:
+        """The lock file of the server on this path."""
+        return Path(f"{self._path}.lock")
+
+    def __fspath__(self) -> str:
+        return os.fspath(self._path)
+
+    def __str__(self) -> str:
+        return str(self._path)
+
+    def __repr__(self) -> str:
+        return f"SocketPath({str(self._path)!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, SocketPath) and self._path == other._path
+
+    def __hash__(self) -> int:
+        return hash(self._path)
 
 
 def _darwin_user_temp_dir() -> str:
@@ -86,6 +139,27 @@ def _reason(exc: OSError) -> str:
 
 def _mode(info: os.stat_result) -> str:
     return f"{stat.S_IMODE(info.st_mode):04o}"
+
+
+def _require_no_acl(fd: int, what: str) -> None:
+    """On macOS, refuse a directory with an extended ACL, which can let others in whatever its mode.
+
+    A mode of 0700 says nothing about an ACL entry such as `everyone allow search`, and macOS
+    keeps those apart from the mode bits. (Linux folds the permissions of a POSIX ACL into the
+    group bits of the mode, which are already required to be clear.)
+    """
+    if sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        libc.acl_get_fd_np.restype = ctypes.c_void_p
+        libc.acl_free.argtypes = [ctypes.c_void_p]
+        ctypes.set_errno(0)
+        acl: int | None = libc.acl_get_fd_np(fd, _ACL_TYPE_EXTENDED)
+        if acl is not None:
+            libc.acl_free(acl)
+            raise SocketError(f"{what} has an access control list: refusing to use it")
+        if ctypes.get_errno() not in {0, errno.ENOENT}:  # ENOENT: there is none
+            raise SocketError(f"cannot check {what} for an access control list")
 
 
 def _open_directory(name: str, *, dir_fd: int | None, what: str) -> int:
@@ -124,6 +198,7 @@ def _verify_leaf(base_fd: int, path: Path, *, create: bool, owner: Uid) -> None:
         if created:
             os.fchmod(fd, 0o700)  # a setgid parent would have passed its bit on
         info = os.fstat(fd)
+        _require_no_acl(fd, f"the socket directory {path}")
         if info.st_uid != owner:
             raise SocketError(f"the socket directory {path} is owned by uid {info.st_uid}")
         if stat.S_IMODE(info.st_mode) != 0o700:
@@ -149,6 +224,7 @@ class SocketDirectory:
         base_fd = _open_directory(str(base), dir_fd=None, what=f"the runtime directory {base}")
         try:
             info = os.fstat(base_fd)
+            _require_no_acl(base_fd, f"the runtime directory {base}")
             if info.st_uid != uid:
                 raise SocketError(f"the runtime directory {base} is owned by uid {info.st_uid}")
             if info.st_mode & 0o077:
@@ -191,7 +267,7 @@ class SocketDirectory:
                 f"the socket path {path} is over {_MAX_SOCKET_PATH_BYTES} bytes, more than a "
                 "Unix socket address can hold; use a shorter XDG_RUNTIME_DIR"
             )
-        return SocketPath(path)
+        return SocketPath(_MINT, path)
 
 
 @final
@@ -226,17 +302,37 @@ class SocketClaim:
         self._released = True
         self._sock.close()
         try:
-            info = self._path.lstat()
+            info = self._path.path.lstat()
             if stat.S_ISSOCK(info.st_mode) and (info.st_dev, info.st_ino) == self._identity:
-                self._path.unlink()
+                self._path.path.unlink()
         except FileNotFoundError:
             pass
         finally:
             os.close(self._lock_fd)
 
+    def touch(self) -> bool:
+        """Refresh the timestamps of the socket, its lock file and its directory.
+
+        Cleaners of old files in temporary directories go by age: macOS's `dirhelper` removes
+        what in `/var/folders/.../T` was not accessed for three days, and a server that runs for
+        weeks touches neither its socket nor its lock file. A server calls this periodically.
+        Returns `False` if the socket file is no longer the one this claim bound (it was
+        removed or replaced, and clients cannot reach this server any more); a purge that
+        already happened cannot be undone.
+        """
+        try:
+            info = self._path.path.lstat()
+            if not stat.S_ISSOCK(info.st_mode) or (info.st_dev, info.st_ino) != self._identity:
+                return False
+            for path in (self._path.path, self._path.lock_path, self._path.path.parent):
+                os.utime(path)
+        except OSError:
+            return False
+        return True
+
 
 def _lock(path: SocketPath, owner: Uid) -> int:
-    lock_path = f"{path}.lock"
+    lock_path = path.lock_path
     try:
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     except OSError as exc:
@@ -258,7 +354,7 @@ def _lock(path: SocketPath, owner: Uid) -> int:
 def _remove_stale(path: SocketPath, owner: Uid) -> None:
     """Remove a socket file left by a dead server. Refuse, untouched, anything else."""
     try:
-        info = path.lstat()
+        info = path.path.lstat()
     except FileNotFoundError:
         return
     except OSError as exc:
@@ -270,7 +366,7 @@ def _remove_stale(path: SocketPath, owner: Uid) -> None:
         )
     if info.st_uid != owner:
         raise SocketError(f"{path} is a socket of uid {info.st_uid}; refusing to remove it")
-    path.unlink()
+    path.path.unlink()
 
 
 def claim_socket(path: SocketPath, *, owner: Uid | None = None) -> SocketClaim:
@@ -290,12 +386,12 @@ def claim_socket(path: SocketPath, *, owner: Uid | None = None) -> SocketClaim:
             sock.close()
             raise SocketError(f"cannot bind {path}: {_reason(exc)}") from None
         try:
-            path.chmod(0o600)
-            info = path.lstat()
+            path.path.chmod(0o600)
+            info = path.path.lstat()
         except OSError as exc:
             sock.close()
             with contextlib.suppress(OSError):
-                path.unlink()
+                path.path.unlink()
             raise SocketError(f"cannot secure {path}: {_reason(exc)}") from None
     except BaseException:
         os.close(lock_fd)

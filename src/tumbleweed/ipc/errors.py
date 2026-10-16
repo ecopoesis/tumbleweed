@@ -7,7 +7,7 @@ the UI, and a peer controls everything up to the frame limit.
 
 from enum import StrEnum
 
-from tumbleweed.core.errors import TumbleweedError, excerpt
+from tumbleweed.core.errors import InvalidValueError, TumbleweedError, excerpt
 
 
 class ErrorCode(StrEnum):
@@ -120,13 +120,17 @@ class RemoteError(IpcError):
 class RequestRefused(IpcError):  # noqa: N818  (not named *Error: it answers a request, it is no failure)
     """Raised by a request handler to answer with a structured error instead of a response.
 
-    The message is sent to the caller (cut to the wire limit), so it must be fit for that: no
-    secrets, no paths the caller may not see. Domain refusals ("denied by policy") belong in
-    response types; this is for conditions of the transport and of the handler itself.
+    The message is sent to the caller (cut to the wire limit, and any character that is not
+    valid UTF-8 written as an escape), so it must be fit for that: no secrets, no paths the
+    caller may not see. Domain refusals ("denied by policy") belong in response types; this is
+    for conditions of the transport and of the handler itself.
     """
 
     def __init__(self, code: ErrorCode, message: str) -> None:
-        super().__init__(f"{code.value}: {message}")
+        given: tuple[object, object] = (code, message)  # a handler may pass anything
+        if not isinstance(given[0], ErrorCode) or not isinstance(given[1], str):
+            raise InvalidValueError("RequestRefused takes an ErrorCode and a str")
+        super().__init__(f"{code.value}: {excerpt(message)}")
         self.code = code
         self.message = message
 

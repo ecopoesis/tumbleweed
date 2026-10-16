@@ -23,13 +23,16 @@ async def connect(
     *,
     limits: IpcLimits | None = None,
     credentials: PeerCredentialsProvider | None = None,
+    answer_diagnostics: bool = True,
 ) -> Connection:
     """Connect to the server at `path` and return the handshaken connection.
 
     The server must run as the same user as this process: the check is made before a byte is
     sent, so a socket another user put at `path` never sees anything. `handler` answers the
-    server's requests; without one every request from the server is refused with
-    `unsupported_request`. The connect and the handshake each get `limits.handshake_timeout`.
+    server's requests (never `ping` or `echo`: the connection answers those itself unless
+    `answer_diagnostics` is `False`, which is for tests); without a handler every other request
+    from the server is refused with `unsupported_request`. The connect and the handshake each get
+    `limits.handshake_timeout`.
 
     Raises `IpcConnectError` if there is nobody to connect to, `PeerAuthenticationError` if the
     server is another user's, and `HandshakeError` (`IncompatibleProtocolError` for a version
@@ -51,4 +54,6 @@ async def connect(
     except BaseException:
         await close_writer(writer)
         raise
-    return Connection(reader, writer, limits=limits, handler=handler)
+    return Connection(
+        reader, writer, limits=limits, handler=handler, answer_diagnostics=answer_diagnostics
+    )

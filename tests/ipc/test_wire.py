@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from tumbleweed.core.ids import IpcRequestId, TaskId
 from tumbleweed.ipc.errors import ErrorCode, MalformedFrameError
-from tumbleweed.ipc.messages import Echo, Echoed, Ping, Pong
+from tumbleweed.ipc.messages import Echo, Echoed, IpcMessage, Ping, Pong
 from tumbleweed.ipc.wire import (
     PROTOCOL_VERSION,
     ErrorFrame,
@@ -138,6 +138,8 @@ REFUSED = {
     "a lone surrogate escape": b'{"kind":"echo","text":"\\ud800"}',
     "NaN": b'{"kind":"hello","version":NaN}',
     "Infinity": b'{"kind":"hello","version":Infinity}',
+    "minus Infinity": b'{"kind":"hello","version":-Infinity}',
+    "a number too large for a float": b'{"kind":"hello","version":1e999}',
     "a truncated object": b'{"kind":"hello","version":1',
     "a NUL byte": b'{"kind":"hello"\x00,"version":1}',
     "single quotes": b"{'kind':'hello','version':1}",
@@ -210,6 +212,28 @@ class TestRefusal:
     def test_text_that_is_not_utf8_cannot_get_into_a_message_to_be_encoded(self) -> None:
         with pytest.raises(ValidationError, match="unicode"):
             Echo(kind="echo", text="\ud800")
+
+
+class WithAFloat(IpcMessage):
+    """A message with a float field, which the protocol does not have yet (a later step may)."""
+
+    x: float
+
+
+class TestNonFiniteNumbers:
+    @pytest.mark.parametrize("token", ["NaN", "Infinity", "-Infinity", "1e999", "-1e999"])
+    def test_a_float_field_refuses_them_on_the_wire(self, token: str) -> None:
+        with pytest.raises(ValidationError):
+            WithAFloat.model_validate_json(f'{{"x": {token}}}')
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_and_when_a_message_is_built(self, value: float) -> None:
+        with pytest.raises(ValidationError):
+            WithAFloat(x=value)
+
+    def test_the_control_a_finite_number_is_accepted(self) -> None:
+        assert WithAFloat.model_validate_json('{"x": 1.5}').x == 1.5
+        assert WithAFloat.model_validate_json('{"x": 1e300}').x == 1e300
 
 
 class TestProperties:

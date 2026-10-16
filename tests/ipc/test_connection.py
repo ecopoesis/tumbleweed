@@ -6,6 +6,7 @@ waits a fixed time for an effect: tests wait on events, and a hang fails at the 
 """
 
 import asyncio
+import errno
 import logging
 from dataclasses import replace
 from datetime import timedelta
@@ -257,7 +258,7 @@ class TestAnswers:
         async def scenario() -> None:
             async with serving(sock_path), connected(sock_path) as client:
                 with pytest.raises(TypeError, match="not a registered request body: Rogue"):
-                    await client.call(Rogue(), Pong)  # type: ignore[arg-type]  # the point
+                    await client.call(Rogue(), Pong)  # type: ignore[arg-type]  # a request that is not registered: the call must refuse it at runtime
 
                 assert await is_alive(client)  # nothing was left pending
 
@@ -334,7 +335,7 @@ class TestTimeouts:
     ) -> None:
         async def scenario() -> None:
             async with serving(sock_path), connected(sock_path) as client:
-                await client.call(Ping(kind="ping"), Pong, request_timeout=bad)  # type: ignore[arg-type]
+                await client.call(Ping(kind="ping"), Pong, request_timeout=bad)  # type: ignore[arg-type]  # a bad timeout on purpose: the call must refuse it at runtime
 
         with pytest.raises(ValueError, match="positive timedelta"):
             run(scenario)
@@ -455,6 +456,25 @@ class TestDisconnects:
 
         run(scenario)
 
+    def test_a_connection_is_not_closed_until_its_cancelled_handlers_have_cleaned_up(
+        self, sock_path: SocketPath
+    ) -> None:
+        async def scenario() -> None:
+            async with serving(sock_path) as (server, handler):
+                client = await connect(sock_path)
+                waiting = asyncio.create_task(client.call(echo("slow-cleanup:x"), Echoed))
+                await handler.started["x"].wait()
+                at_the_server = await next_connection(server)
+
+                await at_the_server.close()  # the handler takes 0.2 s to clean up after itself
+
+                assert handler.cancelled == ["x"]  # `close` came back only after it was done
+                with pytest.raises(ConnectionClosedError):
+                    await waiting
+                await client.close()
+
+        run(scenario)
+
     def test_when_the_peer_drops_the_transport_without_a_word_everything_is_released(
         self, sock_path: SocketPath
     ) -> None:
@@ -554,7 +574,7 @@ class TestDisconnects:
             for client in clients:
                 await client.wait_closed()
                 assert client.is_closed
-            assert not sock_path.exists()
+            assert not sock_path.path.exists()
 
         run(scenario)
 
@@ -569,3 +589,54 @@ class TestConcurrentLoad:
                     assert [a.text for a in answers] == texts
 
         run(scenario)
+
+
+class StubTransport:
+    def set_write_buffer_limits(self, high: int | None = None, low: int | None = None) -> None:
+        pass
+
+    def get_write_buffer_size(self) -> int:
+        return 0
+
+    def abort(self) -> None:
+        pass
+
+
+class ResettingWriter:
+    """A writer whose connection was reset behind the connection's back: `drain` says so."""
+
+    def __init__(self) -> None:
+        self.transport = StubTransport()
+
+    def write(self, data: bytes) -> None:
+        raise AssertionError("nothing may be written to a connection that is known to be reset")
+
+    async def drain(self) -> None:
+        raise ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+def test_a_reset_that_only_the_writer_has_noticed_is_a_closed_connection_not_an_os_error() -> None:
+    async def scenario() -> None:
+        reader = asyncio.StreamReader()  # it has not been told, and never will be
+        connection = Connection(
+            reader,
+            ResettingWriter(),  # type: ignore[arg-type]  # a stand-in writer
+            limits=IpcLimits(),
+            handler=None,
+        )
+        try:
+            with pytest.raises(ConnectionClosedError, match="Connection reset by peer"):
+                await connection.call(Ping(kind="ping"), Pong)
+
+            assert connection.is_closed
+            assert isinstance(connection.close_reason, ConnectionClosedError)
+        finally:
+            await connection.close()
+
+    run(scenario)

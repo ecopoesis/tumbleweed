@@ -1,6 +1,7 @@
 """The IPC server: listens on a claimed socket path and hands out handshaken connections."""
 
 import asyncio
+import contextlib
 import logging
 from datetime import timedelta
 from types import TracebackType
@@ -24,6 +25,12 @@ _logger = logging.getLogger(__name__)
 
 _CLEANUP = timedelta(seconds=2)
 _MAX_CONNECTIONS_LIMIT = 1024
+DEFAULT_REFRESH_INTERVAL = timedelta(hours=6)
+"""How often a server refreshes the timestamps of its socket, lock file and directory.
+
+Well inside the three days after which macOS purges untouched files from its per-user temporary
+directory (see `sockdir`).
+"""
 
 
 @final
@@ -31,10 +38,16 @@ class IpcServer:
     """Serves one socket path: `await server.start()`, `await server.close()`, or `async with`.
 
     Every connection is checked before a byte is read from it: the peer must run as the same
-    user as this process, otherwise it is closed and logged. Then it must complete
-    the handshake within the limits' handshake timeout. At most `max_connections` connections
-    exist at once, handshakes included; further ones are closed at once. Every request on every
-    connection goes to `handler`, which is given the connection the request came from.
+    user as this process, otherwise it is closed and logged. Then it must complete the
+    handshake within the limits' handshake timeout. At most `max_connections` connections exist
+    at once, handshakes included and closing ones counted until they are fully closed; further
+    ones are closed at once. The cap is an argument of the server, not one of `IpcLimits`,
+    which holds what is bounded on one connection. Every request on every connection goes to
+    `handler`, which is given the connection the request came from; the diagnostics
+    (`ping`, `echo`) are answered by the connection and never reach it, unless
+    `answer_diagnostics` is `False` (for tests, and for a proxy that must see everything).
+    Every `refresh_interval` the server touches its socket, lock file and directory, so that a
+    cleaner of old files in a temporary directory does not take them.
     """
 
     def __init__(
@@ -45,20 +58,28 @@ class IpcServer:
         limits: IpcLimits | None = None,
         max_connections: int = 16,
         credentials: PeerCredentialsProvider | None = None,
+        answer_diagnostics: bool = True,
+        refresh_interval: timedelta = DEFAULT_REFRESH_INTERVAL,
     ) -> None:
         if type(max_connections) is not int or not 1 <= max_connections <= _MAX_CONNECTIONS_LIMIT:
             raise InvalidValueError(
                 f"max_connections must be an int from 1 to {_MAX_CONNECTIONS_LIMIT}"
             )
+        if type(refresh_interval) is not timedelta or refresh_interval <= timedelta(0):
+            raise InvalidValueError("refresh_interval must be a positive timedelta")
         self._path = path
         self._handler = handler
         self._limits = IpcLimits() if limits is None else limits
         self._max_connections = max_connections
         self._credentials = SystemPeerCredentials() if credentials is None else credentials
+        self._diagnostics = answer_diagnostics
+        self._refresh_interval = refresh_interval
         self._owner = current_uid()
         self._claim: SocketClaim | None = None
         self._server: asyncio.Server | None = None
+        self._refresher: asyncio.Task[None] | None = None
         self._closing = False
+        self._close_task: asyncio.Task[None] | None = None
         self._handshaking: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
         self._connections: set[Connection] = set()
 
@@ -82,30 +103,21 @@ class IpcServer:
             claim.release()
             raise
         self._claim = claim
+        self._refresher = asyncio.get_running_loop().create_task(
+            self._keep_fresh(claim), name="ipc-server-refresh"
+        )
 
     async def close(self) -> None:
-        """Stop accepting, close every connection and remove the socket file. Idempotent."""
-        claim, server = self._claim, self._server
+        """Stop accepting, close every connection and remove the socket file.
+
+        Idempotent. Callers that arrive while a close is under way wait for that one.
+        """
         self._closing = True
-        if claim is None or server is None:
-            return
-        self._claim = self._server = None
-        server.close()
-        # A peer in its handshake is dropped by closing its transport, which ends the handshake
-        # by itself. (Cancelling the task is no good: before Python 3.12.2 asyncio logs an error
-        # for a cancelled connection callback.)
-        handshaking = dict(self._handshaking)
-        for writer in handshaking.values():
-            writer.transport.abort()
-        if handshaking:
-            await asyncio.wait(handshaking, timeout=_CLEANUP.total_seconds())
-        await asyncio.gather(*(connection.close() for connection in list(self._connections)))
-        try:
-            async with asyncio.timeout(_CLEANUP.total_seconds()):
-                await server.wait_closed()
-        except TimeoutError:
-            _logger.warning("the IPC server's listener did not close in time")
-        claim.release()
+        if self._close_task is None:
+            self._close_task = asyncio.get_running_loop().create_task(
+                self._shut_down(), name="ipc-server-close"
+            )
+        await asyncio.shield(self._close_task)
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -119,8 +131,56 @@ class IpcServer:
     ) -> None:
         await self.close()
 
+    async def _shut_down(self) -> None:
+        claim, server, refresher = self._claim, self._server, self._refresher
+        self._claim = self._server = self._refresher = None
+        if claim is None or server is None:
+            return
+        try:
+            if refresher is not None:
+                refresher.cancel()
+                await asyncio.gather(refresher, return_exceptions=True)
+            server.close()
+            # A peer in its handshake is dropped by closing its transport, which ends the
+            # handshake by itself. (Cancelling the task is no good: before Python 3.12.2
+            # asyncio logs an error for a cancelled connection callback.)
+            handshaking = dict(self._handshaking)
+            for writer in handshaking.values():
+                writer.transport.abort()
+            if handshaking:
+                await asyncio.wait(handshaking, timeout=_CLEANUP.total_seconds())
+            results = await asyncio.gather(
+                *(connection.close() for connection in list(self._connections)),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    _logger.error("closing an IPC connection failed", exc_info=result)
+            try:
+                async with asyncio.timeout(_CLEANUP.total_seconds()):
+                    await server.wait_closed()
+            except TimeoutError:
+                _logger.warning("the IPC server's listener did not close in time")
+        finally:
+            claim.release()
+
+    async def _keep_fresh(self, claim: SocketClaim) -> None:
+        while True:
+            await asyncio.sleep(self._refresh_interval.total_seconds())
+            if not claim.touch():
+                _logger.error(
+                    "the socket file of the IPC server is gone or was replaced: clients cannot "
+                    "reach this server (%s)",
+                    claim.path,
+                )
+
     def _is_closing(self) -> bool:
         return self._closing
+
+    def _live_connections(self) -> int:
+        """Connections not yet fully closed: a closing one holds its place until it is gone."""
+        self._connections = {c for c in self._connections if not c.is_finished}
+        return len(self._connections)
 
     async def _on_connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
@@ -130,14 +190,19 @@ class IpcServer:
         self._handshaking[task] = writer
         admitted = False
         try:
-            self._connections = {c for c in self._connections if not c.is_closed}
-            if len(self._connections) + len(self._handshaking) > self._max_connections:
+            if self._live_connections() + len(self._handshaking) > self._max_connections:
                 _logger.warning("refused an IPC connection: %d are open", self._max_connections)
                 return
             require_same_user(writer, self._credentials, self._owner)
             await server_handshake(reader, writer, limits=self._limits)
             self._connections.add(
-                Connection(reader, writer, limits=self._limits, handler=self._handler)
+                Connection(
+                    reader,
+                    writer,
+                    limits=self._limits,
+                    handler=self._handler,
+                    answer_diagnostics=self._diagnostics,
+                )
             )
             admitted = True
         except IpcError as exc:
@@ -149,4 +214,5 @@ class IpcServer:
         finally:
             del self._handshaking[task]
             if not admitted:
-                await close_writer(writer)
+                with contextlib.suppress(Exception):
+                    await close_writer(writer)

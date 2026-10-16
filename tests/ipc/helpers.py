@@ -7,6 +7,7 @@ happens by a deadline, never that it has not happened yet.
 """
 
 import asyncio
+import os
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
@@ -21,7 +22,7 @@ from tumbleweed.ipc.errors import ErrorCode, RequestRefused
 from tumbleweed.ipc.framing import encode_frame, read_frame
 from tumbleweed.ipc.limits import MAX_FRAME_BYTES, IpcLimits
 from tumbleweed.ipc.messages import Echo, Echoed, Ping, Pong, RequestBody, ResponseBody
-from tumbleweed.ipc.server import IpcServer
+from tumbleweed.ipc.server import DEFAULT_REFRESH_INTERVAL, IpcServer
 from tumbleweed.ipc.sockdir import SocketPath
 from tumbleweed.ipc.wire import (
     PROTOCOL_VERSION,
@@ -61,23 +62,36 @@ class ScriptedHandler:
     - `hold:<key>`: signals `started[key]`, waits for `gates[key]`, then echoes the text. If it
       is cancelled, the key is added to `cancelled`.
     - `callback:<text>`: calls the peer with `Echo(text)` on the connection it was given.
-    - `closeme`, `boom`, `refuse`, `refuse-long`, `wrong`, `none`, `big`: close the connection,
-      fail or answer wrongly in one specific way, see `answer`.
+    - `outside:<key>`: signals `started[key]` and waits for a future in `futures[key]`, which the
+      test cancels, so that the handler is cancelled by something other than its connection.
+    - `slow-cleanup:<key>`: like `hold`, but takes 0.2 s to clean up once it is cancelled.
+    - `stubborn:<key>`: like `hold`, but ignores its cancellation for a long time.
+    - `closeme`, `boom`, `refuse`, `refuse-long`, `refuse-escape`, `refuse-bad`, `wrong`, `none`,
+      `big`: close the connection, fail or answer wrongly in one specific way, see `answer`.
     - anything else is echoed back.
 
     `connections` collects the connection of every request it sees, so that a test can call
-    the peer back without polling for the server's side of the connection.
+    the peer back without polling for the server's side of the connection. `peak_tasks` is the
+    most request tasks (handlers and replies still being sent) it ever saw alive at once.
     """
 
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.started: defaultdict[str, asyncio.Event] = defaultdict(asyncio.Event)
         self.gates: defaultdict[str, asyncio.Event] = defaultdict(asyncio.Event)
+        self.futures: dict[str, asyncio.Future[None]] = {}
         self.cancelled: list[str] = []
         self.connections: list[Connection] = []
+        self.peak_tasks = 0
 
     async def __call__(self, request: RequestBody, connection: Connection, /) -> ResponseBody:
         self.connections.append(connection)
+        alive = sum(
+            1
+            for task in asyncio.all_tasks()
+            if task.get_name().startswith("ipc-request-") and not task.done()
+        )
+        self.peak_tasks = max(self.peak_tasks, alive)
         match request:
             case Ping():
                 return Pong(kind="pong")
@@ -96,6 +110,25 @@ class ScriptedHandler:
             except asyncio.CancelledError:
                 self.cancelled.append(key)
                 raise
+        elif text.startswith("outside:"):
+            self.started[key].set()
+            future = self.futures[key] = asyncio.get_running_loop().create_future()
+            await future
+        elif text.startswith("slow-cleanup:"):
+            self.started[key].set()
+            try:
+                await self.gates[key].wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0.2)
+                self.cancelled.append(key)
+                raise
+        elif text.startswith("stubborn:"):
+            self.started[key].set()
+            try:
+                await self.gates[key].wait()
+            except asyncio.CancelledError:
+                self.cancelled.append(key)
+                await asyncio.sleep(30)  # ignores the cancellation, until the loop is torn down
         elif text.startswith("callback:"):
             reply = await connection.call(Echo(kind="echo", text=key), Echoed)
             return Echoed(kind="echoed", text=f"via:{reply.text}")
@@ -107,10 +140,14 @@ class ScriptedHandler:
             raise RequestRefused(ErrorCode.UNSUPPORTED_REQUEST, "nope")
         elif text == "refuse-long":
             raise RequestRefused(ErrorCode.UNSUPPORTED_REQUEST, "x" * 1000)
+        elif text == "refuse-escape":
+            raise RequestRefused(ErrorCode.UNSUPPORTED_REQUEST, os.fsdecode(b"\xff"))
+        elif text == "refuse-bad":
+            raise RequestRefused("not a code", "m")  # type: ignore[arg-type]  # refused on purpose
         elif text == "wrong":
             return Pong(kind="pong")  # an Echo is answered with an Echoed
         elif text == "none":
-            return None  # type: ignore[return-value]  # a deliberately broken handler
+            return None  # type: ignore[return-value]  # a handler that returns no response, on purpose
         elif text == "big":
             return Echoed(kind="echoed", text=BIG_TEXT)
         return Echoed(kind="echoed", text=text)
@@ -136,10 +173,19 @@ async def serving(
     limits: IpcLimits | None = None,
     max_connections: int = 16,
     credentials: FixedUid | None = None,
+    diagnostics: bool = False,
+    refresh_interval: timedelta = DEFAULT_REFRESH_INTERVAL,
 ) -> AsyncIterator[tuple[IpcServer, ScriptedHandler]]:
+    """A server whose handler sees every request, unless the test is about the diagnostics."""
     handler = ScriptedHandler() if handler is None else handler
     server = IpcServer(
-        path, handler, limits=limits, max_connections=max_connections, credentials=credentials
+        path,
+        handler,
+        limits=limits,
+        max_connections=max_connections,
+        credentials=credentials,
+        answer_diagnostics=diagnostics,
+        refresh_interval=refresh_interval,
     )
     async with server:
         yield server, handler
@@ -151,8 +197,11 @@ async def connected(
     handler: ScriptedHandler | None = None,
     *,
     limits: IpcLimits | None = None,
+    diagnostics: bool = False,
 ) -> AsyncIterator[Connection]:
-    async with await connect(path, handler, limits=limits) as connection:
+    async with await connect(
+        path, handler, limits=limits, answer_diagnostics=diagnostics
+    ) as connection:
         yield connection
 
 
@@ -216,8 +265,12 @@ async def fake_server(
 ) -> AsyncIterator[None]:
     """A server that runs `script` for each client; leaving it drops every client."""
     writers: list[asyncio.StreamWriter] = []
+    scripts: set[asyncio.Task[None]] = set()
 
     async def on_connect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        scripts.add(task)
         writers.append(writer)
         try:
             await script(reader, writer)
@@ -231,6 +284,8 @@ async def fake_server(
         server.close()
         for writer in writers:  # ends each script by EOF: no task is cancelled
             writer.transport.abort()
+        if scripts:
+            await asyncio.wait(scripts, timeout=5)
         await server.wait_closed()
 
 

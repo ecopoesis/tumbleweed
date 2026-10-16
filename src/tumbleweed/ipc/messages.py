@@ -16,9 +16,10 @@ To add a message (S17 and later steps do this; nothing else in `ipc` changes):
    drift test fails until the committed file matches the registry.
 
 The messages below are the transport's own diagnostics (liveness and an echo that carries
-text). They are not business messages; the broker's and the shell's come with S17 and S18.
-A request is always answered by exactly one response body or one error, and which response
-type a request gets is the caller's expectation, checked by `Connection.call`.
+text). They are not business messages, and `Connection` answers them itself: a request handler
+never sees them. The broker's and the shell's messages come with S17 and S18. A request is
+always answered by exactly one response body or one error, and which response type a request
+gets is the caller's expectation, checked by `Connection.call`.
 """
 
 from typing import Annotated, Literal, final
@@ -29,9 +30,13 @@ ECHO_MAX_CHARS = 1024
 
 
 class IpcMessage(BaseModel):
-    """Base of every model that crosses the IPC boundary: strict, frozen, no extra fields."""
+    """Base of every model that crosses the IPC boundary: strict, frozen, no extra fields.
 
-    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+    Floats must be finite: `NaN` and `Infinity` are not JSON, and a peer must not be able to
+    smuggle one into a field that does arithmetic.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True, allow_inf_nan=False)
 
 
 class Request(IpcMessage):
