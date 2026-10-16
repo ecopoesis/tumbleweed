@@ -1,11 +1,22 @@
 """Typed entity IDs: one class per entity, so a `ToolId` can never stand in for a `TaskId`.
 
 The serialized form is `<prefix>_<value>`, e.g. `tsk_01j9z3c7q4v8s2k5m6n7p8r9t0`. The value is a
-ULID: a 48-bit millisecond timestamp followed by 80 random bits, written as 26 characters of
-lowercase Crockford base32. IDs therefore sort by creation time (strictly, within one process),
-and the only accepted spelling is the canonical one, so `str(TaskId(s)) == s` for every valid `s`.
-The 80 random bits come from `secrets`, which is what makes a `PromptId` unguessable (I5); the
-timestamp is not a secret.
+ULID-shaped 128-bit number: a 48-bit millisecond timestamp followed by an 80-bit random field,
+written as 26 characters of lowercase Crockford base32. The only accepted spelling is the
+canonical one, so `str(TaskId(s)) == s` for every valid `s`.
+
+What is guaranteed, precisely. All ID types share one generator per process. The first ID of a
+millisecond takes the whole random field from `secrets`. Any later ID in the same millisecond, or
+while the clock is behind the last ID, adds `1 + secrets.randbits(64)` to the previous value
+(a carry out of the random field moves the timestamp on). So:
+
+- IDs created in one process, of any types, are strictly increasing in creation order, as numbers
+  and as text, even when the clock steps back. Across processes IDs order only by millisecond.
+- Seeing any ID, including the previous one, gives no better than a 2**-64 chance per guess at
+  another: the nearest neighbour is the previous ID plus a 64-bit random amount. That is what
+  keeps a `PromptId` unguessable (I5). The timestamp is public.
+- A forked child resets the generator, so that it draws fresh entropy instead of continuing
+  the parent's sequence.
 
 Create a fresh ID with `TaskId.new()`; turn text from disk, IPC or a model into one with
 `TaskId(text)`, which raises `InvalidValueError` unless the text is exactly a `TaskId`.
@@ -15,6 +26,7 @@ rejected by a `TaskId` field) and dumps to that string in JSON mode. The v1 regi
 complete here; adding an ID type outside it needs a note in the PR.
 """
 
+import os
 import re
 import secrets
 import threading
@@ -33,10 +45,12 @@ _VALUE_PATTERN = r"[0-7][0-9a-hjkmnp-tv-z]{25}"
 _VALUE_RE = re.compile(_VALUE_PATTERN)
 _PREFIX_RE = re.compile(r"[a-z]{3,4}")
 _RANDOM_BITS = 80
+_STEP_BITS = 64
 
 
+@final
 class _MonotonicUlid:
-    """Issues strictly increasing 128-bit ULID values, safe to call from several threads."""
+    """Issues strictly increasing 128-bit values with unpredictable steps, thread-safe."""
 
     def __init__(self, clock_ms: Callable[[], int], entropy: Callable[[int], int]) -> None:
         self._clock_ms = clock_ms
@@ -50,15 +64,28 @@ class _MonotonicUlid:
             if now > self._last >> _RANDOM_BITS:
                 self._last = (now << _RANDOM_BITS) | self._entropy(_RANDOM_BITS)
             else:
-                # Same millisecond, or the clock stepped back: count up from the last value so
-                # creation order is preserved. A carry out of the random part moves the
-                # timestamp forward one millisecond, which preserves it too.
-                self._last += 1
+                # Same millisecond, or the clock stepped back: keep the order by adding to the
+                # last value, but a random amount, so that it cannot be guessed from its
+                # neighbour. A carry out of the random field moves the timestamp on, which keeps
+                # the order too.
+                self._last += 1 + self._entropy(_STEP_BITS)
             return self._last
+
+    def reset(self) -> None:
+        """Forget the last value; a forked child calls this to draw fresh entropy."""
+        self._last = 0
+        # A lock held by another thread at the moment of the fork would never be released here.
+        self._lock = threading.Lock()
 
 
 _ULIDS = _MonotonicUlid(lambda: time.time_ns() // 1_000_000, secrets.randbits)
+os.register_at_fork(after_in_child=_ULIDS.reset)
 _PREFIXES: dict[str, type["EntityId"]] = {}
+
+
+def id_types() -> tuple[type["EntityId"], ...]:
+    """Every ID type of the registry, in definition order."""
+    return tuple(_PREFIXES.values())
 
 
 def _encode(value: int) -> str:
@@ -178,4 +205,5 @@ __all__ = [
     "TaskId",
     "ToolId",
     "ToolInstanceId",
+    "id_types",
 ]

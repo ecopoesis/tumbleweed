@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from tumbleweed.core.ids import EntityId
+from tumbleweed.core.ids import id_types
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -110,14 +110,14 @@ def test_misuse_is_rejected_with_the_expected_errors(fixture: str) -> None:
 
 def test_no_id_type_can_stand_in_for_any_other_not_only_tool_for_task(tmp_path: Path) -> None:
     """The full matrix: every ordered pair of distinct ID types, generated from the registry."""
-    id_types = sorted(EntityId.__subclasses__(), key=lambda t: t.__name__)
+    registry = sorted(id_types(), key=lambda t: t.__name__)
     lines = ["from tumbleweed.core import ids", ""]
     expected_lines = {}
-    for wanted in id_types:
+    for wanted in registry:
         lines.append(f"def needs_{wanted.__name__}(value: ids.{wanted.__name__}) -> None: ...")
     lines.append("")
-    for wanted in id_types:
-        for given in id_types:
+    for wanted in registry:
+        for given in registry:
             if given is wanted:
                 continue
             lines.append(f"needs_{wanted.__name__}(ids.{given.__name__}.new())")
@@ -127,7 +127,7 @@ def test_no_id_type_can_stand_in_for_any_other_not_only_tool_for_task(tmp_path: 
 
     rejected = {d.line: d for d in run_mypy(snippet)}
 
-    assert len(expected_lines) == len(id_types) * (len(id_types) - 1) == 132
+    assert len(expected_lines) == len(registry) * (len(registry) - 1) == 132
     assert sorted(rejected) == sorted(expected_lines)
     for line, (given_name, wanted_name) in expected_lines.items():
         assert rejected[line].code == "arg-type"

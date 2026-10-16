@@ -3,10 +3,14 @@
 import copy
 import itertools
 import operator
+import os
 import pickle
 import re
+import secrets
 import threading
 import time
+import warnings
+from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
@@ -29,6 +33,7 @@ from tumbleweed.core.ids import (
     ToolInstanceId,
     _encode,
     _MonotonicUlid,
+    id_types,
 )
 
 # The complete v1 registry (PLAN S01). Changing it is a deliberate act: this list is the check.
@@ -65,8 +70,8 @@ def value_of(entity_id: EntityId) -> str:
 
 
 def test_the_registry_is_exactly_the_v1_set() -> None:
-    assert set(EntityId.__subclasses__()) == set(REGISTRY)
-    assert {t: t.prefix for t in EntityId.__subclasses__()} == REGISTRY
+    assert id_types() == tuple(REGISTRY)  # the same twelve, in definition order
+    assert {t: t.prefix for t in id_types()} == REGISTRY
     assert len(set(REGISTRY.values())) == len(REGISTRY)
 
 
@@ -145,14 +150,31 @@ class TestCreation:
             id_type()  # type: ignore[call-arg]  # the point of the test: no-argument construction
 
 
+def decode(text: str) -> int:
+    """The 128-bit number behind an ID's text, for tests that look at the arithmetic."""
+    alphabet = "0123456789abcdefghjkmnpqrstvwxyz"
+    number = 0
+    for char in text.partition("_")[2]:
+        number = number << 5 | alphabet.index(char)
+    return number
+
+
 class TestMonotonicGenerator:
     """The generator behind `new()`, driven with a fake clock and fake entropy."""
 
     @staticmethod
-    def make(times: list[int], entropy: list[int]) -> _MonotonicUlid:
+    def make(
+        times: list[int], entropy: list[int], asked: list[int] | None = None
+    ) -> _MonotonicUlid:
         clock = iter(times)
         randomness = iter(entropy)
-        return _MonotonicUlid(lambda: next(clock), lambda _bits: next(randomness))
+
+        def draw(bits: int) -> int:
+            if asked is not None:
+                asked.append(bits)
+            return next(randomness)
+
+        return _MonotonicUlid(lambda: next(clock), draw)
 
     def test_a_new_millisecond_takes_the_timestamp_and_fresh_entropy(self) -> None:
         generator = self.make([1000, 1001], [0xAAAA, 0xBBBB])
@@ -160,28 +182,60 @@ class TestMonotonicGenerator:
         assert generator.next() == (1000 << 80) | 0xAAAA
         assert generator.next() == (1001 << 80) | 0xBBBB
 
-    def test_within_one_millisecond_values_count_up(self) -> None:
-        generator = self.make([1000, 1000, 1000], [0xAAAA])
-
-        assert [generator.next() for _ in range(3)] == [
-            (1000 << 80) | (0xAAAA + n) for n in range(3)
-        ]
-
-    def test_a_clock_that_steps_back_never_makes_values_go_back(self) -> None:
-        generator = self.make([1000, 999, 500], [0xAAAA])
+    def test_within_one_millisecond_each_step_is_one_plus_a_random_amount(self) -> None:
+        asked: list[int] = []
+        generator = self.make([1000, 1000, 1000], [0xAAAA, 5, 7], asked)
 
         values = [generator.next() for _ in range(3)]
 
-        assert values == sorted(set(values))
+        base = (1000 << 80) | 0xAAAA
+        assert values == [base, base + 1 + 5, base + 1 + 5 + 1 + 7]
+        assert asked == [80, 64, 64]  # the whole field once, then 64 bits for each step
 
-    def test_exhausting_the_random_part_carries_into_the_timestamp(self) -> None:
+    def test_a_step_of_zero_entropy_still_moves_forward(self) -> None:
+        generator = self.make([1000, 1000], [0xAAAA, 0])
+
+        assert generator.next() < generator.next()
+
+    def test_a_clock_that_steps_back_keeps_the_order_with_random_steps(self) -> None:
+        asked: list[int] = []
+        generator = self.make([1000, 999, 500], [0xAAAA, 11, 13], asked)
+
+        values = [generator.next() for _ in range(3)]
+
+        base = (1000 << 80) | 0xAAAA
+        assert values == [base, base + 12, base + 12 + 14]
+        assert asked == [80, 64, 64]
+
+    def test_exhausting_the_random_field_carries_into_the_timestamp(self) -> None:
         all_ones = (1 << 80) - 1
-        generator = self.make([1000, 1000], [all_ones])
+        generator = self.make([1000, 1000, 1000], [all_ones, 0, 2**63])
 
-        first, second = generator.next(), generator.next()
+        first, second, third = generator.next(), generator.next(), generator.next()
 
         assert first == (1000 << 80) | all_ones
-        assert second == 1001 << 80
+        assert second == 1001 << 80  # all ones + 1 + 0: the timestamp moved on by one
+        assert third == (1001 << 80) + 1 + 2**63
+        assert first < second < third
+
+    def test_reset_forgets_the_last_value_and_draws_fresh_entropy(self) -> None:
+        asked: list[int] = []
+        generator = self.make([1000, 1000, 1000], [0xAAAA, 5, 0xBBBB], asked)
+        generator.next()
+        generator.next()
+
+        generator.reset()
+
+        assert generator.next() == (1000 << 80) | 0xBBBB  # not the old sequence continued
+        assert asked == [80, 64, 80]
+
+    def test_reset_replaces_a_lock_that_was_held_at_the_moment_of_a_fork(self) -> None:
+        generator = self.make([1000, 1001], [1, 2])
+        generator._lock.acquire()  # as if another thread were inside next() when we forked
+
+        generator.reset()
+
+        assert generator.next() == (1000 << 80) | 1  # does not deadlock
 
     def test_encoding_is_26_big_endian_base32_characters(self) -> None:
         assert _encode(0) == "0" * 26
@@ -189,6 +243,94 @@ class TestMonotonicGenerator:
         assert _encode(31) == "0" * 25 + "z"
         assert _encode(32) == "0" * 24 + "10"
         assert _encode((1 << 128) - 1) == "7" + "z" * 25
+
+    def test_decode_in_these_tests_inverts_the_encoding(self) -> None:
+        for value in (0, 1, 31, 32, 2**80, (1 << 128) - 1):
+            assert decode(f"tsk_{_encode(value)}") == value
+
+
+class TestUnpredictability:
+    """Ordering is kept, but no ID can be derived from its neighbours (I5: PromptId)."""
+
+    NEAR = 2**32  # a step this small, by chance, has a probability of 2**-32 per pair
+
+    def test_consecutive_ids_of_one_type_are_far_apart(self) -> None:
+        numbers = [decode(str(TaskId.new())) for _ in range(5000)]  # several per millisecond
+
+        deltas = [b - a for a, b in itertools.pairwise(numbers)]
+
+        assert all(delta > self.NEAR for delta in deltas)
+
+    def test_consecutive_ids_of_different_types_are_far_apart_too(self) -> None:
+        types = [PromptId, TaskId, ToolId, MessageId]
+        numbers = [decode(str(types[n % len(types)].new())) for n in range(5000)]
+
+        deltas = [b - a for a, b in itertools.pairwise(numbers)]
+
+        assert all(delta > self.NEAR for delta in deltas)
+
+    def test_the_same_millisecond_really_occurs_in_these_runs(self) -> None:
+        """Guards the two tests above: they must exercise the within-a-millisecond path."""
+        timestamps = [decode(str(TaskId.new())) >> 80 for _ in range(5000)]
+
+        assert len(set(timestamps)) < len(timestamps)
+
+    def test_after_a_clock_step_back_ids_are_ordered_and_not_small_steps(self) -> None:
+        clock = iter([1000] * 5 + [900] * 5 + [1000] * 5 + [1001] * 5)
+        generator = _MonotonicUlid(lambda: next(clock), secrets.randbits)
+
+        numbers = [generator.next() for _ in range(20)]
+
+        assert numbers == sorted(numbers)
+        assert len(set(numbers)) == 20
+        # Every step but those into a fresh millisecond (indexes 15) comes from the random step.
+        deltas = [b - a for a, b in itertools.pairwise(numbers)]
+        assert all(delta > self.NEAR for delta in deltas)
+
+    def test_a_guessed_neighbour_is_not_the_next_id(self) -> None:
+        """The attack the fix is for: from one ID, try `previous + 1` and a few neighbours."""
+        first = decode(str(PromptId.new()))
+        second = decode(str(PromptId.new()))
+
+        assert second - first not in range(1, 1000)
+
+    def test_ordering_still_holds_across_a_long_run_and_types(self) -> None:
+        types = id_types()
+        created = [types[n % len(types)].new() for n in range(20000)]
+        numbers = [decode(str(i)) for i in created]
+        texts = [str(i) for i in created]
+
+        assert numbers == sorted(numbers)
+        assert texts == sorted(texts, key=lambda t: t.partition("_")[2])
+        assert len(set(numbers)) == len(numbers)
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="os.fork is not available on this platform")
+    def test_a_forked_child_never_collides_with_its_parent(self, tmp_path: Path) -> None:
+        TaskId.new()  # the parent has state to be inherited
+        parent_last = decode(str(TaskId.new()))
+        report = tmp_path / "child-ids"
+        with warnings.catch_warnings():
+            # Python 3.12 warns when forking a process that has threads (pytest may have some).
+            warnings.simplefilter("ignore", DeprecationWarning)
+            pid = os.fork()
+        if pid == 0:  # the child: report whether the generator was reset, and its IDs
+            status = 1
+            try:
+                reset = ids._ULIDS._last == 0
+                report.write_text("\n".join(str(TaskId.new()) for _ in range(2000)))
+                status = 0 if reset else 2
+            finally:
+                os._exit(status)  # no atexit handlers, no pytest teardown in the child
+        parent_ids = [str(TaskId.new()) for _ in range(2000)]
+        _, wait_status = os.waitpid(pid, 0)
+
+        assert os.waitstatus_to_exitcode(wait_status) == 0, "the child did not reset its generator"
+        child_ids = report.read_text().splitlines()
+        assert len(child_ids) == 2000
+        assert len(set(child_ids)) == 2000
+        assert not set(child_ids) & set(parent_ids)
+        assert not set(child_ids) & {f"tsk_{_encode(parent_last)}"}
+        assert child_ids == sorted(child_ids)
 
 
 class TestParsing:
