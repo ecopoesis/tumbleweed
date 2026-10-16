@@ -83,9 +83,10 @@ All of these must pass before a commit is pushed. CI runs the same commands.
   current host skip with an explicit reason; they never pass vacuously. With
   `TUMBLEWEED_CI=1` (set in CI), a skipped or xfailed `gtk` or `linux` test fails the run (an
   xfail needs `xfail_allowed_in_ci(reason="#<issue>")`), and so does a module skipped as a
-  whole (`importorskip`, `allow_module_level`): skip per test, with markers. The only skips
-  the guard lets through are the ones the `btrfs` gate and the `live` gate raise themselves;
-  a `linux` + `btrfs` test that skips for any other reason fails.
+  whole (`importorskip`, `allow_module_level`): skip per test, with markers. The only skip
+  the guard lets through is the `btrfs` gate's own, raised in setup (it always fires in CI, so
+  a `linux` + `btrfs` test never runs there: reserve `btrfs` for tests of the btrfs backend);
+  any other skip of such a test fails. A `live` test may not also be marked `gtk` or `linux`.
 - Security properties get negative tests: prove the forbidden thing actually fails.
 - Keep logic GTK-free so it can be unit-tested; GTK tests cover the adapter.
 

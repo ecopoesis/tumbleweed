@@ -67,7 +67,7 @@ jobs:
         # more than one version runs. On 3.14 the gtk smoke test fails: PyGObject's gi.events uses
         # asyncio.AbstractEventLoopPolicy, deprecated there, and warnings are errors in our tests.
         # This job deselects gtk tests, so that is not exercised here (a developer on 3.14 sees it
-        # locally; .python-version pins 3.12). Revisit when PyGObject fixes it.
+        # locally; .python-version pins 3.12). Revisit when PyGObject fixes it: #47.
         python: ["3.12", "3.13", "3.14"]
     env:
       # Beats .python-version for every uv command in the job, `uv run` included.

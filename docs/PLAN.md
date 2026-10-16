@@ -94,7 +94,8 @@ way on macOS, in Docker, and in GitHub Actions, with a single shared type vocabu
     as `ignore-without-code`, `redundant-expr`, `truthy-bool`, `possibly-undefined`.
   - pytest: markers `gtk`/`linux`/`btrfs`/`live`, with a conftest hook so that with
     `TUMBLEWEED_CI=1` any skipped `gtk`/`linux` test fails the session (the guard exempts only
-    the skips raised by the `btrfs` gate and the `live` gate; ARCHITECTURE §11).
+    the skip raised by the `btrfs` gate, which always fires in CI; `live` tests never run in
+    CI; ARCHITECTURE §11).
   - coverage report.
   - import-linter, with the ARCHITECTURE §10 contracts for packages that exist; later steps
     add contracts when they create packages.

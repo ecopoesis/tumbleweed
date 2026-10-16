@@ -7,7 +7,6 @@ every directory the image takes, with a model of Docker's matching rules (runs a
 where a Docker daemon is available, against Docker itself.
 """
 
-import os
 import posixpath
 import re
 import shutil
@@ -17,6 +16,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
+from tests.plugins import host
 
 ROOT = Path(__file__).resolve().parents[1]
 # Directories the image takes (`!dir/` lines in .dockerignore), and some it does not.
@@ -222,7 +223,7 @@ def require_docker() -> None:
     """
     if docker_daemon_available():
         return
-    if os.environ.get("TUMBLEWEED_REQUIRE_DOCKER") == "1":
+    if host.read_flag(host.REQUIRE_DOCKER_ENV_VAR):
         pytest.fail("TUMBLEWEED_REQUIRE_DOCKER=1 but there is no Docker daemon to ask")
     pytest.skip("no Docker daemon available to check the model against")
 
@@ -369,3 +370,14 @@ def test_a_present_docker_is_used_whether_or_not_it_is_required(
     require_docker()
     monkeypatch.delenv("TUMBLEWEED_REQUIRE_DOCKER")
     require_docker()
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "2", " 1"])
+def test_a_misspelt_require_docker_flag_is_an_error_not_a_quiet_skip(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "docker_daemon_available", lambda: False)
+    monkeypatch.setenv("TUMBLEWEED_REQUIRE_DOCKER", value)
+
+    with pytest.raises(pytest.UsageError, match="TUMBLEWEED_REQUIRE_DOCKER must be 0 or 1"):
+        require_docker()

@@ -480,9 +480,29 @@ class TestExemptionsAreOnlyForTheirOwnGate:
 
         inner.runpytest().assert_outcomes(failed=1)
 
-    def test_the_live_gates_own_skip_is_exempt_when_live_is_not_enabled(
+    def test_the_gate_exception_raised_from_the_test_body_still_fails(
         self, inner: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Only a skip the gate raises during setup is exempt, not the exception raised later."""
+        monkeypatch.setenv(host.CI_ENV_VAR, "1")  # the btrfs gate itself passes (see `inner`)
+        inner.makepyfile(
+            """
+            import pytest
+            from tests.plugins.host import BtrfsGateSkip
+
+            @pytest.mark.linux
+            @pytest.mark.btrfs
+            def test_raises_the_gate_skip_from_the_body():
+                raise BtrfsGateSkip("not the gate's doing")
+            """
+        )
+
+        inner.runpytest().assert_outcomes(failed=1)
+
+    def test_live_with_gtk_or_linux_is_refused_under_the_guard(
+        self, inner: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It never runs in CI, so the second marker could only hide a test from the guard."""
         monkeypatch.setenv(host.CI_ENV_VAR, "1")
         inner.makepyfile(
             """
@@ -491,34 +511,40 @@ class TestExemptionsAreOnlyForTheirOwnGate:
             @pytest.mark.linux
             @pytest.mark.live
             def test_a_live_linux_test():
-                raise AssertionError("must not run in CI")
+                pass
 
             @pytest.mark.gtk
             @pytest.mark.live
             def test_a_live_gtk_test():
-                raise AssertionError("must not run in CI")
+                pass
+
+            @pytest.mark.live
+            def test_a_live_test():
+                pass
             """
         )
 
-        inner.runpytest().assert_outcomes(skipped=2)
+        result = inner.runpytest()
 
-    def test_any_other_skip_of_a_live_test_still_fails(
-        self, inner: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+        assert result.ret == pytest.ExitCode.USAGE_ERROR
+        result.stderr.fnmatch_lines(["*a live test never runs in CI*test_a_live_linux_test*"])
+        result.stderr.fnmatch_lines(["*test_a_live_gtk_test*"])
+
+    def test_live_with_gtk_or_linux_is_allowed_outside_the_guard(
+        self, inner: pytest.Pytester
     ) -> None:
-        monkeypatch.setenv(host.CI_ENV_VAR, "1")
         inner.makepyfile(
             """
             import pytest
 
             @pytest.mark.linux
             @pytest.mark.live
-            @pytest.mark.skipif(True, reason="no API key")
-            def test_skips_for_another_reason():
+            def test_a_live_linux_test():
                 pass
             """
         )
 
-        inner.runpytest().assert_outcomes(errors=1)
+        inner.runpytest().assert_outcomes(skipped=1)  # skipped by the live gate: not enabled
 
     def test_a_live_only_test_that_skips_for_its_own_reasons_is_not_guarded(
         self, inner: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
@@ -761,3 +787,130 @@ def test_outside_ci_the_xfail_allowance_needs_no_reason(inner: pytest.Pytester) 
     )
 
     inner.runpytest().assert_outcomes(xfailed=1)
+
+
+ALLOWANCE_CASES = {
+    "marked xfail that raises": (
+        "@pytest.mark.xfail(reason='known bug')",
+        "raise AssertionError",
+    ),
+    "marked xfail that is not run": (
+        "@pytest.mark.xfail(reason='known bug', run=False)",
+        "pass",
+    ),
+    "imperative xfail": ("", "pytest.xfail('known bug')"),
+}
+
+
+@pytest.mark.parametrize(
+    ("xfail_mark", "body"), ALLOWANCE_CASES.values(), ids=list(ALLOWANCE_CASES)
+)
+@pytest.mark.parametrize(
+    "allowance",
+    [
+        "@pytest.mark.xfail_allowed_in_ci",
+        '@pytest.mark.xfail_allowed_in_ci(reason="known bug")',
+        '@pytest.mark.xfail_allowed_in_ci(reason="issue 12")',
+        '@pytest.mark.xfail_allowed_in_ci(reason="# 12")',
+    ],
+)
+def test_every_kind_of_xfail_needs_the_issue_reference_in_ci(
+    inner: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+    xfail_mark: str,
+    body: str,
+    allowance: str,
+) -> None:
+    """For a marked xfail, pytest turns the setup check into an XFAIL (or never reaches it)."""
+    monkeypatch.setenv(host.CI_ENV_VAR, "1")
+    inner.makepyfile(
+        f"""
+        import pytest
+
+        @pytest.mark.linux
+        {allowance}
+        {xfail_mark}
+        def test_xfails_with_an_allowance():
+            {body}
+        """
+    )
+
+    result = inner.runpytest("--junitxml=report.xml")
+
+    outcomes = result.parseoutcomes()
+    assert "xfailed" not in outcomes, outcomes
+    assert outcomes.get("failed", 0) + outcomes.get("errors", 0) == 1, outcomes
+    result.stdout.fnmatch_lines(["*xfail_allowed_in_ci needs a reason that references an issue*"])
+    (kinds,) = junit_children(inner.path / "report.xml").values()
+    assert "skipped" not in kinds  # not even in the junit report
+
+
+@pytest.mark.parametrize(
+    ("xfail_mark", "body"), ALLOWANCE_CASES.values(), ids=list(ALLOWANCE_CASES)
+)
+@pytest.mark.parametrize("reason", ["#7", "tracked in #123"])
+def test_every_kind_of_xfail_is_allowed_with_the_issue_reference(
+    inner: pytest.Pytester,
+    monkeypatch: pytest.MonkeyPatch,
+    xfail_mark: str,
+    body: str,
+    reason: str,
+) -> None:
+    monkeypatch.setenv(host.CI_ENV_VAR, "1")
+    inner.makepyfile(
+        f"""
+        import pytest
+
+        @pytest.mark.linux
+        @pytest.mark.xfail_allowed_in_ci(reason={reason!r})
+        {xfail_mark}
+        def test_xfails_with_an_allowance():
+            {body}
+        """
+    )
+
+    inner.runpytest().assert_outcomes(xfailed=1)
+
+
+def test_an_allowance_without_a_reference_is_refused_even_on_an_unguarded_test(
+    inner: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The allowance means nothing without the guard's markers, but it is still a broken one."""
+    monkeypatch.setenv(host.CI_ENV_VAR, "1")
+    inner.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.xfail_allowed_in_ci
+        @pytest.mark.xfail(reason="known bug")
+        def test_xfails():
+            raise AssertionError
+        """
+    )
+
+    result = inner.runpytest()
+
+    assert "xfailed" not in result.parseoutcomes()
+    result.stdout.fnmatch_lines(["*xfail_allowed_in_ci needs a reason*"])
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "2", " 1"])
+def test_a_misspelt_require_docker_flag_is_a_usage_error(
+    inner: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv(host.REQUIRE_DOCKER_ENV_VAR, value)
+    inner.makepyfile("def test_x():\n    pass\n")
+
+    result = inner.runpytest()
+
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines([f"*{host.REQUIRE_DOCKER_ENV_VAR} must be 0 or 1*"])
+
+
+@pytest.mark.parametrize(("value", "expected"), [("", False), ("0", False), ("1", True)])
+def test_read_flag_accepts_only_empty_zero_and_one(
+    monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
+) -> None:
+    monkeypatch.setenv(host.REQUIRE_DOCKER_ENV_VAR, value)
+
+    assert host.read_flag(host.REQUIRE_DOCKER_ENV_VAR) is expected

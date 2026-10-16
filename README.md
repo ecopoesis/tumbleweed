@@ -58,8 +58,8 @@ scripts/test-linux               # all of the above in the Linux container
 
 CI runs the same commands (the macOS job on Python 3.12, 3.13 and 3.14; the container has
 3.12). On 3.14 the `gtk` smoke test currently fails, because PyGObject's `gi.events` uses an
-asyncio API that 3.14 deprecates and our tests treat warnings as errors; the macOS job deselects
-`gtk` tests, and `.python-version` pins 3.12.
+asyncio API that 3.14 deprecates and our tests treat warnings as errors (#47); the macOS job
+deselects `gtk` tests, and `.python-version` pins 3.12.
 `uv run pytest` includes a coverage report.
 
 ### Dependencies
@@ -102,8 +102,8 @@ TUMBLEWEED_CI=1 scripts/test-linux          # as CI: a skipped or xfailed gtk/li
 |---|---|---|
 | `gtk` | a display | runs natively on a Mac with a desktop session, and under weston in the container |
 | `linux` | Linux kernel features | skips on macOS |
-| `btrfs` | a btrfs mount | the `btrfs` gate skips (no loopback btrfs: not Linux, no `mkfs.btrfs`, not root) and that skip alone is exempt from the `TUMBLEWEED_CI` guard, also on a test that carries `linux` or `gtk` too; any other skip of it fails the run; covered by the S27 VM test |
-| `live` | real external services | the `live` gate skips unless `TUMBLEWEED_LIVE=1`, and that skip alone is exempt from the guard; `TUMBLEWEED_LIVE=1` together with `TUMBLEWEED_CI=1` is an error, so they never run in CI |
+| `btrfs` | a btrfs mount | the `btrfs` gate skips (no loopback btrfs: not Linux, no `mkfs.btrfs`, not root) and that setup skip alone is exempt from the `TUMBLEWEED_CI` guard, also on a test that carries `linux` or `gtk` too; any other skip of it fails the run. CI has no root, so the gate always fires there: a `linux` + `btrfs` test never runs in CI, and `btrfs` is reserved for tests of the btrfs backend (S27's VM test covers it) |
+| `live` | real external services | the `live` gate skips unless `TUMBLEWEED_LIVE=1`; that is an error together with `TUMBLEWEED_CI=1`, and under the guard a `live` test may not also be marked `gtk` or `linux`, so live tests never run in CI and are never guarded |
 | `xfail_allowed_in_ci(reason=...)` | | lets a `gtk`/`linux` test xfail under `TUMBLEWEED_CI=1`, where an xfail fails the run like a skip does; the reason must reference an issue, such as `reason="tracked in #123"` |
 
 The first lines of a pytest run say whether the `TUMBLEWEED_CI` guard is active.
