@@ -2,17 +2,20 @@
 
 `parse_ui_spec` is for text (a file, a tool package, an IPC frame) and `validate_ui_spec` for
 a spec already parsed from JSON (the input of a model tool call). Both return a validated
-`UiSpec` or raise `SpecError`, whose message lists the problems without echoing the input.
+`UiSpec` or raise `SpecError`, whose message lists the problems without echoing the input, and
+both go through the same checks, because `validate_ui_spec` writes the data out as JSON text and
+hands that to `parse_ui_spec`:
 
-`parse_ui_spec` adds what pydantic's JSON parser does not do:
-
-- a size limit (`MAX_SPEC_BYTES`), checked before anything is parsed;
+- a size limit (`MAX_SPEC_BYTES`), checked before anything is parsed (and, for parsed data,
+  while it is written out, which stops at the limit);
 - the text must be UTF-8 (no byte-order mark) and valid JSON;
 - an object that repeats a key is refused. Parsers keep the last value and drop the others
   without a word, so `{"root": A, "root": B}` would mean B to us and A to a reader of the text;
 - `NaN` and `Infinity` are refused (the models would refuse them anyway; this says why).
-`UiSpec.model_validate_json` alone does none of these, so use `parse_ui_spec` for any text that
-did not come from `model_dump_json`.
+
+`UiSpec.model_validate_json` and `UiSpec.model_validate` do none of this: no size limit, no
+repeated-key check. Use them only on text that came from `model_dump_json`, never on input from
+the model, a file or another process.
 """
 
 import json
@@ -25,10 +28,11 @@ from tumbleweed.ui.spec.spec import UiSpec
 
 
 def _no_repeated_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    keys = [key for key, _ in pairs]
-    if len(set(keys)) != len(keys):
-        repeated = next(key for key in keys if keys.count(key) > 1)
-        raise ValueError(f"an object repeats the key {repeated[:40]!r}")
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"an object repeats the key {key[:40]!r}")
+        seen.add(key)
     return dict(pairs)
 
 
@@ -67,9 +71,29 @@ def parse_ui_spec(text: str | bytes) -> UiSpec:
         raise SpecError(problems_of(error)) from None
 
 
-def validate_ui_spec(data: object) -> UiSpec:
-    """Validate a spec that is already parsed JSON (dicts, lists, strings, numbers)."""
+def _written_out(data: object) -> str:
+    """The JSON text of parsed JSON, stopping as soon as it is over `MAX_SPEC_BYTES`."""
+    encoder = json.JSONEncoder(ensure_ascii=False, allow_nan=False)
+    chunks: list[str] = []
+    size = 0
     try:
-        return UiSpec.model_validate(data)
-    except ValidationError as error:
-        raise SpecError(problems_of(error)) from None
+        for chunk in encoder.iterencode(data):
+            size += len(chunk)  # a character is at least one byte; parse_ui_spec counts bytes
+            if size > MAX_SPEC_BYTES:
+                raise SpecTooLargeError([f"the spec is over {MAX_SPEC_BYTES} bytes"])
+            chunks.append(chunk)
+    except RecursionError:
+        raise SpecError(["the spec is nested too deeply"]) from None
+    except (TypeError, ValueError) as error:  # not JSON: bytes, a set, NaN, a cycle, a huge int
+        raise SpecError([f"not JSON data: {str(error)[:200]}"]) from None
+    return "".join(chunks)
+
+
+def validate_ui_spec(data: object) -> UiSpec:
+    """Validate a spec that is already parsed JSON (dicts, lists, strings, numbers).
+
+    Exactly as strict as `parse_ui_spec` of the same data written out as JSON: the same size
+    limit, the same refusals. An object that is not JSON data (bytes, a set, a model instance, a
+    cyclic structure, a value that is not finite) is a `SpecError`.
+    """
+    return parse_ui_spec(_written_out(data))

@@ -1,7 +1,11 @@
 """The entry points: JSON text or parsed JSON in, a UiSpec or a bounded SpecError out."""
 
 import json
-from typing import TYPE_CHECKING
+import math
+import time
+from collections.abc import Iterator
+from decimal import Decimal
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 
@@ -213,8 +217,8 @@ class TestHostileShapes:
 
 class TestErrorsAreBounded:
     def test_many_problems_are_cut_to_a_report_of_bounded_size(self) -> None:
-        labels: list[JsonValue] = [{"kind": "label", "text": 5} for _ in range(2000)]
-        text = json.dumps(build({"kind": "box", "children": labels}))
+        fields: dict[str, JsonValue] = {f"unknown_{i}": 0 for i in range(2000)}
+        text = json.dumps(build({"kind": "box", **fields}))
 
         with pytest.raises(SpecError) as raised:
             parse_ui_spec(text)
@@ -271,6 +275,190 @@ class TestErrorsAreBounded:
 
         assert issubclass(SpecError, TumbleweedError)
         assert issubclass(SpecTooLargeError, SpecError)
+
+
+def loose(**fields: object) -> dict[object, object]:
+    """A minimal spec as a dict that may hold things JSON cannot (the point of some tests)."""
+    data: dict[object, object] = dict(minimal().items())
+    data.update(fields)
+    return data
+
+
+def base36(number: int) -> str:
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    result = ""
+    while True:
+        number, digit = divmod(number, 36)
+        result = digits[digit] + result
+        if number == 0:
+            return result
+
+
+class TestRepeatedKeysAreFoundInOnePass:
+    """The check is linear: finding which key repeats must not be quadratic."""
+
+    def test_a_big_object_whose_last_key_repeats_is_refused_fast(self) -> None:
+        keys = [base36(i) for i in range(30_000)]
+        members = ",".join(f'"{key}":0' for key in keys)
+        text = "{" + members + f',"{keys[-1]}":0' + "}"
+        assert len(text.encode()) <= MAX_SPEC_BYTES  # it gets past the size limit to the check
+
+        started = time.perf_counter()
+        with pytest.raises(SpecError, match="repeats the key") as raised:
+            parse_ui_spec(text)
+        elapsed = time.perf_counter() - started
+
+        assert keys[-1] in str(raised.value)
+        # The quadratic search for the repeated key took 6 to 9 seconds on this input.
+        assert elapsed < 1.0
+
+    def test_the_first_repeat_is_the_one_named(self) -> None:
+        # Scanning left to right, `c` repeats (the fourth member) before `b` does (the fifth).
+        with pytest.raises(SpecError, match="repeats the key 'c'"):
+            parse_ui_spec('{"a": 1, "b": 2, "c": 3, "c": 4, "b": 5}')
+
+    def test_distinct_keys_of_any_number_are_fine(self) -> None:
+        keys = [base36(i) for i in range(30_000)]
+        text = "{" + ",".join(f'"{key}":0' for key in keys) + "}"
+
+        with pytest.raises(SpecError) as raised:  # not a spec, but not a repeated key either
+            parse_ui_spec(text)
+
+        assert "repeats the key" not in str(raised.value)
+
+
+def spec_dict_of_size(size: int) -> Json:
+    """A valid spec as parsed JSON whose JSON text is exactly `size` bytes."""
+
+    def entry(key: str, length: int) -> Json:
+        return {"kind": "string", "key": key, "default": "x" * length, "max_length": 65_536}
+
+    state = [entry("a", 65_536), entry("b", 65_536), entry("c", 65_536), entry("d", 1)]
+    data = build(state=state)
+    missing = size - len(json.dumps(data, ensure_ascii=False).encode())
+    assert 0 < missing + 1 <= 65_536
+    state[3] = entry("d", 1 + missing)
+    return build(state=state)
+
+
+class TestParsedJsonTakesTheSameRoad:
+    """`validate_ui_spec` writes the data out and parses it: one set of checks, one size limit."""
+
+    def test_the_helper_builds_what_it_says(self) -> None:
+        for size in (MAX_SPEC_BYTES, MAX_SPEC_BYTES + 1):
+            assert len(json.dumps(spec_dict_of_size(size), ensure_ascii=False).encode()) == size
+
+    def test_a_spec_of_exactly_the_limit_is_accepted(self) -> None:
+        data = spec_dict_of_size(MAX_SPEC_BYTES)
+
+        assert validate_ui_spec(data) == parse_ui_spec(json.dumps(data, ensure_ascii=False))
+
+    def test_a_spec_one_byte_over_the_limit_is_refused(self) -> None:
+        with pytest.raises(SpecTooLargeError, match="over 262144 bytes"):
+            validate_ui_spec(spec_dict_of_size(MAX_SPEC_BYTES + 1))
+
+    def test_a_twelve_megabyte_spec_is_refused(self) -> None:
+        chunks: list[JsonValue] = ["x" * 60_000] * 200
+        big = minimal(state=[{"kind": "json", "key": "k", "default": chunks}])
+
+        with pytest.raises(SpecTooLargeError):
+            validate_ui_spec(big)
+
+    def test_writing_it_out_stops_at_the_limit_and_does_not_walk_the_rest(self) -> None:
+        visited = 0
+
+        class Endless(list[int]):
+            def __iter__(self) -> Iterator[int]:
+                nonlocal visited
+                for _ in range(5_000_000):
+                    visited += 1
+                    yield 0
+
+        with pytest.raises(SpecTooLargeError):
+            validate_ui_spec(loose(state=Endless([0])))
+
+        assert visited < 150_000  # 256 KiB of `0, ` and not five million
+
+    def test_the_limit_counts_bytes_like_parse_ui_spec_does(self) -> None:
+        # Written out as UTF-8, a character can be up to four bytes: the text is over the limit.
+        data = {**minimal(), "title": "\U0001f600" * 80}
+        data["state"] = [
+            {"kind": "string", "key": "k", "default": "\U0001f600" * 1000, "max_length": 1000}
+            for _ in range(70)
+        ]
+
+        with pytest.raises(SpecTooLargeError):
+            validate_ui_spec(data)
+
+    BAD_SPECS: ClassVar[dict[str, Json]] = {
+        "an unknown field": minimal(extra=1),
+        "a wrong type": minimal(title=5),
+        "an unknown kind": build({"kind": "nope"}),
+        "a bad binding": build({"kind": "label", "bind": "missing"}),
+        "an int where a float is not exact": build(
+            state=[{"kind": "float", "key": "x", "default": 2**53 + 1}]
+        ),
+        "a lone surrogate": minimal(title="a\ud800b"),
+        "a control character": minimal(title="a\x1bb"),
+    }
+
+    @pytest.mark.parametrize("data", BAD_SPECS.values(), ids=BAD_SPECS)
+    def test_what_parse_refuses_validate_refuses_with_the_same_problems(self, data: Json) -> None:
+        with pytest.raises(SpecError) as parsed:
+            parse_ui_spec(json.dumps(data, ensure_ascii=False))
+        with pytest.raises(SpecError) as validated:
+            validate_ui_spec(data)
+
+        assert validated.value.problems == parsed.value.problems
+
+    def test_what_parse_accepts_validate_accepts_to_the_same_spec(self) -> None:
+        for name in ("tip_calculator", "photo_adjuster", "csv_viewer"):
+            data = golden(name)
+
+            assert validate_ui_spec(data) == parse_ui_spec(golden_text(name))
+
+    NOT_JSON: ClassVar[dict[str, dict[object, object]]] = {
+        "bytes": loose(title=b"t"),
+        "a set": loose(state={1, 2}),
+        "a model instance": loose(root=parse_ui_spec(MINIMAL_TEXT)),
+        "NaN": loose(state=[{"kind": "float", "key": "x", "default": math.nan}]),
+        "infinity": loose(state=[{"kind": "float", "key": "x", "default": math.inf}]),
+        "a Decimal": loose(title=Decimal("1.5")),
+        "a huge int": loose(title=10**5000),
+        "a tuple key": {**loose(), (1, 2): 3},
+    }
+
+    @pytest.mark.parametrize("data", NOT_JSON.values(), ids=NOT_JSON)
+    def test_data_that_is_not_json_is_a_spec_error(self, data: object) -> None:
+        with pytest.raises(SpecError, match="not JSON data"):
+            validate_ui_spec(data)
+
+    def test_a_cycle_and_a_very_deep_structure_are_spec_errors(self) -> None:
+        cyclic: dict[str, object] = {}
+        cyclic["root"] = cyclic
+        deep: object = []
+        for _ in range(100_000):
+            deep = [deep]
+
+        with pytest.raises(SpecError, match="not JSON data"):
+            validate_ui_spec(cyclic)
+        with pytest.raises(SpecError, match="nested too deeply"):
+            validate_ui_spec({**minimal(), "state": deep})
+
+    def test_an_int_key_that_collides_with_a_str_key_is_a_repeated_key(self) -> None:
+        with pytest.raises(SpecError, match="repeats the key '1'"):
+            validate_ui_spec({1: "a", "1": "b"})
+
+    def test_a_str_subclass_is_written_as_the_text_it_holds(self) -> None:
+        class Lying(str):
+            __slots__ = ()
+
+            def __str__(self) -> str:
+                return "lies"
+
+        spec = validate_ui_spec({**minimal(), "title": Lying("truth")})
+
+        assert spec.title == "truth"
 
 
 class TestValidateParsedJson:
