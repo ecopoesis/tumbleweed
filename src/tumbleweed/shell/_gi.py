@@ -11,8 +11,17 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Pango", "1.0")
+gi.require_version("GLibUnix", "2.0")
 
 # After require_version on purpose, hence the E402.
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import (  # type: ignore[attr-defined]  # noqa: E402  (pygobject-stubs has no GLibUnix)
+    Adw,
+    Gdk,
+    Gio,
+    GLib,
+    GLibUnix,
+    Gtk,
+    Pango,
+)
 
-__all__ = ["Adw", "GLib", "Gdk", "Gio", "Gtk", "Pango"]
+__all__ = ["Adw", "GLib", "GLibUnix", "Gdk", "Gio", "Gtk", "Pango"]
