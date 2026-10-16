@@ -7,7 +7,9 @@ from trusted primitives, sandboxes anything that runs, and saves the tool for re
 **Status:** pre-alpha, under construction. See [`docs/PLAN.md`](docs/PLAN.md) for the v1
 plan and progress, [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it fits
 together, and [`docs/handoff.md`](docs/handoff.md) for the original vision. What exists so
-far is the typed foundation in `src/tumbleweed/core` and the build and test setup around it.
+far is the typed foundation in `src/tumbleweed/core`, the build and test setup around it, and the
+GTK4 shell skeleton (`tumbleweed-shell`: a window with a canvas, a chat panel that echoes, and a
+status strip; see [Running the shell](#running-the-shell)).
 
 ## Development setup (macOS)
 
@@ -39,11 +41,52 @@ macOS strips `DYLD_*` variables from processes started through system shells and
 venv is long (over 127 characters), uv gives console scripts such as `pytest` a `/bin/sh`
 shebang, and the variable is lost. Run `uv run python -m pytest` then.
 
+This is for the tools you run yourself (pytest, a Python prompt): `tumbleweed-shell` does not
+need it, because it finds Homebrew's libraries on its own (next section).
+
 Check the setup:
 
 ```sh
 uv run python -c "import gi; gi.require_version('Gtk', '4.0'); from gi.repository import Gtk; print(Gtk.get_major_version())"
 ```
+
+### Running the shell
+
+```sh
+uv run tumbleweed-shell            # the same as: uv run python -m tumbleweed.shell
+```
+
+One window opens, with no desktop around it:
+
+- the **canvas** (left), where generated tools will render (S10); it shows a placeholder for now;
+- the **side panel** (right): the chat transcript, a multi-line input and a Send button. There is
+  no model yet, so every message is answered with an echo, streamed in small pieces the way a real
+  reply will be (S03 brings the agent behind the same interface);
+- the **status strip** (bottom) with the voice indicator, which reads "idle" until voice arrives (S06);
+- a **reserved strip for trusted prompts** along the top, outside the canvas, which is empty until S18.
+
+Enter sends, Shift+Enter inserts a newline. Ctrl+L focuses the input (and shows the side panel if it
+is hidden), F9 shows or hides the side panel, Ctrl+Q quits. (Ctrl, also on a Mac.) SIGTERM and Ctrl+C
+in the terminal quit the same way. Text from the chat is shown as plain text, never as markup.
+
+**On macOS** the command works from any shell, with or without the `DYLD_FALLBACK_LIBRARY_PATH` line
+above. Homebrew's libraries are not on dyld's search path, and the variable is read when a process
+starts, so `tumbleweed-shell` starts itself again once with `/opt/homebrew/lib` added to
+`DYLD_FALLBACK_LIBRARY_PATH` (dyld's default directories stay on it), and `/opt/homebrew/share` added
+to `XDG_DATA_DIRS` if that is set (a terminal that sets it without Homebrew's directory leaves GTK
+without its GSettings schemas). The relaunch is an `execve` of the same Python with the same arguments,
+so it also works when uv gives the console script a `/bin/sh` shebang, which macOS strips `DYLD_*`
+variables from. It happens only on macOS, only for Apple Silicon's `/opt/homebrew` (Intel Homebrew's
+`/usr/local/lib` is on dyld's path already), and only once (it sets `TUMBLEWEED_RELAUNCHED=1` for the
+new process). The directory is fixed in the code, not read from `HOMEBREW_PREFIX` or from `brew`. On
+Linux nothing of this runs: the process and its environment are left as they are. If GTK still cannot
+be loaded, the command says so in one line and exits with status 1.
+
+**In the container**, the Linux image has no screen, so the shell runs on its headless compositor
+and is for tests, not for looking at: `scripts/test-linux uv run pytest -m gtk -v` runs the GTK tests,
+which include starting the real `python -m tumbleweed.shell` there, waiting for its window, and stopping
+it with SIGTERM. To try the shell on a real Linux desktop, run `uv run tumbleweed-shell` in a session
+with GTK 4.14 and libadwaita 1.5 installed.
 
 ### Checks
 
@@ -100,7 +143,7 @@ TUMBLEWEED_CI=1 scripts/test-linux          # as CI: a skipped or xfailed gtk/li
 
 | Marker | Needs | Notes |
 |---|---|---|
-| `gtk` | a display | runs natively on a Mac with a desktop session, and under weston in the container |
+| `gtk` | a display | runs natively on a Mac with a desktop session (tests that need a layout present a window, which shows briefly), and under weston in the container |
 | `linux` | Linux kernel features | skips on macOS |
 | `btrfs` | a btrfs mount | the `btrfs` gate skips (no loopback btrfs: not Linux, no `mkfs.btrfs`, not root) and that setup skip alone is exempt from the `TUMBLEWEED_CI` guard, also on a test that carries `linux` or `gtk` too; any other skip of it fails the run. CI has no root, so the gate always fires there: a `linux` + `btrfs` test never runs in CI, and `btrfs` is reserved for tests of the btrfs backend (S27's VM test covers it) |
 | `live` | real external services | the `live` gate skips unless `TUMBLEWEED_LIVE=1`; that is an error together with `TUMBLEWEED_CI=1`, and under the guard a `live` test may not also be marked `gtk` or `linux`, so live tests never run in CI and are never guarded |

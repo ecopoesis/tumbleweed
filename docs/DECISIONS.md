@@ -81,3 +81,46 @@ sandbox needs network access in order to think. Tasks within a session are isola
 grants and by excluding earlier tasks' tool results from the context; assistant text still
 carries over (accepted residual risk). Running concurrent per-task agent loops (true
 multi-agent) is post-v1.
+
+## D8 — The shell finds Homebrew's GTK on macOS by relaunching itself (2026-10-16, accepted)
+
+**Context.** On Apple Silicon `/opt/homebrew/lib` is not on dyld's search path, and the GTK
+typelibs name their libraries without a directory, so PyGObject cannot load GTK unless the
+Python has that directory in its rpath (a uv-managed Python does not) or
+`DYLD_FALLBACK_LIBRARY_PATH` names it. S01 documented exporting the variable in the shell profile
+and set it in CI; the `tumbleweed-shell` entry point cannot rely on a profile, and macOS removes
+`DYLD_*` from processes started through `/bin/sh` or `/usr/bin/env`, which includes a console script
+whose uv-written shebang is `/bin/sh`. A terminal that sets `XDG_DATA_DIRS` without
+`/opt/homebrew/share` likewise leaves GTK without its GSettings schemas (Homebrew's GLib defaults
+to that directory only while the variable is unset).
+**Decision.** On macOS, before importing GTK, the entry point `execve`s the same interpreter with
+the same arguments once, with `/opt/homebrew/lib` first on `DYLD_FALLBACK_LIBRARY_PATH` (dyld's
+default directories kept) and `/opt/homebrew/share` appended to `XDG_DATA_DIRS` if that is set.
+The prefix is the fixed Apple Silicon one, not read from the environment or from `brew`; a marker
+variable prevents a second relaunch; nothing is done on other platforms or when both variables are
+already right. Alternatives rejected: exporting the variable in the profile (fragile: lost through
+SIP-protected shells), a launcher shell script (a second entry point beside the console script that
+`uv run` starts), changing `os.environ` in process
+(dyld has already read it), preloading libraries with `ctypes` (tried: with GLib, GObject, Gio and
+GTK loaded by absolute path, the typelibs' leaf-name `dlopen` still fails), and documenting a specific
+Python build (we do not control the interpreter).
+**Consequences.** One extra `exec` on every macOS start (about 15 ms, measured). The relaunched process
+inherits the two variables, so code that starts subprocesses must keep passing an explicit,
+minimal environment (CLAUDE.md), which it must do anyway. Linux and the kiosk target are unaffected.
+
+## D9 — The shell talks to the agent through a callback `Responder` (2026-10-16, accepted)
+
+**Context.** S02 needs an interface for S03 to implement behind a placeholder, ready for replies
+that stream, fail halfway and are cancelled. `tumbleweed.agent` may not import `gi`, and S03 chooses
+how asyncio meets the GLib loop (D2).
+**Decision.** `Responder.start(request, sink) -> ReplyHandle`. The responder reports a reply
+through `ReplySink.emit` as a discriminated union of events (`ReplyDelta`, then exactly one of
+`ReplyFinished` or `ReplyFailed`), on the thread that called `start`; the handle's `cancel` stops it.
+The sink may be called before `start` returns. All models are strict, frozen pydantic classes. The
+shell's controller is the sink: it validates and bounds everything the responder says before it
+reaches the transcript, and ignores events after a reply has ended.
+**Consequences.** No event loop is needed to use or test it, and S03 can drive it from an asyncio
+task or a worker thread without changing the shell. New kinds of event (tool calls) extend the union.
+Timeouts and per-turn limits stay the responder's job (I9). An `AsyncIterator`-returning interface was
+considered and rejected for S02: it would make the shell choose the asyncio integration S03 owns.
+

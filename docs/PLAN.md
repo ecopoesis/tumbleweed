@@ -198,6 +198,9 @@ tracked chokepoint.
 - asyncio on the GLib main loop (`gi.events`). Fallback (D2): a worker-thread loop
   marshalled through `GLib.idle_add`.
 - Shell behaviour:
+  - the agent loop implements S02's `Responder` protocol (`tumbleweed.agent.responder`: `start`,
+    the `ReplyDelta`/`ReplyFinished`/`ReplyFailed` events, `cancel`; DECISIONS D9), replacing the
+    echo responder, and marshals its events onto the GTK main thread;
   - streaming deltas render into the transcript;
   - errors (no key, network, rate limit) show in chat, and the shell never crashes.
 - The system prompt lives in a versioned resource file.
