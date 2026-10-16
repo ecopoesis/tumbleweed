@@ -14,6 +14,16 @@ Pure Python with no daemon, no IPC and no storage (those are S17), and no LLM, a
 ARCHITECTURE section 7 is the contract.
 """
 
+from tumbleweed.broker.deny import (
+    HOME_DENY,
+    SYSTEM_DENY,
+    DenyContext,
+    DenyMatch,
+    DenyRelation,
+    DenyRules,
+    ExtraDeny,
+    deny_entries,
+)
 from tumbleweed.broker.errors import BrokerError, GrantError, PathError, PathFault
 from tumbleweed.broker.fdio import (
     MAX_READ_BYTES,
@@ -28,8 +38,15 @@ from tumbleweed.broker.paths import ResolvedPath, StoredPath
 from tumbleweed.broker.workspace import open_in_workspace, read_workspace_file
 
 __all__ = [
+    "HOME_DENY",
     "MAX_READ_BYTES",
+    "SYSTEM_DENY",
     "BrokerError",
+    "DenyContext",
+    "DenyMatch",
+    "DenyRelation",
+    "DenyRules",
+    "ExtraDeny",
     "FileKind",
     "FsIdentity",
     "GrantError",
@@ -39,6 +56,7 @@ __all__ = [
     "PathFault",
     "ResolvedPath",
     "StoredPath",
+    "deny_entries",
     "open_in_workspace",
     "openat2_available",
     "read_capped",
