@@ -93,8 +93,9 @@ way on macOS, in Docker, and in GitHub Actions, with a single shared type vocabu
   - mypy: `strict`, plus the pydantic plugin, `warn_unreachable`, and extra error codes such
     as `ignore-without-code`, `redundant-expr`, `truthy-bool`, `possibly-undefined`.
   - pytest: markers `gtk`/`linux`/`btrfs`/`live`, with a conftest hook so that with
-    `TUMBLEWEED_CI=1` any skipped `gtk`/`linux` test fails the session (`btrfs` is the only
-    exemption; ARCHITECTURE §11).
+    `TUMBLEWEED_CI=1` any skipped `gtk`/`linux` test fails the session (the guard exempts only
+    the skip raised by the `btrfs` gate, which always fires in CI; `live` tests never run in
+    CI; ARCHITECTURE §11).
   - coverage report.
   - import-linter, with the ARCHITECTURE §10 contracts for packages that exist; later steps
     add contracts when they create packages.
@@ -132,8 +133,9 @@ way on macOS, in Docker, and in GitHub Actions, with a single shared type vocabu
 **Out of scope.** Application code beyond `core` and a GTK smoke test.
 **Acceptance.**
 - Every `CLAUDE.md` command passes on macOS and in `scripts/test-linux`, and CI is green.
-- The CI log shows `bwrap --unshare-all --die-with-parent true` succeeding and a headless GTK
-  widget being created.
+- The CI log shows `bwrap --unshare-all --die-with-parent --ro-bind / / true` succeeding and a
+  headless GTK widget being created. (Without the `--ro-bind / /` the command cannot work:
+  bwrap's new root is empty, so there is no `true` to exec.)
 - A fixture proves mypy rejects passing a `ToolId` where a `TaskId` is expected, and a bare
   `str` where any ID is expected.
 - The `TUMBLEWEED_CI` skip-guard is itself tested.
@@ -728,8 +730,8 @@ and writes its output into the workspace, and the image renders. Negative tests:
   created files.
 - Refusal without a snapshot, and acceptance via a fake-user prompt.
 - The btrfs backend is tested under the `btrfs` marker when a loopback btrfs is available,
-  otherwise skipped with a reason (the marker is exempt from the CI skip-guard; S27's VM test
-  covers it end to end).
+  otherwise skipped with a reason (the `btrfs` gate's skip is exempt from the CI skip-guard,
+  any other skip of the test is not; S27's VM test covers the backend end to end).
 - The undo flow is tested end to end.
 
 **Depends on.** S20.

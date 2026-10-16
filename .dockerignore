@@ -1,0 +1,32 @@
+# The Docker build context is an ALLOWLIST: everything is excluded, then only what the image
+# needs is let back in. A denylist would send any new secret file (an API key in the repo root,
+# say) into an image layer, where it stays; tests/test_docker_context.py checks that every
+# pattern in the "Secrets" section of .gitignore stays out.
+*
+
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
+!CLAUDE.md
+!AGENTS.md
+!src/
+!tests/
+!scripts/
+!docs/
+
+# Read by tests/test_docker_context.py, which checks this very file inside the container too.
+!.gitignore
+!.dockerignore
+!Dockerfile
+
+# Allowed directories can still hold things that must not ship (the host's caches, a key file
+# somebody dropped into src/). Secret patterns are spelled case-insensitively with character
+# classes: git here runs with core.ignorecase=true, so `src/x.KEY` and `tests/.ANTHROPIC-KEY` are
+# secrets to git, and Docker's matching is case-sensitive.
+**/__pycache__
+**/*.py[cod]
+**/.[aA][nN][tT][hH][rR][oO][pP][iI][cC]-[kK][eE][yY]
+**/*.[kK][eE][yY]
+**/*.[pP][eE][mM]
+**/.[eE][nN][vV]*
