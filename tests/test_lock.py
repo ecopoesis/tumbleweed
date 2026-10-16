@@ -1,12 +1,25 @@
-"""The dependency cooldown is in force: no locked artifact is younger than `exclude-newer`.
+"""The dependency cooldown is in force: no locked artifact is younger than its cutoff.
 
 A package version that is only days old can be a compromised release nobody has noticed yet. So
 `[tool.uv] exclude-newer` keeps uv from picking anything newer than 7 days, and uv.lock records
-that window. These tests check the setting and that the lock honours it.
+that window. These tests check the setting, that the lock records it, and that no artifact in the
+lock is younger than its cutoff when the lock was written.
+
+"When the lock was written" is the time of the last git commit that touched uv.lock (now, if it has
+uncommitted changes), not the file's modification time: that is the moment of the checkout, and
+would make the check pass vacuously as time goes by. Where there is no git history (the Linux
+image has none) the age check is skipped with that reason and the setting checks still run; CI runs
+the age check on the macOS jobs, which fetch the full history.
+
+A package can have its own, later cutoff through `[tool.uv] exclude-newer-package` (the README's
+way to take a security fix early); such a package is checked against that cutoff instead.
 """
 
 import datetime as dt
+import os
 import re
+import shutil
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -14,23 +27,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 MINIMUM_COOLDOWN = dt.timedelta(days=7)
-
-
-def cooldown_of(setting: str) -> dt.timedelta:
-    """The span of a relative `exclude-newer` such as "7 days" or "2 weeks"."""
-    match = re.fullmatch(r"(\d+) (day|week)s?", setting)
-    assert match is not None, (
-        f"exclude-newer must be a relative duration like '7 days': {setting!r}"
-    )
-    return dt.timedelta(**{f"{match[2]}s": int(match[1])})
-
-
-def span_of(iso: str) -> dt.timedelta:
-    """The span of the ISO 8601 duration uv writes into the lock, e.g. P7D."""
-    match = re.fullmatch(r"P(?:(\d+)W)?(?:(\d+)D)?", iso)
-    assert match is not None, f"unsupported exclude-newer-span in uv.lock: {iso!r}"
-    return dt.timedelta(weeks=int(match[1] or 0), days=int(match[2] or 0))
-
 
 type Toml = dict[str, object]
 
@@ -45,10 +41,44 @@ def rows(value: object) -> list[Toml]:
     return [table(row) for row in value]
 
 
-def youngest_upload(lock: Toml) -> tuple[dt.datetime, str] | None:
-    """The newest upload time of any artifact in a parsed uv.lock, and which package it is."""
-    youngest: tuple[dt.datetime, str] | None = None
+def cooldown_of(setting: str) -> dt.timedelta:
+    """The span of a relative `exclude-newer` such as "7 days" or "2 weeks"."""
+    match = re.fullmatch(r"(\d+) (day|week)s?", setting)
+    assert match is not None, f"not a relative duration like '7 days': {setting!r}"
+    return dt.timedelta(**{f"{match[2]}s": int(match[1])})
+
+
+def span_of(iso: str) -> dt.timedelta:
+    """The span of the ISO 8601 duration uv writes into the lock, e.g. P7D."""
+    match = re.fullmatch(r"P(?:(\d+)W)?(?:(\d+)D)?", iso)
+    assert match is not None, f"unsupported exclude-newer-span in uv.lock: {iso!r}"
+    return dt.timedelta(weeks=int(match[1] or 0), days=int(match[2] or 0))
+
+
+def normalise(name: str) -> str:
+    """A package name as uv compares them (PEP 503)."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def cutoff_of(setting: str, written: dt.datetime) -> dt.datetime:
+    """The cutoff an `exclude-newer(-package)` value means for a lock written at `written`.
+
+    A relative duration counts back from then; anything else is an absolute date or timestamp.
+    """
+    if re.fullmatch(r"\d+ (day|week)s?", setting):
+        return written - cooldown_of(setting)
+    parsed = dt.datetime.fromisoformat(setting.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.UTC)
+
+
+def too_young(
+    lock: Toml, global_cutoff: dt.datetime, overrides: dict[str, dt.datetime]
+) -> list[str]:
+    """The artifacts of a parsed uv.lock uploaded after the cutoff that applies to their package."""
+    found = []
     for package in rows(lock["package"]):
+        name = normalise(str(package["name"]))
+        cutoff = overrides.get(name, global_cutoff)
         artifacts = [
             *rows(package.get("wheels", [])),
             *([table(package["sdist"])] if "sdist" in package else []),
@@ -57,9 +87,45 @@ def youngest_upload(lock: Toml) -> tuple[dt.datetime, str] | None:
             stamp = artifact.get("upload-time")
             if isinstance(stamp, str):
                 uploaded = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-                if youngest is None or uploaded > youngest[0]:
-                    youngest = (uploaded, f"{package['name']} {package['version']}")
-    return youngest
+                if uploaded > cutoff:
+                    found.append(f"{name} {package['version']} uploaded {uploaded:%Y-%m-%d %H:%M}")
+    return sorted(set(found))
+
+
+def overrides_of(uv_settings: Toml, written: dt.datetime) -> dict[str, dt.datetime]:
+    per_package = uv_settings.get("exclude-newer-package", {})
+    return {
+        normalise(name): cutoff_of(str(value), written)
+        for name, value in table(per_package).items()
+    }
+
+
+def git_output(git: str, root: Path, *args: str) -> str | None:
+    result = subprocess.run(  # noqa: S603  (argv list, no shell)
+        [git, "-C", str(root), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(root), "GIT_CONFIG_NOSYSTEM": "1"},
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def lock_written_at(root: Path) -> dt.datetime | None:
+    """When uv.lock was last written: now if uncommitted, else its last commit; None if unknown."""
+    git = shutil.which("git")
+    if git is None or not (root / ".git").exists():
+        return None
+    status = git_output(git, root, "status", "--porcelain", "--", "uv.lock")
+    if status is None:
+        return None
+    if status.strip():
+        return dt.datetime.now(dt.UTC)
+    stamp = git_output(git, root, "log", "-1", "--format=%ct", "--", "uv.lock")
+    if stamp is None or not stamp.strip():
+        return None
+    return dt.datetime.fromtimestamp(int(stamp), dt.UTC)
 
 
 @pytest.fixture(scope="module")
@@ -88,43 +154,105 @@ def test_the_lock_records_the_same_window(pyproject: Toml, lock: Toml) -> None:
     assert span_of(span) == cooldown_of(setting)
 
 
-def test_no_locked_artifact_is_younger_than_the_cooldown_when_the_lock_was_written(
+def test_no_locked_artifact_is_younger_than_its_cutoff_when_the_lock_was_written(
     pyproject: Toml, lock: Toml
 ) -> None:
-    """The lock was written no earlier than its file time (a checkout only makes it look later)."""
-    setting = table(pyproject["uv"])["exclude-newer"]
+    written = lock_written_at(ROOT)
+    if written is None:
+        pytest.skip("no git history for uv.lock here: the age check runs on the macOS CI jobs")
+    uv_settings = table(pyproject["uv"])
+    setting = uv_settings["exclude-newer"]
     assert isinstance(setting, str)
-    written = dt.datetime.fromtimestamp((ROOT / "uv.lock").stat().st_mtime, dt.UTC)
 
-    youngest = youngest_upload(lock)
+    found = too_young(lock, cutoff_of(setting, written), overrides_of(uv_settings, written))
 
-    assert youngest is not None, "no upload times in uv.lock: the check would prove nothing"
-    uploaded, package = youngest
-    assert uploaded <= written - cooldown_of(setting), (
-        f"{package} was uploaded {uploaded:%Y-%m-%d %H:%M}, inside the cooldown window"
+    assert not found, f"inside the cooldown window when the lock was written: {found}"
+
+
+def test_the_lock_is_not_empty_of_upload_times() -> None:
+    """Guards the age check: with no upload times it would prove nothing."""
+    lock = tomllib.loads((ROOT / "uv.lock").read_text())
+
+    assert any(
+        isinstance(artifact.get("upload-time"), str)
+        for package in rows(lock["package"])
+        for artifact in rows(package.get("wheels", []))
     )
 
 
-def test_the_check_notices_a_package_that_is_too_new() -> None:
-    synthetic: Toml = {
-        "package": [
-            {
-                "name": "old",
-                "version": "1",
-                "sdist": {"upload-time": "2026-01-01T00:00:00Z"},
-            },
+class TestTooYoung:
+    NOW = dt.datetime(2026, 10, 16, 12, 0, tzinfo=dt.UTC)
+    CUTOFF = NOW - dt.timedelta(days=7)
+
+    @staticmethod
+    def lock_of(*packages: Toml) -> Toml:
+        return {"package": list(packages), "options": {}}
+
+    def test_a_package_inside_the_window_is_noticed(self) -> None:
+        lock = self.lock_of(
+            {"name": "old", "version": "1", "sdist": {"upload-time": "2026-01-01T00:00:00Z"}},
             {
                 "name": "fresh",
                 "version": "2",
                 "wheels": [{"upload-time": "2026-10-15T12:00:00.5Z"}, {"url": "no time"}],
             },
             {"name": "project", "version": "0"},
-        ]
-    }
+        )
 
-    youngest = youngest_upload(synthetic)
+        assert too_young(lock, self.CUTOFF, {}) == ["fresh 2 uploaded 2026-10-15 12:00"]
 
-    assert youngest == (dt.datetime(2026, 10, 15, 12, 0, 0, 500000, dt.UTC), "fresh 2")
+    def test_the_cutoff_is_exclusive_of_exactly_that_instant(self) -> None:
+        lock = self.lock_of(
+            {"name": "edge", "version": "1", "sdist": {"upload-time": "2026-10-09T12:00:00Z"}}
+        )
+
+        assert too_young(lock, self.CUTOFF, {}) == []
+
+    def test_a_package_with_its_own_later_cutoff_is_checked_against_that_one(self) -> None:
+        lock = self.lock_of(
+            {"name": "Fixed_Pkg", "version": "3", "sdist": {"upload-time": "2026-10-15T00:00:00Z"}},
+            {"name": "other", "version": "1", "sdist": {"upload-time": "2026-10-15T00:00:00Z"}},
+        )
+        overrides = {normalise("fixed.pkg"): self.NOW}  # the README's early-fix escape hatch
+
+        assert too_young(lock, self.CUTOFF, overrides) == ["other 1 uploaded 2026-10-15 00:00"]
+
+    def test_an_override_is_not_a_blanket_for_newer_than_itself(self) -> None:
+        lock = self.lock_of(
+            {"name": "pkg", "version": "3", "sdist": {"upload-time": "2026-10-16T08:00:00Z"}}
+        )
+
+        assert too_young(lock, self.CUTOFF, {"pkg": self.NOW - dt.timedelta(days=2)}) != []
+
+    def test_overrides_are_read_from_pyproject_as_timestamps_dates_or_spans(self) -> None:
+        uv_settings: Toml = {
+            "exclude-newer-package": {
+                "Some_Package": "2026-10-15T00:00:00Z",
+                "dated": "2026-10-01",
+                "relative": "2 days",
+            }
+        }
+
+        assert overrides_of(uv_settings, self.NOW) == {
+            "some-package": dt.datetime(2026, 10, 15, tzinfo=dt.UTC),
+            "dated": dt.datetime(2026, 10, 1, tzinfo=dt.UTC),
+            "relative": self.NOW - dt.timedelta(days=2),
+        }
+
+    def test_no_overrides_is_normal(self) -> None:
+        assert overrides_of({"exclude-newer": "7 days"}, self.NOW) == {}
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("Foo_Bar", "foo-bar"),
+            ("foo.bar", "foo-bar"),
+            ("FOO--bar", "foo-bar"),
+            ("pytest", "pytest"),
+        ],
+    )
+    def test_names_are_compared_the_way_uv_does(self, name: str, expected: str) -> None:
+        assert normalise(name) == expected
 
 
 @pytest.mark.parametrize(("text", "days"), [("7 days", 7), ("1 week", 7), ("2 weeks", 14)])
@@ -135,3 +263,77 @@ def test_durations_parse(text: str, days: int) -> None:
 @pytest.mark.parametrize(("iso", "days"), [("P7D", 7), ("P1W", 7), ("P2W", 14), ("P2W1D", 15)])
 def test_iso_spans_parse(iso: str, days: int) -> None:
     assert span_of(iso) == dt.timedelta(days=days)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+class TestLockWrittenAt:
+    """The reference time comes from git, not from the file's modification time."""
+
+    @staticmethod
+    def commit(repo: Path, message: str, when: dt.datetime) -> None:
+        git = shutil.which("git") or "git"
+        stamp = when.isoformat()
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(repo),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_DATE": stamp,
+            "GIT_COMMITTER_DATE": stamp,
+        }
+        config = [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.org",
+            "-c",
+            "commit.gpgsign=false",
+        ]
+        for args in (["add", "-A"], [*config, "commit", "-q", "-m", message]):
+            subprocess.run([git, "-C", str(repo), *args], check=True, env=env, capture_output=True)  # noqa: S603
+
+    @pytest.fixture
+    def repo(self, tmp_path: Path) -> Path:
+        git = shutil.which("git") or "git"
+        subprocess.run([git, "init", "-q", str(tmp_path)], check=True, capture_output=True)  # noqa: S603
+        (tmp_path / "uv.lock").write_text("lock v1\n")
+        (tmp_path / "other.txt").write_text("1\n")
+        self.commit(tmp_path, "lock", dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.UTC))
+        return tmp_path
+
+    def test_it_is_the_time_of_the_last_commit_that_touched_the_lock(self, repo: Path) -> None:
+        (repo / "other.txt").write_text("2\n")
+        self.commit(repo, "unrelated", dt.datetime(2026, 6, 1, tzinfo=dt.UTC))
+
+        assert lock_written_at(repo) == dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.UTC)
+
+    def test_a_fresh_file_modification_time_does_not_move_it(self, repo: Path) -> None:
+        """What a new checkout does to every file: the reason mtime is not used."""
+        os.utime(repo / "uv.lock", None)
+
+        assert lock_written_at(repo) == dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.UTC)
+
+    def test_a_later_change_to_the_lock_is_the_new_reference(self, repo: Path) -> None:
+        (repo / "uv.lock").write_text("lock v2\n")
+        self.commit(repo, "relock", dt.datetime(2026, 9, 9, tzinfo=dt.UTC))
+
+        assert lock_written_at(repo) == dt.datetime(2026, 9, 9, tzinfo=dt.UTC)
+
+    def test_an_uncommitted_change_means_now(self, repo: Path) -> None:
+        (repo / "uv.lock").write_text("lock v2, not committed\n")
+
+        written = lock_written_at(repo)
+
+        assert written is not None
+        assert abs(dt.datetime.now(dt.UTC) - written) < dt.timedelta(minutes=1)
+
+    def test_without_git_history_it_is_unknown(self, tmp_path: Path) -> None:
+        (tmp_path / "uv.lock").write_text("lock\n")
+
+        assert lock_written_at(tmp_path) is None
+
+    def test_without_the_git_program_it_is_unknown(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+
+        assert lock_written_at(repo) is None
