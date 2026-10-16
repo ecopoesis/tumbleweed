@@ -192,7 +192,7 @@ class RawPeer:
                 max_bytes=MAX_FRAME_BYTES,
                 frame_timeout=timedelta(seconds=5),
             )
-        except ConnectionResetError:
+        except ConnectionError:  # reset, or a broken pipe from a write after the server closed
             return None
         return None if payload is None else decode_message(payload)
 
