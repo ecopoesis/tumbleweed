@@ -32,6 +32,13 @@ class LyingInt(int):
         return "42"
 
 
+class LyingFloat(float):
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "1.0"
+
+
 class TestStrings:
     def test_a_short_string_is_its_repr(self) -> None:
         assert excerpt("abc") == "'abc'"
@@ -56,6 +63,23 @@ class TestOtherValues:
     @pytest.mark.parametrize(("value", "shown"), [(True, "True"), (False, "False"), (None, "None")])
     def test_bool_and_none_are_shown_as_themselves(self, value: object, shown: str) -> None:
         assert excerpt(value) == shown
+
+    @pytest.mark.parametrize(
+        "value",
+        [1.5, -0.25, 0.0, -0.0, 1e300, 5e-324, 1.7976931348623157e308, 1 / 3, 1e22, 2.0**60],
+    )
+    def test_a_float_is_shown_as_itself_because_a_repr_of_it_is_short_and_safe(
+        self, value: float
+    ) -> None:
+        assert excerpt(value) == repr(value)
+        assert len(excerpt(value)) <= 24
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_floats_are_shown_too(self, value: float) -> None:
+        assert excerpt(value) == repr(value)
+
+    def test_a_float_subclass_is_not_asked_to_describe_itself(self) -> None:
+        assert excerpt(LyingFloat(2.5)) == "<LyingFloat>"
 
     @pytest.mark.parametrize("value", [0, 5, -7, 2**63, -(2**63), 2**64 - 1])
     def test_a_short_int_is_shown(self, value: int) -> None:
@@ -82,7 +106,6 @@ class TestOtherValues:
     @pytest.mark.parametrize(
         ("value", "shown"),
         [
-            (1.5, "<float>"),
             ([1, 2], "<list>"),
             ({"a": 1}, "<dict>"),
             ((1,), "<tuple>"),

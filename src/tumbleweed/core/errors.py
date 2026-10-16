@@ -24,9 +24,10 @@ def excerpt(value: object) -> str:
     Input is bounded only by whatever limit its source enforces, and error messages end up in
     logs and in chat, so they must not echo it whole, nor trust it to describe itself. A `str`
     is shown by its `repr` (which escapes control and format characters) cut to 64 characters,
-    with its length. A `bool`, `None` or an `int` of at most 64 bits is shown by its `repr`. Any
-    other value, a subclass of `str` or `int` included, is shown by its type's name alone: its
-    `repr` could be huge, raise, or lie.
+    with its length. A `bool`, `None`, an `int` of at most 64 bits or a `float` is shown by its
+    `repr` (a float's is at most 24 characters and cannot raise; the model needs to see `1.5`
+    to correct itself). Any other value, a subclass of `str`, `int` or `float` included, is
+    shown by its type's name alone: its `repr` could be huge, raise, or lie.
     """
     kind = type(value)
     if isinstance(value, str) and kind is str:
@@ -37,4 +38,6 @@ def excerpt(value: object) -> str:
     if isinstance(value, int) and kind is int:
         # str() of an int with more than 4300 digits raises ValueError: say how big it is.
         return repr(value) if value.bit_length() <= 64 else f"an int of {value.bit_length()} bits"
+    if isinstance(value, float) and kind is float:
+        return repr(value)
     return f"<{kind.__name__[:_EXCERPT_LIMIT]}>"
