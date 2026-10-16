@@ -1,16 +1,20 @@
-"""The invocation chokepoint (DECISIONS D3): every model call goes through `InvocationRecorder`.
+"""The invocation chokepoint (DECISIONS D3): every model call goes through a `RecordedProvider`.
 
-The agent loop does not hold a provider, it holds the recorder, and asks it to stream a request
-through a provider. The recorder passes the events on untouched and, when the call ends, however
-it ends, appends one JSONL record: `InvocationId`, `SessionId`, `TaskId | None`, the model, token
-usage, latency, the stop reason, the provider's request ID, how it ended and, for a failure, the
-`ErrorKind`.
+`InvocationRecorder.record(provider, session_id=..., task_id=...)` wraps a provider in a
+`RecordedProvider`, and that is the only thing the agent loop accepts (`AgentLoop` is typed with
+it, and `tests/agent/test_chokepoint.py` fails if anything but the loop, the recorder and the
+provider itself calls a provider's `stream`). The wrapper passes the events on untouched and, when
+the call ends, however it ends, appends one JSONL record: `InvocationId`, `SessionId`,
+`TaskId | None`, the model, token usage (the last the provider reported, also for a call that
+failed or was cut short), latency, the stop reason, the provider's request ID, how it ended
+(`ok`, `error`, `cancelled`, `timeout`, `aborted`) and, for a failure, the `ErrorKind`.
 
 What a record never holds (I6): the API key, any prompt, message or tool text, a provider's error
 text. It is built only from validated, closed or length-capped fields, so there is nothing to
-scrub, and `MAX_RECORD_BYTES` bounds a line. The file is `0600` in a `0700` directory; past
-`MAX_LOG_BYTES` it is rotated to `<name>.1` (one backup), so the log is bounded too. A log that
-cannot be written is reported to the logger and never fails the reply.
+scrub, and `MAX_RECORD_BYTES` bounds a line. The file is created `0600` and tightened to it if it
+was looser, in a directory tightened to `0700` (an owner other than the user makes the write fail
+and be reported); past `MAX_LOG_BYTES` it is rotated to `<name>.1` (one backup), so the log is
+bounded too. A log that cannot be written is reported to the logger and never fails the reply.
 """
 
 import asyncio
@@ -29,7 +33,15 @@ from typing import Final, Literal, Protocol, final
 from pydantic import BaseModel, ConfigDict
 
 from tumbleweed.agent.errors import ErrorKind, ProviderError
-from tumbleweed.agent.llm import LlmDone, LlmEvent, LlmProvider, LlmRequest, StopReason, Usage
+from tumbleweed.agent.llm import (
+    LlmDone,
+    LlmEvent,
+    LlmProvider,
+    LlmRequest,
+    StopReason,
+    Usage,
+    UsageUpdate,
+)
 from tumbleweed.core.ids import InvocationId, SessionId, TaskId
 from tumbleweed.core.types import ByteCount, ModelName, ProviderRequestId
 
@@ -53,8 +65,9 @@ class InvocationRecord(BaseModel):
     prompt_version: str
     started_at: datetime
     latency: timedelta
-    outcome: Literal["ok", "error", "cancelled", "aborted"]
-    """`aborted`: the consumer stopped reading before the call ended (a limit was reached)."""
+    outcome: Literal["ok", "error", "cancelled", "timeout", "aborted"]
+    """`timeout`: the reply's deadline cut the call short. `aborted`: the consumer stopped reading
+    before the call ended (a limit was reached)."""
     error_kind: ErrorKind | None
     stop_reason: StopReason | None
     usage: Usage | None
@@ -80,12 +93,14 @@ class JsonlInvocationLog:
             raise ValueError("invocation record over the size bound")
         with self._lock:
             self._path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._path.parent.chmod(0o700)  # only the user's, whatever it was before
             self._rotate_if_large()
             flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
             descriptor = os.open(self._path, flags, 0o600)
             try:
                 if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                     raise OSError("the invocation log is not a regular file")
+                os.fchmod(descriptor, 0o600)  # a file that was looser is tightened, not trusted
                 os.write(descriptor, line)  # one write: lines do not interleave
             finally:
                 os.close(descriptor)
@@ -100,8 +115,39 @@ class JsonlInvocationLog:
 
 
 @final
+class RecordedProvider:
+    """A provider whose every call is recorded. Made only by `InvocationRecorder.record`."""
+
+    def __init__(
+        self,
+        recorder: "InvocationRecorder",
+        provider: LlmProvider,
+        session_id: SessionId,
+        task_id: TaskId | None,
+    ) -> None:
+        self._recorder = recorder
+        self._provider = provider
+        self._session_id = session_id
+        self._task_id = task_id
+
+    def stream(
+        self, request: LlmRequest, *, timed_out: Callable[[], bool] = lambda: False
+    ) -> AsyncGenerator[LlmEvent]:
+        """The events of the provider's stream, and one record when the call is over.
+
+        `timed_out` says whether a cancellation that arrives is the reply's deadline, which is
+        recorded as `timeout` instead of `cancelled`. Close the generator (`contextlib.aclosing`)
+        when you stop reading early, so the record is written then and the provider's stream is
+        released.
+        """
+        return self._recorder.stream(
+            self._provider, request, self._session_id, self._task_id, timed_out
+        )
+
+
+@final
 class InvocationRecorder:
-    """Streams requests through providers and records each call."""
+    """Wraps providers so that their calls are recorded."""
 
     def __init__(
         self,
@@ -118,38 +164,42 @@ class InvocationRecorder:
         self._clock = clock
         self._monotonic = monotonic
 
+    def record(
+        self, provider: LlmProvider, *, session_id: SessionId, task_id: TaskId | None = None
+    ) -> RecordedProvider:
+        return RecordedProvider(self, provider, session_id, task_id)
+
     async def stream(
         self,
         provider: LlmProvider,
         request: LlmRequest,
-        *,
         session_id: SessionId,
         task_id: TaskId | None,
+        timed_out: Callable[[], bool],
     ) -> AsyncGenerator[LlmEvent]:
-        """The events of `provider.stream(request)`, and one record when the call is over.
-
-        Close it (`contextlib.aclosing`) when you stop reading early, so the record is written
-        then and the provider's stream is released.
-        """
         invocation_id = InvocationId.new()
         started_at = self._clock()
         started = self._monotonic()
-        outcome: Literal["ok", "error", "cancelled", "aborted"] = "aborted"
+        outcome: Literal["ok", "error", "cancelled", "timeout", "aborted"] = "aborted"
         error_kind: ErrorKind | None = None
         request_id: ProviderRequestId | None = None
+        usage: Usage | None = None
         done: LlmDone | None = None
         events = provider.stream(request)
         try:
             async for event in events:
-                if isinstance(event, LlmDone):
+                if isinstance(event, UsageUpdate):
+                    usage = event.usage
+                elif isinstance(event, LlmDone):
                     done = event
                 yield event
             outcome = "ok"
         except asyncio.CancelledError:
-            outcome = "cancelled"
+            outcome = "timeout" if timed_out() else "cancelled"
             raise
         except ProviderError as exc:
             outcome, error_kind, request_id = "error", exc.kind, exc.request_id
+            usage = exc.usage or usage
             raise
         except Exception:
             outcome, error_kind = "error", ErrorKind.INTERNAL
@@ -171,7 +221,7 @@ class InvocationRecorder:
                     outcome=outcome,
                     error_kind=error_kind,
                     stop_reason=done.stop_reason if done else None,
-                    usage=done.usage if done else None,
+                    usage=done.usage if done else usage,
                     request_id=done.request_id if done else request_id,
                 )
             )

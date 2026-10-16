@@ -23,7 +23,7 @@ from tumbleweed.agent.config import (
     take_api_key,
 )
 from tumbleweed.agent.echo import EchoResponder
-from tumbleweed.agent.errors import AgentError
+from tumbleweed.agent.errors import AgentError, describe_unexpected
 from tumbleweed.agent.prompts import SYSTEM_PROMPT_VERSION, load_system_prompt
 from tumbleweed.agent.recorder import InvocationRecorder, JsonlInvocationLog
 from tumbleweed.agent.responder import Responder
@@ -89,5 +89,12 @@ def _build_anthropic(
         # No key, a key file that is too open, an unreadable prompt: say so in the chat.
         logger.warning("the model is not available: %s", type(exc).__name__)
         return AgentSetup(UnavailableResponder(str(exc)), _nothing)
+    except Exception as exc:  # noqa: BLE001  (a client that cannot be built must not stop the shell)
+        # The SDK or its HTTP library refused the settings (a base_url the checks let through).
+        logger.error("the model client cannot be set up: %s", describe_unexpected(exc))
+        return AgentSetup(
+            UnavailableResponder("The model client could not be set up: check base_url."),
+            _nothing,
+        )
     logger.info("responder: %s (prompt %s)", model, SYSTEM_PROMPT_VERSION)
     return AgentSetup(responder, responder.close)

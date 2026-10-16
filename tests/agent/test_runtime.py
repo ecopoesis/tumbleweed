@@ -12,6 +12,7 @@ import pytest
 
 from tests.agent.support import RaisingProvider, agent_threads, make_rig
 from tests.shell.fakes import RecordingSink
+from tumbleweed.agent.conversation import Conversation
 from tumbleweed.agent.errors import (
     AgentBusyError,
     LimitError,
@@ -87,6 +88,42 @@ class TestStreaming:
             assert record.task_id is None
 
 
+class TestModelTextThatWouldWedgeTheChat:
+    def test_a_lone_surrogate_and_a_nul_are_replaced_and_the_reply_still_ends(self) -> None:
+        with make_rig([FakeTurn(chunks=("a\ud800b", "c\x00d"))]) as rig:
+            rig.send_and_wait("hi")  # (busy must end: it used to stay true for ever)
+
+            assert rig.last_reply() == ("a\ufffdbc\ufffdd", "complete", None)
+            assert not rig.controller.busy
+
+    def test_the_next_request_is_not_poisoned_by_it(self) -> None:
+        with make_rig([FakeTurn(chunks=("x\udc80y",)), FakeTurn(chunks=("ok",))]) as rig:
+            rig.send_and_wait("first")
+            rig.send_and_wait("second")
+
+            for message in rig.provider.requests[1].messages:
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        block.text.encode("utf-8")  # raises for a lone surrogate
+            assert rig.last_reply()[1] == "complete"
+
+    def test_the_terminal_event_is_emitted_even_if_remembering_the_reply_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def broken(self: Conversation, user_text: str, assistant_text: str) -> None:
+            raise RuntimeError("history bug")
+
+        monkeypatch.setattr(Conversation, "commit", broken)
+        with make_rig([FakeTurn(chunks=("hello",))]) as rig:
+            sink = RecordingSink()
+            rig.responder.start(request(), sink)
+
+            with pytest.raises(RuntimeError, match="history bug"):  # (a dispatcher would log it)
+                rig.dispatcher.run_until(lambda: False, timeout=5)
+
+            assert sink.events == [ReplyDelta(text="hello"), ReplyFinished()]
+
+
 class TestFailures:
     @pytest.mark.parametrize(
         ("error", "shown"),
@@ -154,7 +191,7 @@ class TestFailures:
             assert message is not None
             assert "longer than 1 seconds" in message
             assert rig.provider.calls_cancelled == 1  # the stream was released
-            assert [r.outcome for r in rig.log.records] == ["cancelled"]
+            assert [r.outcome for r in rig.log.records] == ["timeout"]  # not "cancelled"
 
     def test_a_message_over_the_size_limit_is_refused_before_anything_runs(self) -> None:
         with make_rig([]) as rig:

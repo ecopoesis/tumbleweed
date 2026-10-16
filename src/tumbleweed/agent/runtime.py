@@ -31,7 +31,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from typing import Final, Protocol, final
 
 from tumbleweed.agent.conversation import Conversation
-from tumbleweed.agent.errors import AgentBusyError, AgentError, LimitError, ReplyTimeoutError
+from tumbleweed.agent.errors import AgentBusyError, AgentError, LimitError, describe_unexpected
 from tumbleweed.agent.limits import MAX_USER_TEXT_BYTES, AgentLimits
 from tumbleweed.agent.llm import LlmMessage, LlmProvider
 from tumbleweed.agent.loop import AgentLoop
@@ -166,13 +166,11 @@ class AgentResponder:
         self._limits = limits
         self._session_id = SessionId.new()
         self._loop = AgentLoop(
-            provider=provider,
-            recorder=recorder,
+            provider=recorder.record(provider, session_id=self._session_id),
             registry=registry,
             model=model,
             system_prompt=system_prompt,
             limits=limits,
-            session_id=self._session_id,
         )
         self._cleanup = cleanup
         self._conversation = Conversation()
@@ -228,26 +226,16 @@ class AgentResponder:
     # On the worker thread.
 
     async def _drive(self, run: _Run, history: tuple[LlmMessage, ...], text: str) -> None:
-        deadline = asyncio.timeout(self._limits.reply_timeout_seconds)
         try:
-            async with deadline:
-                reply = await self._loop.run(
-                    history, text, lambda piece: self._post(run, ReplyDelta(text=piece))
-                )
-        except TimeoutError:
-            if not deadline.expired():
-                logger.exception("the reply failed with a timeout of its own")
-                self._post(run, ReplyFailed(reason=_INTERNAL_FAILURE))
-                return
-            failure = ReplyTimeoutError(
-                f"The reply took longer than {self._limits.reply_timeout_seconds} seconds "
-                "and was stopped."
+            reply = await self._loop.run(
+                history, text, lambda piece: self._post(run, ReplyDelta(text=piece))
             )
-            self._post(run, ReplyFailed(reason=str(failure)))
         except AgentError as exc:
             self._post(run, ReplyFailed(reason=str(exc)))
-        except Exception:
-            logger.exception("the reply failed unexpectedly")
+        except Exception as exc:  # noqa: BLE001  (the worker is a boundary)
+            # A bug (everything a provider can do wrong is a ProviderError by now): by type and
+            # place only, because its message could hold what a server said.
+            logger.error("the reply failed unexpectedly: %s", describe_unexpected(exc))
             self._post(run, ReplyFailed(reason=_INTERNAL_FAILURE))
         else:
             self._post(run, ReplyFinished(), commit=(text, reply))
@@ -263,13 +251,17 @@ class AgentResponder:
     def _deliver(self, run: _Run, event: ReplyEvent, commit: tuple[str, str] | None) -> None:
         if run.ended:
             return
-        if not isinstance(event, ReplyDelta):
-            run.ended = True
-            if self._active is run:
-                self._active = None
-            if commit is not None:
-                self._conversation.commit(*commit)
-        run.sink.emit(event)
+        try:
+            if not isinstance(event, ReplyDelta):
+                run.ended = True
+                if self._active is run:
+                    self._active = None
+                if commit is not None:
+                    self._conversation.commit(*commit)
+        finally:
+            # The reply must end whatever happens to its record: a terminal event that is not
+            # emitted leaves the chat busy for ever.
+            run.sink.emit(event)
 
 
 @final

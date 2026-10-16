@@ -39,10 +39,12 @@ def test_a_minimal_real_call_streams_an_answer_and_is_recorded(tmp_path: Path) -
     async def scenario() -> tuple[str, list[str]]:
         client = build_client(api_key=key, base_url=DEFAULT_BASE_URL)
         try:
+            recorder = InvocationRecorder(
+                JsonlInvocationLog(log_path), prompt_version=SYSTEM_PROMPT_VERSION
+            )
             loop = AgentLoop(
-                provider=AnthropicProvider(client, effort="low"),
-                recorder=InvocationRecorder(
-                    JsonlInvocationLog(log_path), prompt_version=SYSTEM_PROMPT_VERSION
+                provider=recorder.record(
+                    AnthropicProvider(client, effort="low"), session_id=SessionId.new()
                 ),
                 registry=ToolRegistry(),
                 model=DEFAULT_MODEL,
@@ -50,7 +52,6 @@ def test_a_minimal_real_call_streams_an_answer_and_is_recorded(tmp_path: Path) -
                 limits=AgentLimits(
                     max_turn_output_tokens=TokenCount(1024), reply_timeout_seconds=60
                 ),
-                session_id=SessionId.new(),
             )
             deltas: list[str] = []
             async with asyncio.timeout(60):

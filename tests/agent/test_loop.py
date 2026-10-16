@@ -7,10 +7,15 @@ import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from tests.agent.support import MODEL, MemoryLog, TruncatedProvider
-from tumbleweed.agent.errors import AgentError, LimitError, ProviderError, ProviderRefusedError
+from tumbleweed.agent.errors import (
+    AgentError,
+    LimitError,
+    ProviderError,
+    ProviderRefusedError,
+    ReplyTimeoutError,
+)
 from tumbleweed.agent.fake import FakeProvider, FakeToolCall, FakeTurn
 from tumbleweed.agent.limits import (
-    BYTES_PER_TOKEN_BOUND,
     MAX_REPLY_BYTES,
     MAX_TOOL_CALLS_PER_ITERATION,
     MAX_TURN_OUTPUT_TOKENS,
@@ -50,13 +55,13 @@ class Harness:
         if tools:
             self.registry.register(ToolName("add"), "Add two integers.", AddInput, add)
         self.loop = AgentLoop(
-            provider=provider or self.provider,
-            recorder=InvocationRecorder(self.log, prompt_version="test"),
+            provider=InvocationRecorder(self.log, prompt_version="test").record(
+                provider or self.provider, session_id=SessionId.new()
+            ),
             registry=self.registry,
             model=MODEL,
             system_prompt="sys",
             limits=limits or AgentLimits(),
-            session_id=SessionId.new(),
         )
         self.streamed: list[str] = []
 
@@ -167,7 +172,8 @@ class TestLimits:
         error = harness.fail()
 
         assert isinstance(error, LimitError)
-        assert "token limit" in str(error)
+        assert "16000 output tokens" in str(error)
+        assert "max_turn_output_tokens" in str(error)  # what to raise
         assert harness.streamed == ["partial"]
 
     def test_reply_text_over_the_size_cap_is_never_passed_on(self) -> None:
@@ -189,10 +195,9 @@ class TestLimits:
         assert sum(len(t.encode()) for t in harness.streamed) <= MAX_REPLY_BYTES
         assert len(harness.streamed) == 32
 
-    def test_the_token_limit_fits_a_transcript_message(self) -> None:
-        assert MAX_TURN_OUTPUT_TOKENS * BYTES_PER_TOKEN_BOUND <= MAX_REPLY_BYTES
+    def test_the_token_limit_is_in_range(self) -> None:
         AgentLimits(max_turn_output_tokens=MAX_TURN_OUTPUT_TOKENS)
-        with pytest.raises(ValidationError, match="fits a transcript message"):
+        with pytest.raises(ValidationError, match="from 1 to 128000"):
             AgentLimits(max_turn_output_tokens=TokenCount(MAX_TURN_OUTPUT_TOKENS + 1))
         with pytest.raises(ValidationError):
             AgentLimits(max_turn_output_tokens=TokenCount(0))
@@ -202,6 +207,83 @@ class TestLimits:
     def test_the_other_limits_are_bounded_too(self, field: str, value: int) -> None:
         with pytest.raises(ValidationError):
             AgentLimits.model_validate_json(json.dumps({field: value}))
+
+
+class TestModelTextIsUntrusted:
+    def test_nul_and_lone_surrogates_become_the_replacement_character_before_anything_counts(
+        self,
+    ) -> None:
+        harness = Harness([FakeTurn(chunks=("a\x00b", "c\ud800d", "\udfffe"))])
+
+        reply = harness.run()
+
+        assert reply == "a\ufffdbc\ufffdd\ufffde"
+        assert harness.streamed == ["a\ufffdb", "c\ufffdd", "\ufffde"]
+        reply.encode("utf-8")  # what the conversation and the transcript need
+
+    def test_the_byte_cap_counts_the_cleaned_text_like_the_transcript_does(self) -> None:
+        # NUL is one byte raw and three as U+FFFD: 25000 of them is over the cap only cleaned.
+        harness = Harness([FakeTurn(chunks=("\x00" * 25_000,) * 3)])
+
+        error = harness.fail()
+
+        assert isinstance(error, LimitError)
+        assert sum(len(t.encode()) for t in harness.streamed) <= MAX_REPLY_BYTES
+        assert len(harness.streamed) == 0  # the first 75000 bytes do not fit
+
+    def test_an_empty_delta_is_not_passed_on(self) -> None:
+        harness = Harness([FakeTurn(chunks=("", "a", "", "", "b"))])
+
+        assert harness.run() == "ab"
+        assert harness.streamed == ["a", "b"]
+
+    def test_a_reply_of_only_whitespace_is_empty(self) -> None:
+        error = Harness([FakeTurn(chunks=("  ", "\n\t "))]).fail()
+
+        assert isinstance(error, ProviderError)
+        assert "empty reply" in str(error)
+
+
+class TestOnlyADoneModelEndsAReply:
+    @pytest.mark.parametrize("reason", [StopReason.END_TURN, StopReason.STOP_SEQUENCE])
+    def test_these_are_success(self, reason: StopReason) -> None:
+        assert Harness([FakeTurn(chunks=("fine",), stop_reason=reason)]).run() == "fine"
+
+    @pytest.mark.parametrize(
+        ("reason", "words"),
+        [
+            (StopReason.OTHER, "not understood"),
+            (StopReason.CONTEXT_WINDOW_EXCEEDED, "context window"),
+            (StopReason.MAX_TOKENS, "output tokens"),
+            (StopReason.REFUSAL, "declined"),
+        ],
+    )
+    def test_everything_else_fails_with_a_message_that_says_which(
+        self, reason: StopReason, words: str
+    ) -> None:
+        harness = Harness([FakeTurn(chunks=("half a reply",), stop_reason=reason)])
+
+        error = harness.fail()
+
+        assert words in str(error)
+        assert harness.streamed == ["half a reply"]  # shown, but the reply failed
+
+    def test_a_tool_use_stop_with_no_tool_call_fails(self) -> None:
+        error = Harness([FakeTurn(chunks=("x",), stop_reason=StopReason.TOOL_USE)]).fail()
+
+        assert "named none" in str(error)
+
+    def test_the_stream_is_closed_at_once_when_the_loop_stops_reading_it(self) -> None:
+        harness = Harness([FakeTurn(chunks=("x" * 1024,) * 100)])
+
+        async def scenario() -> list[str]:
+            with pytest.raises(LimitError):
+                await harness.loop.run((), "hi", harness.streamed.append)
+            # Still inside the event loop: a generator left to the garbage collector would not
+            # have been closed, and so not recorded, yet.
+            return [r.outcome for r in harness.log.records]
+
+        assert asyncio.run(scenario()) == ["aborted"]
 
 
 class TestOutcomes:
@@ -241,6 +323,17 @@ class TestOutcomes:
 
         assert harness.provider.calls_cancelled == 1
         assert [r.outcome for r in harness.log.records] == ["cancelled"]
+
+    def test_a_reply_timeout_is_one_error_and_one_timeout_record(self) -> None:
+        harness = Harness(
+            [FakeTurn(chunks=("a",), hang=True)], limits=AgentLimits(reply_timeout_seconds=1)
+        )
+
+        error = harness.fail()
+
+        assert isinstance(error, ReplyTimeoutError)
+        assert "longer than 1 seconds" in str(error)
+        assert [r.outcome for r in harness.log.records] == ["timeout"]
 
     def test_the_user_text_is_what_the_model_sees_last(self) -> None:
         harness = Harness([FakeTurn(chunks=("ok",))])

@@ -1,5 +1,9 @@
 """What the agent remembers between replies: the text turns of the conversation, bounded.
 
+This is S03's stand-in. It lives in memory only and trims by message count and bytes; S04 (chat
+persistence) replaces it with the stored history and its own policy for what a new request is
+built from, so nothing else may depend on how it trims.
+
 Only user and assistant text is kept (ARCHITECTURE section 2: tool results never carry across
 turns), and only turns of replies that finished: a reply that failed, timed out or was cancelled
 leaves no trace, so the next request never starts from a half-written assistant turn. The newest
@@ -15,7 +19,11 @@ from tumbleweed.agent.llm import LlmMessage, TextBlock
 
 
 def _size(message: LlmMessage) -> int:
-    return sum(len(block.text.encode("utf-8")) for block in message.content if block.kind == "text")
+    return sum(
+        len(block.text.encode("utf-8", errors="replace"))
+        for block in message.content
+        if block.kind == "text"
+    )
 
 
 @final

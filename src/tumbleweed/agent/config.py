@@ -97,8 +97,14 @@ class AgentConfig(BaseModel):
     def _base_url_is_safe(cls, value: str) -> str:
         if len(value) > _MAX_URL_CHARS or not value.isprintable() or " " in value:
             raise ValueError("base_url must be a short URL without spaces or control characters")
-        parts = urlsplit(value)
-        host = parts.hostname
+        try:
+            parts = urlsplit(value)
+            host = parts.hostname
+            port = parts.port  # raises ValueError for text and for anything over 65535
+            if port == 0:
+                raise ValueError("port 0")
+        except ValueError:
+            raise ValueError("base_url is not a valid URL (check the host and the port)") from None
         if host is None or parts.username is not None or parts.password is not None:
             raise ValueError("base_url needs a host and no credentials")
         if parts.query or parts.fragment:
@@ -207,28 +213,34 @@ def _read_regular_file(path: Path, *, limit: int, private: bool, what: str) -> b
     except FileNotFoundError:
         raise
     except OSError as exc:
-        reason = "is a symlink" if exc.errno == errno.ELOOP else exc.strerror or "cannot be opened"
-        raise ConfigError(f"The {what} {path} {reason}; it must be a regular file.") from None
+        if exc.errno == errno.ELOOP:
+            raise ConfigError(f"The {what} must not be a symlink: {path}") from None
+        if exc.errno in {errno.EACCES, errno.EPERM}:
+            raise ConfigError(f"The {what} cannot be read (permission denied): {path}") from None
+        raise ConfigError(
+            f"The {what} cannot be opened ({exc.strerror or 'error'}): {path}"
+        ) from None
     try:
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
-            raise ConfigError(f"The {what} {path} is not a regular file.")
+            raise ConfigError(f"The {what} must be a regular file: {path}")
         if info.st_uid != os.geteuid():
-            raise ConfigError(f"The {what} {path} is not owned by you.")
+            raise ConfigError(f"The {what} must be owned by you: {path}")
         forbidden = 0o077 if private else 0o022
         if info.st_mode & forbidden:
-            # The path once, early: the chat shows at most 200 characters of an error.
-            need = "0600" if private else "no write for group or others"
+            # The instruction first, the path last: the chat shows at most 200 characters.
+            need = "0600" if private else "writable only by you"
             raise ConfigError(
-                f"The {what} {path} has mode {stat.S_IMODE(info.st_mode):04o}; it must be {need}."
+                f"The {what} must be {need}, but its mode is {stat.S_IMODE(info.st_mode):04o}: "
+                f"{path}"
             )
         if info.st_size > limit:
-            raise ConfigError(f"The {what} {path} is larger than {limit} bytes.")
+            raise ConfigError(f"The {what} must be under {limit} bytes: {path}")
         data = os.read(descriptor, limit + 1)
     finally:
         os.close(descriptor)
     if len(data) > limit:
-        raise ConfigError(f"The {what} {path} is larger than {limit} bytes.")
+        raise ConfigError(f"The {what} must be under {limit} bytes: {path}")
     return data
 
 
@@ -282,7 +294,7 @@ def load_config(environ: Mapping[str, str]) -> TumbleweedConfig:
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        raise ConfigError(f"The config file {path} is not UTF-8 text.") from None
+        raise ConfigError(f"The config file must be UTF-8 text: {path}") from None
     return parse_config(text, environ, source=str(path))
 
 
@@ -310,15 +322,14 @@ def take_api_key(environ: MutableMapping[str, str], config: AgentConfig) -> ApiK
         data = _read_regular_file(path, limit=MAX_KEY_FILE_BYTES, private=True, what="key file")
     except FileNotFoundError:
         if explicit:
-            raise ConfigError(f"The key file {path} does not exist.") from None
+            raise ConfigError(f"The configured key file does not exist: {path}") from None
         raise MissingKeyError(
-            f"No API key is set. Set {KEY_ENV_VARIABLE}, or put the key in {path} (mode 0600), "
-            "then restart."
+            f"No API key is set. Set {KEY_ENV_VARIABLE}, or put the key (mode 0600) in: {path}"
         ) from None
     try:
         text = data.decode("ascii")
     except UnicodeDecodeError:
-        raise ConfigError(f"The key file {path} is not ASCII text.") from None
+        raise ConfigError(f"The key file must be ASCII text: {path}") from None
     if not text.strip():
-        raise MissingKeyError(f"The key file {path} is empty.")
+        raise MissingKeyError(f"The key file is empty: {path}")
     return _key_from_text(text, source=str(path))

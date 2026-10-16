@@ -23,8 +23,9 @@ from typing import final
 
 from pydantic import BaseModel, JsonValue, TypeAdapter, ValidationError
 
+from tumbleweed.agent.errors import describe_unexpected
 from tumbleweed.agent.limits import MAX_TOOL_INPUT_BYTES, MAX_TOOL_RESULT_BYTES, TOOL_TIMEOUT
-from tumbleweed.agent.llm import ToolSpec
+from tumbleweed.agent.llm import ToolSpec, sanitize_text
 from tumbleweed.core.errors import InvalidValueError, TumbleweedError, excerpt
 from tumbleweed.core.types import PatternStr
 
@@ -56,7 +57,8 @@ class ToolOutcome(BaseModel):
 
 
 def _bounded(text: str) -> str:
-    data = text.encode("utf-8", errors="replace")
+    text = sanitize_text(text)
+    data = text.encode("utf-8")
     if len(data) <= MAX_TOOL_RESULT_BYTES:
         return text
     return data[:MAX_TOOL_RESULT_BYTES].decode("utf-8", errors="ignore") + "\n[truncated]"
@@ -139,6 +141,6 @@ class ToolRegistry:
             return ToolOutcome(
                 text=_one_line(str(exc), _MAX_PROBLEM_CHARS) or "failed", is_error=True
             )
-        except Exception:
-            logger.exception("tool %s failed", name)
+        except Exception as exc:  # noqa: BLE001  (a handler's bug comes back as an error)
+            logger.error("tool %s failed: %s", name, describe_unexpected(exc))
             return ToolOutcome(text=f"The tool {name} failed unexpectedly.", is_error=True)

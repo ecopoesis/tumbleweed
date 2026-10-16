@@ -109,7 +109,7 @@ class TestChoice:
 
         message = chat(agent, dispatcher).messages[1]
         assert message.error is not None
-        assert "mode 0644" in message.error
+        assert "mode is 0644" in message.error
         assert "must be 0600" in message.error
         assert CANARY not in message.error
 
@@ -140,6 +140,46 @@ class TestChoice:
 
             assert "ANTHROPIC_API_KEY" not in environ
             assert "ANTHROPIC_AUTH_TOKEN" not in environ
+
+
+class TestStartupNeverCrashes:
+    @pytest.mark.parametrize("url", ["http://localhost:abc", "https://host:80:80", "https://h:0"])
+    def test_a_base_url_with_a_bad_port_says_so_in_the_chat(
+        self, home: Path, agents: AgentFactory, url: str
+    ) -> None:
+        environ = environ_for(home, ANTHROPIC_API_KEY=CANARY, TUMBLEWEED_BASE_URL=url)
+
+        agent, dispatcher = agents(environ)
+
+        message = chat(agent, dispatcher).messages[1]
+        assert message.state is MessageState.FAILED
+        assert message.error is not None
+        assert "base_url" in message.error
+        assert CANARY not in message.error
+
+    def test_a_client_that_cannot_be_built_says_so_in_the_chat(
+        self, home: Path, agents: AgentFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def refuses(**_kwargs: object) -> anthropic.AsyncAnthropic:
+            raise httpx2.InvalidURL("Invalid port: 'abc' " + CANARY)
+
+        monkeypatch.setattr(factory, "build_client", refuses)
+
+        agent, dispatcher = agents(environ_for(home, ANTHROPIC_API_KEY=CANARY))
+
+        message = chat(agent, dispatcher).messages[1]
+        assert message.error == "The model client could not be set up: check base_url."
+
+    def test_the_key_leaves_the_environment_when_the_config_is_broken_too(
+        self, home: Path, agents: AgentFactory
+    ) -> None:
+        (home / "config" / "tumbleweed" / "config.toml").write_text("[agent\n")
+        environ = environ_for(home, ANTHROPIC_API_KEY=CANARY, ANTHROPIC_AUTH_TOKEN="tok-0123456789")  # noqa: S106
+
+        agents(environ)
+
+        assert "ANTHROPIC_API_KEY" not in environ
+        assert "ANTHROPIC_AUTH_TOKEN" not in environ
 
 
 class TestTheKeyStaysSecret:
@@ -221,6 +261,27 @@ class TestTheKeyStaysSecret:
         assert message.error
         assert CANARY not in self.everything_visible(home, transcript, caplog)
         assert '"outcome":"error"' in (home / "data/tumbleweed/shell/invocations.jsonl").read_text()
+
+    def test_closing_the_agent_closes_the_http_client(
+        self, home: Path, agents: AgentFactory, server: sse.Server, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        made: list[anthropic.AsyncAnthropic] = []
+
+        def remembering(**_kwargs: object) -> anthropic.AsyncAnthropic:
+            client = server.client()
+            made.append(client)
+            return client
+
+        monkeypatch.setattr(factory, "build_client", remembering)
+        server.responses.append(sse.stream_response(sse.message(sse.text_block(0, "hi"))))
+        agent, dispatcher = agents(environ_for(home, ANTHROPIC_API_KEY=CANARY))
+        chat(agent, dispatcher)
+        (client,) = made
+        assert not client.is_closed()
+
+        agent.close()
+
+        assert client.is_closed()
 
     def test_a_child_process_of_the_shell_does_not_have_it(
         self,

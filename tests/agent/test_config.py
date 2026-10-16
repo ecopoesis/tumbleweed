@@ -3,7 +3,6 @@
 import copy
 import os
 import pickle
-import re
 import stat
 import subprocess
 import sys
@@ -163,6 +162,29 @@ class TestFile:
         with pytest.raises(ConfigError, match="key_file"):
             agent(TUMBLEWEED_KEY_FILE=path)
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost:abc",
+            "https://host:80:80",
+            "https://host:0",
+            "https://host:65536",
+            "https://host:-1",
+            "http://localhost:99999",
+            "http://[::1",
+            "https://[not-an-ip]:443",
+        ],
+    )
+    def test_a_base_url_whose_port_or_host_is_malformed_is_a_config_error(self, url: str) -> None:
+        with pytest.raises(ConfigError, match="base_url"):
+            agent(TUMBLEWEED_BASE_URL=url)
+
+    @pytest.mark.parametrize(
+        "url", ["https://host:1", "https://host:65535", "http://localhost:8080"]
+    )
+    def test_a_good_port_is_accepted(self, url: str) -> None:
+        assert agent(TUMBLEWEED_BASE_URL=url).base_url == url
+
     def test_load_config_reads_the_file_under_xdg_config_home(self, home: Path) -> None:
         path = home / "config" / "tumbleweed" / "config.toml"
         path.write_text('[agent]\nresponder = "echo"\n')
@@ -181,7 +203,7 @@ class TestFile:
         path.write_text("")
         path.chmod(0o664)
 
-        with pytest.raises(ConfigError, match="mode 0664"):
+        with pytest.raises(ConfigError, match="mode is 0664"):
             load_config(environ_for(home))
 
     def test_a_symlinked_config_file_is_refused(self, home: Path) -> None:
@@ -189,14 +211,14 @@ class TestFile:
         target.write_text("")
         (home / "config" / "tumbleweed" / "config.toml").symlink_to(target)
 
-        with pytest.raises(ConfigError, match="symlink"):
+        with pytest.raises(ConfigError, match="must not be a symlink"):
             load_config(environ_for(home))
 
     def test_a_huge_config_file_is_refused_unread(self, home: Path) -> None:
         path = home / "config" / "tumbleweed" / "config.toml"
         path.write_text("#" * (MAX_CONFIG_BYTES + 1))
 
-        with pytest.raises(ConfigError, match="larger than"):
+        with pytest.raises(ConfigError, match="must be under"):
             load_config(environ_for(home))
 
     def test_directories_follow_xdg_and_ignore_a_relative_value(self, tmp_path: Path) -> None:
@@ -283,9 +305,10 @@ class TestKey:
         with pytest.raises(ConfigError) as raised:
             take_api_key(environ_for(home), agent())
 
-        assert f"mode {mode:04o}" in str(raised.value)
-        assert str(path) in str(raised.value)
-        assert "must be 0600" in str(raised.value)
+        message = str(raised.value)
+        assert f"mode is {mode:04o}" in message
+        assert "must be 0600" in message
+        assert message.endswith(str(path))  # the instruction first, the path last
         assert KEY not in str(raised.value)
 
     @pytest.mark.parametrize("mode", [0o600, 0o400])
@@ -298,26 +321,26 @@ class TestKey:
         real = write_key(home / "real-key")
         default_key_file(environ_for(home)).symlink_to(real)
 
-        with pytest.raises(ConfigError, match="symlink"):
+        with pytest.raises(ConfigError, match="must not be a symlink"):
             take_api_key(environ_for(home), agent())
 
     @pytest.mark.timeout(10)
     def test_a_fifo_is_refused_and_does_not_hang_the_shell(self, home: Path) -> None:
         os.mkfifo(default_key_file(environ_for(home)), 0o600)
 
-        with pytest.raises(ConfigError, match="not a regular file"):
+        with pytest.raises(ConfigError, match="must be a regular file"):
             take_api_key(environ_for(home), agent())
 
     def test_a_directory_is_refused(self, home: Path) -> None:
         default_key_file(environ_for(home)).mkdir(mode=0o700)
 
-        with pytest.raises(ConfigError, match="not a regular file"):
+        with pytest.raises(ConfigError, match="must be a regular file"):
             take_api_key(environ_for(home), agent())
 
     def test_a_device_is_refused(self, home: Path) -> None:
         elsewhere = "/dev/null"
 
-        with pytest.raises(ConfigError, match=re.escape("not a regular file")):
+        with pytest.raises(ConfigError, match="must be a regular file"):
             take_api_key(environ_for(home), agent(f'[agent]\nkey_file = "{elsewhere}"'))
 
     def test_a_key_file_of_another_user_is_refused(
@@ -326,13 +349,13 @@ class TestKey:
         write_key(default_key_file(environ_for(home)))
         monkeypatch.setattr(os, "geteuid", lambda: home.stat().st_uid + 1)
 
-        with pytest.raises(ConfigError, match="not owned by you"):
+        with pytest.raises(ConfigError, match="must be owned by you"):
             take_api_key(environ_for(home), agent())
 
     def test_a_huge_key_file_is_refused_unread(self, home: Path) -> None:
         write_key(default_key_file(environ_for(home)), "k" * (MAX_KEY_FILE_BYTES + 1))
 
-        with pytest.raises(ConfigError, match="larger than"):
+        with pytest.raises(ConfigError, match="must be under"):
             take_api_key(environ_for(home), agent())
 
     def test_a_missing_default_key_file_says_how_to_set_a_key(self, home: Path) -> None:
@@ -341,8 +364,8 @@ class TestKey:
 
         message = str(raised.value)
         assert "ANTHROPIC_API_KEY" in message
-        assert "api-key" in message
         assert "0600" in message
+        assert message.endswith("api-key")  # the instruction first, the path last
 
     def test_a_missing_configured_key_file_is_a_config_error(self, home: Path) -> None:
         with pytest.raises(ConfigError, match="does not exist"):
@@ -372,7 +395,7 @@ class TestKey:
         default_key_file(environ_for(home)).write_bytes("kéy-0123456789".encode())
         default_key_file(environ_for(home)).chmod(0o600)
 
-        with pytest.raises(ConfigError, match="not ASCII"):
+        with pytest.raises(ConfigError, match="must be ASCII text"):
             take_api_key(environ_for(home), agent())
 
 

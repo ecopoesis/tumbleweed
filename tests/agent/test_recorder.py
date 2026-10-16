@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from tests.agent.support import MODEL, MemoryLog, RaisingProvider
-from tumbleweed.agent.errors import ErrorKind, ProviderRateLimitedError
+from tumbleweed.agent.errors import ErrorKind, ProviderNetworkError, ProviderRateLimitedError
 from tumbleweed.agent.fake import FakeProvider, FakeToolCall, FakeTurn
 from tumbleweed.agent.llm import (
     LlmDone,
@@ -22,6 +22,7 @@ from tumbleweed.agent.llm import (
     StopReason,
     TextBlock,
     TextDelta,
+    Usage,
 )
 from tumbleweed.agent.recorder import (
     MAX_RECORD_BYTES,
@@ -48,10 +49,8 @@ def request(text: str = PROMPT) -> LlmRequest:
 async def consume(
     recorder: InvocationRecorder, provider: LlmProvider, task: TaskId | None = None
 ) -> list[LlmEvent]:
-    return [
-        event
-        async for event in recorder.stream(provider, request(), session_id=SESSION, task_id=task)
-    ]
+    recorded = recorder.record(provider, session_id=SESSION, task_id=task)
+    return [event async for event in recorded.stream(request())]
 
 
 class TestRecords:
@@ -68,7 +67,7 @@ class TestRecords:
 
         events = asyncio.run(consume(recorder, FakeProvider([FakeTurn(chunks=("hi",))]), task))
 
-        assert [e.kind for e in events] == ["text_delta", "done"]  # passed on untouched
+        assert [e.kind for e in events] == ["usage", "text_delta", "done"]  # passed on untouched
         (record,) = log.records
         assert isinstance(record.invocation_id, InvocationId)
         assert (record.session_id, record.task_id) == (SESSION, task)
@@ -115,7 +114,8 @@ class TestRecords:
         (record,) = log.records
         assert (record.outcome, record.error_kind) == ("error", ErrorKind.RATE_LIMITED)
         assert record.request_id == rid
-        assert record.usage is None
+        assert record.usage is not None  # what was known when it failed, not nothing
+        assert record.usage.input_tokens == 5
 
     def test_an_unexpected_exception_is_recorded_as_internal_without_its_text(self) -> None:
         log = MemoryLog()
@@ -132,7 +132,7 @@ class TestRecords:
         provider = FakeProvider([FakeTurn(chunks=("a", "b", "c"))])
 
         async def scenario() -> None:
-            events = recorder.stream(provider, request(), session_id=SESSION, task_id=None)
+            events = recorder.record(provider, session_id=SESSION).stream(request())
             async with contextlib.aclosing(events):
                 async for event in events:
                     if isinstance(event, TextDelta):
@@ -158,6 +158,72 @@ class TestRecords:
         asyncio.run(scenario())
 
         assert [r.outcome for r in log.records] == ["cancelled"]
+
+    def test_a_failed_call_records_the_usage_its_error_carries(self) -> None:
+        log = MemoryLog()
+        carried = Usage(input_tokens=TokenCount(77), output_tokens=TokenCount(3))
+        provider = RaisingProvider(ProviderNetworkError("down", usage=carried))
+
+        with pytest.raises(ProviderNetworkError):
+            asyncio.run(consume(InvocationRecorder(log, prompt_version="v1"), provider))
+
+        assert log.records[0].usage == carried
+
+    def test_a_cancelled_call_records_the_usage_known_so_far(self) -> None:
+        log = MemoryLog()
+        recorder = InvocationRecorder(log, prompt_version="v1")
+        provider = FakeProvider([FakeTurn(chunks=("a",), hang=True)])
+
+        async def scenario() -> None:
+            task = asyncio.ensure_future(consume(recorder, provider))
+            await asyncio.sleep(0.02)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+
+        assert log.records[0].usage is not None
+        assert log.records[0].usage.input_tokens == 5
+        assert log.records[0].stop_reason is None
+
+    def test_an_aborted_call_records_the_usage_known_so_far(self) -> None:
+        log = MemoryLog()
+        recorder = InvocationRecorder(log, prompt_version="v1")
+        provider = FakeProvider([FakeTurn(chunks=("a", "b"))])
+
+        async def scenario() -> None:
+            events = recorder.record(provider, session_id=SESSION).stream(request())
+            async with contextlib.aclosing(events):
+                async for event in events:
+                    if isinstance(event, TextDelta):
+                        break
+
+        asyncio.run(scenario())
+
+        assert log.records[0].outcome == "aborted"
+        assert log.records[0].usage is not None
+
+    def test_a_cancellation_that_is_the_replys_deadline_is_a_timeout(self) -> None:
+        log = MemoryLog()
+        recorder = InvocationRecorder(log, prompt_version="v1")
+        provider = FakeProvider([FakeTurn(chunks=("a",), hang=True)])
+
+        async def scenario() -> None:
+            recorded = recorder.record(provider, session_id=SESSION)
+            deadline = asyncio.timeout(0.05)
+
+            async def read() -> None:
+                async with deadline:
+                    async for _ in recorded.stream(request(), timed_out=deadline.expired):
+                        pass
+
+            with pytest.raises(TimeoutError):
+                await read()
+
+        asyncio.run(scenario())
+
+        assert [r.outcome for r in log.records] == ["timeout"]
 
     def test_a_prompt_version_that_could_not_be_logged_safely_is_refused(self) -> None:
         with pytest.raises(ValueError, match="prompt_version"):
@@ -197,6 +263,21 @@ class TestTheFile:
 
     def test_the_file_is_private_and_so_is_its_directory(self, tmp_path: Path) -> None:
         path = self.log_path(tmp_path)
+        recorder = InvocationRecorder(JsonlInvocationLog(path), prompt_version="v1")
+
+        asyncio.run(consume(recorder, FakeProvider([FakeTurn()])))
+
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+    def test_a_file_that_was_too_open_is_tightened_and_so_is_its_directory(
+        self, tmp_path: Path
+    ) -> None:
+        path = self.log_path(tmp_path)
+        path.parent.mkdir(parents=True, mode=0o755)
+        path.parent.chmod(0o755)
+        path.write_text("")
+        path.chmod(0o666)
         recorder = InvocationRecorder(JsonlInvocationLog(path), prompt_version="v1")
 
         asyncio.run(consume(recorder, FakeProvider([FakeTurn()])))

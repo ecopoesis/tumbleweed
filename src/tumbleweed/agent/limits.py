@@ -2,11 +2,12 @@
 
 The agent may not import the shell, so the transcript's caps are repeated here as constants; a
 test pins each to its twin in `tumbleweed.shell.viewmodel.transcript`. A reply streams into one
-transcript message of at most `MAX_REPLY_BYTES`, so the token limit has to fit it: a token that
-decodes to more than a few UTF-8 bytes is the exception, and `BYTES_PER_TOKEN_BOUND` is the
-bound the limits assume (Claude's tokens are at most 4 bytes of text in practice). Tokens are
-what the provider bills and what `max_tokens` caps, so the token limit is enforced there, and the
-byte cap below it is the hard guarantee: the loop stops a reply the moment it would not fit.
+transcript message of at most `MAX_REPLY_BYTES`, and what guarantees that is a byte count: the
+loop stops a reply the moment its next delta would not fit. The token limit is a different
+bound. It caps cost and time (what the provider bills, what `max_tokens` limits), and it counts
+thinking tokens, which produce no text, so it is not tied to the size of a transcript message
+and no ratio of bytes per token is assumed anywhere. (PLAN S03 asked for a token limit that fits
+the transcript cap; the byte cap is the stronger form of that and lets thinking have room.)
 """
 
 from datetime import timedelta
@@ -19,8 +20,8 @@ from tumbleweed.core.types import ByteCount, TokenCount
 # The twins of the transcript's MAX_ASSISTANT_BYTES and MAX_USER_BYTES.
 MAX_REPLY_BYTES: Final = ByteCount(64 * 1024)
 MAX_USER_TEXT_BYTES: Final = ByteCount(16 * 1024)
-BYTES_PER_TOKEN_BOUND: Final = 4
-MAX_TURN_OUTPUT_TOKENS: Final = TokenCount(MAX_REPLY_BYTES // BYTES_PER_TOKEN_BOUND)
+MAX_TURN_OUTPUT_TOKENS: Final = TokenCount(128_000)  # the largest output of a current model
+DEFAULT_TURN_OUTPUT_TOKENS: Final = TokenCount(16_000)
 
 MAX_ITERATIONS_CEILING: Final = 32
 MAX_REPLY_TIMEOUT_SECONDS: Final = 600
@@ -42,18 +43,15 @@ class AgentLimits(BaseModel):
 
     max_iterations: int = Field(default=8, ge=1, le=MAX_ITERATIONS_CEILING)
     """Model calls in one reply: each tool round trip is one more."""
-    max_turn_output_tokens: TokenCount = TokenCount(8192)
-    """Output tokens over all the calls of one reply."""
+    max_turn_output_tokens: TokenCount = DEFAULT_TURN_OUTPUT_TOKENS
+    """Output tokens (thinking included) over all the calls of one reply."""
     reply_timeout_seconds: int = Field(default=120, ge=1, le=MAX_REPLY_TIMEOUT_SECONDS)
     """Wall-clock time of the whole reply, retries and tool calls included."""
 
     @model_validator(mode="after")
-    def _tokens_fit_a_transcript_message(self) -> Self:
+    def _tokens_are_in_range(self) -> Self:
         if not 1 <= self.max_turn_output_tokens <= MAX_TURN_OUTPUT_TOKENS:
-            raise ValueError(
-                f"max_turn_output_tokens must be from 1 to {MAX_TURN_OUTPUT_TOKENS}, so that a "
-                f"reply fits a transcript message of {MAX_REPLY_BYTES} bytes"
-            )
+            raise ValueError(f"max_turn_output_tokens must be from 1 to {MAX_TURN_OUTPUT_TOKENS}")
         return self
 
     @property
