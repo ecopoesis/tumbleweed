@@ -2,9 +2,13 @@
 
 Two halves of one rule from CLAUDE.md. A test that needs something the host lacks skips with an
 explicit reason, never passes vacuously. And under `TUMBLEWEED_CI=1` (set in CI) a skipped `gtk`
-or `linux` test is a failure, so the sandbox and GTK tests can never pass by skipping. `btrfs` is
-exempt (loopback btrfs needs privileges CI containers lack; the S27 VM test covers it) and so is
-`live` (never runs in CI).
+or `linux` test is a failure, so the sandbox and GTK tests can never pass by skipping. An xfail
+is no better than a skip (an imperative `pytest.xfail()` or a failing `xfail` test would hide
+the same thing), so under CI it fails too, unless the test carries `xfail_allowed_in_ci`.
+
+Exempt from that guard, whatever else a test is marked: `btrfs` (loopback btrfs needs privileges
+CI containers lack; the S27 VM test covers it) and `live`. `live` tests talk to real services and
+run only when `TUMBLEWEED_LIVE=1` is set explicitly, in every environment; CI never sets it.
 
 Registered by `tests/conftest.py`, and by the pytester tests in `tests/plugins/` so that they
 exercise this very code.
@@ -18,27 +22,31 @@ from collections.abc import Generator
 import pytest
 
 CI_ENV_VAR = "TUMBLEWEED_CI"
+LIVE_ENV_VAR = "TUMBLEWEED_LIVE"
 GUARDED_MARKERS = frozenset({"gtk", "linux"})
+EXEMPT_MARKERS = frozenset({"btrfs", "live"})
+XFAIL_ALLOWED_MARKER = "xfail_allowed_in_ci"
 
 _GUARD_ACTIVE = pytest.StashKey[bool]()
+_LIVE_ENABLED = pytest.StashKey[bool]()
 
 
-def _read_ci_flag() -> bool:
-    value = os.environ.get(CI_ENV_VAR, "")
+def _read_flag(name: str) -> bool:
+    value = os.environ.get(name, "")
     if value in {"", "0"}:
         return False
     if value == "1":
         return True
-    # A typo like "true" must not silently switch the guard off.
-    raise pytest.UsageError(f"{CI_ENV_VAR} must be 0 or 1, got {value!r}")
+    # A typo like "true" must not silently switch the guard off (or a live run on).
+    raise pytest.UsageError(f"{name} must be 0 or 1, got {value!r}")
 
 
-def _is_linux() -> bool:
+def is_linux() -> bool:
     return sys.platform.startswith("linux")
 
 
 @functools.cache
-def _gtk_unavailable_reason() -> str | None:
+def gtk_unavailable_reason() -> str | None:
     """Why GTK 4 cannot create widgets on this host, or None if it can."""
     try:
         # Imported here so that a host without PyGObject still runs the other tests.
@@ -64,17 +72,31 @@ def _gtk_unavailable_reason() -> str | None:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    config.stash[_GUARD_ACTIVE] = _read_ci_flag()
+    config.stash[_GUARD_ACTIVE] = _read_flag(CI_ENV_VAR)
+    config.stash[_LIVE_ENABLED] = _read_flag(LIVE_ENV_VAR)
+
+
+def pytest_report_header(config: pytest.Config) -> list[str]:
+    """Print the guard's state, so that a CI log proves it was on where the tests ran."""
+    guard = (
+        "ACTIVE (a skipped or xfailed gtk/linux test fails the run)"
+        if config.stash[_GUARD_ACTIVE]
+        else "inactive"
+    )
+    live = "enabled" if config.stash[_LIVE_ENABLED] else f"skipped (set {LIVE_ENV_VAR}=1 to run)"
+    return [f"tumbleweed: {CI_ENV_VAR} guard {guard}; live tests {live}"]
 
 
 def _host_skip_reason(item: pytest.Item) -> str | None:
-    if item.get_closest_marker("linux") is not None and not _is_linux():
+    if item.get_closest_marker("live") is not None and not item.config.stash[_LIVE_ENABLED]:
+        return f"live test: talks to real services, runs only with {LIVE_ENV_VAR}=1 (never in CI)"
+    if item.get_closest_marker("linux") is not None and not is_linux():
         return (
             "needs Linux kernel features (bwrap, Landlock, seccomp); "
             f"this host is {sys.platform}, use scripts/test-linux"
         )
     if item.get_closest_marker("gtk") is not None:
-        return _gtk_unavailable_reason()
+        return gtk_unavailable_reason()
     return None
 
 
@@ -96,16 +118,29 @@ def pytest_runtest_makereport(
     item: pytest.Item, call: pytest.CallInfo[None]
 ) -> Generator[None, pytest.TestReport, pytest.TestReport]:
     report = yield
-    # An xfail also reports as skipped, with `wasxfail` set: that is not a skip.
-    if not report.skipped or hasattr(report, "wasxfail") or not item.config.stash[_GUARD_ACTIVE]:
+    # An xfail reports as skipped too, with `wasxfail` set (an imperative `pytest.xfail()`, or an
+    # `xfail` test that failed). It hides a gtk/linux test as well as a skip does.
+    if not report.skipped or not item.config.stash[_GUARD_ACTIVE]:
         return report
-    guarded = sorted(GUARDED_MARKERS & {mark.name for mark in item.iter_markers()})
-    if guarded:
-        report.outcome = "failed"
-        report.longrepr = (
-            f"{CI_ENV_VAR}=1: a skipped {'/'.join(guarded)} test fails the run, "
-            f"so it cannot pass by skipping. Skip reason: {_skip_reason(report)}"
-        )
+    marks = {mark.name for mark in item.iter_markers()}
+    guarded = sorted(GUARDED_MARKERS & marks)
+    if not guarded or EXEMPT_MARKERS & marks:
+        return report
+    xfailed = hasattr(report, "wasxfail")
+    if xfailed and XFAIL_ALLOWED_MARKER in marks:
+        return report
+    if xfailed:
+        reason = str(getattr(report, "wasxfail", ""))
+        verdict = f"xfailing (or mark it {XFAIL_ALLOWED_MARKER})"
+        delattr(report, "wasxfail")  # it is a failure now, and must be reported as one
+    else:
+        reason = _skip_reason(report)
+        verdict = "skipping"
+    report.outcome = "failed"
+    report.longrepr = (
+        f"{CI_ENV_VAR}=1: a skipped or xfailed {'/'.join(guarded)} test fails the run, so it "
+        f"cannot pass by {verdict}. Reason: {reason or 'none recorded'}"
+    )
     return report
 
 

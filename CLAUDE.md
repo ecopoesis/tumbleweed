@@ -73,11 +73,13 @@ All of these must pass before a commit is pushed. CI runs the same commands.
   mocks. No test hits the network unless marked `live` (never run in CI).
 - Markers: `gtk` (needs a display; runs under the headless compositor in the container),
   `linux` (needs Linux kernel features: bwrap, Landlock, seccomp), `btrfs` (needs a btrfs
-  mount; exempt from the CI skip-guard, covered by the S27 VM test), `live`.
-  Tests that cannot run on the current host skip with an explicit reason; they never pass
-  vacuously. With `TUMBLEWEED_CI=1` (set in CI), a skipped `gtk` or `linux` test fails the
-  run, and so does a module skipped as a whole (`importorskip`, `allow_module_level`): skip
-  per test, with markers.
+  mount; exempt from the CI skip-guard, also on a test that carries `linux` too; covered by
+  the S27 VM test), `live` (real services; skipped unless `TUMBLEWEED_LIVE=1`, which CI never
+  sets). Tests that cannot run on the current host skip with an explicit reason; they never
+  pass vacuously. With `TUMBLEWEED_CI=1` (set in CI), a skipped or xfailed `gtk` or `linux`
+  test fails the run (a linked-issue xfail needs the `xfail_allowed_in_ci` marker), and so
+  does a module skipped as a whole (`importorskip`, `allow_module_level`): skip per test,
+  with markers.
 - Security properties get negative tests: prove the forbidden thing actually fails.
 - Keep logic GTK-free so it can be unit-tested; GTK tests cover the adapter.
 

@@ -60,9 +60,10 @@ CI runs the same commands. `uv run pytest` includes a coverage report.
 
 ### Linux tests
 
-Parts of Tumbleweed only exist on Linux: the sandbox (bubblewrap, Landlock, seccomp) and
-the btrfs snapshots. Tests that need them are marked `linux` and skip on macOS, with the
-reason printed (`pytest -rs`). `scripts/test-linux` runs everything inside an Ubuntu 24.04
+Parts of Tumbleweed only exist on Linux: the sandbox (bubblewrap, Landlock, seccomp). Tests
+that need those kernel features are marked `linux` and skip on macOS, with the reason printed
+(`pytest -rs`). Tests of the btrfs snapshot backend are marked `btrfs` instead, because they
+also need a btrfs mount that the CI container cannot provide. `scripts/test-linux` runs everything inside an Ubuntu 24.04
 container (the `Dockerfile`) as a non-root user, with GTK on a headless Wayland compositor
 (weston, `GSK_RENDERER=cairo`) and the security options that bubblewrap needs to create
 user namespaces (see [ARCHITECTURE section 11](docs/ARCHITECTURE.md)). It needs Docker
@@ -71,7 +72,7 @@ running. It builds the image first, which is fast once Docker's layer cache is w
 ```sh
 scripts/test-linux                          # format, lint, mypy, import contracts, pytest
 scripts/test-linux uv run pytest -k bwrap   # any other command, in the same environment
-TUMBLEWEED_CI=1 scripts/test-linux          # as CI: a skipped gtk or linux test fails the run
+TUMBLEWEED_CI=1 scripts/test-linux          # as CI: a skipped or xfailed gtk/linux test fails
 ```
 
 ### Test markers
@@ -80,5 +81,8 @@ TUMBLEWEED_CI=1 scripts/test-linux          # as CI: a skipped gtk or linux test
 |---|---|---|
 | `gtk` | a display | runs natively on a Mac with a desktop session, and under weston in the container |
 | `linux` | Linux kernel features | skips on macOS |
-| `btrfs` | a btrfs mount | exempt from the `TUMBLEWEED_CI` guard |
-| `live` | real external services | never run in CI |
+| `btrfs` | a btrfs mount | exempt from the `TUMBLEWEED_CI` guard, also on a test that carries `linux` or `gtk` too; covered by the S27 VM test |
+| `live` | real external services | skipped unless `TUMBLEWEED_LIVE=1` (also exempt from the guard); CI never sets it |
+| `xfail_allowed_in_ci` | | lets a `gtk`/`linux` test xfail under `TUMBLEWEED_CI=1`, where an xfail fails the run like a skip does; use it only with a linked issue |
+
+The first lines of a pytest run say whether the `TUMBLEWEED_CI` guard is active.

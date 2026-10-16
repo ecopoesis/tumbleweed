@@ -136,7 +136,8 @@ markers = [
     "gtk: needs a display; runs under the headless compositor in the Linux container",
     "linux: needs Linux kernel features (bwrap, Landlock, seccomp)",
     "btrfs: needs a btrfs mount; exempt from the TUMBLEWEED_CI skip-guard (covered by S27)",
-    "live: talks to real external services; never run in CI",
+    "live: talks to real external services; runs only with TUMBLEWEED_LIVE=1, never in CI",
+    "xfail_allowed_in_ci: lets a gtk/linux test xfail under TUMBLEWEED_CI=1, which fails it otherwise",
 ]
 
 [tool.coverage.run]
