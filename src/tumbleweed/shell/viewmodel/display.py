@@ -1,101 +1,76 @@
 """The display-only transform of transcript text: keeps text a label can lay out in bounded time.
 
 Transcript text is stored canonical (`Transcript` never changes what it was given, apart from NUL
-and lone surrogates). What the GTK adapter puts into a label goes through `display_text` first,
+and lone surrogates). What the GTK adapter puts into a label goes through this module first,
 because two kinds of text, small enough to pass every cap, can still wreck a layout:
 
 - **One huge grapheme cluster.** Characters that extend a cluster (combining marks, spacing marks,
-  ZWJ, Hangul jamo, ...) glue to the one before them, so 5000 jamo or a long ZWJ chain are a single
-  unbreakable glyph run tens of thousands of pixels wide. Pango will not break inside a cluster, so
-  no wrap mode helps. After `MAX_CLUSTER` code points in one cluster the next extender gets a
-  U+200B ZERO WIDTH SPACE in front: its grapheme-break class is Control, so it ends the cluster.
+  ZWJ, Hangul jamo, a chain of Indic consonants joined by viramas, ...) glue to the one before
+  them, so 5000 jamo or a long ZWJ chain are a single unbreakable glyph run tens of thousands of
+  pixels wide. Pango will not break inside a cluster, so no wrap mode helps. After `MAX_CLUSTER`
+  code points in one cluster the next one gets a U+200B ZERO WIDTH SPACE in front: its
+  grapheme-break class is Control, so it ends the cluster. Clusters are found with a real UAX 29
+  segmenter (`regex`'s `\\X`, see DECISIONS D10), not with tables of ours.
 - **Text with no break opportunity.** Measuring a wrapped label is quadratic in the length of an
   unbroken run (16 KiB of hex took seconds, 64 KiB minutes, on the main thread). A U+200B is also a
   line-break opportunity, and one is inserted whenever `MAX_RUN` code points have gone by without
-  whitespace or one.
+  one. "A break opportunity" here means a real one: whitespace that UAX 14 breaks at, and U+200B.
+  The no-break spaces (U+00A0, U+2007, U+202F), U+2060, U+FEFF and the control characters are
+  *not* breaks: text joined by them has no break opportunity, and they count towards the run.
+
+A message is also split into chunks of at most `MAX_CHUNK` characters (`DisplayChunks`), shown as
+one label each: measuring a label takes time superlinear in its length (64 KiB took 3.5 s, 4 KiB a
+few hundredths of a second), and a streaming reply is measured again after every delta.
 
 Ordinary text is untouched: no legitimate cluster comes near `MAX_CLUSTER` (the longest emoji ZWJ
 sequences have 10 code points, a Devanagari conjunct a handful), and ordinary prose has a space
 within 256 characters. Long runs of CJK or of a URL do get zero-width spaces, which is harmless.
-The result is for display only: copying from a label copies the inserted zero-width spaces too.
+The inserted characters are display only: `DisplayChunks.source_text` gives a selection back
+without them, which is what copying from a label puts on the clipboard.
 """
 
-import unicodedata
+from collections.abc import Iterator
 from typing import Final, final
 
-ZERO_WIDTH_SPACE: Final = "\u200b"
+import regex
+
+ZERO_WIDTH_SPACE: Final = chr(0x200B)
 MAX_CLUSTER: Final = 16
 MAX_RUN: Final = 256
+MAX_CHUNK: Final = 4096
 
-_ZWJ = "\u200d"
-_ZWNJ = "\u200c"
-# Grapheme_Cluster_Break=Prepend: a prepend glues to whatever follows it, itself included.
-_PREPEND = (
-    (0x0600, 0x0605),
-    (0x06DD, 0x06DD),
-    (0x070F, 0x070F),
-    (0x0890, 0x0891),
-    (0x08E2, 0x08E2),
-    (0x0D4E, 0x0D4E),
-    (0x110BD, 0x110BD),
-    (0x110CD, 0x110CD),
-    (0x111C2, 0x111C3),
-    (0x1193F, 0x1193F),
-    (0x11941, 0x11941),
-    (0x11A3A, 0x11A3A),
-    (0x11A84, 0x11A89),
-    (0x11D46, 0x11D46),
-    (0x11F02, 0x11F02),
-)
-_EMOJI_MODIFIERS = (0x1F3FB, 0x1F3FF)
-_TAGS = (0xE0020, 0xE007F)
+_CLUSTER: Final = regex.compile(r"\X")
 
-
-def _in(code: int, *ranges: tuple[int, int]) -> bool:
-    return any(low <= code <= high for low, high in ranges)
-
-
-def _hangul(char: str) -> str:
-    """The Hangul syllable-break class of `char` (UAX 29): L, V, T, LV, LVT, or "" for any other."""
-    code = ord(char)
-    if 0x1100 <= code <= 0x115F or 0xA960 <= code <= 0xA97C:
-        return "L"
-    if 0x1160 <= code <= 0x11A7 or 0xD7B0 <= code <= 0xD7C6:
-        return "V"
-    if 0x11A8 <= code <= 0x11FF or 0xD7CB <= code <= 0xD7FB:
-        return "T"
-    if 0xAC00 <= code <= 0xD7A3:
-        return "LV" if (code - 0xAC00) % 28 == 0 else "LVT"
-    return ""
-
-
-def _hangul_extends(previous: str, char: str) -> bool:
-    """UAX 29 rules GB6 to GB8: which jamo and syllables glue to the one before them."""
-    before, after = _hangul(previous), _hangul(char)
-    if before == "L":
-        return after in {"L", "V", "LV", "LVT"}
-    if before in {"LV", "V"}:
-        return after in {"V", "T"}
-    if before in {"LVT", "T"}:
-        return after == "T"
-    return False
-
-
-def _extends(char: str, previous: str) -> bool:
-    """Whether `char` glues to `previous` into one grapheme cluster (an approximation of UAX 29)."""
-    code = ord(char)
-    return (
-        unicodedata.category(char) in {"Mn", "Me", "Mc"}  # extend and spacing marks
-        or char in {_ZWJ, _ZWNJ}
-        or _in(code, _EMOJI_MODIFIERS, _TAGS)
-        or previous == _ZWJ  # an emoji after a ZWJ continues the sequence
-        or _hangul_extends(previous, char)
-        or _in(ord(previous), *_PREPEND)
+# Where UAX 14 allows a break and a label wraps: the spaces (not the no-break ones), the line and
+# paragraph separators, tab, and the zero-width space. Everything else, controls included, is part
+# of a run.
+_BREAKS: Final = frozenset(
+    chr(code)
+    for code in (
+        0x09,  # tab
+        0x0A,  # line feed
+        0x0B,  # line tabulation
+        0x0C,  # form feed
+        0x0D,  # carriage return
+        0x20,  # space
+        0x85,  # next line
+        0x1680,  # ogham space mark
+        *range(0x2000, 0x2007),  # en quad .. six-per-em space (U+2007, figure space, is no-break)
+        *range(0x2008, 0x200B),  # punctuation space .. hair space
+        0x200B,  # zero width space
+        0x2028,  # line separator
+        0x2029,  # paragraph separator
+        0x205F,  # medium mathematical space
+        0x3000,  # ideographic space
     )
+)
+# What ends a line: a chunk that is cut after one of these does not show it (the label boundary is
+# the line break), or it would add an empty line.
+_LINE_ENDS: Final = frozenset(chr(code) for code in (0x0A, 0x0B, 0x0C, 0x0D, 0x85, 0x2028, 0x2029))
 
 
 def _breaks_line(char: str) -> bool:
-    return char.isspace() or char == ZERO_WIDTH_SPACE
+    return char in _BREAKS
 
 
 @final
@@ -108,28 +83,48 @@ class DisplayText:
     """
 
     def __init__(self) -> None:
-        self._cluster = 0  # code points in the grapheme cluster being read
-        self._run = 0  # code points since the last whitespace or zero-width space
-        self._previous = ""
+        # The grapheme cluster being read (as displayed, so at most `MAX_CLUSTER` code points):
+        # the next piece may continue it, and the segmenter needs to see it to know.
+        self._tail = ""
+        self._run = 0  # code points since the last break opportunity
 
     def feed(self, text: str) -> str:
+        return self.feed_marked(text)[0]
+
+    def feed_marked(self, text: str) -> tuple[str, tuple[int, ...]]:
+        """`feed`, and the offsets in the result of the zero-width spaces that were added."""
+        if not text:
+            return text, ()
+        context = self._tail
+        data = context + text
+        starts = {match.start() for match in _CLUSTER.finditer(data)}
         pieces: list[str] = []
-        changed = False
-        for char in text:
-            extends = bool(self._previous) and _extends(char, self._previous)
-            if (extends and self._cluster >= MAX_CLUSTER) or (
-                self._run >= MAX_RUN and not _breaks_line(char)
-            ):
+        added: list[int] = []
+        position = 0  # length of the result so far
+        cluster = len(context)  # code points in the cluster being read
+        cluster_start = 0  # where it starts in `data`
+        run = self._run
+        for offset in range(len(context), len(data)):
+            char = data[offset]
+            extends = offset not in starts  # glued to the code point before it
+            if (extends and cluster >= MAX_CLUSTER) or (run >= MAX_RUN and not _breaks_line(char)):
                 pieces.append(ZERO_WIDTH_SPACE)
-                changed = True
-                self._cluster = 0
-                self._run = 0
+                added.append(position)
+                position += 1
+                cluster = 0
+                run = 0
                 extends = False  # after the break, `char` starts a cluster of its own
             pieces.append(char)
-            self._cluster = self._cluster + 1 if extends else 1
-            self._run = 0 if _breaks_line(char) else self._run + 1
-            self._previous = char
-        return "".join(pieces) if changed else text
+            position += 1
+            if extends:
+                cluster += 1
+            else:
+                cluster = 1
+                cluster_start = offset
+            run = 0 if _breaks_line(char) else run + 1
+        self._tail = data[cluster_start:]
+        self._run = run
+        return ("".join(pieces) if added else text), tuple(added)
 
 
 def display_text(text: str) -> str:
@@ -140,42 +135,95 @@ def display_text(text: str) -> str:
     return DisplayText().feed(text)
 
 
-MAX_CHUNK: Final = 4096
+def _boundary_after(text: str, index: int) -> bool:
+    """Whether `text` may be cut after `text[index]`: that code point is a whole cluster."""
+    match = _CLUSTER.match(text, index)
+    return match is not None and match.end() == index + 1
+
+
+def _cluster_ends(text: str, low: int, high: int) -> Iterator[int]:
+    """The ends of the clusters of `text` that lie in [low, high], from the last."""
+    ends = [m.end() for m in _CLUSTER.finditer(text, 0, high + MAX_CLUSTER) if m.end() <= high]
+    yield from (end for end in reversed(ends) if end >= low)
+
+
+def _cut(text: str) -> int:
+    """Where to cut `text`, which is over `MAX_CHUNK`, into a head of at most `MAX_CHUNK`.
+
+    After the last line end in the second half of the allowed range if there is one, else after the
+    last other break, and in neither case inside a grapheme cluster. If the range has no break
+    (`display_text` makes that impossible: it puts one in every 256 code points), at the last
+    cluster boundary in it.
+    """
+    low = MAX_CHUNK // 2
+    breaks = [
+        index
+        for index in range(MAX_CHUNK - 1, low - 1, -1)
+        if text[index] in _BREAKS and _boundary_after(text, index)
+    ]
+    for index in breaks:
+        if text[index] in _LINE_ENDS:
+            return index + 1
+    if breaks:
+        return breaks[0] + 1
+    return next(_cluster_ends(text, low, MAX_CHUNK), MAX_CHUNK)
+
+
+def _without_line_end(piece: str) -> str:
+    """`piece` without the one line end it may finish with."""
+    if piece.endswith("\r\n"):
+        return piece[:-2]
+    return piece[:-1] if piece and piece[-1] in _LINE_ENDS else piece
 
 
 @final
 class DisplayChunks:
-    """The display text of one message as chunks of at most about `MAX_CHUNK` characters.
+    """The display text of one message as chunks of at most `MAX_CHUNK` characters.
 
-    A label takes time superlinear in its length to measure (64 KiB of text took 3.5 s, 4 KiB a few
-    hundredths of a second), and a streaming reply is measured again after every delta. Showing a
-    message as a column of labels, one per chunk, keeps each layout small, and a delta touches only
-    the last one. Joined, the chunks are exactly the display text. A chunk ends at a newline, else
-    a space or zero-width space, else (never, given `display_text`'s breaks) at the limit.
+    Showing a message as a column of labels, one per chunk, keeps each layout small, and a delta
+    touches only the last one. A chunk ends at a line end, else a space or zero-width space, never
+    inside a grapheme cluster. A chunk that ends at a line end does not show it: the boundary
+    between two labels is already a line break.
     """
 
     def __init__(self) -> None:
         self._display = DisplayText()
-        self._chunks = [""]
+        self._pieces = [""]  # exactly the display text, cut up
+        self._added: list[list[int]] = [[]]  # per piece, where `DisplayText` added a break
+
+    @property
+    def text(self) -> str:
+        """The whole display text."""
+        return "".join(self._pieces)
 
     @property
     def chunks(self) -> tuple[str, ...]:
-        return tuple(self._chunks)
+        """What each label shows."""
+        return (*(_without_line_end(piece) for piece in self._pieces[:-1]), self._pieces[-1])
+
+    def source_text(self, index: int, start: int, end: int) -> str:
+        """The text of chunk `index` from `start` to `end`, without the breaks that were added.
+
+        A zero-width space the message itself had is kept: only the inserted ones go.
+        """
+        added = set(self._added[index])
+        piece = self._pieces[index]
+        return "".join(piece[i] for i in range(start, min(end, len(piece))) if i not in added)
 
     def feed(self, text: str) -> int:
         """Add `text` (as it arrived, not yet transformed); return the index of the first chunk
         that is new or changed, so that a caller redraws only from there."""
-        first = len(self._chunks) - 1
-        self._chunks[-1] += self._display.feed(text)
-        while len(self._chunks[-1]) > MAX_CHUNK:
-            last = self._chunks[-1]
-            cut = last.rfind("\n", MAX_CHUNK // 2, MAX_CHUNK)
-            if cut < 0:
-                cut = max(
-                    last.rfind(" ", MAX_CHUNK // 2, MAX_CHUNK),
-                    last.rfind(ZERO_WIDTH_SPACE, MAX_CHUNK // 2, MAX_CHUNK),
-                )
-            cut = cut + 1 if cut >= 0 else MAX_CHUNK
-            self._chunks[-1] = last[:cut]
-            self._chunks.append(last[cut:])
+        first = len(self._pieces) - 1
+        shown, added = self._display.feed_marked(text)
+        base = len(self._pieces[-1])
+        self._pieces[-1] += shown
+        self._added[-1].extend(base + offset for offset in added)
+        while len(self._pieces[-1]) > MAX_CHUNK:
+            last = self._pieces[-1]
+            marks = self._added[-1]
+            cut = _cut(last)
+            self._pieces[-1] = last[:cut]
+            self._added[-1] = [m for m in marks if m < cut]
+            self._pieces.append(last[cut:])
+            self._added.append([m - cut for m in marks if m >= cut])
         return first

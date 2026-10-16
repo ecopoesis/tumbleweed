@@ -62,6 +62,21 @@ HEX_ASSISTANT = "ab" * (MAX_ASSISTANT_BYTES // 2 - 4)  # just under 64 KiB
 USER_BUDGET_SECONDS = 4.0
 ASSISTANT_BUDGET_SECONDS = 8.0
 
+# Text that has no break opportunity although `str.isspace()` says it has whitespace in it: joined
+# by these, a label took 3 to 15 seconds for 64 KiB before the break set was the real UAX 14 one.
+JOINED_BY = {
+    "no-break spaces": "a\u00a0",
+    "narrow no-break spaces": "a\u202f",
+    "figure spaces": "a\u2007",
+    "unit separators": "a\u001f",
+    "word joiners": "a\u2060",
+}
+
+
+def joined(unit: str, limit: int) -> str:
+    """`unit` repeated to just under `limit` bytes of UTF-8."""
+    return unit * (limit // len(unit.encode()) - 1)
+
 
 def frame(shell: Shell) -> tuple[tuple[int, int], Bounds, Bounds, int]:
     """What must not move: the window's size, the chrome, the status strip, the panel's width."""
@@ -204,6 +219,52 @@ class TestTranscriptWidth:
         assert scrolled is not None
         assert scrolled.get_hscrollbar().get_mapped()  # the content is reachable, not squeezed
         assert wide.get_width() >= 6000
+
+
+class TestTimeBudgetsForTextJoinedByNoBreakCharacters:
+    """The same budgets for the payloads `str.isspace()` let through, at both caps."""
+
+    @pytest.mark.parametrize("unit", JOINED_BY.values(), ids=list(JOINED_BY))
+    def test_a_16_kib_user_message_lays_out_within_the_budget(
+        self, shown: Shell, unit: str
+    ) -> None:
+        text = joined(unit, MAX_USER_BYTES)
+        type_text(shown, text)
+        started = time.monotonic()
+
+        click_send(shown)
+        assert pump_until(lambda: len(rows(shown)) == 2)
+        row = shown.window.chat_panel.row_for(shown.window.transcript.messages[0].id)
+        assert pump_until(lambda: body_laid_out(row), timeout=USER_BUDGET_SECONDS + 10)
+        reply = shown.window.chat_panel.row_for(shown.window.transcript.messages[1].id)
+        assert pump_until(lambda: body_laid_out(reply), timeout=USER_BUDGET_SECONDS + 10)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < USER_BUDGET_SECONDS, f"{elapsed:.1f} s for 16 KiB joined by {unit!r}"
+
+    @pytest.mark.parametrize("unit", JOINED_BY.values(), ids=list(JOINED_BY))
+    def test_a_64_kib_streamed_reply_lays_out_within_the_budget(
+        self, build_shell: ShellBuilder, unit: str
+    ) -> None:
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        show(shell)
+        settled(shell)
+        type_text(shell, "go")
+        click_send(shell)
+        text = joined(unit, MAX_ASSISTANT_BYTES - 8)
+        started = time.monotonic()
+
+        for piece in chunks(text, 1024):
+            responder.sink.emit(ReplyDelta(text=piece))
+        responder.sink.emit(ReplyFinished())
+        row = shell.window.chat_panel.row_for(shell.window.transcript.messages[1].id)
+        assert pump_until(lambda: body_laid_out(row), timeout=ASSISTANT_BUDGET_SECONDS + 10)
+        elapsed = time.monotonic() - started
+
+        assert len(text.encode()) > 60_000
+        assert elapsed < ASSISTANT_BUDGET_SECONDS, f"{elapsed:.1f} s for 64 KiB joined by {unit!r}"
+        assert row.shown_text.replace(ZERO_WIDTH_SPACE, "") == text  # nothing but breaks was added
 
 
 class TestTimeBudgets:
