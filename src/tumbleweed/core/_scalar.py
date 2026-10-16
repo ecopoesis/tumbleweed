@@ -96,9 +96,12 @@ class FrozenText:
 
     def __init__(self, text: str) -> None:
         raw: object = text  # the annotation is for the checker; callers can still pass anything
-        if not isinstance(raw, str):
+        if type(raw) is not str:
+            # Exactly str: a subclass can lie (`partition`, `__str__`, `__eq__`) to a validator
+            # while the value that gets stored is something else.
             raise InvalidValueError(
                 f"{type(self).__name__} is built from a str, got {type(raw).__name__}"
+                + (" (a str subclass is not accepted)" if isinstance(raw, str) else "")
             )
         type(self)._validate(text)
         object.__setattr__(self, "_text", text)

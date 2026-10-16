@@ -7,7 +7,7 @@ outside as arbitrary objects.
 
 import importlib
 import inspect
-from typing import final
+from typing import SupportsIndex, final
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -209,3 +209,135 @@ class TestSlots:
             task.__dict__["_text"] = "tsk_forged"
 
         assert str(task) == before
+
+
+VALID_ID_TEXT = "tsk_01j9z3c7q4v8s2k5m6n7p8r9t0"
+
+
+class LyingStr(str):
+    """A str that answers every question a validator might ask as if it were valid text."""
+
+    __slots__ = ()
+
+    def partition(self, sep: str, /) -> tuple[str, str, str]:
+        return ("tsk", "_", "01j9z3c7q4v8s2k5m6n7p8r9t0")
+
+    def split(self, sep: str | None = None, maxsplit: SupportsIndex = -1) -> list[str]:
+        return ["a"]
+
+    def startswith(self, *args: object, **kwargs: object) -> bool:
+        return True
+
+    def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+        return b"fine"
+
+    def __str__(self) -> str:
+        return VALID_ID_TEXT
+
+    def __len__(self) -> int:
+        return 5
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __hash__(self) -> int:
+        return 0
+
+
+class LyingInt(int):
+    """An int whose comparisons and conversions lie about the value it really holds."""
+
+    __slots__ = ()
+
+    def __ge__(self, other: int) -> bool:
+        return True
+
+    def __le__(self, other: int) -> bool:
+        return True
+
+    def __gt__(self, other: int) -> bool:
+        return True
+
+    def __lt__(self, other: int) -> bool:
+        return False
+
+    def __index__(self) -> int:
+        return 7
+
+    def __int__(self) -> int:
+        return 7
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __hash__(self) -> int:
+        return 0
+
+
+class TestLyingSubclasses:
+    """A subclass can lie to a validator, so the constructors normalise before they validate."""
+
+    def test_the_liars_really_lie(self) -> None:
+        liar = LyingStr("not valid at all")
+        assert str(liar) == VALID_ID_TEXT
+        assert liar.partition("_")[0] == "tsk"
+        assert liar.startswith("anything")
+        assert LyingInt(-5) >= 0
+        assert LyingInt(-5) <= 10
+        assert int.__index__(LyingInt(-5)) == -5  # the one question it cannot lie about
+
+    @pytest.mark.parametrize("id_type", ids.id_types(), ids=lambda t: t.__name__)
+    def test_an_id_is_not_built_from_a_lying_str(self, id_type: type[EntityId]) -> None:
+        with pytest.raises(InvalidValueError, match="a str subclass is not accepted"):
+            id_type(LyingStr("not an id"))
+
+    @pytest.mark.parametrize("cls", [ContentHash, ModelName, types.ProviderRequestId])
+    def test_a_string_primitive_is_not_built_from_a_lying_str(
+        self, cls: type[ContentHash | ModelName | types.ProviderRequestId]
+    ) -> None:
+        with pytest.raises(InvalidValueError, match="a str subclass is not accepted"):
+            cls(LyingStr("!!! not valid !!!"))
+
+    def test_a_workspace_path_is_not_built_from_a_lying_str(self) -> None:
+        with pytest.raises(InvalidValueError, match="a str subclass is not accepted"):
+            WorkspaceRelPath(LyingStr("../../etc/passwd"))
+
+    def test_an_honest_str_subclass_is_refused_too(self) -> None:
+        class Plain(str):
+            __slots__ = ()
+
+        with pytest.raises(InvalidValueError, match="a str subclass is not accepted"):
+            TaskId(Plain(VALID_ID_TEXT))
+        with pytest.raises(InvalidValueError, match="a str subclass is not accepted"):
+            ModelName(Plain("claude-sonnet-5-5"))
+
+    @pytest.mark.parametrize("cls", [ByteCount, ToolVersion])
+    def test_a_lying_int_is_checked_by_what_it_really_holds(
+        self, cls: type[ByteCount | ToolVersion]
+    ) -> None:
+        for held in (-5, -1, 0 if cls is ToolVersion else -2, 2**70, -(2**70)):
+            with pytest.raises(InvalidValueError, match="must be from"):
+                cls(LyingInt(held))
+
+    @pytest.mark.parametrize("cls", [ByteCount, ToolVersion])
+    def test_a_valid_lying_int_stores_the_real_value_as_an_exact_int(
+        self, cls: type[ByteCount | ToolVersion]
+    ) -> None:
+        stored = cls(LyingInt(3))  # __index__ and __int__ claim 7
+
+        assert int.__index__(stored) == 3
+        assert type(stored) is cls
+        assert LyingInt not in type(stored).__mro__  # not the liar's class, but an exact int
+        assert int(stored) == 3
+
+    def test_a_core_int_scalar_is_accepted_and_normalised(self) -> None:
+        converted = ToolVersion(ByteCount(5))
+
+        assert type(converted) is ToolVersion
+        assert converted == 5
+        with pytest.raises(InvalidValueError, match="must be from 1"):
+            ToolVersion(ByteCount(0))
+
+    def test_a_bool_is_still_refused(self) -> None:
+        with pytest.raises(InvalidValueError, match="must be an int"):
+            ByteCount(True)

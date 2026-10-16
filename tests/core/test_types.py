@@ -263,6 +263,16 @@ class TestWorkspaceRelPath:
             "~",
             "-rf",
             "café/日本語.txt",
+            "a\u00a0b",  # a no-break space is an ordinary space (Zs): allowed
+            "a\u3000b",  # an ideographic space too
+            "emoji \U0001f600.png",
+            # U+200C and U+200D are format characters (Cf) but allowed on purpose:
+            "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466.png",  # family
+            "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645.txt",  # Persian, ZWNJ
+            "\u0915\u094d\u200d\u0937.txt",  # Devanagari, ZWJ
+            "a\u200cb",
+            "a\u200db",
+            "\u0e01\u0e33.txt",  # Thai, with a combining vowel (Mn, Mc): allowed
             "a\\b",  # a backslash is an ordinary file name character on Linux
             "x" * 255,
             "/".join(["d"] * 100),
@@ -300,7 +310,9 @@ class TestWorkspaceRelPath:
             ("gnp.\u202eexe", "control, format or line-separator"),  # RLO: reads as exe.png
             ("a\u2066b", "control, format or line-separator"),  # LRI, a bidi isolate
             ("a\u200bb", "control, format or line-separator"),  # zero-width space
-            ("a\u200db", "control, format or line-separator"),  # zero-width joiner
+            ("a\u2060b", "control, format or line-separator"),  # word joiner
+            ("a\u200eb", "control, format or line-separator"),  # left-to-right mark
+            ("a\U000e0041b", "control, format or line-separator"),  # tag character
             ("a\ufeffb", "control, format or line-separator"),  # BOM / zero-width no-break
             ("a\u00adb", "control, format or line-separator"),  # soft hyphen
             ("a\u2028b", "control, format or line-separator"),  # line separator (Zl)
@@ -512,13 +524,40 @@ class TestCanonicalPath:
         assert str(CanonicalPath.resolve(tree / "real")) == str(tree / "real")
 
     @pytest.mark.parametrize(
-        "surrogate", [chr(0xD800), chr(0xDBFF), chr(0xDFFF)], ids=lambda c: hex(ord(c))
+        "surrogate",
+        # Lone surrogates, and U+DC80..U+DCFF, which is how Python spells a file name byte that
+        # is not UTF-8 (os.fsdecode(b"\xff") is chr(0xDCFF)).
+        [chr(0xD800), chr(0xDBFF), chr(0xDC80), chr(0xDCFF), chr(0xDFFF)],
+        ids=lambda c: hex(ord(c)),
     )
-    def test_a_lone_surrogate_is_refused_not_a_crash(self, tree: Path, surrogate: str) -> None:
+    def test_a_surrogate_is_refused_not_a_crash(self, tree: Path, surrogate: str) -> None:
         for text in (f"/{surrogate}", f"{tree}/real/a{surrogate}b", f"{tree}/{surrogate}/x"):
-            with pytest.raises(InvalidValueError, match="cannot canonicalise") as raised:
+            with pytest.raises(InvalidValueError, match="not valid UTF-8") as raised:
                 CanonicalPath.resolve(text)
             assert len(str(raised.value)) < 300
+
+    def test_a_file_name_byte_that_is_not_utf8_is_refused(self, tree: Path) -> None:
+        text = f"{tree}/real/" + os.fsdecode(b"bad-\xff-name")  # surrogate-escaped on this host
+
+        with pytest.raises(InvalidValueError, match="not valid UTF-8"):
+            CanonicalPath.resolve(text)
+
+    def test_a_result_that_is_not_utf8_is_refused_too(
+        self, tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A symlink target can hold bytes that are not UTF-8: refuse what resolve() returns."""
+        monkeypatch.setattr(Path, "resolve", lambda self, strict=False: Path("/srv/\udcff"))
+
+        with pytest.raises(InvalidValueError, match="not valid UTF-8"):
+            CanonicalPath.resolve(tree / "real")
+
+    def test_whatever_resolve_returns_can_be_dumped_to_json(self, tree: Path) -> None:
+        adapter = TypeAdapter(CanonicalPath)
+
+        for given in (tree, tree / "link", tree / "not" / "yet", Path("/")):
+            canonical = CanonicalPath.resolve(given)
+            assert adapter.dump_json(canonical) == f'"{canonical}"'.encode()
+            str(canonical).encode("utf-8")  # and is valid UTF-8, with no surrogate
 
     def test_a_too_long_name_is_refused_deterministically(self, tree: Path) -> None:
         with pytest.raises(InvalidValueError, match="File name too long"):

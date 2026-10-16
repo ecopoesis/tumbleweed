@@ -40,9 +40,14 @@ _MAX_PATH_BYTES = 4096  # Linux PATH_MAX
 _MAX_NAME_BYTES = 255  # Linux NAME_MAX
 # Unicode categories no workspace path may contain: control characters (C0, DEL and C1, so NUL,
 # newline, U+009B CSI, U+0085 NEL), format characters (U+202E right-to-left override, zero-width
-# characters, byte-order marks) and the line and paragraph separators U+2028 and U+2029. They
-# make a name look like something else, or end a line, in a log, a terminal or the UI.
+# space, byte-order marks, soft hyphen, tag characters) and the line and paragraph separators
+# U+2028 and U+2029. They make a name look like something else, or end a line, in a log, a
+# terminal or the UI.
 _FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
+# The two format characters that are part of how real names are spelled: the zero-width
+# non-joiner (Persian, Indic scripts) and the zero-width joiner (Indic scripts, emoji sequences
+# such as a family). Allowed on purpose, though they are invisible; the rest of Cf stays banned.
+_ALLOWED_FORMAT = frozenset({"\u200c", "\u200d"})
 
 
 def _describe_int(value: int) -> str:
@@ -72,12 +77,15 @@ class _BoundedInt(int):
         raw: object = value  # the annotation is for the checker; callers can still pass anything
         if not isinstance(raw, int) or isinstance(raw, bool):
             raise InvalidValueError(f"{cls.__name__} must be an int, got {type(raw).__name__}")
-        if not cls._minimum <= value <= cls._maximum:
+        # An int subclass (our own scalars included) can lie in `__ge__` or `__index__`. Take the
+        # value it really holds as an exact int, then validate and store that.
+        number = int.__index__(raw)
+        if not cls._minimum <= number <= cls._maximum:
             raise InvalidValueError(
                 f"{cls.__name__} must be from {cls._minimum} to {cls._maximum}, "
-                f"got {_describe_int(value)}"
+                f"got {_describe_int(number)}"
             )
-        return super().__new__(cls, value)
+        return super().__new__(cls, number)
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -110,8 +118,12 @@ class _PatternStr(str):
 
     def __new__(cls, value: str) -> Self:
         raw: object = value  # the annotation is for the checker; callers can still pass anything
-        if not isinstance(raw, str):
-            raise InvalidValueError(f"{cls.__name__} must be a str, got {type(raw).__name__}")
+        if type(raw) is not str:
+            # Exactly str: a subclass can lie to `fullmatch` about the text it holds.
+            raise InvalidValueError(
+                f"{cls.__name__} must be a str, got {type(raw).__name__}"
+                + (" (a str subclass is not accepted)" if isinstance(raw, str) else "")
+            )
         if cls._pattern.fullmatch(value) is None:
             raise InvalidValueError(
                 f"invalid {cls.__name__}: expected {cls._expects}, got {excerpt(value)}"
@@ -185,10 +197,12 @@ class WorkspaceRelPath(FrozenText):
 
     Rejected: empty, absolute, containing `..`, `.` or empty components (`a//b`, `a/`), any
     character of Unicode category Cc (NUL, C0 and C1 controls such as U+009B), Cf (format
-    characters such as U+202E, U+200B, U+FEFF), Zl or Zp (U+2028, U+2029), text that is not
-    valid UTF-8, and anything over Linux's PATH_MAX (4096) or NAME_MAX (255). Symlinks are not
-    visible to this check: trusted code must still open the path component by component
-    without following them.
+    characters such as U+202E, U+200B, U+FEFF, U+00AD, tag characters), Zl or Zp (U+2028,
+    U+2029), text that is not valid UTF-8, and anything over Linux's PATH_MAX (4096) or
+    NAME_MAX (255). Two Cf characters are allowed on purpose: U+200C (zero-width non-joiner)
+    and U+200D (zero-width joiner), which Persian and Indic names and emoji sequences such as a
+    family need. Symlinks are not visible to this check: trusted code must still open the path
+    component by component without following them.
     """
 
     __slots__ = ()
@@ -199,7 +213,10 @@ class WorkspaceRelPath(FrozenText):
             raise InvalidValueError("WorkspaceRelPath must not be empty")
         if text.startswith("/"):
             raise InvalidValueError(f"WorkspaceRelPath must be relative, got {excerpt(text)}")
-        if any(unicodedata.category(char) in _FORBIDDEN_CATEGORIES for char in text):
+        if any(
+            unicodedata.category(char) in _FORBIDDEN_CATEGORIES and char not in _ALLOWED_FORMAT
+            for char in text
+        ):
             raise InvalidValueError(
                 "WorkspaceRelPath must not contain control, format or line-separator "
                 f"characters, got {excerpt(text)}"
@@ -233,6 +250,22 @@ def _reason(exc: Exception) -> str:
     if isinstance(exc, OSError) and exc.strerror:
         return exc.strerror
     return type(exc).__name__
+
+
+def _require_utf8(text: str, original: str) -> None:
+    """Refuse text that is not valid UTF-8, that is, that holds a surrogate.
+
+    Python represents a file name byte that is not UTF-8 as a lone surrogate (U+DC80..U+DCFF)
+    and refuses nothing else. Such a path cannot be written to JSON or the audit log, nor
+    compared with what another process decodes, so a `CanonicalPath` never holds one.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InvalidValueError(
+            f"cannot canonicalise {excerpt(original)}: the path is not valid UTF-8 "
+            "(a surrogate: a lone one, or a file name byte that is not UTF-8)"
+        ) from None
 
 
 def _require_no_symlinks(resolved: str, original: str) -> None:
@@ -288,22 +321,25 @@ class CanonicalPath(FrozenText):
     def resolve(cls, path: str | PathLike[str]) -> Self:
         """Canonicalise an absolute path. A relative one is refused, not resolved against cwd.
 
-        Raises `InvalidValueError` for a relative path, a NUL byte or lone surrogate, a symlink
-        loop, and a path whose existing components cannot all be inspected (EACCES, ...).
+        Raises `InvalidValueError` for a relative path, a NUL byte, text that is not valid UTF-8
+        (a surrogate, before or after resolving), a symlink loop, and a path whose existing
+        components cannot all be inspected (EACCES, ...).
         """
         text = fspath(path)
         if "\0" in text:
             raise InvalidValueError(f"path contains a NUL byte: {excerpt(text)}")
         if not PurePosixPath(text).is_absolute():
             raise InvalidValueError(f"path must be absolute, got {excerpt(text)}")
+        _require_utf8(text, text)
         try:
             resolved = str(Path(text).resolve())
-        # RuntimeError: a symlink loop before Python 3.13. ValueError: includes the
-        # UnicodeEncodeError for a lone surrogate, which no filesystem call can take.
+        # RuntimeError: a symlink loop before Python 3.13. ValueError: anything else the
+        # filesystem calls refuse about the text itself.
         except (OSError, RuntimeError, ValueError) as exc:
             raise InvalidValueError(
                 f"cannot canonicalise {excerpt(text)}: {_reason(exc)}"
             ) from None
+        _require_utf8(resolved, text)  # a symlink target can hold bytes that are not UTF-8
         _require_no_symlinks(resolved, text)
         return cls._adopt(resolved)
 
