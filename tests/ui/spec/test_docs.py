@@ -158,9 +158,14 @@ def test_the_events_table_matches_the_components() -> None:
 
 
 def test_every_relative_link_on_the_page_goes_somewhere() -> None:
-    for target in re.findall(r"\]\(([^)#]+)(?:#[^)]*)?\)", TEXT):
-        if target.startswith("http"):
-            continue
+    links = [
+        target
+        for target in re.findall(r"\]\(([^)#]+)(?:#[^)]*)?\)", TEXT)
+        if not target.startswith("http")
+    ]
+
+    assert len(links) >= 5  # the pattern really finds the page's links
+    for target in links:
         assert (Path(DOC).parent / target).resolve().exists(), target
 
 
@@ -169,5 +174,8 @@ def test_every_anchor_link_on_the_page_has_a_heading() -> None:
         return re.sub(r"[^a-z0-9 -]", "", heading.lower()).replace(" ", "-")
 
     headings = {slug(h) for h in re.findall(r"^#+ (.+)$", TEXT, re.MULTILINE)}
-    for anchor in re.findall(r"\]\(#([^)]+)\)", TEXT):
+    anchors = re.findall(r"\]\(#([^)]+)\)", TEXT)
+
+    assert len(anchors) >= 3
+    for anchor in anchors:
         assert anchor in headings, anchor

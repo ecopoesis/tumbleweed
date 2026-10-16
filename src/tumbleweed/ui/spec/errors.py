@@ -9,6 +9,7 @@ field or an unknown `kind`, which the cut to `MAX_PROBLEM_LENGTH` bounds.
 """
 
 from collections.abc import Sequence
+from typing import final
 
 from pydantic import ValidationError
 
@@ -36,6 +37,7 @@ class SpecError(TumbleweedError):
         super().__init__("; ".join(self.problems))
 
 
+@final
 class SpecTooLargeError(SpecError):
     """The raw spec is longer than `MAX_SPEC_BYTES`, so it was not even parsed."""
 

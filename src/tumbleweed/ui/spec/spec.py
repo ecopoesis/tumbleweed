@@ -23,7 +23,7 @@ the component (`root.children[2] (slider)`), state entry or handler it is about.
 """
 
 from collections.abc import Collection, Iterator, Mapping
-from typing import Annotated, Final, Literal, Self, assert_never
+from typing import Annotated, Final, Literal, Self, assert_never, final
 
 from pydantic import BeforeValidator, Field, model_validator
 
@@ -98,6 +98,7 @@ def _accepts(decl: StateDecl, value_type: ExprType) -> bool:
             return False
 
 
+@final
 class _Problems:
     """Collects what is wrong with a spec, bounded so that a hostile spec costs little."""
 
@@ -141,6 +142,7 @@ def _walk(root: Component) -> Iterator[tuple[Component, str, int]]:
         stack.extend((c, p, depth + 1) for c, p in reversed(children))
 
 
+@final
 class UiSpec(SpecModel):
     """A complete UI spec. Build it with `parse_ui_spec` (JSON text) or `validate_ui_spec`."""
 

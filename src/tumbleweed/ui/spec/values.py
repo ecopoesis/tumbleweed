@@ -15,9 +15,16 @@ them (I11): a valid ref is not proof that the file is safe to read.
 
 import math
 import unicodedata
-from typing import Annotated, Final, Literal, Self, assert_never, get_args
+from typing import Annotated, Final, Literal, Self, assert_never, final, get_args
 
-from pydantic import AfterValidator, BeforeValidator, Field, model_validator
+from pydantic import (
+    AfterValidator,
+    BeforeValidator,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from tumbleweed.core.errors import InvalidValueError, excerpt
 from tumbleweed.core.types import JsonValue, WorkspaceRelPath
@@ -71,12 +78,14 @@ def _check_image_path(path: WorkspaceRelPath) -> WorkspaceRelPath:
     return path
 
 
+@final
 class FileRef(SpecModel):
     """A file in the task's workspace."""
 
     path: Annotated[WorkspaceRelPath, AfterValidator(_check_file_path)]
 
 
+@final
 class ImageRef(SpecModel):
     """A PNG, JPEG or WebP image in the task's workspace."""
 
@@ -135,6 +144,7 @@ type ColumnType = Literal["string", "int", "float", "bool"]
 type CellValue = bool | SafeInt | FiniteFloat | Cell
 
 
+@final
 class TableColumn(SpecModel):
     """One typed column. The name is the header the renderer shows."""
 
@@ -156,6 +166,7 @@ def _cell_matches(value: CellValue, column: ColumnType) -> bool:
             assert_never(unreachable)
 
 
+@final
 class Table(SpecModel):
     """Typed columns and rows of cells. A table value carries its own columns.
 
@@ -173,6 +184,25 @@ class Table(SpecModel):
         Field(max_length=MAX_TABLE_ROWS),
         BeforeValidator(as_tuple),
     ] = ()
+
+    @field_validator("rows", mode="after")
+    @classmethod
+    def _floats_are_floats(
+        cls, rows: tuple[tuple[CellValue, ...], ...], info: ValidationInfo[None]
+    ) -> tuple[tuple[CellValue, ...], ...]:
+        # An `int` cell of a `float` column is stored as a float, so that `5` and `5.0` are one
+        # spelling of one value, as they are in a float field.
+        columns = info.data.get("columns")
+        if not columns:
+            return rows
+        float_columns = {i for i, column in enumerate(columns) if column.type == "float"}
+        return tuple(
+            tuple(
+                float(cell) if i in float_columns and type(cell) is int else cell
+                for i, cell in enumerate(row)
+            )
+            for row in rows
+        )
 
     @model_validator(mode="after")
     def _rows_fit_the_columns(self) -> Self:

@@ -172,6 +172,15 @@ class TestTable:
         with pytest.raises(ValidationError):
             table([("c", kind)], [[cell]])
 
+    def test_an_int_cell_of_a_float_column_is_stored_as_a_float(self) -> None:
+        mixed = table([("a", "float"), ("b", "int")], [[2, 3], [2.5, 4]])
+        spelt_out = table([("a", "float"), ("b", "int")], [[2.0, 3], [2.5, 4]])
+
+        assert [type(cell) for cell in mixed.rows[0]] == [float, int]
+        assert mixed == spelt_out
+        # Two spellings of one table are one set of bytes.
+        assert mixed.model_dump_json() == spelt_out.model_dump_json()
+
     def test_an_int_is_a_float_but_not_the_other_way(self) -> None:
         table([("c", "float")], [[2]])
         with pytest.raises(ValidationError, match="is of type int"):

@@ -28,7 +28,7 @@ a cycle (including an entry that refers to itself).
 """
 
 from collections.abc import Mapping, Sequence
-from typing import Literal, assert_never
+from typing import Literal, assert_never, final
 
 from tumbleweed.core.errors import InvalidValueError, excerpt
 from tumbleweed.ui.spec.expr import (
@@ -96,6 +96,7 @@ def _arithmetic_type(types: Sequence[ExprType]) -> ExprType:
 type _Wanted = Literal["bool", "number", "string"]
 
 
+@final
 class _Checker:
     def __init__(self, decls: Mapping[StateKey, StateDecl]) -> None:
         self._decls = decls

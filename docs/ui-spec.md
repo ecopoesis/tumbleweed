@@ -332,7 +332,8 @@ an image's bytes before decoding it (S11).
 
 **`Table`** is `{"columns": [{"name": ..., "type": ...}], "rows": [[...], ...]}`. A column type is
 `string`, `int`, `float` or `bool`, and every row has one cell of that type per column (an
-integer is a valid `float` cell; `1.5` is not an `int` cell, nor is an integer beyond 2**53 - 1).
+integer is accepted in a `float` column and stored as a float; `1.5` is not an `int` cell, nor is an
+integer beyond 2**53 - 1).
 Column names are distinct and non-empty. A table has at most 32 columns, 10,000 rows and 20,000
 cells. A `table` entry bounds the rows but does not fix the columns: the value brings its own,
 because a CSV viewer cannot know the headers of a file it has not read.
@@ -666,7 +667,9 @@ models are built so that this needs no change to the spec:
 - every number is exact in canonical JSON (safe integers, finite floats), and no type depends on how
   a number is written;
 - the dump of a spec (`model_dump_json`) writes every field, so a default that is written and one
-  that is left out dump to the same bytes;
+  that is left out dump to the same bytes, and an integer given for a float (a float field, a
+  float column of a table, an item of a list of floats) is stored as a float, so `5` and `5.0`
+  dump alike;
 - two things that are distinct as written and the same after NFC normalisation, such as enum
   options and table column names, are refused as duplicates now rather than after saving;
 - a spec holds defaults, never the user's current values.

@@ -250,31 +250,78 @@ class TestBindings:
 
         assert mentions(problems, f"({component})", "binds unknown state key x")
 
-    def test_a_computed_entry_is_read_only(self, component: str) -> None:
-        template, kinds, writes, _ = BOUND[component]
-        scalar = next((k for k in ("string", "bool", "int", "float") if k in kinds), None)
-        if scalar is None:  # image and table: no scalar to compute, nothing to check here
-            return
-        entry: Json = {**TARGETS[scalar], "computed": LITERALS[scalar]}
 
-        if writes:
-            problems = refused(build(template, [entry]))
-            assert mentions(problems, f"({component})", "binds x two-way, but it is computed")
+# The components that can bind a kind of entry that can be computed, and a number.
+COMPUTABLE_BINDERS = [c for c, (_, kinds, _, _) in BOUND.items() if kinds & set(FITS)]
+NUMBER_BINDERS = [c for c, (_, kinds, _, _) in BOUND.items() if kinds & {"int", "float"}]
+
+
+def test_the_components_that_cannot_bind_a_computed_entry_are_these() -> None:
+    # No computed image, table or enum exists, so there is no computed entry to bind to them.
+    assert set(BOUND) - set(COMPUTABLE_BINDERS) == {"image", "table", "dropdown"}
+    assert set(NUMBER_BINDERS) == {"progress", "slider", "spin"}
+
+
+@pytest.mark.parametrize("component", COMPUTABLE_BINDERS)
+def test_a_computed_entry_is_read_only(component: str) -> None:
+    template, kinds, writes, _ = BOUND[component]
+    scalar = next(kind for kind in FITS if kind in kinds)
+    entry: Json = {**TARGETS[scalar], "computed": LITERALS[scalar]}
+
+    if writes:
+        problems = refused(build(template, [entry]))
+        assert mentions(problems, f"({component})", "binds x two-way, but it is computed")
+    else:
+        assert accepted(build(template, [entry])).root.kind == component
+
+
+@pytest.mark.parametrize("component", NUMBER_BINDERS)
+def test_numbers_must_have_both_bounds_where_the_widget_needs_a_range(component: str) -> None:
+    template, _, _, bounded = BOUND[component]
+
+    for target in UNBOUNDED_NUMBERS:
+        if bounded:
+            problems = refused(build(template, [target]))
+            assert mentions(problems, "needs both a minimum and a maximum")
         else:
-            assert accepted(build(template, [entry])).root.kind == component
+            accepted(build(template, [target]))
 
-    def test_numbers_must_have_both_bounds_where_the_widget_needs_a_range(
-        self, component: str
+
+class TestWholeNumberFieldsAreExact:
+    """Every field of whole numbers refuses a bool, a float and a string, as `int` fields do."""
+
+    FIELDS: ClassVar[list[tuple[str, Json]]] = [
+        ("box spacing", {"kind": "box", "spacing": 1}),
+        ("grid columns", {"kind": "grid", "columns": 1}),
+        ("grid row spacing", {"kind": "grid", "columns": 1, "row_spacing": 1}),
+        ("heading level", {"kind": "heading", "level": 1, "text": "t"}),
+    ]
+    NUMBER_FIELD: ClassVar[dict[str, str]] = {
+        "box spacing": "spacing",
+        "grid columns": "columns",
+        "grid row spacing": "row_spacing",
+        "heading level": "level",
+    }
+
+    @pytest.mark.parametrize(("name", "component"), FIELDS, ids=[f[0] for f in FIELDS])
+    @pytest.mark.parametrize("bad", [True, 1.0, "1", None])
+    def test_a_component_number_is_a_real_int(
+        self, name: str, component: Json, bad: JsonValue
     ) -> None:
-        template, kinds, _, bounded = BOUND[component]
-        if "int" not in kinds:
-            return  # this component binds no number
-        for target in UNBOUNDED_NUMBERS:
-            if bounded:
-                problems = refused(build(template, [target]))
-                assert mentions(problems, "needs both a minimum and a maximum")
-            else:
-                accepted(build(template, [target]))
+        accepted(build(component))
+        with pytest.raises(SpecError):
+            validate_ui_spec(build({**component, self.NUMBER_FIELD[name]: bad}))
+
+    @pytest.mark.parametrize(
+        ("kind", "field"),
+        [("string", "max_length"), ("list", "max_items"), ("table", "max_rows")],
+    )
+    @pytest.mark.parametrize("bad", [True, 1.0, "1", None])
+    def test_a_state_bound_is_a_real_int(self, kind: str, field: str, bad: JsonValue) -> None:
+        entry: Json = {**TARGETS[kind], field: bad}
+
+        with pytest.raises(SpecError):
+            validate_ui_spec(build(state=[entry]))
 
 
 class TestTheWholeTreeIsChecked:

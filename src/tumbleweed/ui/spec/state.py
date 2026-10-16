@@ -38,6 +38,8 @@ from pydantic import (
     Field,
     TypeAdapter,
     ValidationError,
+    ValidationInfo,
+    field_validator,
     model_validator,
 )
 
@@ -218,6 +220,16 @@ class ListState(_StateBase):
     item_type: ScalarType
     max_items: Annotated[int, Field(ge=1, le=MAX_LIST_ITEMS)] = DEFAULT_LIST_MAX_ITEMS
     default: Annotated[tuple[ListItem, ...], BeforeValidator(as_tuple)] = ()
+
+    @field_validator("default", mode="after")
+    @classmethod
+    def _floats_are_floats(
+        cls, default: tuple[ListItem, ...], info: ValidationInfo[None]
+    ) -> tuple[ListItem, ...]:
+        # An `int` item of a list of floats is stored as a float: `5` and `5.0` are one value.
+        if info.data.get("item_type") != "float":
+            return default
+        return tuple(float(item) if type(item) is int else item for item in default)
 
     @model_validator(mode="after")
     def _default_is_valid(self) -> Self:

@@ -371,6 +371,18 @@ class TestList:
         accepts("list", item_type="int", max_items=2, default=[1, 2])
         refuse("list", "3 items, the limit is 2", item_type="int", max_items=2, default=[1, 2, 3])
 
+    def test_an_int_item_of_a_list_of_floats_is_stored_as_a_float(self) -> None:
+        mixed = decl("list", item_type="float", default=[1, 2.5])
+        spelt_out = decl("list", item_type="float", default=[1.0, 2.5])
+        ints = decl("list", item_type="int", default=[1, 2])
+
+        assert isinstance(mixed, ListState)
+        assert [type(item) for item in mixed.default] == [float, float]
+        assert mixed == spelt_out
+        assert DECL.dump_json(mixed) == DECL.dump_json(spelt_out)
+        assert isinstance(ints, ListState)
+        assert [type(item) for item in ints.default] == [int, int]
+
     def test_a_list_default_is_held_as_a_tuple(self) -> None:
         parsed = decl("list", item_type="int", default=[1, 2])
 
