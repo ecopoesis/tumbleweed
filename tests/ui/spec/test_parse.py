@@ -1,7 +1,9 @@
 """The entry points: JSON text or parsed JSON in, a UiSpec or a bounded SpecError out."""
 
+import inspect
 import json
 import math
+import sys
 import time
 import tracemalloc
 from collections.abc import Iterator
@@ -576,6 +578,24 @@ class TestParsedJsonTakesTheSameRoad:
         for data in (cyclic, looping, {**minimal(), "state": deep}):
             with pytest.raises(SpecError, match="nested too deeply"):
                 validate_ui_spec(data)
+
+    def test_a_caller_deep_in_its_own_stack_still_gets_a_spec_error(self) -> None:
+        # The walk is iterative and the data is at most 200 deep, but the writer recurses, and
+        # a caller may have little stack left: a RecursionError must not escape.
+        value: object = []
+        for _ in range(190):  # within the 200 the walk allows
+            value = [value]
+        data = {**minimal(), "state": value}
+        base = len(inspect.stack(0))
+
+        def descend(levels: int) -> None:
+            if levels:
+                descend(levels - 1)
+                return
+            validate_ui_spec(data)
+
+        with pytest.raises(SpecError, match="nested too deeply"):
+            descend(sys.getrecursionlimit() - base - 100)
 
     def test_the_deepest_nesting_that_pydantic_parses_is_not_cut_short(self) -> None:
         # The walk allows what the text path allows, and no more: 200 levels, the root included.
