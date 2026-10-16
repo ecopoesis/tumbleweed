@@ -10,19 +10,30 @@ from pydantic import GetCoreSchemaHandler
 from pydantic_core import core_schema
 
 
-def scalar_schema[Raw](
+def scalar_schema[Raw: (int, str)](
     cls: type,
+    raw_type: type[Raw],
     raw: core_schema.CoreSchema,
     build: Callable[[Raw], object],
     serialization: core_schema.SerSchema,
 ) -> core_schema.CoreSchema:
-    """Build the pydantic schema for a scalar type that is a validated wrapper of `Raw`.
+    """Build the pydantic schema for a scalar type that is a validated wrapper of a `raw_type`.
 
-    The raw value (`str` or `int`) is validated strictly, so `"5"` is never a byte count and
-    `True` is never a version, then handed to `build`. An instance of `cls` is accepted as is;
-    an instance of any other type is not. Dumped to JSON the value is its raw form.
+    The raw value is validated strictly, so `"5"` is never a byte count and `True` is never a
+    version, and must be a plain `int` or `str`: an instance of another typed scalar (a
+    `ByteCount` for a `ToolVersion` field) is refused even though it is an `int` underneath.
+    It is then handed to `build`. An instance of `cls` is accepted as is. Dumped to JSON the
+    value is its raw form.
     """
-    from_raw = core_schema.no_info_after_validator_function(build, raw)
+
+    def plain(value: object) -> object:
+        if type(value) is not raw_type:
+            raise ValueError(f"expected a plain {raw_type.__name__}, got {type(value).__name__}")
+        return value
+
+    from_raw = core_schema.no_info_after_validator_function(
+        build, core_schema.no_info_before_validator_function(plain, raw)
+    )
     return core_schema.json_or_python_schema(
         json_schema=from_raw,
         python_schema=core_schema.union_schema([core_schema.is_instance_schema(cls), from_raw]),
@@ -66,7 +77,7 @@ class FrozenText:
     def __get_pydantic_core_schema__(
         cls, source_type: object, handler: GetCoreSchemaHandler
     ) -> core_schema.CoreSchema:
-        return scalar_schema(cls, cls._raw_schema(), cls, core_schema.to_string_ser_schema())
+        return scalar_schema(cls, str, cls._raw_schema(), cls, core_schema.to_string_ser_schema())
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError(f"{type(self).__name__} is immutable")
