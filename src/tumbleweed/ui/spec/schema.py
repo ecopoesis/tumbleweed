@@ -5,10 +5,12 @@ test fails when it no longer matches the models. After a change to the models, r
 
     uv run python -m tumbleweed.ui.spec.schema --write
 
-and `--check` (the default) says whether the committed file is current. The schema is a faithful
-description of what the models accept for shape, types and bounds; the cross-reference rules
-(names that exist, expression types, cycles) cannot be written in JSON Schema and are in
-`docs/ui-spec.md`.
+and `--check` (the default) says whether the committed file is current. The schema describes
+shape, types and numeric and length bounds, and anything it rejects the models reject. It is
+looser than the models: JSON Schema cannot express the cross-reference rules (names that exist,
+expression types, cycles) or the character rules of text and workspace paths. Those are in
+`docs/ui-spec.md` and enforced by the models, so the schema is a guide for writing a spec and
+never a substitute for validating one.
 """
 
 import json

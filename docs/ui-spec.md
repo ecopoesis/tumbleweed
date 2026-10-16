@@ -4,7 +4,9 @@ The model emits a UI spec as JSON. A fixed renderer builds GTK widgets from it a
 nothing else. This is the contract between the two ([ARCHITECTURE section 4](ARCHITECTURE.md),
 [D5](DECISIONS.md), invariants I1, I4 and I9). It is implemented, without GTK, in
 [`src/tumbleweed/ui/spec/`](../src/tumbleweed/ui/spec/), described for machines by
-[`schemas/ui-spec.v1.json`](../schemas/ui-spec.v1.json), and tested in
+[`schemas/ui-spec.v1.json`](../schemas/ui-spec.v1.json) (shape, types and bounds; looser than the
+models, because JSON Schema cannot say what [section 10](#10-what-is-checked-across-the-spec)
+lists, nor the character rules for text and paths), and tested in
 [`tests/ui/spec/`](../tests/ui/spec/).
 
 Parts of this page are generated from the code and checked against it by
