@@ -6,9 +6,9 @@ Three layers, each with a test that would fail if the layer were removed:
    it or on an overlay, so the two have separate allocations that do not intersect.
 2. Content cannot grow the layout: a canvas widget that asks for 6000 x 6000 pixels does not make
    the window bigger or move the chrome or the status strip.
-3. Content cannot draw or take input outside the canvas: a hostile widget that paints an area far
-   larger than itself leaves the chrome's pixels alone, and a click on the chrome lands on the
-   chrome.
+3. Content cannot draw or take input outside the canvas: a hostile widget that paints, and claims
+   clicks on, an area far larger than itself leaves the chrome's pixels alone, and a click on the
+   chrome lands on the chrome.
 
 They use real layout and real rendering (a window presented on the display), not a model of it.
 """

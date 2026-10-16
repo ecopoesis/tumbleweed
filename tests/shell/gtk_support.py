@@ -140,11 +140,17 @@ def _solid_factory() -> Callable[[Rgb, bool, tuple[int, int]], "Gtk.Widget"]:
                 area = rect(0, 0, self.get_width(), self.get_height())
             snapshot.append_color(self._color, area)
 
+        def do_contains(self, x: float, y: float) -> bool:
+            # A leaky widget also claims every point as its own, so that a click anywhere would
+            # land on it if nothing clipped it.
+            return self._leak or (0 <= x < self.get_width() and 0 <= y < self.get_height())
+
     return Solid
 
 
 def solid(rgb: Rgb, *, leak: bool = False, size: tuple[int, int] = (10, 10)) -> "Gtk.Widget":
-    """A widget that paints `rgb` over its allocation, or, with `leak`, over a huge area."""
+    """A widget that paints `rgb` over its allocation; with `leak`, it paints and claims clicks
+    over a huge area instead."""
     return _solid_factory()(rgb, leak, size)
 
 
