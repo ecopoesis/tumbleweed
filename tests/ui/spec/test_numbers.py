@@ -17,9 +17,11 @@ from tests.ui.spec import jcs
 from tests.ui.spec.jcs import canonicalize, double_from_bits, es_number
 from tests.ui.spec.support import STATE_KINDS, Json, build, lit_int
 from tumbleweed.ui.spec.errors import SpecError
+from tumbleweed.ui.spec.expr import FloatLit
 from tumbleweed.ui.spec.limits import MAX_SAFE_INT
 from tumbleweed.ui.spec.parse import parse_ui_spec, validate_ui_spec
 from tumbleweed.ui.spec.spec import UiSpec
+from tumbleweed.ui.spec.state import FloatState
 
 if TYPE_CHECKING:
     from tumbleweed.core.types import JsonValue
@@ -247,9 +249,12 @@ class TestExpressionLiteralsSurviveCanonicalisation:
             '"key":"x","kind":"float"}]}'
         )
 
-        literal = spec.state[0].computed  # type: ignore[union-attr]  # a FloatState
-        assert type(literal.value) is float  # type: ignore[union-attr]
-        assert literal.value == 1e16  # type: ignore[union-attr]
+        entry = spec.state[0]
+        assert isinstance(entry, FloatState)
+        literal = entry.computed
+        assert isinstance(literal, FloatLit)
+        assert type(literal.value) is float
+        assert literal.value == 1e16
 
 
 class TestTheOneRuleForNumbers:
