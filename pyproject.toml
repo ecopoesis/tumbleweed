@@ -5,6 +5,12 @@ description = "An AI-first OS shell: voice and chat in, generated tools out."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    # The official Claude SDK behind our `LlmProvider` protocol (DECISIONS D3, S03): streaming,
+    # typed errors and the client's timeout and retry configuration, so that we do not hand-roll
+    # an SSE client for the one service the agent talks to. Pure Python (pydantic, httpx2, jiter
+    # and their dependencies have wheels for every platform we lock). >=1.13 is the newest release
+    # inside the 7-day cooldown today (1.15.0 is younger); it uses httpx2, not httpx (#43).
+    "anthropic>=1.13",
     "pydantic>=2.11",
     # Built from source against the system GTK (Homebrew on macOS, apt in the Linux image).
     # >=3.50 for `gi.events` (asyncio on the GLib main loop), see DECISIONS D2.
