@@ -51,6 +51,8 @@ All of these must pass before a commit is pushed. CI runs the same commands.
    unless there is a documented reason not to, and discriminated unions on a `kind` field.
    No `dict[str, Any]` payloads; arbitrary JSON is `JsonValue`. Parse incoming bytes with
    `model_validate_json`; ID and primitive fields validate from their raw JSON form.
+   Never `model_construct` or `model_copy(update=...)`: they skip validation. Rebuild with
+   `model_validate` (`tests/test_forgery_guards.py` lints for this).
 6. **Interfaces are `typing.Protocol`s.** Concrete classes not designed for subclassing are
    `@final`. Prefer PEP 695 generics (`class Box[T]: ...`).
 7. **PyGObject code** (GTK, GStreamer, VTE) uses `pygobject-stubs` (GTK4 config). Stub gaps
