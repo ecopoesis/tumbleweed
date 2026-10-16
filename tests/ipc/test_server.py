@@ -392,7 +392,7 @@ class TestClosing:
 
                     done, _pending = await asyncio.wait({second}, timeout=0.3)
                     assert not done  # it is waiting for the close that is under way
-                    assert sock_path.path.exists()  # which has not finished
+                    assert not first.done()  # which has not finished
 
                     release.set()
                     await asyncio.gather(first, second)
