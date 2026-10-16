@@ -82,6 +82,44 @@ on them).
   (grant-checked by the broker; code runs in bubblewrap). This deliberately differs from
   the handoff's "each workspace agent in a bubblewrap container"; D7 records why.
 
+### IPC
+
+Shell and broker share one connection over a Unix socket (D4, implemented in `tumbleweed.ipc`;
+the socket directory is in section 9). Either side sends requests and answers the other's,
+concurrently, on that one connection.
+
+- **Wire format.** A frame is a 4-byte big-endian length, then that many bytes of UTF-8 JSON, at
+  most 1 MiB (`MAX_FRAME_BYTES`, I9). A length over the limit, or zero, ends the connection as
+  soon as the header is read, before any of the body. From the first byte of a frame the rest
+  has to arrive within 5 s, so a peer that trickles bytes is dropped however slowly it goes.
+  Waiting for the next frame to begin is unbounded unless an idle timeout is set, which it is
+  not by default: the connection lasts the session and is legitimately quiet.
+- **Messages.** A frame is a pydantic model from one closed discriminated union on `kind`:
+  `hello`, `request`, `response`, `error`. The bodies of requests and responses are two more
+  closed unions, which each later step extends (`tumbleweed.ipc.messages`). Everything is strict:
+  exact JSON types, typed IDs, no unknown fields, no duplicate keys. `schemas/ipc.v1.json` is
+  generated from the models, and a test fails when it drifts.
+- **Handshake.** The client sends `hello` with its protocol version; the server answers with its
+  own `hello`, or with an `error` frame (`incompatible_protocol`, `bad_handshake`) and closes.
+  Versions must be equal. Before the handshake a server reads one frame of at most 4 KiB within 5 s.
+- **Correlation.** A request carries an `IpcRequestId` chosen by its sender, and the answer
+  carries the same id. An answer counts only for a request that is waiting on the same
+  connection: ids mean nothing on any other, which is what S18's "answers only from the
+  connection the prompt was sent on" relies on. An answer that matches no waiting request is
+  ignored (it may have lost a race with a timeout), and a peer that reuses an id still in
+  progress ends the connection.
+- **Bounds (I9).** Per connection and direction, 32 requests in flight; callers wait 30 s for an
+  answer, handlers get 30 s to produce one, and a stalled write is given up after 10 s; a server
+  keeps at most 16 connections. All of it is configurable (`IpcLimits`), never above the frame
+  limit. When a connection ends, for any reason, every request waiting on it fails at once and
+  running handlers are cancelled. A peer that breaks the protocol is sent a last `error` frame
+  and disconnected.
+- **Authentication (I2, D4).** Each end reads the other's uid from the kernel, before reading a
+  byte from it, and drops the connection unless it is its own: `SO_PEERCRED` on Linux,
+  `LOCAL_PEERCRED` (what `getpeereid(3)` wraps) on macOS. If the uid cannot be read the peer is
+  refused. The client checks the server too, so it never talks to a socket another user put at
+  the broker's path.
+
 ## 3. Request flow
 
 1. The user speaks (push-to-talk or wake word) or types. Speech goes through the STT backend;
@@ -332,6 +370,18 @@ within the grants a task already holds (which is why grants are narrow and snaps
 | btrfs snapshots | dedicated subvolume on the same filesystem, on the deny list | Never |
 | Workspaces | `$XDG_DATA_HOME/tumbleweed/workspaces/<TaskId>/` | Only their own, at `/workspace` |
 | Sockets | `$XDG_RUNTIME_DIR/tumbleweed/` (mode 0700) | Never |
+
+**Sockets.** `$XDG_RUNTIME_DIR/tumbleweed/` is created with mode 0700 and owned by the user. An
+existing one that is a symlink, has another owner or has any mode but 0700 is refused, never
+repaired; so is a base directory that group or others can enter. Where `XDG_RUNTIME_DIR` is
+unset, which is the case on macOS, the base is the per-user temporary directory the system
+provides (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, `/var/folders/.../T/`: the user's own, 0700,
+cleared at reboot); on any other platform an unset variable is an error. Socket names are 1 to
+24 characters from `a-z0-9-`, and the whole path must fit a socket address (103 bytes). A server
+holds an exclusive lock on `<name>.sock.lock` while it runs, so the kernel releases it if the
+server dies; a socket file found at its path is then removed only if it is a socket owned by the
+user, and any other file (a regular file, a directory, a symlink, another user's socket) is left
+alone and refused. A second server on a live path is refused and the first is not disturbed.
 
 ## 10. Code layout and layering
 
