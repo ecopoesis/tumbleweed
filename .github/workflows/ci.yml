@@ -29,6 +29,22 @@ jobs:
         with:
           persist-credentials: false
 
+      # The Docker build-context test (no secret can reach an image layer) needs a real Docker
+      # daemon, which the container does not have, so it runs here on the runner: the locked dev
+      # tools, without building PyGObject. TUMBLEWEED_REQUIRE_DOCKER makes a missing daemon fail
+      # the step instead of skipping the test.
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.1" # keep in step with the Dockerfile
+          enable-cache: false
+
+      - name: Docker build context, checked against the real Docker
+        env:
+          TUMBLEWEED_REQUIRE_DOCKER: "1"
+        run: |
+          uv sync --locked --no-install-project --no-install-package pygobject --no-install-package pycairo
+          uv run --no-sync python -m pytest --no-cov tests/test_docker_context.py -rs
+
       # Ubuntu 24.04 runners block unprivileged user namespaces with AppArmor, and bubblewrap
       # needs them (ARCHITECTURE section 11).
       - name: Allow unprivileged user namespaces

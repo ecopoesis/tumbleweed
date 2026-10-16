@@ -8,6 +8,8 @@
 !uv.lock
 !.python-version
 !README.md
+!CLAUDE.md
+!AGENTS.md
 !src/
 !tests/
 !scripts/
@@ -19,10 +21,12 @@
 !Dockerfile
 
 # Allowed directories can still hold things that must not ship (the host's caches, a key file
-# somebody dropped into src/).
+# somebody dropped into src/). Secret patterns are spelled case-insensitively with character
+# classes: git here runs with core.ignorecase=true, so `src/x.KEY` and `tests/.ANTHROPIC-KEY` are
+# secrets to git, and Docker's matching is case-sensitive.
 **/__pycache__
 **/*.py[cod]
-**/.anthropic-key
-**/*.key
-**/*.pem
-**/.env*
+**/.[aA][nN][tT][hH][rR][oO][pP][iI][cC]-[kK][eE][yY]
+**/*.[kK][eE][yY]
+**/*.[pP][eE][mM]
+**/.[eE][nN][vV]*
