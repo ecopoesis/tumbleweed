@@ -13,7 +13,8 @@ dependencies = [
     "anthropic>=1.13",
     "pydantic>=2.11",
     # Built from source against the system GTK (Homebrew on macOS, apt in the Linux image).
-    # >=3.50 for `gi.events` (asyncio on the GLib main loop), see DECISIONS D2.
+    # >=3.50 was chosen for `gi.events` (D2); the agent runs its own loop on a worker thread
+    # instead (D11, #47); the floor stays where it was.
     "PyGObject>=3.50",
     # Unicode grapheme-cluster segmentation (UAX 29: `\X`) for the transcript's display transform,
     # which keeps a hostile cluster from wrecking the layout. The data is upstream's, current with
@@ -266,3 +267,20 @@ forbidden_modules = [
     "openai",
     "litellm",
 ]
+
+# The provider interface (`tumbleweed.agent.llm`) is what everything else uses; the SDK itself
+# stays in the one module that adapts it (DECISIONS D3), so a proxy or another vendor replaces one
+# file. Direct imports only: the shell reaches the SDK through the factory, which is the point.
+[[tool.importlinter.contracts]]
+name = "the Anthropic SDK is imported only by tumbleweed.agent.anthropic_provider (D3)"
+type = "forbidden"
+source_modules = [
+    "tumbleweed.agent",
+    "tumbleweed.core",
+    "tumbleweed.ipc",
+    "tumbleweed.shell",
+    "tumbleweed.ui",
+]
+forbidden_modules = ["anthropic"]
+allow_indirect_imports = true
+ignore_imports = ["tumbleweed.agent.anthropic_provider -> anthropic"]

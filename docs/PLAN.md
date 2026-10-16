@@ -197,7 +197,7 @@ tracked chokepoint.
     `MAX_ASSISTANT_BYTES` (64 KiB per transcript message), or that cap is revisited;
   - cancellation with Esc.
 - asyncio on the GLib main loop (`gi.events`). Fallback (D2): a worker-thread loop
-  marshalled through `GLib.idle_add`.
+  marshalled through `GLib.idle_add`. S03 took the fallback (D11, #47).
 - Shell behaviour:
   - the agent loop implements S02's `Responder` protocol (`tumbleweed.agent.responder`: `start`,
     the `ReplyDelta`/`ReplyFinished`/`ReplyFailed` events, `cancel`; DECISIONS D9), replacing the

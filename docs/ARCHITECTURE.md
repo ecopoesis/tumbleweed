@@ -430,6 +430,11 @@ Each invariant names where it is enforced. Reviews check every change against th
   from the connection it sent the prompt to.
 - **I6 — Secrets stay out.** The API key never enters model context, logs, the invocation
   log, sandboxes (environment is cleared), workspaces or tool packages.
+  The agent takes the key out of the process environment when it starts (so no child process
+  inherits it), reads a key file only if it is a regular file of the user's with mode 0600 and not a
+  symlink, holds it in an object that cannot print, and shows the user only fixed error texts: a
+  provider's own words are never displayed or logged. The SDK's DEBUG and INFO logging, which would
+  hold prompts and error text, is turned down to WARNING.
 - **I7 — Everything privileged is audited.** Every grant decision, sandbox run, snapshot,
   restore and revocation is appended to the broker's audit log.
 - **I8 — Tools don't carry privilege.** Tool packages never contain grants or user state.
@@ -507,7 +512,7 @@ src/tumbleweed/
   ui/gtk/     GTK4 adapter that renders specs
   shell/      Adw application, window, chat panel, trusted prompts, terminal pane
   shell/viewmodel/  transcript view-model and chat controller (no GTK)
-  agent/      agent loop, tool registry, LLM providers, invocation recorder, prompts;
+  agent/      agent loop, tool registry, LLM providers, invocation recorder, prompts, config;
               the `Responder` interface the shell is built against (`agent/responder.py`)
   voice/      audio capture, STT, TTS, VAD, wake word
   history/    chat persistence
@@ -522,6 +527,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
 - `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
   import `gi`.
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
+- The Anthropic SDK is imported only by `agent.anthropic_provider`; the rest of the agent, and
+  everything else, uses the `LlmProvider` interface (D3). `agent` runs its asyncio loop on its own
+  worker thread and reaches the GTK main thread only through a dispatcher the shell injects (D11).
 - `shell.viewmodel` never imports `gi`, directly or through another module, so it cannot import
   the GTK adapter modules of `shell` either. `tests/test_import_contracts.py` plants each
   forbidden import in a copy of the tree and checks that its contract breaks.

@@ -8,8 +8,9 @@ from trusted primitives, sandboxes anything that runs, and saves the tool for re
 plan and progress, [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for how it fits
 together, and [`docs/handoff.md`](docs/handoff.md) for the original vision. What exists so
 far is the typed foundation in `src/tumbleweed/core`, the build and test setup around it, and the
-GTK4 shell skeleton (`tumbleweed-shell`: a window with a canvas, a chat panel that echoes, and a
-status strip; see [Running the shell](#running-the-shell)).
+GTK4 shell skeleton (`tumbleweed-shell`: a window with a canvas, a chat panel that talks to Claude,
+and a status strip; see [Running the shell](#running-the-shell) and
+[Talking to Claude](#talking-to-claude)).
 
 ## Development setup (macOS)
 
@@ -60,10 +61,10 @@ uv run tumbleweed-shell --version  # answered at once, with no window and no GTK
 One window opens, with no desktop around it:
 
 - the **canvas** (left), where generated tools will render (S10); it shows a placeholder for now;
-- the **side panel** (right): the chat transcript, a multi-line input and a Send button. There is
-  no model yet, so every message is answered with an echo, streamed in small pieces the way a real
-  reply will be (S03 brings the agent behind the same interface). While a reply streams the Send
-  button waits, and the input stays editable;
+- the **side panel** (right): the chat transcript, a multi-line input and a Send button. Messages are
+  answered by Claude, streamed in as they are written (with no key configured the chat says how to
+  set one; `responder = "echo"` brings back the S02 placeholder that echoes). While a reply streams
+  the Send button waits, and the input stays editable; **Esc** stops the reply;
 - the **status strip** (bottom) with the voice indicator, which reads "idle" until voice arrives (S06);
 - a **reserved strip for trusted prompts** along the top, outside the canvas, which is empty until S18.
 
@@ -107,6 +108,63 @@ which include starting the real `python -m tumbleweed.shell` there (also with wa
 waiting for its window, and stopping it with SIGTERM and SIGINT. To try the shell on a real Linux
 desktop, run `uv run tumbleweed-shell` in a session with GTK 4.14 and libadwaita 1.5 installed.
 
+### Talking to Claude
+
+The chat is answered by the agent (`tumbleweed.agent`) through the Anthropic SDK, behind an
+`LlmProvider` interface (DECISIONS D3). It needs an API key. Either export it,
+
+```sh
+ANTHROPIC_API_KEY=sk-ant-... uv run tumbleweed-shell
+```
+
+or put it in a file only you can read (the default is `$XDG_CONFIG_HOME/tumbleweed/api-key`, that
+is `~/.config/tumbleweed/api-key`; `key_file` in the config names another one):
+
+```sh
+mkdir -p ~/.config/tumbleweed && chmod 700 ~/.config/tumbleweed
+(umask 077; cat > ~/.config/tumbleweed/api-key)      # paste the key, then Ctrl+D
+```
+
+The key file must be a regular file you own with mode 0600: a looser mode, a symlink, a FIFO or
+a device is refused, and the chat says why. The shell takes the key out of its own environment
+when it starts, so the programs it starts later never inherit it, and it never reaches the logs,
+the invocation log, the chat or the model's context (ARCHITECTURE I6). `ANTHROPIC_LOG=debug` is
+ignored: the SDK's debug output would hold your prompts.
+
+Settings live in `$XDG_CONFIG_HOME/tumbleweed/config.toml` (all optional, no secrets in it; the
+file must not be writable by others). Environment variables override it:
+
+```toml
+[agent]
+responder = "anthropic"                 # or "echo": the placeholder   (TUMBLEWEED_RESPONDER)
+base_url = "https://api.anthropic.com"  # a LiteLLM-style proxy later  (TUMBLEWEED_BASE_URL)
+key_file = "/home/me/keys/anthropic"    # absolute path                (TUMBLEWEED_KEY_FILE)
+effort = "low"                          # thinking depth; unset = the model's default
+
+[agent.models]
+chat = "claude-sonnet-5-5"              # one setting per role         (TUMBLEWEED_MODEL)
+
+[agent.limits]                          # per reply (ARCHITECTURE I9)
+max_iterations = 8                      # model calls, each tool round trip is one more
+max_turn_output_tokens = 8192           # at most 16384: a reply fits a 64 KiB transcript message
+reply_timeout_seconds = 120             # wall-clock, retries and tools included
+```
+
+`base_url` must be `https` (plain `http` only to `localhost`, for a local proxy): the key is sent
+there. Errors (no key, no network, rate limit, overload, a timeout, a limit reached) appear under
+the reply in the chat; the shell keeps running. Every model call is appended to
+`$XDG_DATA_HOME/tumbleweed/shell/invocations.jsonl` (mode 0600, rotated at 10 MiB): its ID, session,
+model, token usage, latency, stop reason, the provider's request ID and how it ended. It holds no
+prompt, answer or secret. The system prompt is the versioned file
+`src/tumbleweed/agent/prompts/system_v1.md`.
+
+**A real call** (the `live` test, never run in CI) sends one tiny request and checks the answer, the
+invocation log and that the key is not in it:
+
+```sh
+TUMBLEWEED_LIVE=1 ANTHROPIC_API_KEY="$(cat path/to/key)" uv run pytest -m live tests/agent -v
+```
+
 ### Checks
 
 ```sh
@@ -132,9 +190,11 @@ younger than a week, because a compromised release is usually noticed within day
 relative and recorded in the lock (`exclude-newer-span`), so the lock does not go stale as time
 passes. `tests/test_lock.py` checks that nothing in the lock is younger.
 
-The runtime dependencies are `pydantic`, `PyGObject` and `regex` (a UAX 29 grapheme-cluster
+The runtime dependencies are `pydantic`, `PyGObject`, `regex` (a UAX 29 grapheme-cluster
 segmenter for the transcript's display transform; DECISIONS D10, with `types-regex` for the type
-checker). A new one needs its justification in the PR and a lock for macOS and Linux.
+checker) and `anthropic` (the official Claude SDK, behind our provider interface; it brings
+`httpx2`, `jiter` and a few small pure-Python packages, all locked for the three platforms, and
+1.13 is the newest release inside the cooldown today). A new one needs its justification in the PR and a lock for macOS and Linux.
 
 - To update: `uv lock --upgrade`, which re-resolves with the window as of today.
 - To take a newer release of one package before its week is up (a security fix), add

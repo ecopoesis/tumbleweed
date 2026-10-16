@@ -90,6 +90,16 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         SANDBOX,
         (),
     ),
+    "the agent loop imports the Anthropic SDK": (
+        "agent/loop.py",
+        "import anthropic",
+        "the Anthropic SDK is imported only by",
+    ),
+    "the shell imports the Anthropic SDK": (
+        "shell/window.py",
+        "import anthropic",
+        "the Anthropic SDK is imported only by",
+    ),
 }
 
 
