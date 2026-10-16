@@ -95,7 +95,7 @@ class TestEchoResponder:
         assert [e.text for e in sink.events if isinstance(e, ReplyDelta)] == [ECHO_PREFIX]
 
     def test_chunk_boundaries_do_not_change_the_text(self) -> None:
-        text = "one two\nthree é中\U0001f600 end"
+        text = "one two\nthree \u00e9\u4e2d\U0001f600 end"
         for size in (1, 2, 3, DEFAULT_CHUNK_CHARS, 1000):
             sink = RecordingSink()
             EchoResponder(chunk_chars=size).start(request(text), sink)

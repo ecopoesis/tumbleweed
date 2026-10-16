@@ -15,6 +15,7 @@ HEADER = "import sys\nsys.modules['gi'] = None  # any `import gi` now raises Imp
 GTK_FREE = [
     "tumbleweed.shell.viewmodel.transcript",
     "tumbleweed.shell.viewmodel.chat",
+    "tumbleweed.shell.viewmodel.display",
     "tumbleweed.agent.responder",
     "tumbleweed.agent.echo",
     "tumbleweed.shell.launch",  # imports the GTK app only when main() runs

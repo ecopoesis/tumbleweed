@@ -8,10 +8,16 @@ transcript refuses (too large, not text) fails the reply and cancels the respond
 reaching a widget.
 
 A reply is closed exactly once: by the responder's terminal event, by that refusal, by
-`cancel`, or by the responder's `start` raising. What arrives after that is dropped.
+`cancel`, or by the responder's `start` raising. What arrives after that is dropped. A reply is
+closed only after its transcript message has ended, so a terminal event the transcript refuses
+(a failure with no text for a reason) fails the reply with a fixed reason instead of leaving the
+chat waiting for it forever. Events must arrive on the thread that sent the message (D9): from
+another one the sink raises `WrongThreadError`, since the transcript and the widgets under it
+are not thread-safe.
 """
 
 import logging
+import threading
 from typing import assert_never, final
 
 from tumbleweed.agent.responder import (
@@ -30,6 +36,20 @@ from tumbleweed.shell.viewmodel.transcript import Transcript
 logger = logging.getLogger(__name__)
 
 _START_FAILED = "The reply could not be started."
+_BAD_FAILURE = "The reply failed, and the failure could not be described."
+
+
+class WrongThreadError(TumbleweedError):
+    """A reply's events were reported from a thread other than the one that sent the message."""
+
+
+def describe_error(error: BaseException) -> str:
+    """`str(error)`, or its type's name if that is empty or raises (a report must not fail)."""
+    try:
+        text = str(error)
+    except Exception:  # noqa: BLE001  (a __str__ that raises must not cost us the error report)
+        return type(error).__name__
+    return text or type(error).__name__
 
 
 @final
@@ -39,6 +59,7 @@ class _Reply:
     def __init__(self, transcript: Transcript, message_id: MessageId) -> None:
         self._transcript = transcript
         self._message_id = message_id
+        self._thread = threading.get_ident()
         self._handle: ReplyHandle | None = None
         self._cancel_when_known = False
         self.closed = False
@@ -51,20 +72,39 @@ class _Reply:
         """
         self._handle = handle
         if self._cancel_when_known:
-            handle.cancel()
+            self._cancel(handle)
 
     def abort(self, reason: str) -> None:
-        """Fail the reply with `reason` and stop the responder. A no-op once closed."""
+        """Fail the reply with `reason` if its message is still streaming, and stop the responder.
+
+        A no-op once closed. The responder is stopped even if failing the message raises.
+        """
         if self.closed:
             return
         self.closed = True
-        self._transcript.fail(self._message_id, reason)
-        if self._handle is not None:
-            self._handle.cancel()
-        else:
-            self._cancel_when_known = True
+        try:
+            if self._transcript.streaming == self._message_id:
+                self._transcript.fail(self._message_id, reason)
+        finally:
+            if self._handle is not None:
+                self._cancel(self._handle)
+            else:
+                self._cancel_when_known = True
+
+    def _cancel(self, handle: ReplyHandle) -> None:
+        try:
+            handle.cancel()
+        except Exception:
+            # The responder's bug must not stop the shell from quitting or from taking its next
+            # message: say so, and go on.
+            logger.exception("cancelling the responder's reply %s failed", self._message_id)
 
     def emit(self, event: ReplyEvent) -> None:
+        if threading.get_ident() != self._thread:
+            raise WrongThreadError(
+                "reply events must be reported on the thread that sent the message "
+                "(marshal them, for example with GLib.idle_add)"
+            )
         if self.closed:
             logger.debug("dropped an event of the closed reply %s", self._message_id)
             return
@@ -79,13 +119,21 @@ class _Reply:
                     self._transcript.append(self._message_id, text)
                 except InvalidValueError as exc:
                     logger.warning("refused a delta of reply %s: %s", self._message_id, exc)
-                    self.abort(str(exc))
+                    self.abort(describe_error(exc))
             case ReplyFinished():
-                self.closed = True
-                self._transcript.finish(self._message_id)
+                try:
+                    self._transcript.finish(self._message_id)
+                finally:
+                    self.closed = True
             case ReplyFailed(reason=reason):
-                self.closed = True
-                self._transcript.fail(self._message_id, reason)
+                try:
+                    self._transcript.fail(self._message_id, reason)
+                except InvalidValueError:
+                    # A reason that is not text. The message is still streaming: fail it.
+                    logger.warning("reply %s: the failure had no usable reason", self._message_id)
+                    self.abort(_BAD_FAILURE)
+                else:
+                    self.closed = True
             case _ as unreachable:
                 assert_never(unreachable)
 
@@ -120,7 +168,7 @@ class ChatController:
         except TumbleweedError as exc:
             # A failure the responder expects (no key, no network): the user sees it in the chat.
             logger.warning("the responder refused to start: %s", type(exc).__name__)
-            reply.abort(str(exc) or _START_FAILED)
+            reply.abort(describe_error(exc))
             return
         except BaseException:
             # A bug. Do not leave a message streaming forever, and let the bug be seen.

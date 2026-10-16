@@ -1,6 +1,8 @@
 """Tests for the GTK-free chat controller, against fakes of the Responder protocol."""
 
 import logging
+import threading
+from typing import get_args
 
 import pytest
 
@@ -8,7 +10,7 @@ from tests.shell.fakes import ManualResponder
 from tumbleweed.agent.echo import ECHO_PREFIX, EchoResponder
 from tumbleweed.agent.responder import ReplyDelta, ReplyEvent, ReplyFailed, ReplyFinished
 from tumbleweed.core.errors import InvalidValueError, TumbleweedError
-from tumbleweed.shell.viewmodel.chat import ChatController
+from tumbleweed.shell.viewmodel.chat import ChatController, WrongThreadError, describe_error
 from tumbleweed.shell.viewmodel.transcript import (
     MAX_ASSISTANT_BYTES,
     MAX_MESSAGES,
@@ -278,13 +280,45 @@ class TestStartFailures:
 
     def test_an_error_after_a_synchronous_delta_still_fails_the_reply(self) -> None:
         responder = ManualResponder(raises=RuntimeError("bug"))
-        responder.before_return = []
+        responder.before_return = [ReplyDelta(text="partial")]
         transcript, controller = setup(responder)
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="bug"):
             controller.send("q")
 
+        message = transcript.messages[1]
+        assert (message.text, message.state) == ("partial", MessageState.FAILED)
+        assert message.error == "The reply could not be started."
         assert transcript.streaming is None
+        assert not controller.busy
+
+    def test_a_domain_error_whose_str_raises_still_shows_as_a_failed_reply(self) -> None:
+        class BrokenError(TumbleweedError):
+            def __str__(self) -> str:
+                raise RuntimeError("no description for you")
+
+        responder = ManualResponder(raises=BrokenError())
+        transcript, controller = setup(responder)
+
+        controller.send("q")  # does not raise
+
+        assert (transcript.messages[1].state, transcript.messages[1].error) == (
+            MessageState.FAILED,
+            "BrokenError",
+        )
+        assert not controller.busy
+
+    @pytest.mark.parametrize("message", ["", "boom"])
+    def test_describe_error_is_the_message_or_else_the_type_and_never_raises(
+        self, message: str
+    ) -> None:
+        assert describe_error(ValueError(message)) == (message or "ValueError")
+
+        class BrokenError(Exception):
+            def __str__(self) -> str:
+                raise RuntimeError
+
+        assert describe_error(BrokenError()) == "BrokenError"
 
 
 class TestCancel:
@@ -352,14 +386,168 @@ class TestCancel:
         assert len(responder.requests) == 2
 
 
-def test_event_union_is_exhaustively_handled() -> None:
-    """Every `ReplyEvent` variant has a behaviour: none is silently ignored."""
+class TestFailureEvents:
+    def failed_reply(self) -> tuple[Transcript, ChatController, ManualResponder]:
+        responder = ManualResponder()
+        transcript, controller = setup(responder)
+        controller.send("q")
+        return transcript, controller, responder
+
+    @pytest.mark.parametrize("reason", [None, 5, b"bytes", ["a"]], ids=repr)
+    def test_a_failure_without_text_for_a_reason_still_ends_the_reply(self, reason: object) -> None:
+        transcript, controller, responder = self.failed_reply()
+        responder.sink.emit(ReplyDelta(text="part"))
+        event = ReplyFailed.model_construct(  # forgery-ok: tests the sink's own validation
+            reason=reason  # type: ignore[arg-type]  # the point
+        )
+
+        responder.sink.emit(event)  # does not raise
+
+        message = transcript.messages[1]
+        assert (message.text, message.state) == ("part", MessageState.FAILED)
+        assert message.error == "The reply failed, and the failure could not be described."
+        assert not controller.busy
+        assert responder.handle.cancelled  # the responder is told to stop, too
+        controller.send("the chat still works")  # the next message is accepted
+        assert len(responder.requests) == 2
+
+    def test_events_after_a_failure_are_dropped_and_raise_nothing(self) -> None:
+        transcript, _, responder = self.failed_reply()
+        responder.sink.emit(ReplyDelta(text="part"))
+        responder.sink.emit(ReplyFailed(reason="no network"))
+        before = transcript.messages
+
+        responder.sink.emit(ReplyDelta(text="late"))
+        responder.sink.emit(ReplyFinished())
+        responder.sink.emit(ReplyFailed(reason="again"))
+
+        assert transcript.messages == before
+        assert before[1].error == "no network"
+
+    def test_events_after_a_finish_are_dropped_and_raise_nothing(self) -> None:
+        transcript, _, responder = self.failed_reply()
+        responder.sink.emit(ReplyFinished())
+        before = transcript.messages
+
+        responder.sink.emit(ReplyDelta(text="late"))
+        responder.sink.emit(ReplyFailed(reason="late"))
+        responder.sink.emit(ReplyFinished())
+
+        assert transcript.messages == before
+
+
+class TestThreads:
+    def test_events_from_another_thread_are_refused_with_a_clear_error(self) -> None:
+        responder = ManualResponder()
+        transcript, controller = setup(responder)
+        controller.send("q")
+        before = transcript.messages
+        errors: list[BaseException] = []
+
+        def report() -> None:
+            try:
+                responder.sink.emit(ReplyDelta(text="from a worker"))
+            except BaseException as exc:  # noqa: BLE001  (the test collects whatever is raised)
+                errors.append(exc)
+
+        worker = threading.Thread(target=report)
+        worker.start()
+        worker.join(timeout=10)
+
+        assert not worker.is_alive()
+        (error,) = errors
+        assert isinstance(error, WrongThreadError)
+        assert "GLib.idle_add" in str(error)
+        assert transcript.messages == before  # nothing changed
+        assert controller.busy  # and the reply is still open for events from the right thread
+        responder.sink.emit(ReplyDelta(text="from the main thread"))
+        assert transcript.messages[1].text == "from the main thread"
+
+    def test_a_terminal_event_from_another_thread_does_not_end_the_reply(self) -> None:
+        responder = ManualResponder()
+        transcript, controller = setup(responder)
+        controller.send("q")
+        errors: list[BaseException] = []
+
+        def report() -> None:
+            try:
+                responder.sink.emit(ReplyFinished())
+            except BaseException as exc:  # noqa: BLE001  (the test collects whatever is raised)
+                errors.append(exc)
+
+        worker = threading.Thread(target=report)
+        worker.start()
+        worker.join(timeout=10)
+
+        assert [type(error) for error in errors] == [WrongThreadError]
+        assert transcript.messages[1].state is MessageState.STREAMING
+        assert controller.busy
+
+
+class TestCancelFailures:
+    def test_a_handle_whose_cancel_raises_does_not_stop_a_cancel(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        responder = ManualResponder(cancel_raises=RuntimeError("cancel is broken"))
+        transcript, controller = setup(responder)
+        controller.send("q")
+
+        with caplog.at_level(logging.ERROR):
+            controller.cancel()  # does not raise
+
+        assert transcript.messages[1].state is MessageState.FAILED
+        assert not controller.busy
+        assert "cancel is broken" in caplog.text
+        controller.send("again")  # the chat goes on
+        assert len(responder.requests) == 2
+
+    def test_a_cancel_that_raises_on_a_refused_delta_inside_start_is_logged_too(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        responder = ManualResponder(cancel_raises=RuntimeError("cancel is broken"))
+        responder.before_return = [ReplyDelta(text="x" * (MAX_ASSISTANT_BYTES + 1))]
+        transcript, controller = setup(responder)
+
+        with caplog.at_level(logging.ERROR):
+            controller.send("q")  # does not raise: the cancel runs once the handle is known
+
+        assert transcript.messages[1].state is MessageState.FAILED
+        assert "cancel is broken" in caplog.text
+
+
+SAMPLE_EVENTS: dict[str, ReplyEvent] = {
+    "delta": ReplyDelta(text="a"),
+    "finished": ReplyFinished(),
+    "failed": ReplyFailed(reason="no"),
+}
+EXPECTED_AFTER = {
+    "delta": ("a", MessageState.STREAMING, None),
+    "finished": ("", MessageState.COMPLETE, None),
+    "failed": ("", MessageState.FAILED, "no"),
+}
+
+
+def union_kinds() -> set[str]:
+    """The `kind` of every member of the `ReplyEvent` union, read from the union itself."""
+    annotated = ReplyEvent.__value__  # the alias's own value: Annotated[union, Field(...)]
+    (union, _field) = get_args(annotated)
+    return {str(member.model_fields["kind"].default) for member in get_args(union)}
+
+
+def test_the_samples_cover_every_member_of_the_event_union() -> None:
+    """A new kind of event fails here until the sink handles it and a sample is added."""
+    assert set(SAMPLE_EVENTS) == union_kinds()
+    assert set(EXPECTED_AFTER) == union_kinds()
+
+
+@pytest.mark.parametrize("kind", sorted(SAMPLE_EVENTS))
+def test_every_kind_of_event_has_its_own_effect_on_the_transcript(kind: str) -> None:
     responder = ManualResponder()
     transcript, controller = setup(responder)
     controller.send("q")
-    events: list[ReplyEvent] = [ReplyDelta(text="a"), ReplyFinished()]
 
-    for event in events:
-        responder.sink.emit(event)
+    responder.sink.emit(SAMPLE_EVENTS[kind])
 
-    assert transcript.messages[1].state is MessageState.COMPLETE
+    message = transcript.messages[1]
+    assert (message.text, message.state, message.error) == EXPECTED_AFTER[kind]
+    assert controller.busy == (kind == "delta")

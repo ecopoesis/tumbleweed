@@ -1,5 +1,7 @@
 """Tests for the GTK-free transcript view-model."""
 
+import re
+
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
@@ -111,7 +113,7 @@ class TestUserMessages:
         assert transcript.messages == ()
 
     def test_the_limit_counts_utf8_bytes_not_characters(self) -> None:
-        euros = "€" * (MAX_USER_BYTES // 3 + 1)  # 3 bytes each
+        euros = "\u20ac" * (MAX_USER_BYTES // 3 + 1)  # 3 bytes each
 
         assert len(euros) < MAX_USER_BYTES
         with pytest.raises(InvalidValueError, match="bytes"):
@@ -309,17 +311,117 @@ class TestStreaming:
             transcript.append(reply, "\U0001f600" * (MAX_ASSISTANT_BYTES // 4 + 1))
 
 
+class TestStreamingCost:
+    """A reply of many deltas is checked delta by delta, not message by message."""
+
+    def test_the_text_scanned_stays_linear_in_the_reply_not_in_the_delta_count(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scanned: list[int] = []
+
+        class CountingPattern:
+            def __init__(self, pattern: "re.Pattern[str]") -> None:
+                self._pattern = pattern
+
+            def search(self, text: str) -> "re.Match[str] | None":
+                scanned.append(len(text))
+                return self._pattern.search(text)
+
+            def sub(self, replacement: str, text: str) -> str:
+                scanned.append(len(text))
+                return self._pattern.sub(replacement, text)
+
+        monkeypatch.setattr(
+            "tumbleweed.shell.viewmodel.transcript._UNSAFE_TEXT",
+            CountingPattern(re.compile("[\x00\ud800-\udfff]")),
+        )
+        transcript = Transcript()
+        reply = streaming_reply(transcript)
+        scanned.clear()
+
+        for _ in range(2000):
+            transcript.append(reply, "x" * 32)
+
+        assert len(transcript.message(reply).text) == 64_000
+        assert sum(scanned) <= 2 * 64_000  # quadratic would be about 64 million
+
+    def test_the_cap_holds_exactly_across_deltas_of_different_widths(self) -> None:
+        transcript = Transcript()
+        reply = streaming_reply(transcript)
+        transcript.append(reply, "\u00e9" * ((MAX_ASSISTANT_BYTES - 1) // 2))  # 2 bytes each
+        assert len(transcript.message(reply).text.encode()) == MAX_ASSISTANT_BYTES - 2
+
+        transcript.append(reply, "ab")  # exactly at the cap
+        with pytest.raises(InvalidValueError, match="over"):
+            transcript.append(reply, "c")
+        with pytest.raises(InvalidValueError, match="over"):
+            transcript.append(reply, "\U0001f600")
+
+        assert len(transcript.message(reply).text.encode()) == MAX_ASSISTANT_BYTES
+
+    def test_a_refused_delta_does_not_count_against_the_cap(self) -> None:
+        transcript = Transcript()
+        reply = streaming_reply(transcript)
+        transcript.append(reply, "a" * (MAX_ASSISTANT_BYTES - 1))
+        with pytest.raises(InvalidValueError):
+            transcript.append(reply, "\u00e9")  # 2 bytes: one too many
+
+        transcript.append(reply, "b")  # one byte still fits
+
+        assert len(transcript.message(reply).text) == MAX_ASSISTANT_BYTES
+
+    def test_the_next_reply_starts_counting_from_zero(self) -> None:
+        transcript = Transcript()
+        first = streaming_reply(transcript)
+        transcript.append(first, "a" * MAX_ASSISTANT_BYTES)
+        transcript.finish(first)
+        transcript.add_user("again")
+        second = transcript.begin_assistant().id
+
+        transcript.append(second, "b" * MAX_ASSISTANT_BYTES)
+
+        assert len(transcript.message(second).text) == MAX_ASSISTANT_BYTES
+
+    def test_the_message_model_still_scans_the_text_for_everyone_else(self) -> None:
+        # The transcript skips the rescan with a context only it can supply; a caller passing any
+        # other context, or none (a session restored from disk), gets the full checks.
+        for context in (None, object()):
+            with pytest.raises(ValidationError):
+                TranscriptMessage.model_validate(
+                    {
+                        "id": MessageId.new(),
+                        "role": Role.ASSISTANT,
+                        "text": "a" * (MAX_ASSISTANT_BYTES + 1),
+                        "state": MessageState.COMPLETE,
+                        "error": None,
+                    },
+                    context=context,
+                )
+            with pytest.raises(ValidationError):
+                TranscriptMessage.model_validate(
+                    {
+                        "id": MessageId.new(),
+                        "role": Role.ASSISTANT,
+                        "text": "a\x00b",
+                        "state": MessageState.COMPLETE,
+                        "error": None,
+                    },
+                    context=context,
+                )
+
+
 class TestFailureReason:
     def fail_with(self, reason: object) -> TranscriptMessage:
         transcript = Transcript()
-        return transcript.fail(streaming_reply(transcript), reason)  # type: ignore[arg-type]
+        reply = streaming_reply(transcript)
+        return transcript.fail(reply, reason)  # type: ignore[arg-type]  # the point: not a str
 
     def test_a_long_reason_is_truncated_to_the_limit(self) -> None:
         error = self.fail_with("x" * 10_000).error
 
         assert error is not None
         assert len(error) == MAX_ERROR_CHARS
-        assert error.endswith("…")
+        assert error.endswith("\u2026")
 
     def test_a_reason_is_collapsed_to_one_line(self) -> None:
         assert self.fail_with("one\n\ntwo\t three\r\nfour").error == "one two three four"
@@ -329,7 +431,7 @@ class TestFailureReason:
         assert self.fail_with(reason).error == "The reply failed."
 
     def test_nul_in_a_reason_is_replaced(self) -> None:
-        assert self.fail_with("bad\x00thing\ud800").error == "bad�thing�"
+        assert self.fail_with("bad\x00thing\ud800").error == "bad\ufffdthing\ufffd"
 
     def test_a_reason_must_be_a_str(self) -> None:
         with pytest.raises(InvalidValueError, match="must be a str"):

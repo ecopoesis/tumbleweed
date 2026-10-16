@@ -15,6 +15,8 @@ here, at the entry point:
   `InvalidValueError` or a `TranscriptError`, and nothing changes;
 - an error reason is collapsed to one line and truncated.
 
+A delta is validated on its own, and a running byte count enforces the cap, so a reply of any
+number of deltas costs time proportional to its length, not to its length times the delta count.
 One reply streams at a time, and no user message is accepted while it does.
 """
 
@@ -22,7 +24,7 @@ import enum
 import re
 from typing import Final, Protocol, Self, assert_never, final
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 
 from tumbleweed.core.errors import InvalidValueError, TumbleweedError
 from tumbleweed.core.ids import MessageId
@@ -36,8 +38,13 @@ MAX_ERROR_CHARS: Final = 200
 # NUL ends a C string, and a lone surrogate (U+D800..U+DFFF) cannot be encoded as UTF-8: either
 # one, handed to GTK, raises or truncates. U+FFFD is the standard stand-in.
 _UNSAFE_TEXT = re.compile("[\x00\ud800-\udfff]")
-_REPLACEMENT = "�"
+_REPLACEMENT = "\ufffd"
 _NO_REASON = "The reply failed."
+# Validation context that only this module can supply (a private name, so a lint-clean caller cannot
+# import it): the transcript has checked the text of a streaming message delta by delta, and the
+# model need not scan the whole message again for each one. Everyone else, a session restored from
+# disk (S04) included, gets the full checks.
+_TEXT_CHECKED = object()
 
 
 class TranscriptError(TumbleweedError):
@@ -91,12 +98,15 @@ class TranscriptMessage(BaseModel):
     error: str | None = None
 
     @model_validator(mode="after")
-    def _is_consistent(self) -> Self:
+    def _is_consistent(self, info: ValidationInfo[object]) -> Self:
         if (self.state is MessageState.FAILED) != (self.error is not None):
             raise ValueError("a failed message carries an error, and only a failed one does")
         if self.role is Role.USER and self.state is not MessageState.COMPLETE:
             raise ValueError("a user message is complete from the start")
-        if (problem := _text_problem(self.role, self.text)) is not None:
+        if (
+            info.context is not _TEXT_CHECKED
+            and (problem := _text_problem(self.role, self.text)) is not None
+        ):
             raise ValueError(f"the text {problem}")
         if self.error is not None and (
             len(self.error) > MAX_ERROR_CHARS or _UNSAFE_TEXT.search(self.error) is not None
@@ -131,7 +141,7 @@ def _checked(role: Role, value: object, what: str) -> str:
 def _one_line(value: object) -> str:
     """A failure reason for display: one line, at most `MAX_ERROR_CHARS` characters."""
     line = " ".join(_clean(value, "reason").split()) or _NO_REASON
-    return line if len(line) <= MAX_ERROR_CHARS else line[: MAX_ERROR_CHARS - 1] + "…"
+    return line if len(line) <= MAX_ERROR_CHARS else line[: MAX_ERROR_CHARS - 1] + "\u2026"
 
 
 @final
@@ -142,6 +152,7 @@ class Transcript:
         self._messages: list[TranscriptMessage] = []
         self._positions: dict[MessageId, int] = {}
         self._streaming: MessageId | None = None
+        self._streaming_bytes = 0  # UTF-8 bytes of the streaming message, kept as deltas arrive
         self._observers: list[TranscriptObserver] = []
 
     @property
@@ -194,6 +205,7 @@ class Transcript:
             raise TranscriptError("a reply is already streaming")
         if len(self._messages) >= MAX_MESSAGES:
             raise TranscriptError(f"the transcript is full ({MAX_MESSAGES} messages)")
+        self._streaming_bytes = 0
         return self._add(Role.ASSISTANT, "", MessageState.STREAMING)
 
     def append(self, message_id: MessageId, delta: str) -> TranscriptMessage:
@@ -207,8 +219,11 @@ class Transcript:
         cleaned = _clean(delta, "reply text")
         if not cleaned:
             return message
-        text = _checked(Role.ASSISTANT, message.text + cleaned, "reply")
-        return self._change(message, text, MessageState.STREAMING, None)
+        size = self._streaming_bytes + len(cleaned.encode("utf-8"))
+        if size > MAX_ASSISTANT_BYTES:
+            raise InvalidValueError(f"reply is over {MAX_ASSISTANT_BYTES} bytes")
+        self._streaming_bytes = size
+        return self._change(message, message.text + cleaned, MessageState.STREAMING, None)
 
     def finish(self, message_id: MessageId) -> TranscriptMessage:
         """End the streaming message normally."""
@@ -242,8 +257,12 @@ class Transcript:
     def _change(
         self, old: TranscriptMessage, text: str, state: MessageState, error: str | None
     ) -> TranscriptMessage:
-        # Rebuilt through the constructor, so every invariant is checked again.
-        message = TranscriptMessage(id=old.id, role=old.role, text=text, state=state, error=error)
+        # Rebuilt through validation, so every invariant is checked again; the text is not scanned
+        # again, because it is the checked text of `old` plus a delta checked by `append`.
+        message = TranscriptMessage.model_validate(
+            {"id": old.id, "role": old.role, "text": text, "state": state, "error": error},
+            context=_TEXT_CHECKED,
+        )
         self._messages[self._positions[old.id]] = message
         if state is not MessageState.STREAMING:
             self._streaming = None
