@@ -72,20 +72,23 @@ class SystemPeerCredentials:
     """Reads the peer's uid from the kernel: `SO_PEERCRED` on Linux, `LOCAL_PEERCRED` on macOS."""
 
     def peer_uid(self, sock: SupportsGetsockopt, /) -> Uid:
+        # One chain, so that the branch for the other platform is dropped by the type checker
+        # instead of being reported as unreachable.
         try:
             if sys.platform.startswith("linux"):
                 return parse_linux_ucred(
                     sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED.size)
                 )
-            if sys.platform == "darwin":
+            elif sys.platform == "darwin":
                 return parse_darwin_xucred(
                     sock.getsockopt(_SOL_LOCAL, socket.LOCAL_PEERCRED, _XUCRED_SIZE)
                 )
+            else:
+                raise PeerCredentialsError(f"peer credentials are not supported on {sys.platform}")
         except OSError as exc:
             raise PeerCredentialsError(
                 f"cannot read the peer credentials: {exc.strerror or type(exc).__name__}"
             ) from None
-        raise PeerCredentialsError(f"peer credentials are not supported on {sys.platform}")
 
 
 def require_same_user(
