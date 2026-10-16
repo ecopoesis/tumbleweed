@@ -31,18 +31,23 @@ All of these must pass before a commit is pushed. CI runs the same commands.
    `MessageId`, `TaskId`, `ToolId`, `GrantId`, `IpcRequestId`, …). Never pass a bare `str`,
    `int` or `UUID` as an ID across a function, class, IPC or storage boundary. IDs are
    validated on parse, carry a type prefix in their serialized form (e.g. `tsk_…`), and
-   compare unequal across types. The v1 registry is created in S01; adding an ID type
-   outside it needs a note in the PR.
+   compare unequal across types. Create one with `TaskId.new()`, parse text with
+   `TaskId(text)`. The v1 registry is created in S01; adding an ID type outside it needs a
+   note in the PR.
 3. **Domain primitives are typed.** Canonical absolute paths vs workspace-relative paths,
    byte counts, durations, versions, model names, capability values: each has a dedicated
    type (`NewType` when the type exists only for the checker, a validating wrapper class
    when it must hold at runtime). A function that needs a canonical path takes
-   `CanonicalPath`, not `str` or `Path`.
+   `CanonicalPath`, not `str` or `Path`. A `CanonicalPath` comes only from
+   `CanonicalPath.resolve()` and is never parsed from stored or received text: keep the text
+   and resolve it again. `WorkspaceRelPath(text)` validates; every other primitive in
+   `tumbleweed.core.types` validates on construction too.
 4. **Closed sets are enums or `Literal`s**, matched exhaustively with `assert_never`.
 5. **Everything that crosses a boundary is a pydantic v2 model**: IPC, disk, LLM tool
    calls, sandbox I/O, UI specs. Use `ConfigDict(strict=True, extra="forbid", frozen=True)`
    unless there is a documented reason not to, and discriminated unions on a `kind` field.
-   No `dict[str, Any]` payloads; arbitrary JSON is `JsonValue`.
+   No `dict[str, Any]` payloads; arbitrary JSON is `JsonValue`. Parse incoming bytes with
+   `model_validate_json`; ID and primitive fields validate from their raw JSON form.
 6. **Interfaces are `typing.Protocol`s.** Concrete classes not designed for subclassing are
    `@final`. Prefer PEP 695 generics (`class Box[T]: ...`).
 7. **PyGObject code** (GTK, GStreamer, VTE) uses `pygobject-stubs` (GTK4 config). Stub gaps
@@ -71,7 +76,8 @@ All of these must pass before a commit is pushed. CI runs the same commands.
   mount; exempt from the CI skip-guard, covered by the S27 VM test), `live`.
   Tests that cannot run on the current host skip with an explicit reason; they never pass
   vacuously. With `TUMBLEWEED_CI=1` (set in CI), a skipped `gtk` or `linux` test fails the
-  run.
+  run, and so does a module skipped as a whole (`importorskip`, `allow_module_level`): skip
+  per test, with markers.
 - Security properties get negative tests: prove the forbidden thing actually fails.
 - Keep logic GTK-free so it can be unit-tested; GTK tests cover the adapter.
 
