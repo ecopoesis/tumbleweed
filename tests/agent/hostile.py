@@ -14,8 +14,10 @@ import asyncio
 import json
 import logging
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+
+import httpx2
 
 from tests.agent import sse
 from tumbleweed.agent.anthropic_provider import AnthropicProvider, build_client
@@ -253,6 +255,44 @@ def request() -> LlmRequest:
     )
 
 
+class _CountingStream(httpx2.AsyncByteStream):
+    def __init__(self, inner: httpx2.AsyncByteStream, counter: "CountingTransport") -> None:
+        self._inner = inner
+        self._counter = counter
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._inner:
+            self._counter.read += len(chunk)
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+class CountingTransport(httpx2.AsyncBaseTransport):
+    """The real network, counting the bytes of response bodies that the client really reads.
+
+    (What the server managed to send says little: the kernel's socket buffers, which differ
+    between macOS and Linux, soak up megabytes before the client's close reaches it.)
+    """
+
+    def __init__(self) -> None:
+        self._inner = httpx2.AsyncHTTPTransport()
+        self.read = 0
+
+    async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
+        response = await self._inner.handle_async_request(request)
+        return httpx2.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            stream=_CountingStream(response.stream, self),  # type: ignore[arg-type]
+            extensions=response.extensions,
+        )
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
 @dataclass
 class Outcome:
     events: list[LlmEvent]
@@ -260,12 +300,18 @@ class Outcome:
 
 
 async def play(
-    behaviour: Behaviour, *, read_timeout: float = 5.0, server: Server | None = None
+    behaviour: Behaviour,
+    *,
+    read_timeout: float = 5.0,
+    transport: httpx2.AsyncBaseTransport | None = None,
 ) -> tuple[Outcome, Server]:
     """Run the provider against `behaviour`; its events, the error it ended with, the server."""
-    async with server or Server(behaviour) as running:
+    async with Server(behaviour) as running:
         client = build_client(
-            api_key=ApiKey(CANARY), base_url=running.url, read_timeout=read_timeout
+            api_key=ApiKey(CANARY),
+            base_url=running.url,
+            read_timeout=read_timeout,
+            transport=transport,
         )
 
         async def no_sleep(_seconds: float) -> None:

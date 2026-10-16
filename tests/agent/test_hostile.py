@@ -125,27 +125,32 @@ def test_the_usage_known_before_a_failure_travels_with_the_error() -> None:
 
 
 class TestBounds:
-    def test_a_stream_is_cut_off_at_the_limit_and_the_server_is_not_read_to_the_end(self) -> None:
-        outcome, server = asyncio.run(play(SCENARIOS["endless_pings"]))
+    def test_a_stream_is_cut_off_at_the_limit_and_not_read_to_the_end(self) -> None:
+        network = hostile.CountingTransport()
 
-        assert isinstance(outcome.error, ProviderError)
-        sent = server.exchanges[0].sent
-        assert sent < 6 * 1024 * 1024  # the client hung up
-        assert sent < MAX_RESPONSE_BYTES + 4 * 1024 * 1024  # socket buffers, not the whole flood
-
-    def test_one_giant_delta_is_refused_without_being_buffered_whole(self) -> None:
-        outcome, server = asyncio.run(play(SCENARIOS["giant_delta"]))
+        outcome, _ = asyncio.run(play(SCENARIOS["endless_pings"], transport=network))
 
         assert isinstance(outcome.error, ProviderError)
         assert "larger than expected" in str(outcome.error)
-        assert server.exchanges[0].sent < 6 * 1024 * 1024
+        assert network.read <= MAX_RESPONSE_BYTES + 256 * 1024  # one read past the limit, at most
+
+    def test_one_giant_delta_is_refused_without_being_buffered_whole(self) -> None:
+        network = hostile.CountingTransport()
+
+        outcome, _ = asyncio.run(play(SCENARIOS["giant_delta"], transport=network))
+
+        assert isinstance(outcome.error, ProviderError)
+        assert "larger than expected" in str(outcome.error)
+        assert network.read <= MAX_RESPONSE_BYTES + 256 * 1024
         assert not any(isinstance(e, TextDelta) for e in outcome.events)
 
     def test_an_error_body_is_cut_not_refused_so_the_status_still_decides(self) -> None:
-        outcome, server = asyncio.run(play(SCENARIOS["huge_error_body"]))
+        network = hostile.CountingTransport()
+
+        outcome, _ = asyncio.run(play(SCENARIOS["huge_error_body"], transport=network))
 
         assert type(outcome.error) is ProviderOverloadedError
-        assert server.exchanges[0].sent < MAX_ERROR_BODY_BYTES + 4 * 1024 * 1024
+        assert network.read <= 3 * (MAX_ERROR_BODY_BYTES + 256 * 1024)  # (three attempts)
 
     def test_the_limits_are_what_the_docs_say(self) -> None:
         assert MAX_RESPONSE_BYTES == 2 * 1024 * 1024
