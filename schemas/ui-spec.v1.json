@@ -1,0 +1,2273 @@
+{
+  "$defs": {
+    "Abs": {
+      "additionalProperties": false,
+      "description": "The absolute value of a number, of the same type.",
+      "properties": {
+        "kind": {
+          "const": "abs",
+          "title": "Kind",
+          "type": "string"
+        },
+        "operand": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "operand"
+      ],
+      "title": "Abs",
+      "type": "object"
+    },
+    "Add": {
+      "additionalProperties": false,
+      "description": "`left + right`: `int` if both are, else `float`.",
+      "properties": {
+        "kind": {
+          "const": "add",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "$ref": "#/$defs/Expr"
+        },
+        "right": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "left",
+        "right"
+      ],
+      "title": "Add",
+      "type": "object"
+    },
+    "AgentHandler": {
+      "additionalProperties": false,
+      "description": "Send the event and the state to the agent.",
+      "properties": {
+        "kind": {
+          "const": "agent",
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Name",
+          "type": "string"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "maxLength": 1000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Note"
+        }
+      },
+      "required": [
+        "kind",
+        "name"
+      ],
+      "title": "AgentHandler",
+      "type": "object"
+    },
+    "And": {
+      "additionalProperties": false,
+      "description": "True when all of 2 to `MAX_EXPR_ARGS` bools are. Type `bool`.",
+      "properties": {
+        "kind": {
+          "const": "and",
+          "title": "Kind",
+          "type": "string"
+        },
+        "args": {
+          "$ref": "#/$defs/Args"
+        }
+      },
+      "required": [
+        "kind",
+        "args"
+      ],
+      "title": "And",
+      "type": "object"
+    },
+    "Args": {
+      "items": {
+        "$ref": "#/$defs/Expr"
+      },
+      "maxItems": 8,
+      "minItems": 2,
+      "type": "array"
+    },
+    "BoolLit": {
+      "additionalProperties": false,
+      "description": "`true` or `false`. Type `bool`.",
+      "properties": {
+        "kind": {
+          "const": "bool",
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ],
+      "title": "BoolLit",
+      "type": "object"
+    },
+    "BoolState": {
+      "additionalProperties": false,
+      "description": "A switch or flag.",
+      "properties": {
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "bool",
+          "title": "Kind",
+          "type": "string"
+        },
+        "default": {
+          "type": "boolean",
+          "title": "Default"
+        },
+        "computed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Expr"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "key",
+        "kind",
+        "default"
+      ],
+      "title": "BoolState",
+      "type": "object"
+    },
+    "Box": {
+      "additionalProperties": false,
+      "description": "Children in a row or a column.",
+      "properties": {
+        "kind": {
+          "const": "box",
+          "title": "Kind",
+          "type": "string"
+        },
+        "orientation": {
+          "$ref": "#/$defs/Orientation",
+          "default": "vertical"
+        },
+        "spacing": {
+          "$ref": "#/$defs/Spacing",
+          "default": 8
+        },
+        "children": {
+          "$ref": "#/$defs/Children",
+          "default": []
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Box",
+      "type": "object"
+    },
+    "Button": {
+      "additionalProperties": false,
+      "description": "A push button.",
+      "properties": {
+        "kind": {
+          "const": "button",
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 200,
+          "title": "Label",
+          "type": "string"
+        },
+        "on_click": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "On Click"
+        }
+      },
+      "required": [
+        "kind",
+        "label"
+      ],
+      "title": "Button",
+      "type": "object"
+    },
+    "CellValue": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      ]
+    },
+    "Check": {
+      "additionalProperties": false,
+      "description": "A check box with a label, two-way bound to a `bool` entry.",
+      "properties": {
+        "kind": {
+          "const": "check",
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 200,
+          "title": "Label",
+          "type": "string"
+        },
+        "bind": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Bind",
+          "type": "string"
+        },
+        "on_change": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "On Change"
+        }
+      },
+      "required": [
+        "kind",
+        "label",
+        "bind"
+      ],
+      "title": "Check",
+      "type": "object"
+    },
+    "Children": {
+      "items": {
+        "$ref": "#/$defs/Component"
+      },
+      "maxItems": 64,
+      "type": "array"
+    },
+    "ColumnType": {
+      "enum": [
+        "string",
+        "int",
+        "float",
+        "bool"
+      ],
+      "type": "string"
+    },
+    "Component": {
+      "discriminator": {
+        "mapping": {
+          "box": "#/$defs/Box",
+          "button": "#/$defs/Button",
+          "check": "#/$defs/Check",
+          "dropdown": "#/$defs/Dropdown",
+          "entry": "#/$defs/Entry",
+          "expander": "#/$defs/Expander",
+          "grid": "#/$defs/Grid",
+          "heading": "#/$defs/Heading",
+          "image": "#/$defs/Image",
+          "label": "#/$defs/Label",
+          "progress": "#/$defs/Progress",
+          "separator": "#/$defs/Separator",
+          "slider": "#/$defs/Slider",
+          "spin": "#/$defs/Spin",
+          "switch": "#/$defs/Switch",
+          "table": "#/$defs/TableView",
+          "tabs": "#/$defs/Tabs",
+          "text_view": "#/$defs/TextView"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Box"
+        },
+        {
+          "$ref": "#/$defs/Grid"
+        },
+        {
+          "$ref": "#/$defs/Label"
+        },
+        {
+          "$ref": "#/$defs/Heading"
+        },
+        {
+          "$ref": "#/$defs/Button"
+        },
+        {
+          "$ref": "#/$defs/Entry"
+        },
+        {
+          "$ref": "#/$defs/Switch"
+        },
+        {
+          "$ref": "#/$defs/Check"
+        },
+        {
+          "$ref": "#/$defs/Slider"
+        },
+        {
+          "$ref": "#/$defs/Spin"
+        },
+        {
+          "$ref": "#/$defs/Dropdown"
+        },
+        {
+          "$ref": "#/$defs/Progress"
+        },
+        {
+          "$ref": "#/$defs/Separator"
+        },
+        {
+          "$ref": "#/$defs/Image"
+        },
+        {
+          "$ref": "#/$defs/TableView"
+        },
+        {
+          "$ref": "#/$defs/TextView"
+        },
+        {
+          "$ref": "#/$defs/Tabs"
+        },
+        {
+          "$ref": "#/$defs/Expander"
+        }
+      ]
+    },
+    "Concat": {
+      "additionalProperties": false,
+      "description": "2 to `MAX_EXPR_ARGS` strings joined in order. Type `string`; numbers need `format_number`.",
+      "properties": {
+        "kind": {
+          "const": "concat",
+          "title": "Kind",
+          "type": "string"
+        },
+        "args": {
+          "$ref": "#/$defs/Args"
+        }
+      },
+      "required": [
+        "kind",
+        "args"
+      ],
+      "title": "Concat",
+      "type": "object"
+    },
+    "Div": {
+      "additionalProperties": false,
+      "description": "`left / right`: always `float`.",
+      "properties": {
+        "kind": {
+          "const": "div",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "$ref": "#/$defs/Expr"
+        },
+        "right": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "left",
+        "right"
+      ],
+      "title": "Div",
+      "type": "object"
+    },
+    "Dropdown": {
+      "additionalProperties": false,
+      "description": "A drop-down list of the options of an `enum` entry, two-way bound to it.",
+      "properties": {
+        "kind": {
+          "const": "dropdown",
+          "title": "Kind",
+          "type": "string"
+        },
+        "bind": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Bind",
+          "type": "string"
+        },
+        "on_change": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "On Change"
+        }
+      },
+      "required": [
+        "kind",
+        "bind"
+      ],
+      "title": "Dropdown",
+      "type": "object"
+    },
+    "Entry": {
+      "additionalProperties": false,
+      "description": "A one-line text field, two-way bound to a `string` entry.",
+      "properties": {
+        "kind": {
+          "const": "entry",
+          "title": "Kind",
+          "type": "string"
+        },
+        "bind": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Bind",
+          "type": "string"
+        },
+        "placeholder": {
+          "default": "",
+          "maxLength": 200,
+          "title": "Placeholder",
+          "type": "string"
+        },
+        "on_change": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "On Change"
+        },
+        "on_activate": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "On Activate"
+        }
+      },
+      "required": [
+        "kind",
+        "bind"
+      ],
+      "title": "Entry",
+      "type": "object"
+    },
+    "EnumState": {
+      "additionalProperties": false,
+      "description": "One of a fixed list of options (a dropdown). The value is the option's text.",
+      "properties": {
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "enum",
+          "title": "Kind",
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Options",
+          "type": "array"
+        },
+        "default": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "title": "Default"
+        }
+      },
+      "required": [
+        "key",
+        "kind",
+        "options",
+        "default"
+      ],
+      "title": "EnumState",
+      "type": "object"
+    },
+    "Eq": {
+      "additionalProperties": false,
+      "description": "`left == right`, for two numbers, two strings or two bools. Type `bool`.",
+      "properties": {
+        "kind": {
+          "const": "eq",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "$ref": "#/$defs/Expr"
+        },
+        "right": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "left",
+        "right"
+      ],
+      "title": "Eq",
+      "type": "object"
+    },
+    "Expander": {
+      "additionalProperties": false,
+      "description": "A title that shows or hides its child.",
+      "properties": {
+        "kind": {
+          "const": "expander",
+          "title": "Kind",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 200,
+          "title": "Title",
+          "type": "string"
+        },
+        "expanded": {
+          "default": false,
+          "title": "Expanded",
+          "type": "boolean"
+        },
+        "child": {
+          "$ref": "#/$defs/Component"
+        }
+      },
+      "required": [
+        "kind",
+        "title",
+        "child"
+      ],
+      "title": "Expander",
+      "type": "object"
+    },
+    "Expr": {
+      "discriminator": {
+        "mapping": {
+          "abs": "#/$defs/Abs",
+          "add": "#/$defs/Add",
+          "and": "#/$defs/And",
+          "bool": "#/$defs/BoolLit",
+          "concat": "#/$defs/Concat",
+          "div": "#/$defs/Div",
+          "eq": "#/$defs/Eq",
+          "float": "#/$defs/FloatLit",
+          "format_number": "#/$defs/FormatNumber",
+          "ge": "#/$defs/Ge",
+          "gt": "#/$defs/Gt",
+          "if": "#/$defs/If",
+          "int": "#/$defs/IntLit",
+          "le": "#/$defs/Le",
+          "lt": "#/$defs/Lt",
+          "max": "#/$defs/Max",
+          "min": "#/$defs/Min",
+          "mul": "#/$defs/Mul",
+          "ne": "#/$defs/Ne",
+          "not": "#/$defs/Not",
+          "or": "#/$defs/Or",
+          "ref": "#/$defs/Ref",
+          "round": "#/$defs/Round",
+          "string": "#/$defs/StrLit",
+          "sub": "#/$defs/Sub"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BoolLit"
+        },
+        {
+          "$ref": "#/$defs/IntLit"
+        },
+        {
+          "$ref": "#/$defs/FloatLit"
+        },
+        {
+          "$ref": "#/$defs/StrLit"
+        },
+        {
+          "$ref": "#/$defs/Ref"
+        },
+        {
+          "$ref": "#/$defs/Add"
+        },
+        {
+          "$ref": "#/$defs/Sub"
+        },
+        {
+          "$ref": "#/$defs/Mul"
+        },
+        {
+          "$ref": "#/$defs/Div"
+        },
+        {
+          "$ref": "#/$defs/Min"
+        },
+        {
+          "$ref": "#/$defs/Max"
+        },
+        {
+          "$ref": "#/$defs/Abs"
+        },
+        {
+          "$ref": "#/$defs/Round"
+        },
+        {
+          "$ref": "#/$defs/Eq"
+        },
+        {
+          "$ref": "#/$defs/Ne"
+        },
+        {
+          "$ref": "#/$defs/Lt"
+        },
+        {
+          "$ref": "#/$defs/Le"
+        },
+        {
+          "$ref": "#/$defs/Gt"
+        },
+        {
+          "$ref": "#/$defs/Ge"
+        },
+        {
+          "$ref": "#/$defs/And"
+        },
+        {
+          "$ref": "#/$defs/Or"
+        },
+        {
+          "$ref": "#/$defs/Not"
+        },
+        {
+          "$ref": "#/$defs/If"
+        },
+        {
+          "$ref": "#/$defs/Concat"
+        },
+        {
+          "$ref": "#/$defs/FormatNumber"
+        }
+      ]
+    },
+    "FileRef": {
+      "additionalProperties": false,
+      "description": "A file in the task's workspace.",
+      "properties": {
+        "path": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "FileRef",
+      "type": "object"
+    },
+    "FileState": {
+      "additionalProperties": false,
+      "description": "A reference to a file in the workspace, or none yet.",
+      "properties": {
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "file",
+          "title": "Kind",
+          "type": "string"
+        },
+        "default": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "key",
+        "kind"
+      ],
+      "title": "FileState",
+      "type": "object"
+    },
+    "FloatLit": {
+      "additionalProperties": false,
+      "description": "A finite number. Type `float`; `5` is accepted and means 5.0.",
+      "properties": {
+        "kind": {
+          "const": "float",
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value",
+          "type": "number"
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ],
+      "title": "FloatLit",
+      "type": "object"
+    },
+    "FloatState": {
+      "additionalProperties": false,
+      "description": "A finite number, optionally bounded. A slider or spin button needs both bounds.",
+      "properties": {
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "float",
+          "title": "Kind",
+          "type": "string"
+        },
+        "default": {
+          "type": "number",
+          "title": "Default"
+        },
+        "minimum": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Minimum"
+        },
+        "maximum": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maximum"
+        },
+        "step": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Step"
+        },
+        "computed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Expr"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "key",
+        "kind",
+        "default"
+      ],
+      "title": "FloatState",
+      "type": "object"
+    },
+    "FormatNumber": {
+      "additionalProperties": false,
+      "description": "A number as text, with a fixed count of decimals and optional digit grouping.\n\n`decimals` is 0 to `MAX_DECIMALS`. `grouping` separates thousands. There is no format\nstring and no locale: the renderer always writes `.` before the decimals and `,` between\nthe groups, so a tool looks the same everywhere. Type `string`.",
+      "properties": {
+        "kind": {
+          "const": "format_number",
+          "title": "Kind",
+          "type": "string"
+        },
+        "operand": {
+          "$ref": "#/$defs/Expr"
+        },
+        "decimals": {
+          "default": 0,
+          "maximum": 10,
+          "minimum": 0,
+          "title": "Decimals",
+          "type": "integer"
+        },
+        "grouping": {
+          "default": false,
+          "title": "Grouping",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "operand"
+      ],
+      "title": "FormatNumber",
+      "type": "object"
+    },
+    "Ge": {
+      "additionalProperties": false,
+      "description": "`left >= right`, for two numbers. Type `bool`.",
+      "properties": {
+        "kind": {
+          "const": "ge",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "$ref": "#/$defs/Expr"
+        },
+        "right": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "left",
+        "right"
+      ],
+      "title": "Ge",
+      "type": "object"
+    },
+    "Grid": {
+      "additionalProperties": false,
+      "description": "Children placed left to right, then top to bottom, `columns` to a row.",
+      "properties": {
+        "kind": {
+          "const": "grid",
+          "title": "Kind",
+          "type": "string"
+        },
+        "columns": {
+          "maximum": 12,
+          "minimum": 1,
+          "title": "Columns",
+          "type": "integer"
+        },
+        "row_spacing": {
+          "$ref": "#/$defs/Spacing",
+          "default": 8
+        },
+        "column_spacing": {
+          "$ref": "#/$defs/Spacing",
+          "default": 8
+        },
+        "children": {
+          "$ref": "#/$defs/Children",
+          "default": []
+        }
+      },
+      "required": [
+        "kind",
+        "columns"
+      ],
+      "title": "Grid",
+      "type": "object"
+    },
+    "Gt": {
+      "additionalProperties": false,
+      "description": "`left > right`, for two numbers. Type `bool`.",
+      "properties": {
+        "kind": {
+          "const": "gt",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "$ref": "#/$defs/Expr"
+        },
+        "right": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "left",
+        "right"
+      ],
+      "title": "Gt",
+      "type": "object"
+    },
+    "Handler": {
+      "discriminator": {
+        "mapping": {
+          "agent": "#/$defs/AgentHandler",
+          "sandbox": "#/$defs/SandboxHandler",
+          "set": "#/$defs/SetHandler"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SetHandler"
+        },
+        {
+          "$ref": "#/$defs/SandboxHandler"
+        },
+        {
+          "$ref": "#/$defs/AgentHandler"
+        }
+      ]
+    },
+    "Heading": {
+      "additionalProperties": false,
+      "description": "Like a label, larger. `level` 1 is the largest.",
+      "properties": {
+        "kind": {
+          "const": "heading",
+          "title": "Kind",
+          "type": "string"
+        },
+        "level": {
+          "default": 1,
+          "maximum": 3,
+          "minimum": 1,
+          "title": "Level",
+          "type": "integer"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "maxLength": 1000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text"
+        },
+        "bind": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bind"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Heading",
+      "type": "object"
+    },
+    "If": {
+      "additionalProperties": false,
+      "description": "`then` when `condition` is true, else `otherwise`.\n\nThe branches have the same type, or are both numbers (then the result is `float` if either\nis). Only the chosen branch is meaningful, but both are always type-checked.",
+      "properties": {
+        "kind": {
+          "const": "if",
+          "title": "Kind",
+          "type": "string"
+        },
+        "condition": {
+          "$ref": "#/$defs/Expr"
+        },
+        "then": {
+          "$ref": "#/$defs/Expr"
+        },
+        "otherwise": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "condition",
+        "then",
+        "otherwise"
+      ],
+      "title": "If",
+      "type": "object"
+    },
+    "Image": {
+      "additionalProperties": false,
+      "description": "The image an `image` entry refers to (nothing while the entry is empty).",
+      "properties": {
+        "kind": {
+          "const": "image",
+          "title": "Kind",
+          "type": "string"
+        },
+        "bind": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Bind",
+          "type": "string"
+        },
+        "alt": {
+          "default": "",
+          "maxLength": 200,
+          "title": "Alt",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "bind"
+      ],
+      "title": "Image",
+      "type": "object"
+    },
+    "ImageRef": {
+      "additionalProperties": false,
+      "description": "A PNG, JPEG or WebP image in the task's workspace.",
+      "properties": {
+        "path": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "ImageRef",
+      "type": "object"
+    },
+    "ImageState": {
+      "additionalProperties": false,
+      "description": "A reference to a PNG, JPEG or WebP image in the workspace, or none yet.",
+      "properties": {
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "image",
+          "title": "Kind",
+          "type": "string"
+        },
+        "default": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "key",
+        "kind"
+      ],
+      "title": "ImageState",
+      "type": "object"
+    },
+    "IntLit": {
+      "additionalProperties": false,
+      "description": "An integer within +-(2**53 - 1). Type `int`; `5.0` is not an integer here.",
+      "properties": {
+        "kind": {
+          "const": "int",
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "title": "Value",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ],
+      "title": "IntLit",
+      "type": "object"
+    },
+    "IntState": {
+      "additionalProperties": false,
+      "description": "A whole number, optionally bounded. A slider or spin button needs both bounds.",
+      "properties": {
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "int",
+          "title": "Kind",
+          "type": "string"
+        },
+        "default": {
+          "type": "integer",
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "title": "Default"
+        },
+        "minimum": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Minimum"
+        },
+        "maximum": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Maximum"
+        },
+        "step": {
+          "default": 1,
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "title": "Step",
+          "type": "integer"
+        },
+        "computed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Expr"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "key",
+        "kind",
+        "default"
+      ],
+      "title": "IntState",
+      "type": "object"
+    },
+    "JsonState": {
+      "additionalProperties": false,
+      "description": "Any JSON value, for data that has no better type (and for composition ports).",
+      "properties": {
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "json",
+          "title": "Kind",
+          "type": "string"
+        },
+        "default": {
+          "$ref": "#/$defs/JsonValue",
+          "default": null
+        }
+      },
+      "required": [
+        "key",
+        "kind"
+      ],
+      "title": "JsonState",
+      "type": "object"
+    },
+    "JsonValue": {},
+    "Label": {
+      "additionalProperties": false,
+      "description": "Plain text: static `text`, or the value of a `string` or `enum` entry (`bind`).",
+      "properties": {
+        "kind": {
+          "const": "label",
+          "title": "Kind",
+          "type": "string"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "maxLength": 1000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text"
+        },
+        "bind": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bind"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Label",
+      "type": "object"
+    },
+    "Le": {
+      "additionalProperties": false,
+      "description": "`left <= right`, for two numbers. Type `bool`.",
+      "properties": {
+        "kind": {
+          "const": "le",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "$ref": "#/$defs/Expr"
+        },
+        "right": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "left",
+        "right"
+      ],
+      "title": "Le",
+      "type": "object"
+    },
+    "ListItem": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "maximum": 9007199254740991,
+          "minimum": -9007199254740991,
+          "type": "integer"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "maxLength": 1000,
+          "type": "string"
+        }
+      ]
+    },
+    "ListState": {
+      "additionalProperties": false,
+      "description": "A list of scalars of one type.",
+      "properties": {
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "list",
+          "title": "Kind",
+          "type": "string"
+        },
+        "item_type": {
+          "$ref": "#/$defs/ScalarType"
+        },
+        "max_items": {
+          "default": 100,
+          "maximum": 1000,
+          "minimum": 1,
+          "title": "Max Items",
+          "type": "integer"
+        },
+        "default": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ListItem"
+          },
+          "default": [],
+          "title": "Default"
+        }
+      },
+      "required": [
+        "key",
+        "kind",
+        "item_type"
+      ],
+      "title": "ListState",
+      "type": "object"
+    },
+    "Lt": {
+      "additionalProperties": false,
+      "description": "`left < right`, for two numbers. Type `bool`.",
+      "properties": {
+        "kind": {
+          "const": "lt",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "$ref": "#/$defs/Expr"
+        },
+        "right": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "left",
+        "right"
+      ],
+      "title": "Lt",
+      "type": "object"
+    },
+    "Max": {
+      "additionalProperties": false,
+      "description": "The largest of 2 to `MAX_EXPR_ARGS` numbers: `int` if all are, else `float`.",
+      "properties": {
+        "kind": {
+          "const": "max",
+          "title": "Kind",
+          "type": "string"
+        },
+        "args": {
+          "$ref": "#/$defs/Args"
+        }
+      },
+      "required": [
+        "kind",
+        "args"
+      ],
+      "title": "Max",
+      "type": "object"
+    },
+    "Min": {
+      "additionalProperties": false,
+      "description": "The smallest of 2 to `MAX_EXPR_ARGS` numbers: `int` if all are, else `float`.",
+      "properties": {
+        "kind": {
+          "const": "min",
+          "title": "Kind",
+          "type": "string"
+        },
+        "args": {
+          "$ref": "#/$defs/Args"
+        }
+      },
+      "required": [
+        "kind",
+        "args"
+      ],
+      "title": "Min",
+      "type": "object"
+    },
+    "Mul": {
+      "additionalProperties": false,
+      "description": "`left * right`: `int` if both are, else `float`.",
+      "properties": {
+        "kind": {
+          "const": "mul",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "$ref": "#/$defs/Expr"
+        },
+        "right": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "left",
+        "right"
+      ],
+      "title": "Mul",
+      "type": "object"
+    },
+    "Ne": {
+      "additionalProperties": false,
+      "description": "`left != right`, for two numbers, two strings or two bools. Type `bool`.",
+      "properties": {
+        "kind": {
+          "const": "ne",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "$ref": "#/$defs/Expr"
+        },
+        "right": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "left",
+        "right"
+      ],
+      "title": "Ne",
+      "type": "object"
+    },
+    "Not": {
+      "additionalProperties": false,
+      "description": "The opposite of a bool. Type `bool`.",
+      "properties": {
+        "kind": {
+          "const": "not",
+          "title": "Kind",
+          "type": "string"
+        },
+        "operand": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "operand"
+      ],
+      "title": "Not",
+      "type": "object"
+    },
+    "Or": {
+      "additionalProperties": false,
+      "description": "True when any of 2 to `MAX_EXPR_ARGS` bools is. Type `bool`.",
+      "properties": {
+        "kind": {
+          "const": "or",
+          "title": "Kind",
+          "type": "string"
+        },
+        "args": {
+          "$ref": "#/$defs/Args"
+        }
+      },
+      "required": [
+        "kind",
+        "args"
+      ],
+      "title": "Or",
+      "type": "object"
+    },
+    "Orientation": {
+      "enum": [
+        "vertical",
+        "horizontal"
+      ],
+      "type": "string"
+    },
+    "Progress": {
+      "additionalProperties": false,
+      "description": "A bar showing an `int` or `float` entry between its `minimum` and `maximum`.",
+      "properties": {
+        "kind": {
+          "const": "progress",
+          "title": "Kind",
+          "type": "string"
+        },
+        "bind": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Bind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "bind"
+      ],
+      "title": "Progress",
+      "type": "object"
+    },
+    "Ref": {
+      "additionalProperties": false,
+      "description": "The current value of a state entry. Type: that of the entry (an enum is a `string`).",
+      "properties": {
+        "kind": {
+          "const": "ref",
+          "title": "Kind",
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "key"
+      ],
+      "title": "Ref",
+      "type": "object"
+    },
+    "Round": {
+      "additionalProperties": false,
+      "description": "A number rounded to the nearest whole number, as an `int`. Always `int`.",
+      "properties": {
+        "kind": {
+          "const": "round",
+          "title": "Kind",
+          "type": "string"
+        },
+        "operand": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "operand"
+      ],
+      "title": "Round",
+      "type": "object"
+    },
+    "SandboxHandler": {
+      "additionalProperties": false,
+      "description": "Call a function of one of the tool's code modules in a sandbox.",
+      "properties": {
+        "kind": {
+          "const": "sandbox",
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Name",
+          "type": "string"
+        },
+        "module": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Module",
+          "type": "string"
+        },
+        "function": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Function",
+          "type": "string"
+        },
+        "inputs": {
+          "default": [],
+          "items": {
+            "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Inputs",
+          "type": "array"
+        },
+        "outputs": {
+          "items": {
+            "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Outputs",
+          "type": "array"
+        },
+        "debounce_ms": {
+          "default": 0,
+          "maximum": 10000,
+          "minimum": 0,
+          "title": "Debounce Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "name",
+        "module",
+        "function",
+        "outputs"
+      ],
+      "title": "SandboxHandler",
+      "type": "object"
+    },
+    "ScalarType": {
+      "enum": [
+        "bool",
+        "int",
+        "float",
+        "string"
+      ],
+      "type": "string"
+    },
+    "Separator": {
+      "additionalProperties": false,
+      "description": "A line between sections.",
+      "properties": {
+        "kind": {
+          "const": "separator",
+          "title": "Kind",
+          "type": "string"
+        },
+        "orientation": {
+          "$ref": "#/$defs/Orientation",
+          "default": "horizontal"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Separator",
+      "type": "object"
+    },
+    "SetAssignment": {
+      "additionalProperties": false,
+      "description": "`target` becomes the value of `value`.",
+      "properties": {
+        "target": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Target",
+          "type": "string"
+        },
+        "value": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "target",
+        "value"
+      ],
+      "title": "SetAssignment",
+      "type": "object"
+    },
+    "SetHandler": {
+      "additionalProperties": false,
+      "description": "Assign expression results to state entries.",
+      "properties": {
+        "kind": {
+          "const": "set",
+          "title": "Kind",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Name",
+          "type": "string"
+        },
+        "assignments": {
+          "items": {
+            "$ref": "#/$defs/SetAssignment"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Assignments",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "name",
+        "assignments"
+      ],
+      "title": "SetHandler",
+      "type": "object"
+    },
+    "Slider": {
+      "additionalProperties": false,
+      "description": "A slider, two-way bound to an `int` or `float` entry that has both bounds.",
+      "properties": {
+        "kind": {
+          "const": "slider",
+          "title": "Kind",
+          "type": "string"
+        },
+        "bind": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Bind",
+          "type": "string"
+        },
+        "on_change": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "On Change"
+        }
+      },
+      "required": [
+        "kind",
+        "bind"
+      ],
+      "title": "Slider",
+      "type": "object"
+    },
+    "Spacing": {
+      "maximum": 64,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "Spin": {
+      "additionalProperties": false,
+      "description": "A spin button, two-way bound to an `int` or `float` entry that has both bounds.",
+      "properties": {
+        "kind": {
+          "const": "spin",
+          "title": "Kind",
+          "type": "string"
+        },
+        "bind": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Bind",
+          "type": "string"
+        },
+        "on_change": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "On Change"
+        }
+      },
+      "required": [
+        "kind",
+        "bind"
+      ],
+      "title": "Spin",
+      "type": "object"
+    },
+    "StateDecl": {
+      "discriminator": {
+        "mapping": {
+          "bool": "#/$defs/BoolState",
+          "enum": "#/$defs/EnumState",
+          "file": "#/$defs/FileState",
+          "float": "#/$defs/FloatState",
+          "image": "#/$defs/ImageState",
+          "int": "#/$defs/IntState",
+          "json": "#/$defs/JsonState",
+          "list": "#/$defs/ListState",
+          "string": "#/$defs/StringState",
+          "table": "#/$defs/TableState"
+        },
+        "propertyName": "kind"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/BoolState"
+        },
+        {
+          "$ref": "#/$defs/IntState"
+        },
+        {
+          "$ref": "#/$defs/FloatState"
+        },
+        {
+          "$ref": "#/$defs/StringState"
+        },
+        {
+          "$ref": "#/$defs/EnumState"
+        },
+        {
+          "$ref": "#/$defs/ImageState"
+        },
+        {
+          "$ref": "#/$defs/FileState"
+        },
+        {
+          "$ref": "#/$defs/TableState"
+        },
+        {
+          "$ref": "#/$defs/ListState"
+        },
+        {
+          "$ref": "#/$defs/JsonState"
+        }
+      ]
+    },
+    "StrLit": {
+      "additionalProperties": false,
+      "description": "Authored text (block rules: no control characters but newline and tab). Type `string`.",
+      "properties": {
+        "kind": {
+          "const": "string",
+          "title": "Kind",
+          "type": "string"
+        },
+        "value": {
+          "maxLength": 1000,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "value"
+      ],
+      "title": "StrLit",
+      "type": "object"
+    },
+    "StringState": {
+      "additionalProperties": false,
+      "description": "Text of at most `max_length` characters. Whatever the user types is stored as is.",
+      "properties": {
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "string",
+          "title": "Kind",
+          "type": "string"
+        },
+        "default": {
+          "type": "string",
+          "maxLength": 65536,
+          "title": "Default"
+        },
+        "max_length": {
+          "default": 1000,
+          "maximum": 65536,
+          "minimum": 1,
+          "title": "Max Length",
+          "type": "integer"
+        },
+        "computed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Expr"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "key",
+        "kind",
+        "default"
+      ],
+      "title": "StringState",
+      "type": "object"
+    },
+    "Sub": {
+      "additionalProperties": false,
+      "description": "`left - right`: `int` if both are, else `float`.",
+      "properties": {
+        "kind": {
+          "const": "sub",
+          "title": "Kind",
+          "type": "string"
+        },
+        "left": {
+          "$ref": "#/$defs/Expr"
+        },
+        "right": {
+          "$ref": "#/$defs/Expr"
+        }
+      },
+      "required": [
+        "kind",
+        "left",
+        "right"
+      ],
+      "title": "Sub",
+      "type": "object"
+    },
+    "Switch": {
+      "additionalProperties": false,
+      "description": "An on/off switch, two-way bound to a `bool` entry.",
+      "properties": {
+        "kind": {
+          "const": "switch",
+          "title": "Kind",
+          "type": "string"
+        },
+        "bind": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Bind",
+          "type": "string"
+        },
+        "on_change": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "On Change"
+        }
+      },
+      "required": [
+        "kind",
+        "bind"
+      ],
+      "title": "Switch",
+      "type": "object"
+    },
+    "TabPage": {
+      "additionalProperties": false,
+      "description": "One page of `tabs`: not a component itself.",
+      "properties": {
+        "title": {
+          "maxLength": 200,
+          "title": "Title",
+          "type": "string"
+        },
+        "content": {
+          "$ref": "#/$defs/Component"
+        }
+      },
+      "required": [
+        "title",
+        "content"
+      ],
+      "title": "TabPage",
+      "type": "object"
+    },
+    "Table": {
+      "additionalProperties": false,
+      "description": "Typed columns and rows of cells. A table value carries its own columns.\n\nA state declaration of kind `table` bounds the value (`max_rows`) but does not fix its\ncolumns, because a CSV viewer cannot know the headers of a file it has not read. Every row\nhas one cell per column, of that column's type; an `int` is accepted in a `float` column.\nRows are bounded by `MAX_TABLE_ROWS` and, with the columns, by `MAX_TABLE_CELLS`.",
+      "properties": {
+        "columns": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TableColumn"
+          },
+          "maxItems": 32,
+          "title": "Columns",
+          "type": "array"
+        },
+        "rows": {
+          "default": [],
+          "items": {
+            "items": {
+              "$ref": "#/$defs/CellValue"
+            },
+            "type": "array"
+          },
+          "maxItems": 10000,
+          "title": "Rows",
+          "type": "array"
+        }
+      },
+      "title": "Table",
+      "type": "object"
+    },
+    "TableColumn": {
+      "additionalProperties": false,
+      "description": "One typed column. The name is the header the renderer shows.",
+      "properties": {
+        "name": {
+          "maxLength": 1000,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/ColumnType"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "title": "TableColumn",
+      "type": "object"
+    },
+    "TableState": {
+      "additionalProperties": false,
+      "description": "Rows and columns. The value carries its own typed columns; this bounds the row count.",
+      "properties": {
+        "key": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Key",
+          "type": "string"
+        },
+        "kind": {
+          "const": "table",
+          "title": "Kind",
+          "type": "string"
+        },
+        "max_rows": {
+          "default": 1000,
+          "maximum": 10000,
+          "minimum": 1,
+          "title": "Max Rows",
+          "type": "integer"
+        },
+        "default": {
+          "$ref": "#/$defs/Table"
+        }
+      },
+      "required": [
+        "key",
+        "kind"
+      ],
+      "title": "TableState",
+      "type": "object"
+    },
+    "TableView": {
+      "additionalProperties": false,
+      "description": "The rows and typed columns of a `table` entry.",
+      "properties": {
+        "kind": {
+          "const": "table",
+          "title": "Kind",
+          "type": "string"
+        },
+        "bind": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Bind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "bind"
+      ],
+      "title": "TableView",
+      "type": "object"
+    },
+    "Tabs": {
+      "additionalProperties": false,
+      "description": "Pages, one visible at a time, with their titles as tabs.",
+      "properties": {
+        "kind": {
+          "const": "tabs",
+          "title": "Kind",
+          "type": "string"
+        },
+        "pages": {
+          "items": {
+            "$ref": "#/$defs/TabPage"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "title": "Pages",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "pages"
+      ],
+      "title": "Tabs",
+      "type": "object"
+    },
+    "TextView": {
+      "additionalProperties": false,
+      "description": "Multi-line text bound to a `string` entry; two-way when `editable`, else read-only.",
+      "properties": {
+        "kind": {
+          "const": "text_view",
+          "title": "Kind",
+          "type": "string"
+        },
+        "bind": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "Bind",
+          "type": "string"
+        },
+        "editable": {
+          "default": false,
+          "title": "Editable",
+          "type": "boolean"
+        },
+        "monospace": {
+          "default": false,
+          "title": "Monospace",
+          "type": "boolean"
+        },
+        "on_change": {
+          "anyOf": [
+            {
+              "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "On Change"
+        }
+      },
+      "required": [
+        "kind",
+        "bind"
+      ],
+      "title": "TextView",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A complete UI spec. Build it with `parse_ui_spec` (JSON text) or `validate_ui_spec`.",
+  "properties": {
+    "version": {
+      "const": "tumbleweed.ui/1",
+      "title": "Version",
+      "type": "string"
+    },
+    "title": {
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+    },
+    "state": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/StateDecl"
+      },
+      "maxItems": 128,
+      "title": "State",
+      "type": "array"
+    },
+    "root": {
+      "$ref": "#/$defs/Component"
+    },
+    "handlers": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Handler"
+      },
+      "maxItems": 64,
+      "title": "Handlers",
+      "type": "array"
+    }
+  },
+  "required": [
+    "version",
+    "title",
+    "root"
+  ],
+  "title": "tumbleweed.ui/1",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tumbleweed:ui-spec:v1"
+}

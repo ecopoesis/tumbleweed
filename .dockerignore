@@ -14,6 +14,7 @@
 !tests/
 !scripts/
 !docs/
+!schemas/
 
 # Read by tests/test_docker_context.py, which checks this very file inside the container too.
 !.gitignore
