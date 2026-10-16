@@ -173,3 +173,9 @@ name = "core never imports gi (ARCHITECTURE section 10)"
 type = "forbidden"
 source_modules = ["tumbleweed.core"]
 forbidden_modules = ["gi"]
+
+[[tool.importlinter.contracts]]
+name = "ui.spec never imports gi (ARCHITECTURE section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.ui.spec"]
+forbidden_modules = ["gi"]
