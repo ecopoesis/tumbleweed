@@ -7,11 +7,12 @@ import os
 import pickle
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, final
 
 import pytest
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
+from tumbleweed.core import types
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.ids import TaskId, ToolId
 from tumbleweed.core.types import (
@@ -20,6 +21,7 @@ from tumbleweed.core.types import (
     ContentHash,
     JsonValue,
     ModelName,
+    PatternStr,
     ProviderRequestId,
     ToolVersion,
     WorkspaceRelPath,
@@ -857,3 +859,25 @@ class TestHugeNumbersThroughPydantic:
             with pytest.raises(ValidationError) as raised:
                 attempt()
             assert len(str(raised.value)) < 600
+
+
+class TestPatternStrIsPublic:
+    """Other packages build their own validated names on it (the UI spec's state keys)."""
+
+    def test_a_name_type_outside_core_validates_like_the_ones_in_core(self) -> None:
+        @final
+        class Slug(PatternStr, pattern=r"[a-z]+", expects="lowercase letters"):
+            __slots__ = ()
+
+        assert Slug("abc") == "abc"
+        with pytest.raises(InvalidValueError, match="invalid Slug: expected lowercase letters"):
+            Slug("ABC")
+        with pytest.raises(TypeError, match="cannot subclass Slug: it is final"):
+            type("Forged", (Slug,), {"__slots__": ()}, pattern=".*", expects="anything")
+        assert type(TypeAdapter(Slug).validate_json('"abc"')) is Slug
+        assert not hasattr(Slug("a"), "__dict__")
+
+    def test_it_is_the_class_core_uses_for_its_own_names(self) -> None:
+        assert issubclass(ContentHash, PatternStr)
+        assert issubclass(ModelName, PatternStr)
+        assert "PatternStr" in types.__all__

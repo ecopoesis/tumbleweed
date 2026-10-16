@@ -143,6 +143,13 @@ class _PatternStr(str):
         )
 
 
+# The public name of `_PatternStr`, for packages that define validated names of their own (the
+# UI spec's state keys and handler names): `class X(PatternStr, pattern=..., expects=...)`, then
+# `@final` and `__slots__ = ()` like the classes below. `_BoundedInt` has no public name because
+# nothing outside core needs a bounded int yet.
+PatternStr = _PatternStr
+
+
 @final
 class ByteCount(_BoundedInt, minimum=0):
     """A number of bytes: never negative."""
@@ -363,6 +370,7 @@ __all__ = [
     "ContentHash",
     "JsonValue",
     "ModelName",
+    "PatternStr",
     "ProviderRequestId",
     "ToolVersion",
     "WorkspaceRelPath",
