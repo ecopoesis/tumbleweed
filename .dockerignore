@@ -1,15 +1,23 @@
-# Keep the build context small and the image independent of the host's state: the macOS .venv
-# in particular must never reach a Linux image.
-.git
-.venv
-.worktrees
-.omc
-.claude
-.mypy_cache
-.ruff_cache
-.pytest_cache
-.coverage
-coverage.xml
-htmlcov
+# The Docker build context is an ALLOWLIST: everything is excluded, then only what the image
+# needs is let back in. A denylist would send any new secret file (an API key in the repo root,
+# say) into an image layer, where it stays; tests/test_docker_context.py checks that every
+# pattern in the "Secrets" section of .gitignore stays out.
+*
+
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
+!src/
+!tests/
+!scripts/
+!docs/
+
+# Allowed directories can still hold things that must not ship (the host's caches, a key file
+# somebody dropped into src/).
 **/__pycache__
-docs
+**/*.py[cod]
+**/.anthropic-key
+**/*.key
+**/*.pem
+**/.env*

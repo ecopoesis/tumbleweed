@@ -19,6 +19,8 @@ result-*
 # Secrets (never commit)
 .anthropic-key
 *.key
+*.pem
+.env*
 
 # Local tooling / orchestration state
 .omc/
