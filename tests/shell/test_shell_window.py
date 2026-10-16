@@ -109,9 +109,7 @@ class TestTheWindowBuilds:
     def test_the_voice_indicator_starts_idle(self, echo_shell: Shell) -> None:
         assert echo_shell.window.status_strip.voice.text == "Voice: idle"
 
-    def test_activating_the_application_makes_one_window_and_reuses_it(
-        self, build_shell: ShellBuilder
-    ) -> None:
+    def test_activating_the_application_makes_one_window_and_reuses_it(self) -> None:
         from tumbleweed.agent.echo import EchoResponder
         from tumbleweed.shell._gi import Gio
         from tumbleweed.shell.app import ShellApplication
