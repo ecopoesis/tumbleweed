@@ -1,0 +1,92 @@
+{
+  "version": "tumbleweed.ui/1",
+  "title": "Photo adjuster",
+  "state": [
+    {"kind": "string", "key": "photo_path", "default": "", "max_length": 1024},
+    {"kind": "int", "key": "brightness", "default": 0, "minimum": -100, "maximum": 100},
+    {"kind": "int", "key": "contrast", "default": 0, "minimum": -100, "maximum": 100},
+    {"kind": "bool", "key": "grayscale", "default": false},
+    {"kind": "image", "key": "result"},
+    {
+      "kind": "string",
+      "key": "status",
+      "default": "Enter the path of a photo, then press Adjust.",
+      "max_length": 200
+    },
+    {
+      "kind": "string",
+      "key": "summary",
+      "default": "",
+      "computed": {
+        "kind": "concat",
+        "args": [
+          {"kind": "string", "value": "Brightness "},
+          {"kind": "format_number", "operand": {"kind": "ref", "key": "brightness"}},
+          {"kind": "string", "value": ", contrast "},
+          {"kind": "format_number", "operand": {"kind": "ref", "key": "contrast"}},
+          {
+            "kind": "if",
+            "condition": {"kind": "ref", "key": "grayscale"},
+            "then": {"kind": "string", "value": ", grayscale"},
+            "otherwise": {"kind": "string", "value": ""}
+          }
+        ]
+      }
+    }
+  ],
+  "root": {
+    "kind": "box",
+    "children": [
+      {"kind": "heading", "text": "Photo adjuster"},
+      {
+        "kind": "entry",
+        "bind": "photo_path",
+        "placeholder": "Path of a photo",
+        "on_activate": "adjust"
+      },
+      {"kind": "image", "bind": "result", "alt": "The adjusted photo"},
+      {
+        "kind": "grid",
+        "columns": 2,
+        "children": [
+          {"kind": "label", "text": "Brightness"},
+          {"kind": "slider", "bind": "brightness", "on_change": "adjust"},
+          {"kind": "label", "text": "Contrast"},
+          {"kind": "slider", "bind": "contrast", "on_change": "adjust"},
+          {"kind": "label", "text": "Grayscale"},
+          {"kind": "switch", "bind": "grayscale", "on_change": "adjust"}
+        ]
+      },
+      {"kind": "label", "bind": "summary"},
+      {
+        "kind": "box",
+        "orientation": "horizontal",
+        "children": [
+          {"kind": "button", "label": "Adjust", "on_click": "adjust"},
+          {"kind": "button", "label": "Reset", "on_click": "reset"}
+        ]
+      },
+      {"kind": "label", "bind": "status"}
+    ]
+  },
+  "handlers": [
+    {
+      "kind": "sandbox",
+      "name": "adjust",
+      "module": "photo",
+      "function": "adjust",
+      "inputs": ["photo_path", "brightness", "contrast", "grayscale"],
+      "outputs": ["result", "status"],
+      "debounce_ms": 250
+    },
+    {
+      "kind": "set",
+      "name": "reset",
+      "assignments": [
+        {"target": "brightness", "value": {"kind": "int", "value": 0}},
+        {"target": "contrast", "value": {"kind": "int", "value": 0}},
+        {"target": "grayscale", "value": {"kind": "bool", "value": false}}
+      ]
+    }
+  ]
+}
