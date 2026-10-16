@@ -134,3 +134,23 @@ Events must arrive on the thread that sent the message; the sink raises `WrongTh
 another one. In the worker-thread fallback of D2 the shell injects a main-thread dispatcher built
 on `GLib.idle_add` and the agent calls it; the agent never imports `gi`.
 
+## D10 — Grapheme clusters are found with `regex`'s UAX 29 segmenter (2026-10-16, accepted)
+
+**Context.** Text that passes every size cap can still wreck the shell's layout: one grapheme
+cluster of thousands of code points (jamo, a ZWJ chain, a conjunct chain) is one unbreakable glyph
+run, and Pango never breaks inside a cluster. The display transform (`tumbleweed.shell.viewmodel.display`)
+has to know where clusters are to cap them. Tables of ours for the Extend, SpacingMark, Prepend,
+Hangul and Indic conjunct (GB9c) rules were tried first and were wrong in the ways the reviews
+found: non-mark Extend characters (U+FF9E, ZWNJ), Hangul syllable sequences, conjunct chains.
+**Decision.** Use `regex` (`\X`, upstream's Unicode data) as a real UAX 29 segmenter. It is a new
+runtime dependency, and `types-regex` a dev one for `mypy --strict`. It is a C extension with
+wheels for every platform the lock covers (macOS arm64, Linux x86_64 and aarch64, Python 3.12 to
+3.14), segments 64 KiB in about 6 ms, and the standard library has nothing equivalent. The
+transform keeps a cap of its own that does not depend on the segmenter (a break every 256 code
+points), so a segmenter that differs from Pango's, or a bug in it, cannot make layout unbounded; it
+only makes the cluster cap less exact. The segmenter never sees anything but text, and its pattern
+is a constant.
+**Consequences.** One more locked dependency to keep current. The transform is exact for new Unicode
+versions as soon as `regex` is. Break opportunities stay our own small set (the UAX 14 spaces and
+U+200B), because `regex` has no line breaker and an over-inserted U+200B is harmless.
+

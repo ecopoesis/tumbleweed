@@ -71,13 +71,19 @@ Enter sends, Shift+Enter inserts a newline. Ctrl+L focuses the input (and shows 
 is hidden), F9 shows or hides the side panel, Ctrl+Q quits. (Ctrl, also on a Mac.) SIGTERM and Ctrl+C
 in the terminal quit the same way. Text from the chat is shown as plain text, never as markup, and
 very long or hostile text (a 5000-character grapheme cluster, 64 KiB with no spaces) cannot widen the
-window or freeze it: it is shown with zero-width spaces added, so copying from the transcript copies
-those too.
+window or freeze it: it is shown with zero-width spaces added. Ctrl+C and Copy in a message's menu put
+the message's own text on the clipboard, without them; a selection that is only primary (pasted with
+a middle click) or dragged out still has them.
 
 The command takes no arguments but `--help` and `--version`; anything else, a file name included, is
-refused with a one-line error and exit status 2. It does not register on the session bus (a second
-`tumbleweed-shell` is a second shell), so it exports no actions there. Without a display (no
-`WAYLAND_DISPLAY` or `DISPLAY` that works) it says so in one line and exits with status 1.
+refused with a one-line error and exit status 2. The application is non-unique: it claims no
+well-known name on the session bus, and a second `tumbleweed-shell` is a second shell, not a request
+to the first. That does **not** keep it off the bus: GLib still exports the application's and the
+window's actions (`quit`, `focus-input`, `toggle-side-panel`) there, so any process of your user that
+can reach the session bus can activate them. A test starts a private bus and pins that list (#54);
+nothing security-relevant, such as a permission prompt or a grant, is ever to be an action. Without a
+display (no `WAYLAND_DISPLAY` or `DISPLAY` that works) the command says so in one line and exits
+with status 1.
 
 **On macOS** the command works from any shell, with or without the `DYLD_FALLBACK_LIBRARY_PATH` line
 above. Homebrew's libraries are not on dyld's search path, and the variable is read when a process
@@ -125,6 +131,10 @@ environments`), and with a cooldown: `exclude-newer = "7 days"` keeps uv from ch
 younger than a week, because a compromised release is usually noticed within days. The window is
 relative and recorded in the lock (`exclude-newer-span`), so the lock does not go stale as time
 passes. `tests/test_lock.py` checks that nothing in the lock is younger.
+
+The runtime dependencies are `pydantic`, `PyGObject` and `regex` (a UAX 29 grapheme-cluster
+segmenter for the transcript's display transform; DECISIONS D10, with `types-regex` for the type
+checker). A new one needs its justification in the PR and a lock for macOS and Linux.
 
 - To update: `uv lock --upgrade`, which re-resolves with the window as of today.
 - To take a newer release of one package before its week is up (a security fix), add

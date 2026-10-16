@@ -298,9 +298,10 @@ Each invariant names where it is enforced. Reviews check every change against th
   sandbox handler run per tool instance in flight; slider-driven handlers are debounced. In the
   shell: a size cap per transcript message and a cap on their number
   (`tumbleweed.shell.viewmodel.transcript`), and a bound on what a message can cost to lay out:
-  text goes into labels through `tumbleweed.shell.viewmodel.display`, which breaks the grapheme
-  clusters and the unbroken runs that would make a label wider than the window or quadratic to
-  measure, and a long message is shown as a column of small labels.
+  text goes into labels through `tumbleweed.shell.viewmodel.display` (UAX 29 clusters from
+  `regex`, D10), which breaks the grapheme clusters and the unbroken runs that would make a label
+  wider than the window or quadratic to measure, and a long message is shown as a column of small
+  labels.
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input.
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps

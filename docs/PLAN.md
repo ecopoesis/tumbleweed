@@ -228,6 +228,9 @@ tracked chokepoint.
 - On start, restore the last session; a "new session" action starts a fresh one.
   Restoring a session and "new session" respect `MAX_MESSAGES`, the transcript view-model's cap
   of 1000 messages (S02).
+- The shell is non-unique (S02: no well-known name, a second `tumbleweed-shell` is a second
+  shell), so two shells can have the store open at once: handle SQLite concurrency (WAL, busy
+  timeouts), and decide who owns "the last session" to restore.
 - The transcript sent to the model uses an explicit truncation strategy: it keeps the system
   prompt and the most recent turns within a token budget.
 
@@ -411,6 +414,9 @@ and `set` handlers.
   interactions: emitting a signal changes state, and bound widgets update. The tip
   calculator works with no agent round trip.
 - A malformed-node isolation test.
+- (#53) The renderer creates no surface that can cover trusted chrome from a spec: no popovers,
+  dialogs, tooltips, drag icons or other windows. A test renders every golden fixture and a
+  hostile spec and asserts that the shell has no toplevel or popup but its own window.
 
 **Depends on.** S09, S02.
 
@@ -653,6 +659,11 @@ audit.
   - the voice path cannot resolve a prompt;
   - the rate limit holds.
 - End-to-end grant and picker flows with a fake user.
+- (#53) While a prompt is pending, any surface that is not chrome (a popover, a tooltip, a menu, a
+  dialog) is closed or blocked, so nothing from the canvas sits above the prompt.
+- (#54) No prompt, answer, picker result or grant is a GAction: a test against a private session
+  bus (as `tests/shell/test_session_bus.py` does for S02) lists everything the shell exports and
+  asserts none of it is one.
 
 **Depends on.** S17, S12.
 
