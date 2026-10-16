@@ -73,11 +73,21 @@ select = [
     "W",
 ]
 
+[tool.ruff.format]
+# Each fixture line carries its own expected-error marker, so the layout is not ours to change.
+exclude = ["tests/type_safety/fixtures/*.py"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = [
     "D100",
     "D104",
     "S101",  # assert is how tests assert
+]
+"tests/type_safety/fixtures/*.py" = [
+    "E501",    # marker comments make lines long
+    "F841",    # the misuse is the point, not the variables
+    "PTH123",
+    "SIM115",
 ]
 "scripts/**" = ["T20"]
 
@@ -90,8 +100,8 @@ strict = true
 plugins = ["pydantic.mypy"]
 files = ["src", "tests"]
 mypy_path = "src"
-# The negative fixtures contain deliberate type errors; tests/typing runs mypy on them.
-exclude = ["^tests/typing/fixtures/"]
+# The negative fixtures contain deliberate type errors; tests/type_safety runs mypy on them.
+exclude = ["^tests/type_safety/fixtures/"]
 warn_unreachable = true
 # `Any` is banned in our code (CLAUDE.md typing rule 1), also implicitly via missing stubs.
 disallow_any_explicit = true
