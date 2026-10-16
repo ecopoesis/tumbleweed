@@ -352,6 +352,9 @@ graph must be acyclic, and an entry that reads itself is a cycle; `UiSpec.comput
 the order to evaluate in. An expression can read entries of kind `bool`, `int`, `float`, `string`
 and `enum` (which reads as a string), and no others.
 
+An `enum` entry cannot be computed: its value must be one of its options, which an
+expression cannot guarantee before it runs. To derive a choice, compute a `string`.
+
 **Checking a value.** `check_value(declaration, value)` decides whether a value belongs to an
 entry. It is how defaults are checked, and `UiSpec.validate_patch(patch, only=..., current=...)`
 uses it for everything that arrives later, from `patch_state` or from a sandbox: every key must be
@@ -656,7 +659,8 @@ A handler has a `name` and a `kind`.
   the `inputs` as JSON and nothing else. Its result may write only the `outputs`: declared,
   non-computed entries, validated with `validate_patch(result, only=outputs)` before any is
   applied. A `set` handler holds at most <!-- limit: MAX_HANDLER_ITEMS -->16<!-- /limit --> assignments and a `sandbox` handler at most
-  <!-- limit: MAX_HANDLER_ITEMS -->16<!-- /limit --> inputs and <!-- limit: MAX_HANDLER_ITEMS -->16<!-- /limit --> outputs, at least one output. `debounce_ms` (0 to <!-- limit: MAX_DEBOUNCE_MS -->10,000<!-- /limit -->) waits that long after the last event before calling; 0
+  <!-- limit: MAX_HANDLER_ITEMS -->16<!-- /limit --> inputs and <!-- limit: MAX_HANDLER_ITEMS -->16<!-- /limit --> outputs, at least one output (the result is a patch: a call that may write nothing gives
+  the user no feedback, and a handler that only has side effects can write a status entry). `debounce_ms` (0 to <!-- limit: MAX_DEBOUNCE_MS -->10,000<!-- /limit -->) waits that long after the last event before calling; 0
   calls at once in the spec, but S20's runtime applies a minimum debounce floor to a sandbox
   handler driven by `on_change` of a slider or a spin button (I9: slider-driven handlers are
   debounced), and coalesces events that arrive while a call is in flight. At most one call per tool instance runs at a time (I9). The spec holds no code and
