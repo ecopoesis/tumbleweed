@@ -62,11 +62,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The floor and the newest Python the dependencies support. 3.14 waits for PyGObject:
-        # its gi.events uses asyncio.AbstractEventLoopPolicy, deprecated there, and warnings are
-        # errors in our tests. Behaviour that differs between versions (Path.resolve on a symlink
-        # loop or an unsearchable directory) is why more than one version runs.
-        python: ["3.12", "3.13"]
+        # The floor, and every newer Python the dependencies support. Behaviour that differs
+        # between versions (Path.resolve on a symlink loop or an unsearchable directory) is why
+        # more than one version runs. On 3.14 the gtk smoke test fails: PyGObject's gi.events uses
+        # asyncio.AbstractEventLoopPolicy, deprecated there, and warnings are errors in our tests.
+        # This job deselects gtk tests, so that is not exercised here (a developer on 3.14 sees it
+        # locally; .python-version pins 3.12). Revisit when PyGObject fixes it.
+        python: ["3.12", "3.13", "3.14"]
     env:
       # Beats .python-version for every uv command in the job, `uv run` included.
       UV_PYTHON: ${{ matrix.python }}
@@ -74,6 +76,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Full history: tests/test_lock.py dates uv.lock by its last commit, and a shallow
+          # clone would date it by the checkout, which makes the cooldown check vacuous.
+          fetch-depth: 0
 
       # The README's setup, so that its instructions are tested too. PyGObject builds against these.
       - name: Install GTK

@@ -56,7 +56,10 @@ uv run pytest                    # tests runnable on this Mac; others skip with 
 scripts/test-linux               # all of the above in the Linux container
 ```
 
-CI runs the same commands (the macOS job on Python 3.12 and 3.13; the container has 3.12).
+CI runs the same commands (the macOS job on Python 3.12, 3.13 and 3.14; the container has
+3.12). On 3.14 the `gtk` smoke test currently fails, because PyGObject's `gi.events` uses an
+asyncio API that 3.14 deprecates and our tests treat warnings as errors; the macOS job deselects
+`gtk` tests, and `.python-version` pins 3.12.
 `uv run pytest` includes a coverage report.
 
 ### Dependencies
