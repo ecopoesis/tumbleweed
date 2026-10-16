@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Nix
+result
+result-*
+
+# Local tooling / orchestration state
+.omc/
+.worktrees/
+.claude/settings.local.json
+
+# OS
+.DS_Store
