@@ -247,9 +247,16 @@ audited.
   `/etc/shadow`, and similar. A grant is refused if its canonical path **equals, is inside,
   or is an ancestor of** any deny entry. So `~` itself is never grantable. The full list
   lives in the broker policy module (`tumbleweed.broker.deny`) and is tested. Entries are
-  matched by file identity and by case- and Unicode-folded text, never by text alone, so a
-  case variant on a case-insensitive volume (the macOS dev host), a bind mount of a protected
-  directory, or a hard link to a protected file entry such as `~/.netrc` is refused too.
+  matched at decision time by file identity and by case- and Unicode-folded text, never by text
+  alone, so a case variant on a case-insensitive volume (the macOS dev host), a bind mount of a
+  protected directory, or a request for a hard link to a protected file entry such as
+  `~/.netrc` is refused too; a stored grant is re-checked at run time by folded text only (a
+  stored record has no identities along it; #66). Entries under `~/.config`, `~/.local/share`,
+  `~/.local/state` and `~/.cache` are protected where `$XDG_*_HOME` move them as well. The
+  sockets of the user's desktop and shell under `/tmp` (`.X11-unix`, `.ICE-unix`, `tmux-<uid>`,
+  `$TMUX_TMPDIR`) are entries, which makes `/tmp` ungrantable by the ancestor rule, and so is
+  `/var/tmp`: a read-only bind still lets a sandbox `connect()` to a socket. Any directory that
+  is world-writable and sticky is refused as a grant target too.
 - **Path handling.** At decision time the broker canonicalises the path once (absolute,
   `..` and symlinks resolved), checks it against the deny rules, and stores the canonical
   path together with its identity `(statfs f_fsid, st_ino)` (`st_dev` is not stable across
@@ -261,8 +268,10 @@ audited.
   grant therefore refuses the run instead of redirecting it. Two typed records carry this
   (`tumbleweed.broker.paths`): `ResolvedPath`, what a decision learned (the canonical text and
   the identity of each directory on the way and of the target), and `StoredPath`, what a grant
-  keeps (canonical text and the target's identity), which is only ever used by `StoredPath.open`
-  and never resolved again.
+  keeps (canonical text and the target's identity), which is opened by `StoredPath.open` and
+  never resolved again. Opens, at decision time and at run time, can wait as long as the file
+  system takes to answer (a hung network or FUSE mount); the daemon decides on a worker it can
+  abandon (S17).
 - **Network.** `net.full` gives the sandbox its own network namespace connected through
   `slirp4netns --disable-host-loopback` (no host loopback, no host abstract sockets),
   never `--share-net`. The payload is held with bwrap `--block-fd` until the network is
@@ -275,7 +284,9 @@ audited.
   call `start_task(..., fresh_context=true)`). Applying a tool grant to a run counts as issuing it to the task for
   taint purposes; a tool grant that would conflict with the task's taint is withheld from
   that run. Tool grants are applied oldest first, so of two conflicting ones the older applies
-  and the newer is withheld. A task inheriting turns from an fs-tainted task starts fs-tainted (§2):
+  and the newer is withheld: the older is the one the user made first, and the result then does
+  not depend on which request happens to arrive first (S24 shows the user which tool grants a
+  run withheld). A task inheriting turns from an fs-tainted task starts fs-tainted (§2):
   `start_task` passes `fresh_context` to the broker, which copies the ended task's taint to
   the new task unless it is true. The broker's taint state is authoritative. A tool
   package records the taint of the task it was saved from, because its code and defaults

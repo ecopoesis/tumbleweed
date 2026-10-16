@@ -5,8 +5,10 @@ only way to use a place safely is to walk to it one component at a time, never f
 symlink, and to keep the descriptor: what the descriptor refers to cannot change. The walk is
 done in one of two ways, which refuse the same things:
 
-- `COMPONENTWISE`: one `open(name, O_NOFOLLOW | O_DIRECTORY, dir_fd=...)` per directory. Works on
-  every host (macOS included).
+- `COMPONENTWISE`: one `open(name, O_NOFOLLOW | O_DIRECTORY, dir_fd=...)` per directory, with
+  `O_PATH` where there is one (Linux), so that a directory on the way needs search permission
+  only, as for `openat2`. Works on every host (macOS included, where there is no `O_PATH` and a
+  directory on the way must also be readable: a difference of the host, not of the strategy).
 - `OPENAT2` (Linux 5.6 and later, x86_64 and aarch64): one `openat2(2)` for all the directories
   with `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH`, so the kernel refuses any
   symlink on the way. `AUTO`, the default, uses it where the host has it. When the kernel
