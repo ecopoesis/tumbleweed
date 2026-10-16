@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from gi.repository import Graphene
 
-    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.shell._gi import Gio, Gtk
     from tumbleweed.shell.app import ShellApplication
     from tumbleweed.shell.chat_panel import MessageRow
     from tumbleweed.shell.window import ShellWindow
@@ -254,3 +254,26 @@ def bounds(widget: "Gtk.Widget", relative_to: "Gtk.Widget") -> Bounds:
         area.get_x() + area.get_width(),
         area.get_y() + area.get_height(),
     )
+
+
+def clipboard_text(widget: "Gtk.Widget") -> str | None:
+    """What the widget's clipboard holds as text, read through the main loop with a deadline."""
+    from tumbleweed.shell._gi import GLib
+
+    clipboard = widget.get_clipboard()
+    result: list[str | None] = []
+
+    def done(_source: object, outcome: "Gio.AsyncResult") -> None:
+        try:
+            result.append(clipboard.read_text_finish(outcome))
+        except GLib.Error:
+            result.append(None)
+
+    clipboard.read_text_async(None, done)
+    pump_until(lambda: bool(result), timeout=DEADLINE_SECONDS)
+    return result[0] if result else None
+
+
+def set_clipboard_text(widget: "Gtk.Widget", text: str) -> None:
+    widget.get_clipboard().set(text)
+    pump(0.05)

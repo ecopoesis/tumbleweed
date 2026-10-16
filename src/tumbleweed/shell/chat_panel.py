@@ -20,6 +20,7 @@ from tumbleweed.shell.viewmodel.chat import ChatController, describe_error
 from tumbleweed.shell.viewmodel.display import DisplayChunks, display_text
 from tumbleweed.shell.viewmodel.transcript import (
     MessageState,
+    ReplyInFlightError,
     Role,
     Transcript,
     TranscriptMessage,
@@ -90,9 +91,18 @@ class MessageRow(Gtk.Box):
         for index in range(first, len(chunks)):
             if index == len(self.paragraphs):
                 label = plain_label("", wrap=True, selectable=True)
+                # Copying (Ctrl+C and the context menu both emit this) puts the message's own text
+                # on the clipboard, without the zero-width spaces that were added for display.
+                label.connect("copy-clipboard", self._on_copy, index)
                 self.paragraphs.append(label)
                 self._body.append(label)
             self.paragraphs[index].set_text(chunks[index])
+
+    def _on_copy(self, label: Gtk.Label, index: int) -> None:
+        selected, start, end = label.get_selection_bounds()
+        if selected:
+            label.get_clipboard().set(self._chunks.source_text(index, start, end))
+        label.stop_emission_by_name("copy-clipboard")  # the default would copy what is shown
 
     def _show_state(self, message: TranscriptMessage) -> None:
         match message.state:
@@ -231,10 +241,14 @@ class ChatPanel(Gtk.Box):
         sent_before = len(self._transcript.messages)
         try:
             self._controller.send(text)
+        except ReplyInFlightError as exc:
+            # The notice goes with the reply it complains about. The text stays in the input.
+            self._show_notice(describe_error(exc), busy=True)
+            return
         except TumbleweedError as exc:
-            # Our own bounded message (too large, a reply streaming, transcript full). The text
-            # stays in the input so that it can be edited.
-            self._show_notice(describe_error(exc), busy=self._controller.busy)
+            # Our own bounded message (too large, transcript full). It stays until the next send,
+            # whatever a reply does meanwhile; the text stays in the input to be edited.
+            self._show_notice(describe_error(exc))
             return
         except Exception:
             logger.exception("sending a message failed")

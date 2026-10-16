@@ -40,15 +40,20 @@ MAX_ERROR_CHARS: Final = 200
 _UNSAFE_TEXT = re.compile("[\x00\ud800-\udfff]")
 _REPLACEMENT = "\ufffd"
 _NO_REASON = "The reply failed."
-# Validation context that only this module can supply (a private name, so a lint-clean caller cannot
-# import it): the transcript has checked the text of a streaming message delta by delta, and the
-# model need not scan the whole message again for each one. Everyone else, a session restored from
-# disk (S04) included, gets the full checks.
+# Validation context that only this module supplies: the transcript has checked the text of a
+# streaming message delta by delta, and the model need not scan the whole message again for each
+# one. Everyone else, a session restored from disk (S04) included, gets the full checks.
+# `tests/test_validation_context_lint.py` fails the build on any other reference to this name and
+# on any `context=` passed to a model validation without a reviewed `# forgery-ok: <reason>`.
 _TEXT_CHECKED = object()
 
 
 class TranscriptError(TumbleweedError):
     """The transcript cannot do that now: unknown message, wrong state, or no room left."""
+
+
+class ReplyInFlightError(TranscriptError):
+    """A reply is streaming, so no new message is taken until it ends."""
 
 
 class Role(enum.StrEnum):
@@ -194,7 +199,7 @@ class Transcript:
         if not cleaned:
             raise InvalidValueError("message is empty")
         if self._streaming is not None:
-            raise TranscriptError("a reply is still streaming")
+            raise ReplyInFlightError("a reply is still streaming")
         if len(self._messages) + 2 > MAX_MESSAGES:  # one slot is kept for the reply
             raise TranscriptError(f"the transcript is full ({MAX_MESSAGES} messages)")
         return self._add(Role.USER, cleaned, MessageState.COMPLETE)
@@ -202,7 +207,7 @@ class Transcript:
     def begin_assistant(self) -> TranscriptMessage:
         """Open an empty assistant message in the `STREAMING` state and return it."""
         if self._streaming is not None:
-            raise TranscriptError("a reply is already streaming")
+            raise ReplyInFlightError("a reply is already streaming")
         if len(self._messages) >= MAX_MESSAGES:
             raise TranscriptError(f"the transcript is full ({MAX_MESSAGES} messages)")
         self._streaming_bytes = 0
@@ -261,7 +266,7 @@ class Transcript:
         # again, because it is the checked text of `old` plus a delta checked by `append`.
         message = TranscriptMessage.model_validate(
             {"id": old.id, "role": old.role, "text": text, "state": state, "error": error},
-            context=_TEXT_CHECKED,
+            context=_TEXT_CHECKED,  # forgery-ok: the transcript's own checked-text path
         )
         self._messages[self._positions[old.id]] = message
         if state is not MessageState.STREAMING:
@@ -277,6 +282,7 @@ __all__ = [
     "MAX_MESSAGES",
     "MAX_USER_BYTES",
     "MessageState",
+    "ReplyInFlightError",
     "Role",
     "Transcript",
     "TranscriptError",

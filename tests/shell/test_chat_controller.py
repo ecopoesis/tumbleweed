@@ -18,6 +18,7 @@ from tumbleweed.shell.viewmodel.transcript import (
     Role,
     Transcript,
     TranscriptError,
+    TranscriptMessage,
 )
 
 
@@ -551,3 +552,51 @@ def test_every_kind_of_event_has_its_own_effect_on_the_transcript(kind: str) -> 
     message = transcript.messages[1]
     assert (message.text, message.state, message.error) == EXPECTED_AFTER[kind]
     assert controller.busy == (kind == "delta")
+
+
+class TestAbortGuards:
+    def test_abort_stops_the_responder_even_when_failing_the_message_raises(self) -> None:
+        class FailingObserver:
+            def message_added(self, message: TranscriptMessage) -> None:
+                return
+
+            def message_changed(self, message: TranscriptMessage) -> None:
+                if message.state is MessageState.FAILED:
+                    raise RuntimeError("observer bug")
+
+        responder = ManualResponder()
+        transcript, controller = setup(responder)
+        controller.send("q")
+        transcript.subscribe(FailingObserver())
+
+        with pytest.raises(RuntimeError, match="observer bug"):
+            controller.cancel()
+
+        assert responder.handle.cancelled  # the responder was told to stop all the same
+        assert responder.handle.cancel_calls == 1
+
+    def test_abort_leaves_a_message_that_already_ended_alone_and_still_stops_the_responder(
+        self,
+    ) -> None:
+        responder = ManualResponder()
+        transcript, controller = setup(responder)
+        controller.send("q")
+        reply_id = transcript.messages[1].id
+        transcript.fail(reply_id, "ended by someone else")  # not through the sink
+        before = transcript.messages
+
+        controller.cancel()  # must not raise TranscriptError: the message is not streaming
+
+        assert transcript.messages == before
+        assert responder.handle.cancelled
+
+    def test_a_cancel_after_a_refused_delta_raises_nothing_and_cancels_once(self) -> None:
+        responder = ManualResponder()
+        transcript, controller = setup(responder)
+        controller.send("q")
+        responder.sink.emit(ReplyDelta(text="x" * (MAX_ASSISTANT_BYTES + 1)))  # aborts the reply
+
+        controller.cancel()
+
+        assert responder.handle.cancel_calls == 1
+        assert transcript.messages[1].state is MessageState.FAILED

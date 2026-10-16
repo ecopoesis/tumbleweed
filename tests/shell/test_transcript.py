@@ -395,7 +395,7 @@ class TestStreamingCost:
                         "state": MessageState.COMPLETE,
                         "error": None,
                     },
-                    context=context,
+                    context=context,  # forgery-ok: a test of the model's own full checks
                 )
             with pytest.raises(ValidationError):
                 TranscriptMessage.model_validate(
@@ -406,7 +406,7 @@ class TestStreamingCost:
                         "state": MessageState.COMPLETE,
                         "error": None,
                     },
-                    context=context,
+                    context=context,  # forgery-ok: a test of the model's own full checks
                 )
 
 

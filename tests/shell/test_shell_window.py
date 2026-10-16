@@ -16,12 +16,14 @@ from tests.shell.gtk_support import (
     Shell,
     ancestor_of,
     click_send,
+    clipboard_text,
     input_text,
     labels_in,
     press,
     pump,
     pump_until,
     rows,
+    set_clipboard_text,
     show,
     solid,
     type_text,
@@ -33,6 +35,7 @@ from tumbleweed.shell.viewmodel.transcript import MAX_USER_BYTES, MessageState, 
 
 if TYPE_CHECKING:
     from tumbleweed.shell._gi import Gtk
+    from tumbleweed.shell.chat_panel import MessageRow
 
 pytestmark = pytest.mark.gtk
 
@@ -846,7 +849,9 @@ class TestThePanelAndTheTranscript:
 
 
 class TestApplication:
-    def test_the_application_does_not_register_on_the_session_bus(self) -> None:
+    def test_the_application_is_non_unique_so_it_never_claims_the_well_known_name(self) -> None:
+        # Only the flag is checked here. What NON_UNIQUE does and does not keep off the session bus
+        # is checked against a real bus in test_session_bus.py (a flag test passes with no bus).
         from tumbleweed.agent.echo import EchoResponder
         from tumbleweed.shell._gi import Gio
         from tumbleweed.shell.app import ShellApplication
@@ -854,9 +859,6 @@ class TestApplication:
         app = ShellApplication(EchoResponder())
 
         assert app.get_flags() & Gio.ApplicationFlags.NON_UNIQUE
-        app.register(None)
-        assert app.get_dbus_connection() is None  # nothing exported: no app.* or win.* actions
-        assert app.get_dbus_object_path() is None
 
     def test_quit_on_signals_installs_and_removes_its_sources(self, echo_shell: Shell) -> None:
         from tumbleweed.shell._gi import GLib
@@ -873,10 +875,16 @@ class TestApplication:
     def test_run_without_a_display_says_so_in_one_line_and_returns_1(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        from tumbleweed.shell._gi import Gdk
+        from tumbleweed.shell._gi import Gdk, Gio
         from tumbleweed.shell.app import run
 
+        def loop_started(*_: object) -> int:
+            # A regression of the guard would start the real GLib loop and hang: fail instead.
+            raise AssertionError("the main loop was started without a display")
+
         monkeypatch.setattr(Gdk.Display, "get_default", staticmethod(lambda: None))
+        monkeypatch.setattr("tumbleweed.shell.app.ShellApplication.run", loop_started)
+        monkeypatch.setattr(Gio.Application, "run", loop_started)
 
         with caplog.at_level(logging.ERROR):
             status = run()
@@ -921,3 +929,190 @@ class TestGeometry:
         show(echo_shell)
 
         assert echo_shell.window.chat_panel.get_width() == SIDE_PANEL_WIDTH
+
+
+class TestNoticeKinds:
+    def test_a_size_refusal_while_a_reply_streams_survives_the_reply_ending(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        panel = shell.window.chat_panel
+        type_text(shell, "question")
+        click_send(shell)
+        assert shell.window.controller.busy
+        type_text(shell, "x" * (MAX_USER_BYTES + 1))
+
+        click_send(shell)  # refused for its size, while the reply is still streaming
+
+        assert f"over {MAX_USER_BYTES} bytes" in panel.notice.get_text()
+        responder.sink.emit(ReplyFinished())
+        assert panel.notice.get_visible()  # it is not about the reply, so the reply ending keeps it
+        assert f"over {MAX_USER_BYTES} bytes" in panel.notice.get_text()
+
+    def test_the_still_streaming_refusal_is_its_own_kind_of_error(self) -> None:
+        from tumbleweed.shell.viewmodel.transcript import (
+            ReplyInFlightError,
+            Transcript,
+            TranscriptError,
+        )
+
+        transcript = Transcript()
+        transcript.add_user("q")
+        transcript.begin_assistant()
+
+        with pytest.raises(ReplyInFlightError, match="still streaming"):
+            transcript.add_user("again")
+        with pytest.raises(ReplyInFlightError, match="already streaming"):
+            transcript.begin_assistant()
+        assert issubclass(ReplyInFlightError, TranscriptError)
+
+
+class TestDisplayTextOnEveryLabel:
+    def test_a_failure_reason_goes_through_the_display_transform(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        from tumbleweed.shell.viewmodel.display import ZERO_WIDTH_SPACE, display_text
+
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        type_text(shell, "q")
+        click_send(shell)
+        reason = "\u1100" * 150  # one cluster of 150 code points, under the 200-character cap
+
+        responder.sink.emit(ReplyFailed(reason=reason))
+
+        status = shell.window.chat_panel.row_for(shell.window.transcript.messages[1].id).status
+        assert status.get_text() == display_text(reason)
+        assert ZERO_WIDTH_SPACE in status.get_text()
+        assert status.get_text().replace(ZERO_WIDTH_SPACE, "") == reason
+
+    def test_a_notice_goes_through_the_display_transform(
+        self, build_shell: ShellBuilder, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tumbleweed.core.errors import TumbleweedError
+        from tumbleweed.shell.viewmodel.display import ZERO_WIDTH_SPACE, display_text
+
+        shell = build_shell(ManualResponder())
+        message = "\u1100" * 120
+
+        def refuse(text: str) -> None:
+            raise TumbleweedError(message)
+
+        monkeypatch.setattr(shell.window.controller, "send", refuse)
+        type_text(shell, "q")
+
+        click_send(shell)
+
+        notice = shell.window.chat_panel.notice
+        assert notice.get_text() == display_text(message)
+        assert ZERO_WIDTH_SPACE in notice.get_text()
+
+
+class TestCopying:
+    """What the clipboard gets is the message's own text, not the display text."""
+
+    SOURCE = "ab" * 400 + "\u200b" + "cd" * 300  # one added break near 256, 512, 768, ...
+
+    def long_reply(self, build_shell: ShellBuilder, text: str) -> tuple[Shell, "MessageRow"]:
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        show(shell)
+        type_text(shell, "go")
+        click_send(shell)
+        for start in range(0, len(text), 500):
+            responder.sink.emit(ReplyDelta(text=text[start : start + 500]))
+        responder.sink.emit(ReplyFinished())
+        row = shell.window.chat_panel.row_for(shell.window.transcript.messages[1].id)
+        return shell, row
+
+    def test_the_label_shows_added_breaks_that_the_source_does_not_have(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        _shell, row = self.long_reply(build_shell, self.SOURCE)
+
+        assert row.shown_text != self.SOURCE
+        assert row.shown_text.count("\u200b") > self.SOURCE.count("\u200b")  # some were added
+
+    @pytest.mark.parametrize("how", ["ctrl+c", "context menu"])
+    def test_copying_everything_gives_the_source_text_exactly(
+        self, build_shell: ShellBuilder, how: str
+    ) -> None:
+        _shell, row = self.long_reply(build_shell, self.SOURCE)
+        label = row.paragraphs[0]
+        set_clipboard_text(label, "sentinel")
+        label.select_region(0, -1)
+
+        if how == "ctrl+c":
+            label.emit("copy-clipboard")  # what the key binding does
+        else:
+            label.activate_action("clipboard.copy", None)  # what the context menu's Copy does
+        pump(0.1)
+
+        copied = clipboard_text(label)
+        assert copied == self.SOURCE  # the message's own zero-width space is still there
+        assert copied != row.shown_text
+
+    def test_copying_a_part_that_spans_an_added_break_gives_the_source_between_its_ends(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        _shell, row = self.long_reply(build_shell, "ab" * 600)
+        label = row.paragraphs[0]
+        shown = label.get_text()
+        assert "\u200b" in shown[250:270]
+        label.select_region(250, 270)
+
+        label.emit("copy-clipboard")
+        pump(0.1)
+
+        assert clipboard_text(label) == shown[250:270].replace("\u200b", "")
+
+    def test_copying_from_a_later_chunk_counts_from_that_chunk(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        _shell, row = self.long_reply(build_shell, "ab" * 9000)
+        assert len(row.paragraphs) >= 3
+        label = row.paragraphs[2]
+        label.select_region(0, 300)
+
+        label.emit("copy-clipboard")
+        pump(0.1)
+
+        assert clipboard_text(label) == label.get_text()[:300].replace("\u200b", "")
+
+    def test_with_nothing_selected_the_clipboard_is_left_alone(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        _shell, row = self.long_reply(build_shell, self.SOURCE)
+        label = row.paragraphs[0]
+        label.select_region(0, 0)
+        set_clipboard_text(label, "sentinel")
+
+        label.emit("copy-clipboard")
+        pump(0.1)
+
+        assert clipboard_text(label) == "sentinel"
+
+    def test_a_user_message_copies_its_source_too(self, echo_shell: Shell) -> None:
+        show(echo_shell)
+        type_text(echo_shell, "ab" * 500)
+        click_send(echo_shell)
+        row = echo_shell.window.chat_panel.row_for(echo_shell.window.transcript.messages[0].id)
+        label = row.paragraphs[0]
+        label.select_region(0, -1)
+
+        label.emit("copy-clipboard")
+        pump(0.1)
+
+        assert clipboard_text(label) == "ab" * 500
+
+    def test_a_chunk_cut_at_a_line_end_does_not_end_in_an_empty_line(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        text = ("word " * 30 + "\n") * 100  # 15,100 characters of 150-character lines
+        _shell, row = self.long_reply(build_shell, text)
+
+        assert len(row.paragraphs) > 1
+        for label in row.paragraphs[:-1]:
+            assert not label.get_text().endswith("\n")  # that would show as a blank line
+        assert row.shown_text.count("\n") == text.count("\n") - (len(row.paragraphs) - 1)
