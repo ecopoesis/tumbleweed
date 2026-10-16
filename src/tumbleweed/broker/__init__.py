@@ -14,6 +14,7 @@ Pure Python with no daemon, no IPC and no storage (those are S17), and no LLM, a
 ARCHITECTURE section 7 is the contract.
 """
 
+from tumbleweed.broker.capabilities import Capability, CapabilityKind, FsRead, FsWrite, NetFull
 from tumbleweed.broker.deny import (
     HOME_DENY,
     SYSTEM_DENY,
@@ -33,8 +34,20 @@ from tumbleweed.broker.fdio import (
     openat2_available,
     read_capped,
 )
+from tumbleweed.broker.grants import (
+    Grant,
+    GrantOrigin,
+    GrantScope,
+    OnceGrant,
+    RunContext,
+    RunTrigger,
+    TaskGrant,
+    ToolBinding,
+    ToolGrant,
+)
 from tumbleweed.broker.identity import FsIdentity
 from tumbleweed.broker.paths import ResolvedPath, StoredPath
+from tumbleweed.broker.task import TaintKind, TaskState, merged_taint
 from tumbleweed.broker.workspace import open_in_workspace, read_workspace_file
 
 __all__ = [
@@ -42,6 +55,8 @@ __all__ = [
     "MAX_READ_BYTES",
     "SYSTEM_DENY",
     "BrokerError",
+    "Capability",
+    "CapabilityKind",
     "DenyContext",
     "DenyMatch",
     "DenyRelation",
@@ -49,14 +64,29 @@ __all__ = [
     "ExtraDeny",
     "FileKind",
     "FsIdentity",
+    "FsRead",
+    "FsWrite",
+    "Grant",
     "GrantError",
+    "GrantOrigin",
+    "GrantScope",
+    "NetFull",
+    "OnceGrant",
     "OpenStrategy",
     "OpenedPath",
     "PathError",
     "PathFault",
     "ResolvedPath",
+    "RunContext",
+    "RunTrigger",
     "StoredPath",
+    "TaintKind",
+    "TaskGrant",
+    "TaskState",
+    "ToolBinding",
+    "ToolGrant",
     "deny_entries",
+    "merged_taint",
     "open_in_workspace",
     "openat2_available",
     "read_capped",
