@@ -64,6 +64,8 @@ class LimitsPlan:
     @property
     def unenforced(self) -> tuple[LimitKind, ...]:
         missing: list[LimitKind] = []
+        if not (self.scope and self.scope_memory):
+            missing.append(LimitKind.MEMORY_TOTAL)
         if not (self.scope and self.scope_pids):
             missing.append(LimitKind.PIDS)
         if not (self.scope and self.scope_cpu):

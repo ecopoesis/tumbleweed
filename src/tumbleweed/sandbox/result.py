@@ -15,13 +15,16 @@ from tumbleweed.core.types import ByteCount
 
 
 class LimitKind(StrEnum):
-    """The limits that depend on the host. Wall time and output the launcher keeps itself."""
+    """The limits only a cgroup can enforce, so that a host without one may lack them.
 
-    CPU_TIME = "cpu_time"
-    CPU_RATE = "cpu_rate"
-    MEMORY = "memory"
+    The others are always in force: wall time and output by the launcher, CPU time, file size
+    and (per process) address space by rlimits.
+    """
+
+    MEMORY_TOTAL = "memory_total"
+    """Memory of the whole sandbox. Without it each process has its own address-space limit."""
     PIDS = "pids"
-    FILE_SIZE = "file_size"
+    CPU_RATE = "cpu_rate"
 
 
 class LimitsBackend(StrEnum):
@@ -51,9 +54,10 @@ _CONFIG = ConfigDict(strict=True, extra="forbid", frozen=True)
 class LimitsReport(BaseModel):
     """Which mechanism limited the run, and which limits it could not enforce.
 
-    `unenforced` lists a limit that was requested and is not applied on this host (`pids` and
-    `cpu_rate` without a systemd scope), so a caller can refuse to proceed or warn the user.
-    `memory` is enforced either way, but as address space (`RLIMIT_AS`) without a scope.
+    `unenforced` lists a limit that was requested and is not applied on this host (without a
+    systemd scope: `memory_total`, `pids` and `cpu_rate`), so a caller can refuse to proceed or
+    warn the user. Memory is then limited per process, as address space (`RLIMIT_AS`), which a
+    program that starts many processes multiplies.
     """
 
     model_config = _CONFIG

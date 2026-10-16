@@ -110,6 +110,8 @@ def descriptor_number(source: object, what: str) -> int:
         raise InvalidPolicyError(f"{what} is closed: {type(exc).__name__}") from None
     if type(number) is not int or number < 0:
         raise InvalidPolicyError(f"{what}.fileno() did not return a descriptor number")
+    if number < 3:
+        raise InvalidPolicyError(f"{what} is descriptor {number}, a standard stream")
     return number
 
 

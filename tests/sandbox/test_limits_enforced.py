@@ -326,7 +326,11 @@ class TestReport:
         result = run_sandbox(policy(workspace, "/bin/true"))
 
         assert result.limits.backend is LimitsBackend.RLIMIT
-        assert result.limits.unenforced == (LimitKind.PIDS, LimitKind.CPU_RATE)
+        assert result.limits.unenforced == (
+            LimitKind.MEMORY_TOTAL,
+            LimitKind.PIDS,
+            LimitKind.CPU_RATE,
+        )
         assert result.limits.detail == "the systemd scope is switched off"
 
     def test_the_default_runner_reports_what_this_host_can_do(self, workspace: Opened) -> None:
@@ -394,7 +398,7 @@ class TestScopeWrapper:
         result = asyncio.run(runner.run(policy(workspace, "/bin/true")))
 
         assert result.limits.backend is LimitsBackend.SYSTEMD_SCOPE
-        assert result.limits.unenforced == ()
+        assert result.limits.unenforced == (LimitKind.MEMORY_TOTAL,)
         assert any(arg.startswith("--as=") for arg in fake.calls()[1])
 
     def test_the_descriptors_reach_bwrap_through_the_wrapper(

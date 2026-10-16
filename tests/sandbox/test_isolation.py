@@ -680,6 +680,16 @@ class TestConfinement:
                 f"still in the host's {name} namespace"
             )
 
+    def test_the_program_has_a_session_of_its_own_so_it_has_no_terminal_to_inject_into(
+        self, workspace: Opened
+    ) -> None:
+        # Without --new-session the program shares the launcher's session, whose leader is
+        # outside the sandbox's pid namespace, and `getsid` reports 0 for it.
+        seen = report(workspace, payloads.SELF)
+
+        assert seen["sid"] != 0
+        assert seen["sid"] in seen.items("pids")
+
     def test_the_program_is_alone_in_its_own_pid_namespace(self, workspace: Opened) -> None:
         seen = report(workspace, payloads.SELF)
 

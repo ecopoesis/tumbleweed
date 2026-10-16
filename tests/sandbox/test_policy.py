@@ -117,6 +117,15 @@ class TestGrantMount:
         with pytest.raises(InvalidPolicyError, match="closed"):
             GrantMount(source=handle, target=MountPath("/a"), access=GrantAccess.READ)
 
+    @pytest.mark.parametrize("number", [0, 1, 2])
+    def test_a_standard_stream_is_not_a_descriptor_to_mount(self, number: int) -> None:
+        class Stream:
+            def fileno(self) -> int:
+                return number
+
+        with pytest.raises(InvalidPolicyError, match="a standard stream"):
+            GrantMount(source=Stream(), target=MountPath("/a"), access=GrantAccess.READ)
+
     @pytest.mark.parametrize("number", [True, -1, "3", 3.0])
     def test_fileno_must_return_a_descriptor_number(self, number: object) -> None:
         class Odd:

@@ -100,7 +100,11 @@ class TestReport:
         report = LimitsPlan(detail="systemd-run is not installed").report()
 
         assert report.backend is LimitsBackend.RLIMIT
-        assert report.unenforced == (LimitKind.PIDS, LimitKind.CPU_RATE)
+        assert report.unenforced == (
+            LimitKind.MEMORY_TOTAL,
+            LimitKind.PIDS,
+            LimitKind.CPU_RATE,
+        )
         assert report.detail == "systemd-run is not installed"
 
     def test_a_scope_that_lacks_a_controller_reports_that_limit(self) -> None:
@@ -111,7 +115,11 @@ class TestReport:
     def test_the_report_is_what_the_probe_saw_not_what_was_asked(self) -> None:
         plan = LimitsPlan(scope=False, scope_pids=True, scope_memory=True, scope_cpu=True)
 
-        assert plan.unenforced == (LimitKind.PIDS, LimitKind.CPU_RATE)
+        assert plan.unenforced == (
+            LimitKind.MEMORY_TOTAL,
+            LimitKind.PIDS,
+            LimitKind.CPU_RATE,
+        )
         assert plan.address_space
 
 
@@ -184,7 +192,7 @@ class TestProbe:
         plan = asyncio.run(probe_scope(str(fake.path), {}))
 
         assert plan.scope
-        assert plan.unenforced == (LimitKind.CPU_RATE,)
+        assert plan.unenforced == (LimitKind.MEMORY_TOTAL, LimitKind.CPU_RATE)
         assert plan.address_space
 
     def test_a_failing_systemd_run_gives_a_plan_with_the_reason(self, fake: FakeSystemd) -> None:
@@ -281,7 +289,11 @@ class TestRunnerPlan:
 
         assert not plan.scope
         assert plan.detail == "systemd-run is not installed"
-        assert plan.report().unenforced == (LimitKind.PIDS, LimitKind.CPU_RATE)
+        assert plan.report().unenforced == (
+            LimitKind.MEMORY_TOTAL,
+            LimitKind.PIDS,
+            LimitKind.CPU_RATE,
+        )
 
 
 class TestPlatform:

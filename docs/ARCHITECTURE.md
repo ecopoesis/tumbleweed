@@ -140,6 +140,57 @@ concurrently, on that one connection.
   refused. The client checks the server too, so it never talks to a socket another user put at
   the broker's path.
 
+### Sandbox launcher
+
+`tumbleweed.sandbox` (S14) runs one argv list, never a shell, in bubblewrap. The broker builds a
+`SandboxPolicy` and hands it to a `SandboxRunner`; the package imports none of the broker, agent,
+shell, voice or `gi` (section 10).
+
+- **What the program sees.** An empty root, mounted read-only after everything else is in place,
+  with: the runtime (`RuntimeSpec`: an allowlist of read-only mounts, `/usr`, the merged-usr
+  symlinks and the dynamic loader's two files of `/etc` in the container and CI, a store closure on
+  NixOS; nothing from a home directory is accepted); a fresh `/proc` and a minimal read-only `/dev`;
+  size-limited tmpfs mounts at `/tmp` and `/dev/shm`; the task workspace read-write at
+  `/workspace` (the working directory); retained workspaces read-only at `/inputs/<ConnectionId>`;
+  and each grant at its host path. Workspace, inputs and grants are bound by the descriptor the
+  broker opened and verified (`--bind-fd`, `--ro-bind-fd`), never by a path bwrap would resolve
+  again, so a path swapped for a symlink after the check changes nothing. bwrap closes the
+  descriptors before the program runs. A grant may sit inside another (the shallower is mounted
+  first; inside a read-only one the mount point must already exist), may not be, contain or be
+  inside `/proc`, `/dev`, `/sys`, `/workspace` or `/inputs`, may not replace `/tmp`, and may not
+  overlap a runtime path.
+- **Flags.** `--unshare-all --unshare-user --disable-userns --die-with-parent --new-session
+  --clearenv --cap-drop ALL`, plus a hostname of its own. There is no network option until S22:
+  the sandbox's `lo` is its own, and no host interface, host loopback or host abstract socket is
+  there.
+- **Environment.** Empty, plus the variables the policy lists, each of which must be on the
+  policy's allowlist (otherwise the policy is refused, not trimmed). A name that looks like a
+  secret (`key`, `token`, `secret`, `passw`, `credential`, `auth`, `anthropic`) is refused even on
+  the allowlist (I6). bwrap adds `PWD`.
+- **Limits (I9).** Wall time and output are the launcher's: stdout and stderr are read
+  concurrently, each cut at `max_output_bytes`, and exceeding the cap or the wall clock `SIGKILL`s
+  bwrap, which takes the sandbox's PID namespace down with it (`--die-with-parent`). CPU time, file
+  size and core dumps are `prlimit` rlimits (soft equal to hard, so an overrun is an uncatchable
+  `SIGKILL`). Memory, `pids.max` and a CPU quota come from `systemd-run --user --scope` when the
+  host has a systemd user manager whose controllers are delegated. The launcher proves that
+  once, by starting a scope and reading the limits the kernel reports for it; a limit it did not
+  see applied is not counted. Otherwise memory is `RLIMIT_AS` per process, there is no `pids`
+  limit and no CPU quota, and **every result says so** (`LimitsReport.unenforced`, with the reason
+  in `detail`). The container and CI have no user manager, so they run the rlimit path; the scope
+  path is tested against a stand-in for `systemd-run` there (it cannot show a kernel enforcing the
+  limits), and on the target (S26) the scope is expected.
+- **Failure.** A program that fails is a result. A sandbox that could not be set up (a mount
+  source gone, a program that does not exist, user namespaces refused, a scope that cannot be
+  started) raises `SandboxLaunchError` with bwrap's own message and runs nothing: there is no
+  fallback to an unconfined run. bwrap reports the program's exit status only once it has run it,
+  which is how the two are told apart.
+- **Known gaps, by design of the step.** The seccomp filter and Landlock are S15's. Until then a
+  read-only bind of a directory that holds a Unix socket still allows `connect()` to it from the
+  sandbox (#15); the policy core's deny rules (S16) keep the broker, runtime and display sockets'
+  directories from being granted, and S15 adds the seccomp and Landlock denials. Memory is per
+  process without a scope, so a program that starts many processes multiplies it, and nothing
+  bounds the disk a program writes to its workspace beyond the per-file limit.
+
 ## 3. Request flow
 
 1. The user speaks (push-to-talk or wake word) or types. Speech goes through the STT backend;

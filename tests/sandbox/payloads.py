@@ -101,6 +101,8 @@ out = {
     "ns": {n: os.readlink(f"/proc/self/ns/{n}") for n in os.listdir("/proc/self/ns")},
     "fds": sorted(int(n) for n in os.listdir("/proc/self/fd")),
     "cwd": os.getcwd(),
+    "sid": os.getsid(0),
+    "pgrp": os.getpgrp(),
     "root": sorted(os.listdir("/")),
     "etc": sorted(os.listdir("/etc")) if os.path.isdir("/etc") else None,
     "mount_options": {fields[4]: fields[5].split(",") for fields in mounts},
