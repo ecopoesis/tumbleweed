@@ -1,0 +1,57 @@
+{
+  "version": "tumbleweed.ui/1",
+  "title": "CSV viewer",
+  "state": [
+    {"kind": "string", "key": "csv_path", "default": "", "max_length": 1024},
+    {"kind": "enum", "key": "delimiter", "options": ["comma", "semicolon", "tab"], "default": "comma"},
+    {"kind": "bool", "key": "has_header", "default": true},
+    {"kind": "table", "key": "data", "max_rows": 1000},
+    {"kind": "string", "key": "raw_head", "default": "", "max_length": 4096},
+    {
+      "kind": "string",
+      "key": "status",
+      "default": "Enter the path of a CSV file, then press Load.",
+      "max_length": 200
+    }
+  ],
+  "root": {
+    "kind": "box",
+    "children": [
+      {"kind": "heading", "text": "CSV viewer"},
+      {
+        "kind": "grid",
+        "columns": 2,
+        "children": [
+          {"kind": "label", "text": "File"},
+          {"kind": "entry", "bind": "csv_path", "placeholder": "Path of a CSV file", "on_activate": "load"},
+          {"kind": "label", "text": "Delimiter"},
+          {"kind": "dropdown", "bind": "delimiter"},
+          {"kind": "label", "text": "First row is a header"},
+          {"kind": "switch", "bind": "has_header"}
+        ]
+      },
+      {"kind": "button", "label": "Load", "on_click": "load"},
+      {"kind": "label", "bind": "status"},
+      {
+        "kind": "tabs",
+        "pages": [
+          {"title": "Table", "content": {"kind": "table", "bind": "data"}},
+          {
+            "title": "Raw text",
+            "content": {"kind": "text_view", "bind": "raw_head", "monospace": true}
+          }
+        ]
+      }
+    ]
+  },
+  "handlers": [
+    {
+      "kind": "sandbox",
+      "name": "load",
+      "module": "csv_view",
+      "function": "load",
+      "inputs": ["csv_path", "delimiter", "has_header"],
+      "outputs": ["data", "raw_head", "status"]
+    }
+  ]
+}

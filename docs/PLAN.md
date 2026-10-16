@@ -382,7 +382,9 @@ and `set` handlers.
   - computed-state recomputation;
   - binding resolution and `set` handler execution;
   - an event dispatch interface for `sandbox`/`agent` handlers (sinks injected later);
-  - origin tracking, so that state changes from `patch_state` never fire handlers.
+  - origin tracking, so that state changes from `patch_state` never fire handlers;
+  - the interpreter implements [docs/ui-spec.md section 7, Evaluation](ui-spec.md#evaluation); the
+    tests cover each rule.
 - A GTK adapter covering:
   - layout: box, grid;
   - basic widgets: label, heading, button, text entry, switch, check button, slider, spin

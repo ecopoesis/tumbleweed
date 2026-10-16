@@ -107,3 +107,15 @@ TUMBLEWEED_CI=1 scripts/test-linux          # as CI: a skipped or xfailed gtk/li
 | `xfail_allowed_in_ci(reason=...)` | | lets a `gtk`/`linux` test xfail under `TUMBLEWEED_CI=1`, where an xfail fails the run like a skip does; the reason must reference an issue, such as `reason="tracked in #123"` |
 
 The first lines of a pytest run say whether the `TUMBLEWEED_CI` guard is active.
+
+### UI spec
+
+The contract between the model and the renderer, `tumbleweed.ui/1`, is documented in
+[`docs/ui-spec.md`](docs/ui-spec.md), with golden examples in `tests/ui/spec/golden/`. After a
+change to its models, regenerate the committed JSON Schema and the generated parts of the
+reference; the tests fail until you do:
+
+```sh
+uv run python -m tumbleweed.ui.spec.schema --write
+uv run python -m tests.ui.spec.docgen --write
+```

@@ -1,0 +1,172 @@
+{
+  "version": "tumbleweed.ui/1",
+  "title": "Tip calculator",
+  "state": [
+    {"kind": "float", "key": "bill", "default": 50, "minimum": 0, "maximum": 10000, "step": 0.01},
+    {"kind": "int", "key": "tip_percent", "default": 18, "minimum": 0, "maximum": 50},
+    {"kind": "int", "key": "people", "default": 2, "minimum": 1, "maximum": 20},
+    {
+      "kind": "float",
+      "key": "tip_amount",
+      "default": 0,
+      "computed": {
+        "kind": "div",
+        "left": {
+          "kind": "round",
+          "operand": {
+            "kind": "mul",
+            "left": {
+              "kind": "div",
+              "left": {
+                "kind": "mul",
+                "left": {"kind": "ref", "key": "bill"},
+                "right": {"kind": "ref", "key": "tip_percent"}
+              },
+              "right": {"kind": "int", "value": 100}
+            },
+            "right": {"kind": "int", "value": 100}
+          }
+        },
+        "right": {"kind": "int", "value": 100}
+      }
+    },
+    {
+      "kind": "float",
+      "key": "total",
+      "default": 0,
+      "computed": {
+        "kind": "add",
+        "left": {"kind": "ref", "key": "bill"},
+        "right": {"kind": "ref", "key": "tip_amount"}
+      }
+    },
+    {
+      "kind": "float",
+      "key": "per_person",
+      "default": 0,
+      "computed": {
+        "kind": "div",
+        "left": {"kind": "ref", "key": "total"},
+        "right": {"kind": "ref", "key": "people"}
+      }
+    },
+    {
+      "kind": "bool",
+      "key": "shared",
+      "default": false,
+      "computed": {
+        "kind": "gt",
+        "left": {"kind": "ref", "key": "people"},
+        "right": {"kind": "int", "value": 1}
+      }
+    },
+    {
+      "kind": "string",
+      "key": "tip_text",
+      "default": "",
+      "computed": {
+        "kind": "concat",
+        "args": [
+          {"kind": "string", "value": "Tip ("},
+          {"kind": "format_number", "operand": {"kind": "ref", "key": "tip_percent"}},
+          {"kind": "string", "value": "%): $"},
+          {
+            "kind": "format_number",
+            "operand": {"kind": "ref", "key": "tip_amount"},
+            "decimals": 2,
+            "grouping": true
+          }
+        ]
+      }
+    },
+    {
+      "kind": "string",
+      "key": "total_text",
+      "default": "",
+      "computed": {
+        "kind": "concat",
+        "args": [
+          {"kind": "string", "value": "Total: $"},
+          {
+            "kind": "format_number",
+            "operand": {"kind": "ref", "key": "total"},
+            "decimals": 2,
+            "grouping": true
+          }
+        ]
+      }
+    },
+    {
+      "kind": "string",
+      "key": "per_person_text",
+      "default": "",
+      "computed": {
+        "kind": "if",
+        "condition": {"kind": "ref", "key": "shared"},
+        "then": {
+          "kind": "concat",
+          "args": [
+            {"kind": "string", "value": "Each of "},
+            {"kind": "format_number", "operand": {"kind": "ref", "key": "people"}},
+            {"kind": "string", "value": " pays $"},
+            {
+              "kind": "format_number",
+              "operand": {"kind": "ref", "key": "per_person"},
+              "decimals": 2,
+              "grouping": true
+            }
+          ]
+        },
+        "otherwise": {"kind": "string", "value": ""}
+      }
+    },
+    {
+      "kind": "string",
+      "key": "verdict",
+      "default": "",
+      "computed": {
+        "kind": "if",
+        "condition": {
+          "kind": "ge",
+          "left": {"kind": "ref", "key": "tip_percent"},
+          "right": {"kind": "int", "value": 20}
+        },
+        "then": {"kind": "string", "value": "A generous tip"},
+        "otherwise": {
+          "kind": "if",
+          "condition": {
+            "kind": "lt",
+            "left": {"kind": "ref", "key": "tip_percent"},
+            "right": {"kind": "int", "value": 10}
+          },
+          "then": {"kind": "string", "value": "A modest tip"},
+          "otherwise": {"kind": "string", "value": "A customary tip"}
+        }
+      }
+    }
+  ],
+  "root": {
+    "kind": "box",
+    "spacing": 12,
+    "children": [
+      {"kind": "heading", "text": "Tip calculator"},
+      {
+        "kind": "grid",
+        "columns": 2,
+        "children": [
+          {"kind": "label", "text": "Bill ($)"},
+          {"kind": "spin", "bind": "bill"},
+          {"kind": "label", "text": "Tip (%)"},
+          {"kind": "slider", "bind": "tip_percent"},
+          {"kind": "label", "text": "People"},
+          {"kind": "spin", "bind": "people"}
+        ]
+      },
+      {"kind": "separator"},
+      {"kind": "label", "bind": "tip_text"},
+      {"kind": "label", "bind": "total_text"},
+      {"kind": "label", "bind": "per_person_text"},
+      {"kind": "label", "bind": "verdict"}
+    ]
+  }
+}

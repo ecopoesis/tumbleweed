@@ -21,7 +21,7 @@ from tests.plugins import host
 
 ROOT = Path(__file__).resolve().parents[1]
 # Directories the image takes (`!dir/` lines in .dockerignore), and some it does not.
-ALLOWED_DIRS = ["src", "src/tumbleweed", "tests", "tests/core", "scripts", "docs"]
+ALLOWED_DIRS = ["src", "src/tumbleweed", "tests", "tests/core", "scripts", "docs", "schemas"]
 OTHER_DIRS = [".github", ".git", ".venv", "build", "notes"]
 
 
@@ -162,6 +162,7 @@ def test_a_secret_file_is_excluded_from_the_context(path: str) -> None:
         "tests/core/test_ids.py",
         "scripts/linux-checks",
         "docs/ARCHITECTURE.md",
+        "schemas/ui-spec.v1.json",
         ".gitignore",  # the tests of the context itself read these three
         ".dockerignore",
         "Dockerfile",

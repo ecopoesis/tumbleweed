@@ -113,8 +113,9 @@ on them).
 
 ## 4. Generated UI
 
-The model emits a **declarative JSON UI spec** (`tumbleweed.ui/1`, defined in S09). A fixed
-renderer maps it to GTK4 widgets. A spec contains:
+The model emits a **declarative JSON UI spec** (`tumbleweed.ui/1`, defined in S09 and
+referenced in [`ui-spec.md`](ui-spec.md)). A fixed renderer maps it to GTK4 widgets. A spec
+contains:
 
 - **state**: typed declarations (bool, int, float, string, enum, image, table, …) with
   defaults and constraints. A state entry may be **computed** from an expression over

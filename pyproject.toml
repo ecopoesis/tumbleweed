@@ -14,12 +14,14 @@ dependencies = [
 [dependency-groups]
 dev = [
     "import-linter>=2.3",
+    "jsonschema>=4.23",
     "mypy>=1.15",
     "pygobject-stubs>=2.13",
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "pytest-timeout>=2.3",
     "ruff>=0.11",
+    "types-jsonschema>=4.23",
 ]
 
 [build-system]
@@ -172,4 +174,10 @@ include_external_packages = true
 name = "core never imports gi (ARCHITECTURE section 10)"
 type = "forbidden"
 source_modules = ["tumbleweed.core"]
+forbidden_modules = ["gi"]
+
+[[tool.importlinter.contracts]]
+name = "ui.spec never imports gi (ARCHITECTURE section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.ui.spec"]
 forbidden_modules = ["gi"]
