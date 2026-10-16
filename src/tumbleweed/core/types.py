@@ -312,7 +312,8 @@ class CanonicalPath(FrozenText):
     would be a claim nobody checked. So storage and IPC hold the text, and `resolve` is for making
     a new decision about a path. A decision already made is used by opening the stored path
     component by component with `O_NOFOLLOW` and verifying its identity, never by resolving it
-    again (ARCHITECTURE section 7; the typed stored-path record is S16's). Models may hold a
+    again (ARCHITECTURE section 7; the typed stored-path record is
+    `tumbleweed.broker.paths.StoredPath`). Models may hold a
     `CanonicalPath` and dump it, e.g. for the audit log.
 
     Canonical means symlinks and dots only: case and Unicode normalisation are not applied, and

@@ -42,7 +42,8 @@ All of these must pass before a commit is pushed. CI runs the same commands.
    `CanonicalPath.resolve()`, to make a new decision about a path, and is never parsed from
    stored or received text. A decision already made is used by opening the stored path
    component by component with `O_NOFOLLOW` and verifying its identity (ARCHITECTURE section
-   7), never by resolving the text again; S16 defines the typed stored-path record (#16).
+   7), never by resolving the text again; the typed stored-path record is `StoredPath` in
+   `tumbleweed.broker.paths`.
    `WorkspaceRelPath(text)` validates; every other primitive in `tumbleweed.core.types`
    validates on construction too.
 4. **Closed sets are enums or `Literal`s**, matched exhaustively with `assert_never`.

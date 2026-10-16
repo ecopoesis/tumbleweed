@@ -182,6 +182,29 @@ root_package = "tumbleweed"
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
+name = "broker never imports agent, shell, voice, ui.gtk, gi or an LLM SDK (ARCHITECTURE section 10, I2)"
+type = "forbidden"
+source_modules = ["tumbleweed.broker"]
+forbidden_modules = [
+    "tumbleweed.agent",
+    "tumbleweed.shell",
+    "tumbleweed.voice",
+    "tumbleweed.ui.gtk",
+    "gi",
+    "anthropic",
+    "openai",
+    "litellm",
+]
+
+# S16 is the policy core, which has no IPC; S17 builds the daemon on it and replaces this contract
+# with the one that lets the daemon (and only it) use `tumbleweed.ipc`.
+[[tool.importlinter.contracts]]
+name = "broker policy core never imports ipc (S16; S17 lifts this for the daemon)"
+type = "forbidden"
+source_modules = ["tumbleweed.broker"]
+forbidden_modules = ["tumbleweed.ipc"]
+
+[[tool.importlinter.contracts]]
 name = "core never imports gi (ARCHITECTURE section 10)"
 type = "forbidden"
 source_modules = ["tumbleweed.core"]

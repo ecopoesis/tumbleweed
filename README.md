@@ -194,6 +194,17 @@ is covered with a fake credentials provider.
 
 The first lines of a pytest run say whether the `TUMBLEWEED_CI` guard is active.
 
+### Broker policy core
+
+`src/tumbleweed/broker` is the decision logic behind every grant (ARCHITECTURE section 7), as
+pure code with no daemon, IPC or storage yet (S17 builds those on it): capabilities, grant
+scopes, the static deny rules with the ancestor rule, sticky taint, the write gate, and the
+path handling (`ResolvedPath` when deciding, `StoredPath` and a component-by-component open
+that follows no symlink when running). Its tests include property tests (hypothesis) that
+generate escape attempts. A few tests need a case-insensitive volume, which a Mac has and the
+Linux container does not (they skip there, with the reason), and the `openat2` ones need Linux
+(marked `linux`, run by `scripts/test-linux`); between them both ways of opening are covered.
+
 ### UI spec
 
 The contract between the model and the renderer, `tumbleweed.ui/1`, is documented in
