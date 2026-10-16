@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Least privilege: no job writes to the repository, and none gets a token that could. Do not
+# add `pull_request_target`: it would run untrusted PR code with this repository's secrets.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # A skipped gtk or linux test fails the run, so the sandbox and GTK tests cannot pass by
+  # skipping (tests/plugins/host.py, ARCHITECTURE section 11).
+  TUMBLEWEED_CI: "1"
+
+jobs:
+  linux:
+    name: Linux (full suite in the container)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Ubuntu 24.04 runners block unprivileged user namespaces with AppArmor, and bubblewrap
+      # needs them (ARCHITECTURE section 11).
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # The same image and docker flags as a developer's `scripts/test-linux`. Its log shows the
+      # `bwrap --unshare-all --die-with-parent ...` check and the headless GTK widget.
+      - name: Run the full suite in the Linux image
+        run: scripts/test-linux
+
+  macos:
+    name: macOS (platform-neutral subset)
+    runs-on: macos-15 # Apple Silicon, like the development machines
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The README's setup, so that its instructions are tested too. PyGObject builds against these.
+      - name: Install GTK
+        run: brew install gtk4 libadwaita gobject-introspection pkg-config cairo
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.1" # keep in step with the Dockerfile
+          enable-cache: false
+
+      - name: Install the locked dependencies
+        run: uv sync --locked
+
+      - name: Format
+        run: uv run ruff format --check .
+      - name: Lint
+        run: uv run ruff check .
+      - name: Type check
+        run: uv run mypy
+      - name: Import contracts
+        run: uv run lint-imports
+
+      # gtk and linux tests need a display and a Linux kernel: the Linux job runs those.
+      - name: Tests
+        run: uv run pytest -m "not gtk and not linux and not btrfs and not live"
