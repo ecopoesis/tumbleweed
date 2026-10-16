@@ -1,8 +1,11 @@
 """What goes wrong with a spec, in a form that is safe to show to the model or to log.
 
 A spec comes from the model, and a rejected one goes back to the model so that it can correct
-itself (S12). Both directions need bounded text: the problems are counted and cut to length, and
-they name where the problem is and what is wrong, never the offending value.
+itself (S12). Both directions need bounded text: at most `MAX_REPORTED_PROBLEMS` problems of at
+most `MAX_PROBLEM_LENGTH` characters each. A problem says where it is and what is wrong. The
+validators of the text types, names and references quote at most a short excerpt (64 characters)
+of the offending value; pydantic's own messages quote none, except that they name an unknown
+field or an unknown `kind`, which the cut to `MAX_PROBLEM_LENGTH` bounds.
 """
 
 from collections.abc import Sequence
@@ -28,8 +31,8 @@ class SpecError(TumbleweedError):
 
     def __init__(self, problems: Sequence[str]) -> None:
         shown = tuple(_bounded(problem) for problem in problems[:MAX_REPORTED_PROBLEMS])
-        omitted = len(problems) - len(shown)
-        self.problems = shown + ((f"... and {omitted} more problems",) if omitted > 0 else ())
+        more = len(problems) > len(shown)
+        self.problems = shown + (("... and more problems",) if more else ())
         super().__init__("; ".join(self.problems))
 
 

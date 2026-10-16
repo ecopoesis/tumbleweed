@@ -15,7 +15,7 @@ them (I11): a valid ref is not proof that the file is safe to read.
 
 import math
 import unicodedata
-from typing import Annotated, Final, Literal, Self, get_args
+from typing import Annotated, Final, Literal, Self, assert_never, get_args
 
 from pydantic import AfterValidator, BeforeValidator, Field, model_validator
 
@@ -86,8 +86,12 @@ class ImageRef(SpecModel):
 # --- JSON ------------------------------------------------------------------------------------
 
 
-def _check_json(value: JsonValue) -> JsonValue:
-    """Walk a JSON value (iteratively: depth is attacker-chosen) and enforce the limits."""
+def check_json(value: JsonValue) -> JsonValue:
+    """Walk a JSON value (iteratively: depth is attacker-chosen) and enforce the limits.
+
+    Also refuses what is not JSON at all (a tuple, a set, an object), exactly: a subclass of
+    `dict` or `list` is not one either.
+    """
     nodes = 0
     stack: list[tuple[JsonValue, int]] = [(value, 1)]
     while stack:
@@ -123,7 +127,7 @@ def _check_json_string(text: str) -> None:
     check_data_text(text)
 
 
-JsonData = Annotated[JsonValue, AfterValidator(_check_json)]
+JsonData = Annotated[JsonValue, AfterValidator(check_json)]
 
 # --- tables ----------------------------------------------------------------------------------
 
@@ -148,6 +152,8 @@ def _cell_matches(value: CellValue, column: ColumnType) -> bool:
             return type(value) in {int, float}  # `5` and `5.0` are the same JSON number
         case "bool":
             return type(value) is bool
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 class Table(SpecModel):
@@ -189,6 +195,6 @@ class Table(SpecModel):
                 if not _cell_matches(cell, column.type):
                     raise InvalidValueError(
                         f"table row {number}, column {excerpt(column.name)} is of type "
-                        f"{column.type}, got a {type(cell).__name__}"
+                        f"{column.type}, got {type(cell).__name__}"
                     )
         return self

@@ -6,6 +6,7 @@ import unicodedata
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.types import JsonValue, WorkspaceRelPath
 from tumbleweed.ui.spec import values
 from tumbleweed.ui.spec.limits import (
@@ -182,7 +183,7 @@ class TestTable:
             table([("c", "int")], [[MAX_SAFE_INT + 1]])
 
     def test_the_error_names_the_row_and_column_not_the_cell(self) -> None:
-        with pytest.raises(ValidationError, match=r"row 1, column 'b' is of type int, got a str"):
+        with pytest.raises(ValidationError, match=r"row 1, column 'b' is of type int, got str"):
             table([("a", "int"), ("b", "int")], [[1, 2], [3, "secret " * 50]])
 
     @pytest.mark.parametrize("rows", [[[1, 2]], [[]], [[1], [1, 2]]])
@@ -323,6 +324,17 @@ class TestJsonData:
         for bad in ((1, 2), {1, 2}, b"x", object(), {1: "a"}):
             with pytest.raises(ValidationError):
                 JSON.validate_python(bad)
+
+    def test_the_check_itself_refuses_what_pydantic_would_have_stopped_first(self) -> None:
+        class Sub(dict[str, JsonValue]):
+            pass
+
+        for bad in ((1, 2), {1, 2}, object(), Sub(a=1), [(1, 2)]):
+            with pytest.raises(InvalidValueError, match="is not a JSON value"):
+                values.check_json(bad)  # type: ignore[arg-type]  # the point of the test
+        assert values.check_json({"a": [1, None, True, 1.5, "x"]}) == {
+            "a": [1, None, True, 1.5, "x"]
+        }
 
 
 class TestPortTypes:

@@ -38,7 +38,7 @@ from tumbleweed.ui.spec.limits import (
 )
 
 _BLOCK_CONTROLS: Final = frozenset({"\n", "\t"})
-_ALLOWED_FORMAT: Final = frozenset({"‌", "‍"})  # zero-width non-joiner and joiner
+_ALLOWED_FORMAT: Final = frozenset({"\u200c", "\u200d"})  # zero-width non-joiner and joiner
 _FORBIDDEN_CATEGORIES: Final = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
 
 
