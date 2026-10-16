@@ -11,6 +11,7 @@ import threading
 import time
 import warnings
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
@@ -499,6 +500,18 @@ class TestEquality:
 
 class TestImmutability:
     @pytest.mark.parametrize("id_type", ID_PARAMS)
+    def test_there_is_no_instance_dict_to_rewrite_the_value_through(
+        self, id_type: type[EntityId]
+    ) -> None:
+        entity_id = id_type.new()
+        text = str(entity_id)
+
+        assert not hasattr(entity_id, "__dict__")
+        with pytest.raises(TypeError):
+            vars(entity_id)["_text"] = "tsk_forged"
+        assert str(entity_id) == text
+
+    @pytest.mark.parametrize("id_type", ID_PARAMS)
     def test_attributes_cannot_be_set_changed_or_deleted(self, id_type: type[EntityId]) -> None:
         entity_id = id_type.new()
         text = str(entity_id)
@@ -538,14 +551,14 @@ class TestSubclassing:
         with pytest.raises(TypeError, match="already TaskId's"):
 
             class Duplicate(EntityId, prefix="tsk"):
-                pass
+                __slots__ = ()
 
     @pytest.mark.parametrize("prefix", ["", "ab", "abcde", "TSK", "ts1", "ts_", "tsk "])
     def test_a_prefix_must_be_three_or_four_lowercase_letters(self, prefix: str) -> None:
         with pytest.raises(TypeError, match="3-4 lowercase letters"):
 
             class Odd(EntityId, prefix=prefix):
-                pass
+                __slots__ = ()
 
     def test_a_failed_definition_leaves_the_registry_alone(self) -> None:
         before = dict(ids._PREFIXES)
@@ -553,7 +566,7 @@ class TestSubclassing:
         with pytest.raises(TypeError):
 
             class Odd(EntityId, prefix="X"):
-                pass
+                __slots__ = ()
 
         assert before == ids._PREFIXES
 
@@ -561,7 +574,84 @@ class TestSubclassing:
         with pytest.raises(TypeError, match="prefix"):
 
             class Nameless(EntityId):  # type: ignore[call-arg]  # the point of the test
+                __slots__ = ()
+
+    @pytest.mark.parametrize("id_type", ID_PARAMS)
+    def test_a_final_id_type_cannot_be_subclassed_at_runtime_either(
+        self, id_type: type[EntityId]
+    ) -> None:
+        """mypy rejects it too (the misuse fixture); this is for code mypy does not see."""
+        before = dict(ids._PREFIXES)
+
+        with pytest.raises(TypeError, match=f"cannot subclass {id_type.__name__}: it is final"):
+            type("Forged", (id_type,), {"__slots__": ()}, prefix="forg")
+
+        assert before == ids._PREFIXES  # the failed attempt did not register anything
+
+    def test_a_subclass_must_declare_slots(self) -> None:
+        with pytest.raises(TypeError, match="must declare __slots__"):
+
+            class Leaky(EntityId, prefix="lky"):
                 pass
+
+        assert "lky" not in ids._PREFIXES
+
+
+class TestAbstractBase:
+    def test_the_base_cannot_be_constructed(self) -> None:
+        with pytest.raises(TypeError, match="EntityId is abstract"):
+            EntityId("tsk_01j9z3c7q4v8s2k5m6n7p8r9t0")
+
+    @pytest.mark.parametrize("bad", [123, None, b"x", ToolId.new()])
+    def test_the_base_says_abstract_whatever_it_is_given(self, bad: object) -> None:
+        with pytest.raises(TypeError, match="EntityId is abstract"):
+            EntityId(bad)  # type: ignore[arg-type]  # the point of the test
+
+    def test_the_base_cannot_create_a_new_id(self) -> None:
+        with pytest.raises(TypeError, match="EntityId is abstract"):
+            EntityId.new()
+
+    def test_the_base_cannot_be_a_pydantic_field(self) -> None:
+        with pytest.raises(TypeError, match="EntityId is abstract"):
+
+            class Bad(BaseModel):
+                id: EntityId
+
+
+class TestInputTypes:
+    """Whatever is passed in, a constructor answers with InvalidValueError and nothing else."""
+
+    BAD_INPUTS: ClassVar[list[object]] = [
+        123,
+        0,
+        1.5,
+        True,
+        None,
+        b"tsk_" + VALUE.encode(),
+        bytearray(b"x"),
+        ["tsk_x"],
+        ("tsk_x",),
+        {"a": 1},
+        object(),
+        10**5000,
+    ]
+
+    @pytest.mark.parametrize("id_type", ID_PARAMS)
+    def test_a_non_str_is_rejected(self, id_type: type[EntityId]) -> None:
+        for bad in [*self.BAD_INPUTS, TaskId.new(), ToolId.new(), PromptId.new()]:
+            with pytest.raises(InvalidValueError, match="is built from a str"):
+                id_type(bad)  # type: ignore[arg-type]  # the point of the test
+
+    @pytest.mark.parametrize(("a_type", "b_type"), CROSS_TYPE_PARAMS)
+    def test_another_id_is_not_text(self, a_type: type[EntityId], b_type: type[EntityId]) -> None:
+        with pytest.raises(InvalidValueError, match="is built from a str, got"):
+            a_type(b_type.new())  # type: ignore[arg-type]  # the point of the test
+
+    def test_the_message_names_the_type_and_not_the_value(self) -> None:
+        with pytest.raises(InvalidValueError) as raised:
+            TaskId(10**5000)  # type: ignore[arg-type]  # the point of the test
+
+        assert len(str(raised.value)) < 100
 
 
 class Record(BaseModel):

@@ -81,6 +81,7 @@ class _MonotonicUlid:
 _ULIDS = _MonotonicUlid(lambda: time.time_ns() // 1_000_000, secrets.randbits)
 os.register_at_fork(after_in_child=_ULIDS.reset)
 _PREFIXES: dict[str, type["EntityId"]] = {}
+_ABSTRACT = "EntityId is abstract: use a concrete ID type, such as TaskId"
 
 
 def id_types() -> tuple[type["EntityId"], ...]:
@@ -95,6 +96,7 @@ def _encode(value: int) -> str:
 class EntityId(FrozenText):
     """Base class of every entity ID. Subclass it once per entity, with a unique prefix."""
 
+    __slots__ = ()
     prefix: ClassVar[str]
 
     def __init_subclass__(cls, *, prefix: str) -> None:
@@ -106,9 +108,16 @@ class EntityId(FrozenText):
         _PREFIXES[prefix] = cls
         cls.prefix = prefix
 
+    def __init__(self, text: str) -> None:
+        if type(self) is EntityId:
+            raise TypeError(_ABSTRACT)
+        super().__init__(text)
+
     @classmethod
     def new(cls) -> Self:
         """Create an ID that sorts after every ID created before it in this process."""
+        if cls is EntityId:
+            raise TypeError(_ABSTRACT)
         return cls(f"{cls.prefix}_{_encode(_ULIDS.next())}")
 
     @classmethod
@@ -127,7 +136,7 @@ class EntityId(FrozenText):
     @classmethod
     def _raw_schema(cls) -> core_schema.CoreSchema:
         if cls is EntityId:
-            raise TypeError("EntityId is abstract: annotate with a concrete ID type, e.g. TaskId")
+            raise TypeError(_ABSTRACT)
         return core_schema.str_schema(strict=True, pattern=f"^{cls.prefix}_{_VALUE_PATTERN}$")
 
 
@@ -135,60 +144,84 @@ class EntityId(FrozenText):
 class SessionId(EntityId, prefix="ses"):
     """A chat session: the conversation that starts on launch (or "new session") and persists."""
 
+    __slots__ = ()
+
 
 @final
 class MessageId(EntityId, prefix="msg"):
     """One message (user, assistant or tool result) in a session's transcript."""
+
+    __slots__ = ()
 
 
 @final
 class TaskId(EntityId, prefix="tsk"):
     """A task: a unit of work with its own workspace, grants and tool-result context (D7)."""
 
+    __slots__ = ()
+
 
 @final
 class ToolId(EntityId, prefix="tool"):
     """A saved tool, across all of its versions."""
+
+    __slots__ = ()
 
 
 @final
 class ToolInstanceId(EntityId, prefix="inst"):
     """One rendering of a tool on the canvas; belongs to the task that created it."""
 
+    __slots__ = ()
+
 
 @final
 class GrantId(EntityId, prefix="grt"):
     """A capability grant recorded by the broker."""
+
+    __slots__ = ()
 
 
 @final
 class PromptId(EntityId, prefix="prm"):
     """A trusted permission prompt. Unguessable and single-use (I5)."""
 
+    __slots__ = ()
+
 
 @final
 class RunId(EntityId, prefix="run"):
     """One sandbox run (a handler call or `run_code`)."""
+
+    __slots__ = ()
 
 
 @final
 class SnapshotId(EntityId, prefix="snap"):
     """A snapshot of the paths a write-enabled run may change (I13)."""
 
+    __slots__ = ()
+
 
 @final
 class ConnectionId(EntityId, prefix="conn"):
     """A wire from one tool instance's output port to another's input port."""
+
+    __slots__ = ()
 
 
 @final
 class IpcRequestId(EntityId, prefix="req"):
     """Correlates an IPC response with its request."""
 
+    __slots__ = ()
+
 
 @final
 class InvocationId(EntityId, prefix="inv"):
     """One LLM call, as recorded by the invocation chokepoint (D3)."""
+
+    __slots__ = ()
 
 
 __all__ = [

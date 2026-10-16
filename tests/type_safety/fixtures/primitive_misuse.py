@@ -72,3 +72,9 @@ def strings_are_not_bare_strs_or_each_other(text: str, model: ModelName) -> None
 def json_values_are_json(path: Path) -> None:
     send({"a": path})  # expect: dict-item: has incompatible type "str": "Path"
     send({1, 2})  # expect: arg-type: incompatible type "set[int]"
+
+
+def int_primitives_of_different_types_are_not_comparable(
+    count: ByteCount, version: ToolVersion
+) -> bool:
+    return count == version  # expect: comparison-overlap: Non-overlapping equality check

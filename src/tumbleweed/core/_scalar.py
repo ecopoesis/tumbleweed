@@ -9,6 +9,33 @@ from typing import NoReturn, Self
 from pydantic import GetCoreSchemaHandler
 from pydantic_core import core_schema
 
+from tumbleweed.core.errors import InvalidValueError
+
+
+def check_subclass(cls: type) -> None:
+    """Enforce at runtime what mypy enforces statically, for every scalar class.
+
+    No subclass of a `@final` class: a subclass could override the constructor or `__eq__` and
+    forge a validated value. And `__slots__` must be declared (`__slots__ = ()` is enough), so
+    that instances have no `__dict__` through which a validated value could be rewritten.
+    """
+    for base in cls.__bases__:
+        if base.__dict__.get("__final__", False):
+            raise TypeError(f"{cls.__name__} cannot subclass {base.__name__}: it is final")
+    if "__slots__" not in cls.__dict__:
+        raise TypeError(f"{cls.__name__} must declare __slots__ (`__slots__ = ()` will do)")
+
+
+def exact_instance[T](cls: type[T]) -> Callable[[object], T]:
+    """A pydantic validator that accepts an instance of exactly `cls`, not of a subclass."""
+
+    def validate(value: object) -> T:
+        if type(value) is not cls:
+            raise ValueError(f"expected a {cls.__name__}, got {type(value).__name__}")
+        return value
+
+    return validate
+
 
 def scalar_schema[Raw: (int, str)](
     cls: type,
@@ -19,10 +46,11 @@ def scalar_schema[Raw: (int, str)](
 ) -> core_schema.CoreSchema:
     """Build the pydantic schema for a scalar type that is a validated wrapper of a `raw_type`.
 
-    The raw value is validated strictly, so `"5"` is never a byte count and `True` is never a
-    version, and must be a plain `int` or `str`: an instance of another typed scalar (a
-    `ByteCount` for a `ToolVersion` field) is refused even though it is an `int` underneath.
-    It is then handed to `build`. An instance of `cls` is accepted as is. Dumped to JSON the
+    The raw value must be exactly a `str` or `int` (so `"5"` is never a byte count and `True`
+    is never a version, and a `ByteCount` is refused for a `ToolVersion` field even though it
+    is an `int` underneath), and is handed to `build`, which validates it. In Python mode an
+    instance of exactly `cls` is accepted as is: an instance of a subclass is not. In JSON mode
+    the raw schema also applies, which is what a JSON Schema export shows. Dumped to JSON the
     value is its raw form.
     """
 
@@ -31,12 +59,21 @@ def scalar_schema[Raw: (int, str)](
             raise ValueError(f"expected a plain {raw_type.__name__}, got {type(value).__name__}")
         return value
 
-    from_raw = core_schema.no_info_after_validator_function(
-        build, core_schema.no_info_before_validator_function(plain, raw)
-    )
+    def from_python(value: object) -> object:
+        if type(value) is cls:
+            return value
+        if type(value) is not raw_type:
+            raise ValueError(
+                f"expected a {cls.__name__} or a plain {raw_type.__name__}, "
+                f"got {type(value).__name__}"
+            )
+        return build(value)
+
     return core_schema.json_or_python_schema(
-        json_schema=from_raw,
-        python_schema=core_schema.union_schema([core_schema.is_instance_schema(cls), from_raw]),
+        json_schema=core_schema.no_info_after_validator_function(
+            build, core_schema.no_info_before_validator_function(plain, raw)
+        ),
+        python_schema=core_schema.no_info_plain_validator_function(from_python),
         serialization=serialization,
     )
 
@@ -45,14 +82,24 @@ class FrozenText:
     """Immutable wrapper around one validated string.
 
     Equality, hashing and ordering are per concrete class: two values of different types are
-    never equal, even when their text is. Subclasses implement `_validate` and `_raw_schema`.
-    Instances cannot be pickled (pickle would rebuild one without validating it); `copy` and
-    `deepcopy` return the instance itself.
+    never equal, even when their text is. Subclasses implement `_validate` and `_raw_schema`, and
+    must declare `__slots__` (see `check_subclass`). Instances cannot be pickled (pickle would
+    rebuild one without validating it); `copy` and `deepcopy` return the instance itself.
     """
 
+    __slots__ = ("_text",)
     _text: str
 
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        check_subclass(cls)
+
     def __init__(self, text: str) -> None:
+        raw: object = text  # the annotation is for the checker; callers can still pass anything
+        if not isinstance(raw, str):
+            raise InvalidValueError(
+                f"{type(self).__name__} is built from a str, got {type(raw).__name__}"
+            )
         type(self)._validate(text)
         object.__setattr__(self, "_text", text)
 

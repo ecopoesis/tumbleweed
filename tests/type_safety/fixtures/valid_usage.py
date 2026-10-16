@@ -83,4 +83,4 @@ def correct_usage(untrusted_text: str, untrusted_number: int) -> None:
     needs_task(record.task)
     by_task: dict[TaskId, int] = {record.task: 1}
     assert by_task[record.task] == 1
-    assert TaskId.new() == TaskId.new()
+    assert record.task == record.task  # an ID equals itself

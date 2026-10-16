@@ -1,16 +1,19 @@
 """Tests for the domain primitives in `tumbleweed.core.types`."""
 
 import copy
+import errno
 import hashlib
 import os
 import pickle
+from decimal import Decimal
 from pathlib import Path, PurePosixPath
+from typing import ClassVar
 
 import pytest
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from tumbleweed.core.errors import InvalidValueError
-from tumbleweed.core.ids import TaskId
+from tumbleweed.core.ids import TaskId, ToolId
 from tumbleweed.core.types import (
     ByteCount,
     CanonicalPath,
@@ -25,16 +28,56 @@ from tumbleweed.core.types import (
 SHA256_OF_EMPTY = hashlib.sha256(b"").hexdigest()
 
 
+INT64_MAX = 2**63 - 1
+
+NOT_INTS: list[object] = [
+    1.5,
+    5.0,
+    float("nan"),
+    Decimal(5),
+    "5",
+    b"5",
+    None,
+    True,
+    False,
+    [5],
+    (5,),
+    {5},
+    object(),
+    complex(5),
+]
+
+
 class TestByteCount:
-    @pytest.mark.parametrize("value", [0, 1, 1024, 2**63, 10**30])
-    def test_accepts_zero_and_up(self, value: int) -> None:
+    @pytest.mark.parametrize("value", [0, 1, 1024, 2**53, INT64_MAX])
+    def test_accepts_zero_up_to_int64(self, value: int) -> None:
         assert ByteCount(value) == value
         assert isinstance(ByteCount(value), int)
 
-    @pytest.mark.parametrize("value", [-1, -(10**30)])
-    def test_rejects_negative(self, value: int) -> None:
-        with pytest.raises(InvalidValueError, match="at least 0"):
+    @pytest.mark.parametrize("value", [-1, -(2**63), INT64_MAX + 1, 2**64, 10**30])
+    def test_rejects_out_of_range(self, value: int) -> None:
+        with pytest.raises(
+            InvalidValueError, match="ByteCount must be from 0 to 9223372036854775807"
+        ):
             ByteCount(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [10**5000, -(10**5000), 2**100_000],
+        ids=["10**5000", "-(10**5000)", "2**100_000"],
+    )
+    def test_a_huge_int_is_an_invalid_value_with_a_short_message(self, value: int) -> None:
+        """str() of an int this big raises ValueError itself; it must not leak out."""
+        with pytest.raises(InvalidValueError) as raised:
+            ByteCount(value)
+
+        assert len(str(raised.value)) < 150
+        assert "bits" in str(raised.value)
+
+    @pytest.mark.parametrize("bad", NOT_INTS, ids=lambda v: type(v).__name__ + repr(v)[:12])
+    def test_only_a_real_int_is_accepted(self, bad: object) -> None:
+        with pytest.raises(InvalidValueError, match="ByteCount must be an int"):
+            ByteCount(bad)  # type: ignore[arg-type]  # the point of the test
 
     def test_works_where_an_int_is_expected(self) -> None:
         limit = ByteCount(4)
@@ -43,20 +86,54 @@ class TestByteCount:
         assert b"abcdef"[:limit] == b"abcd"
         assert ByteCount(3) + ByteCount(4) == 7  # arithmetic gives a plain int, to be rewrapped
 
+    def test_has_no_instance_dict(self) -> None:
+        assert not hasattr(ByteCount(1), "__dict__")
+
 
 class TestToolVersion:
-    @pytest.mark.parametrize("value", [1, 2, 10**9])
-    def test_accepts_positive(self, value: int) -> None:
+    @pytest.mark.parametrize("value", [1, 2, 10**9, INT64_MAX])
+    def test_accepts_positive_up_to_int64(self, value: int) -> None:
         assert ToolVersion(value) == value
 
-    @pytest.mark.parametrize("value", [0, -1])
-    def test_rejects_zero_and_negative(self, value: int) -> None:
-        with pytest.raises(InvalidValueError, match="at least 1"):
+    @pytest.mark.parametrize("value", [0, -1, INT64_MAX + 1, 10**30])
+    def test_rejects_zero_negative_and_too_big(self, value: int) -> None:
+        with pytest.raises(InvalidValueError, match="ToolVersion must be from 1 to"):
             ToolVersion(value)
+
+    @pytest.mark.parametrize("bad", NOT_INTS, ids=lambda v: type(v).__name__ + repr(v)[:12])
+    def test_only_a_real_int_is_accepted(self, bad: object) -> None:
+        with pytest.raises(InvalidValueError, match="ToolVersion must be an int"):
+            ToolVersion(bad)  # type: ignore[arg-type]  # the point of the test
 
     def test_orders_like_a_number(self) -> None:
         assert ToolVersion(1) < ToolVersion(2)
         assert sorted([ToolVersion(3), ToolVersion(1)]) == [1, 3]
+
+
+class TestNumbersAreDistinctOnlyToTheTypeChecker:
+    """Documented limit of building the primitives on `int`: unlike entity IDs, they are ints."""
+
+    def test_different_int_primitives_with_the_same_value_compare_equal_at_runtime(self) -> None:
+        # Typed as object: mypy itself flags `ByteCount(5) == ToolVersion(5)` as non-overlapping,
+        # which is the static half of "distinct"; this is the runtime half.
+        count: object = ByteCount(5)
+        version: object = ToolVersion(5)
+
+        assert count == version
+        assert hash(count) == hash(version)
+        assert {count, version} == {5}
+
+    def test_a_primitive_equals_the_plain_value_it_wraps(self) -> None:
+        assert ByteCount(5) == 5
+        assert ContentHash("0" * 64) == "0" * 64
+        assert ModelName("claude-sonnet-5-5") == "claude-sonnet-5-5"
+
+    def test_entity_ids_are_the_contrast(self) -> None:
+        assert TaskId.new() != ToolId.new()
+        assert TaskId("tsk_01j9z3c7q4v8s2k5m6n7p8r9t0") != ToolId("tool_01j9z3c7q4v8s2k5m6n7p8r9t0")
+
+    def test_a_primitive_can_be_rewrapped_as_another_by_constructing_it_explicitly(self) -> None:
+        assert ToolVersion(ByteCount(5)) == 5  # validated again, and a conscious conversion
 
 
 class TestContentHash:
@@ -134,6 +211,38 @@ class TestProviderRequestId:
             ProviderRequestId(bad)
 
 
+class TestStringInputTypes:
+    """Whatever is passed in, a constructor answers with InvalidValueError and nothing else."""
+
+    BAD: ClassVar[list[object]] = [
+        123,
+        0,
+        1.5,
+        True,
+        None,
+        b"0" * 64,
+        bytearray(b"x"),
+        ["x"],
+        {"x": 1},
+        object(),
+        TaskId.new(),
+        10**5000,
+    ]
+
+    @pytest.mark.parametrize("cls", [ContentHash, ModelName, ProviderRequestId])
+    def test_a_non_str_is_rejected(
+        self, cls: type[ContentHash | ModelName | ProviderRequestId]
+    ) -> None:
+        for bad in self.BAD:
+            with pytest.raises(InvalidValueError, match=f"{cls.__name__} must be a str, got"):
+                cls(bad)  # type: ignore[arg-type]  # the point of the test
+
+    @pytest.mark.parametrize("bad", BAD, ids=lambda v: type(v).__name__)
+    def test_workspace_rel_path_rejects_a_non_str(self, bad: object) -> None:
+        with pytest.raises(InvalidValueError, match="WorkspaceRelPath is built from a str"):
+            WorkspaceRelPath(bad)  # type: ignore[arg-type]  # the point of the test
+
+
 class TestWorkspaceRelPath:
     @pytest.mark.parametrize(
         "text",
@@ -175,12 +284,26 @@ class TestWorkspaceRelPath:
             ("./a", "empty, '.' or '..'"),
             ("a//b", "empty, '.' or '..'"),
             ("a/", "empty, '.' or '..'"),
-            ("a\x00b", "control characters"),
-            ("\x00", "control characters"),
-            ("a\nb", "control characters"),
-            ("a\tb", "control characters"),
-            ("a\x1bb", "control characters"),
-            ("a\x7fb", "control characters"),
+            ("a\x00b", "control, format or line-separator"),
+            ("\x00", "control, format or line-separator"),
+            ("a\nb", "control, format or line-separator"),
+            ("a\tb", "control, format or line-separator"),
+            ("a\x1bb", "control, format or line-separator"),
+            ("a\x7fb", "control, format or line-separator"),
+            ("a\x9bb", "control, format or line-separator"),  # C1: CSI, starts an ANSI sequence
+            ("a\x85b", "control, format or line-separator"),  # C1: NEL, a line break
+            ("a\x80b", "control, format or line-separator"),
+            ("a\x9fb", "control, format or line-separator"),
+            ("gnp.\u202eexe", "control, format or line-separator"),  # RLO: reads as exe.png
+            ("a\u2066b", "control, format or line-separator"),  # LRI, a bidi isolate
+            ("a\u200bb", "control, format or line-separator"),  # zero-width space
+            ("a\u200db", "control, format or line-separator"),  # zero-width joiner
+            ("a\ufeffb", "control, format or line-separator"),  # BOM / zero-width no-break
+            ("a\u00adb", "control, format or line-separator"),  # soft hyphen
+            ("a\u2028b", "control, format or line-separator"),  # line separator (Zl)
+            ("a\u2029b", "control, format or line-separator"),  # paragraph separator (Zp)
+            ("\u202e", "control, format or line-separator"),
+            ("d/a\u202ee/f", "control, format or line-separator"),
             ("\ud800", "UTF-8"),
             ("a/\udfffb", "UTF-8"),
             ("x" * 256, "component is over 255 bytes"),
@@ -318,18 +441,119 @@ class TestCanonicalPath:
         with pytest.raises(InvalidValueError, match="NUL"):
             CanonicalPath.resolve(text)
 
-    def test_a_symlink_loop_is_refused(self, tree: Path) -> None:
+    @pytest.mark.parametrize("tail", ["", "/x", "/x/y/z"])
+    @pytest.mark.parametrize("loop", ["loop-a", "loop-b"])
+    def test_a_symlink_loop_is_refused_on_every_python_version(
+        self, tree: Path, loop: str, tail: str
+    ) -> None:
+        """Python 3.12 raises for a loop; 3.13 and later return it unresolved. Both are refused."""
         with pytest.raises(InvalidValueError, match="cannot canonicalise"):
-            CanonicalPath.resolve(tree / "loop-a" / "x")
+            CanonicalPath.resolve(f"{tree}/{loop}{tail}")
 
-    def test_a_too_long_name_is_refused_not_a_crash(self, tree: Path) -> None:
-        # Resolving asks the OS, and the OS says ENAMETOOLONG on Linux; macOS tolerates the
-        # lookup of a missing name. Either way: a CanonicalPath or InvalidValueError, nothing else.
+    def test_a_symlink_left_in_the_result_is_refused(
+        self, tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """What Path.resolve does on 3.12 for an unsearchable parent, and on 3.13+ for a loop."""
+        monkeypatch.setattr(Path, "resolve", lambda self, strict=False: self)
+
+        with pytest.raises(InvalidValueError, match="'link' is a symlink that could not be"):
+            CanonicalPath.resolve(tree / "link" / "file.txt")
+
+    def test_a_symlink_at_the_end_of_the_result_is_refused_too(
+        self, tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Path, "resolve", lambda self, strict=False: self)
+
+        with pytest.raises(InvalidValueError, match="'dangling' is a symlink"):
+            CanonicalPath.resolve(tree / "dangling")
+
+    @pytest.mark.skipif(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        reason="root can search any directory, so there is no EACCES to provoke",
+    )
+    def test_a_directory_that_cannot_be_searched_is_refused(self, tree: Path) -> None:
+        """Python 3.12's resolve() returns the path unresolved when it may not look inside."""
+        locked = tree / "locked"
+        locked.mkdir()
+        (locked / "inner").symlink_to(tree / "real")
+        locked.chmod(0)
         try:
-            resolved = CanonicalPath.resolve(tree / ("x" * 5000))
-        except InvalidValueError:
-            return
-        assert str(resolved).startswith(str(tree))
+            with pytest.raises(
+                InvalidValueError, match="cannot inspect 'inner': Permission denied"
+            ):
+                CanonicalPath.resolve(locked / "inner" / "x")
+        finally:
+            locked.chmod(0o700)  # so that the temporary directory can be removed
+
+    @pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.ENAMETOOLONG, errno.ELOOP])
+    def test_any_lstat_failure_but_absence_is_refused(
+        self, tree: Path, monkeypatch: pytest.MonkeyPatch, code: int
+    ) -> None:
+        def failing_lstat(self: Path) -> os.stat_result:
+            raise OSError(code, os.strerror(code), str(self))
+
+        monkeypatch.setattr(Path, "lstat", failing_lstat)
+
+        with pytest.raises(InvalidValueError, match=os.strerror(code)):
+            CanonicalPath.resolve(tree / "real")
+
+    @pytest.mark.parametrize("code", [errno.ENOENT, errno.ENOTDIR])
+    def test_absence_is_not_a_failure(
+        self, tree: Path, monkeypatch: pytest.MonkeyPatch, code: int
+    ) -> None:
+        def absent(self: Path) -> os.stat_result:
+            raise OSError(code, os.strerror(code), str(self))
+
+        monkeypatch.setattr(Path, "lstat", absent)
+
+        assert str(CanonicalPath.resolve(tree / "real")) == str(tree / "real")
+
+    @pytest.mark.parametrize(
+        "surrogate", [chr(0xD800), chr(0xDBFF), chr(0xDFFF)], ids=lambda c: hex(ord(c))
+    )
+    def test_a_lone_surrogate_is_refused_not_a_crash(self, tree: Path, surrogate: str) -> None:
+        for text in (f"/{surrogate}", f"{tree}/real/a{surrogate}b", f"{tree}/{surrogate}/x"):
+            with pytest.raises(InvalidValueError, match="cannot canonicalise") as raised:
+                CanonicalPath.resolve(text)
+            assert len(str(raised.value)) < 300
+
+    def test_a_too_long_name_is_refused_deterministically(self, tree: Path) -> None:
+        with pytest.raises(InvalidValueError, match="File name too long"):
+            CanonicalPath.resolve(tree / ("x" * 5000))
+
+    def test_error_messages_never_carry_the_whole_path(self, tree: Path) -> None:
+        tail = "y" * 300
+        for text in (
+            f"{tree}/loop-a/{tail}",
+            f"{tree}/{tail}\x00",
+            f"{tree}/{tail}/\ud800",
+            f"{tail}/relative",
+        ):
+            with pytest.raises(InvalidValueError) as raised:
+                CanonicalPath.resolve(text)
+            assert tail not in str(raised.value)
+            assert len(str(raised.value)) < 400
+            # The original OSError, or whatever was caught, repeats the full path: not chained.
+            assert raised.value.__cause__ is None
+            assert raised.value.__context__ is None or raised.value.__suppress_context__
+
+    def test_no_symlink_survives_in_anything_resolve_returns(self, tree: Path) -> None:
+        inputs = [
+            tree / "link",
+            tree / "link" / "sub" / "..",
+            tree / "rel-link" / ".." / "file.txt",
+            tree / "chain1" / "sub",
+            tree / "dangling",
+            tree / "link" / "new" / "dir",
+            tree / "real" / ".." / "link" / "file.txt",
+        ]
+        for given in inputs:
+            resolved = Path(str(CanonicalPath.resolve(given)))
+            walked = Path("/")
+            for part in resolved.parts[1:]:
+                walked /= part
+                if walked.exists() or walked.is_symlink():
+                    assert not walked.is_symlink(), f"{given} resolved to {resolved}"
 
     def test_there_is_no_constructor_from_text(self) -> None:
         with pytest.raises(TypeError, match=r"CanonicalPath\.resolve"):
@@ -501,8 +725,14 @@ class TestPydantic:
     def test_json_schema_carries_the_constraints(self) -> None:
         properties = Boundary.model_json_schema()["properties"]
 
-        assert properties["size"] == {"minimum": 0, "title": "Size", "type": "integer"}
+        assert properties["size"] == {
+            "maximum": INT64_MAX,
+            "minimum": 0,
+            "title": "Size",
+            "type": "integer",
+        }
         assert properties["version"]["minimum"] == 1
+        assert properties["version"]["maximum"] == INT64_MAX
         assert properties["digest"]["pattern"] == "^(?:[0-9a-f]{64})$"
         assert properties["model"]["pattern"].startswith("^(?:[A-Za-z0-9]")
         assert properties["path"]["minLength"] == 1
@@ -540,3 +770,29 @@ class TestPydantic:
         model = Boundary.model_validate_json(boundary_json())
 
         assert model.model_copy(deep=True) == model
+
+
+class TestDictKeys:
+    """Documented limit: int-based primitives dump as JSON object keys but do not validate back."""
+
+    def test_a_dict_keyed_by_an_int_primitive_dumps_to_string_keys(self) -> None:
+        adapter = TypeAdapter(dict[ByteCount, int])
+
+        assert adapter.dump_json({ByteCount(5): 1, ByteCount(7): 2}) == b'{"5":1,"7":2}'
+
+    def test_but_the_json_cannot_be_validated_back_by_design(self) -> None:
+        adapter = TypeAdapter(dict[ByteCount, int])
+
+        with pytest.raises(ValidationError):
+            adapter.validate_json('{"5": 1}')
+
+    def test_python_mode_keys_are_fine(self) -> None:
+        adapter = TypeAdapter(dict[ByteCount, int])
+
+        assert adapter.validate_python({ByteCount(5): 1, 7: 2}) == {5: 1, 7: 2}
+
+    def test_string_primitives_round_trip_as_keys(self) -> None:
+        adapter = TypeAdapter(dict[ContentHash, int])
+        mapping = {ContentHash("a" * 64): 1}
+
+        assert adapter.validate_json(adapter.dump_json(mapping)) == mapping
