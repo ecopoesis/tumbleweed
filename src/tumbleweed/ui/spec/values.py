@@ -50,7 +50,7 @@ from tumbleweed.ui.spec.text import (
     as_tuple,
     canonical_text,
     check_data_text,
-    exact_double,
+    double_of,
     text_bytes,
 )
 
@@ -136,18 +136,37 @@ def _json_text(text: str) -> int:
     return text_bytes(text)
 
 
+def _as_doubles(value: JsonValue) -> JsonValue:
+    """`value` with every integer beyond `MAX_SAFE_INT` replaced by the double it stands for.
+
+    Recursive, which is safe: it only runs on a value `check_json` has found to be at most
+    `MAX_JSON_DEPTH` deep.
+    """
+    if type(value) is int and abs(value) > MAX_SAFE_INT:
+        return double_of(value)
+    if type(value) is list:
+        return [_as_doubles(item) for item in value]
+    if type(value) is dict:
+        return {key: _as_doubles(item) for key, item in value.items()}
+    return value
+
+
 def check_json(value: object) -> JsonValue:
     """Walk a JSON value (iteratively: depth is attacker-chosen) and enforce the limits.
 
     At most `MAX_JSON_NODES` nodes, `MAX_JSON_DEPTH` levels, `MAX_VALUE_TEXT_BYTES` bytes of
-    text; integers must be exactly some double and floats finite (`tumbleweed.ui.spec.text`);
-    the keys of an object must be distinct once normalised as the tool store does (NFC, line
-    feeds). The walk stops at the first limit crossed, and a list is not unpacked if it
-    cannot fit. Also refuses what is not JSON at all (a tuple, a set, an object), exactly: a
-    subclass of `dict` or `list` is not one either.
+    text; the keys of an object are strings and distinct once normalised as the tool store does
+    (NFC, line feeds); an integer must stand for a double (`tumbleweed.ui.spec.text`) and is
+    returned as that float if it is beyond 2**53 - 1, so that a value is the same after
+    canonical JSON has written it as it was before; a float must be finite. The walk stops at
+    the first limit crossed (in the middle of an object, at the key that crosses the text
+    budget), and a list is not unpacked if it cannot fit. Also refuses what is not JSON at
+    all (a tuple, a set, an object, a key that is not a string), exactly: a subclass of
+    `dict` or `list` is not one either.
     """
     nodes = 0
     text = 0
+    beyond_safe = False
     stack: list[tuple[object, int]] = [(value, 1)]
     while stack:
         current, depth = stack.pop()
@@ -159,10 +178,18 @@ def check_json(value: object) -> JsonValue:
         if type(current) is dict:
             keys: set[str] = set()
             for key, child in current.items():
+                if type(key) is not str:
+                    raise InvalidValueError(
+                        f"a key of a JSON object must be a string, got {excerpt(key)}"
+                    )
                 nodes += 1
                 if nodes + len(stack) > MAX_JSON_NODES:
                     raise InvalidValueError(f"JSON value has more than {MAX_JSON_NODES} nodes")
                 text += _json_text(key)
+                if text > MAX_VALUE_TEXT_BYTES:
+                    raise InvalidValueError(
+                        f"JSON value has more than {MAX_VALUE_TEXT_BYTES} bytes of text"
+                    )
                 canonical = key if key.isascii() and "\r" not in key else canonical_text(key)
                 if canonical in keys:
                     raise InvalidValueError(
@@ -178,7 +205,8 @@ def check_json(value: object) -> JsonValue:
         elif type(current) is str:
             text += _json_text(current)
         elif type(current) is int:
-            exact_double(current)
+            double_of(current)
+            beyond_safe = beyond_safe or abs(current) > MAX_SAFE_INT
         elif type(current) is float:
             if not math.isfinite(current):
                 raise InvalidValueError("JSON number must be finite")
@@ -189,10 +217,13 @@ def check_json(value: object) -> JsonValue:
                 f"JSON value has more than {MAX_VALUE_TEXT_BYTES} bytes of text"
             )
     # Sound: the walk accepted nothing but exact dicts, lists, strings, ints, floats, bools, None.
-    return cast("JsonValue", value)
+    checked = cast("JsonValue", value)
+    return _as_doubles(checked) if beyond_safe else checked
 
 
-JsonData = Annotated[JsonValue, AfterValidator(check_json)]
+# Checked before pydantic sees the value, so that a value that breaks a limit is refused without
+# being copied, and so that pydantic's lax mode cannot turn a `bytes` key into a `str` one first.
+JsonData = Annotated[JsonValue, BeforeValidator(check_json)]
 
 # --- tables ----------------------------------------------------------------------------------
 

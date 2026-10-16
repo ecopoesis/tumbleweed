@@ -253,21 +253,50 @@ class TestAsTuple:
 # Integers that a double holds exactly, and some that it does not (above 2**53 the doubles are
 # the multiples of 2, then 4, ...).
 EXACT_INTS = [0, 1, -1, 2**53 - 1, 2**53, -(2**53), 2**53 + 2, 10**16, 10**20, 2**100, 10**22]
-INEXACT_INTS = [2**53 + 1, -(2**53) - 1, 2**53 + 3, 10**16 + 1, 10**23 + 1, 3 * 2**100 + 1]
+INEXACT_INTS = [
+    2**53 + 1,
+    -(2**53) - 1,
+    2**53 + 3,
+    10**16 + 1,
+    10**23 + 1,
+    3 * 2**100 + 1,
+    2**60 + 1,
+    1152921504606847001,
+    10**21 - 1,
+]
+# Integers that no double equals but that are the way canonical JSON writes one (2**60 is
+# 1152921504606846976 exactly): what a saved spec holds when it is read back.
+SPELLED_INTS = [
+    (1152921504606847000, float(2**60)),
+    (-1152921504606847000, -float(2**60)),
+    (295147905179352830000, float(2**68)),
+    (123456789012345680000, 1.2345678901234568e20),
+    (999999999999999700000, 999999999999999700000.0),
+]
 
 
-class TestExactDouble:
+class TestDoubleOf:
     @pytest.mark.parametrize("value", EXACT_INTS, ids=lambda v: str(v)[:12])
     def test_an_int_a_double_holds_comes_back_as_that_float(self, value: int) -> None:
-        number = text.exact_double(value)
+        number = text.double_of(value)
 
         assert type(number) is float
         assert int(number) == value
 
+    @pytest.mark.parametrize(("value", "double"), SPELLED_INTS, ids=lambda v: str(v)[:12])
+    def test_an_int_that_is_how_canonical_json_writes_a_double_is_that_double(
+        self, value: int, double: float
+    ) -> None:
+        number = text.double_of(value)
+
+        assert type(number) is float
+        assert number == double
+        assert int(number) != value  # the digits are not the double's exact value
+
     @pytest.mark.parametrize("value", INEXACT_INTS, ids=lambda v: str(v)[:12])
     def test_an_int_no_double_equals_is_refused_not_rounded(self, value: int) -> None:
         with pytest.raises(InvalidValueError, match="no double is equal"):
-            text.exact_double(value)
+            text.double_of(value)
 
     @pytest.mark.parametrize(
         "value",
@@ -277,7 +306,7 @@ class TestExactDouble:
         self, value: int
     ) -> None:
         with pytest.raises(InvalidValueError, match="too large for a double") as raised:
-            text.exact_double(value)
+            text.double_of(value)
 
         assert len(str(raised.value)) < 100
 
@@ -292,6 +321,14 @@ class TestFloatPositionsTakeExactIntegers:
         assert type(number) is float
         assert int(number) == value
         assert FINITE_FLOAT.validate_json(str(value)) == number
+
+    @pytest.mark.parametrize(("value", "double"), SPELLED_INTS, ids=lambda v: str(v)[:12])
+    def test_accepts_the_spelling_of_a_double_and_stores_the_double(
+        self, value: int, double: float
+    ) -> None:
+        assert FINITE_FLOAT.validate_python(value) == double
+        assert FINITE_FLOAT.validate_json(str(value)) == double
+        assert POSITIVE_FINITE_FLOAT.validate_python(abs(value)) == abs(double)
 
     @pytest.mark.parametrize("value", INEXACT_INTS, ids=lambda v: str(v)[:12])
     def test_refuses_what_it_would_have_to_round(self, value: int) -> None:
@@ -324,7 +361,10 @@ class TestIntPositionsStayWithinSafeIntegers:
 class TestScalarCell:
     """A table cell or list item: one validator, one message."""
 
-    @pytest.mark.parametrize("value", [True, False, 0, -5, 2**53, 10**20, 1.5, -0.0, "", "text"])
+    @pytest.mark.parametrize(
+        "value",
+        [True, False, 0, -5, 2**53, 10**20, 1152921504606847000, 1.5, -0.0, "", "text"],
+    )
     def test_accepts_a_bool_a_number_or_a_string(self, value: object) -> None:
         assert CELL.validate_python(value) == value
         assert type(CELL.validate_python(value)) is type(value)
@@ -341,6 +381,7 @@ class TestScalarCell:
             float("nan"),
             float("inf"),
             2**53 + 1,
+            2**60 + 1,
             "a\0b",
             "\ud800",
         ],

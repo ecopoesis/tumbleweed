@@ -16,17 +16,22 @@ Two kinds of text, because they have different owners:
 
 Numbers are IEEE-754 doubles, as in I-JSON and in RFC 8785 (JCS), the canonical JSON that the
 tool store hashes (S23), and one rule covers them everywhere, so that a spec still validates
-after canonicalisation, which writes `1e16` as `10000000000000000`:
+after canonicalisation, which writes `1e16` as `10000000000000000` and `2**60` as
+`1152921504606847000`:
 
 - a number in an `int` position (an `int` entry or literal, a table `int` cell, an item of a list
   of ints) is a whole number of magnitude at most 2**53 - 1, and is never written as `5.0`;
 - a number in a `float` position (a `float` entry or literal, a `float` column, an item of a
-  list of floats) is a finite double. It may be written as an integer of any size that is
-  exactly a double, and is then stored as a float: `5`, `5.0` and `5e0` are one value;
-- a number in a `json` value is a finite double, an integer being accepted by the same test.
+  list of floats) is a finite double. It may be written as an integer of any size that stands for
+  a double, and is then stored as a float: `5`, `5.0` and `5e0` are one value;
+- a number in a `json` value is a finite double, an integer being accepted by the same test (and
+  stored as a float if it is beyond 2**53 - 1).
 
-No type is inferred from how a number is written. An integer that no double equals, such as
-2**53 + 1, is refused in a float or JSON position, not silently rounded.
+An integer stands for a double if it is exactly that double (`2**70`) or if it is how
+canonical JSON writes the nearest one (`1152921504606847000`, which is not exactly `2**60`:
+`tumbleweed.core.jcs.double_of_int`). No type is inferred from how a number is written. An
+integer that is neither, such as 2**53 + 1 or 10**400, is refused in a float or JSON position,
+not silently rounded.
 """
 
 import math
@@ -36,6 +41,7 @@ from typing import Annotated, Final
 from pydantic import AfterValidator, BeforeValidator, Field, PlainValidator, WithJsonSchema
 
 from tumbleweed.core.errors import InvalidValueError, excerpt
+from tumbleweed.core.jcs import double_of_int
 from tumbleweed.ui.spec.limits import (
     MAX_CELL_LENGTH,
     MAX_LINE_LENGTH,
@@ -51,6 +57,7 @@ type Scalar = bool | int | float | str
 _BLOCK_CONTROLS: Final = ("\n", "\t")
 _ALLOWED_FORMAT: Final = frozenset({"\u200c", "\u200d"})  # zero-width non-joiner and joiner
 _FORBIDDEN_CATEGORIES: Final = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+_DOUBLE_BITS: Final = 1024  # no double is as wide as 2**1024
 
 
 def _check_authored(value: str, *, allowed_controls: tuple[str, ...]) -> str:
@@ -116,27 +123,34 @@ def canonical_text(value: str) -> str:
     return unicodedata.normalize("NFC", value.replace("\r\n", "\n").replace("\r", "\n"))
 
 
-def exact_double(value: int) -> float:
-    """The float equal to the integer `value`, or `InvalidValueError` if no float is."""
-    try:
-        number = float(value)
-    except OverflowError:
-        raise InvalidValueError("an integer too large for a double") from None
-    if int(number) != value:
-        raise InvalidValueError("an integer that no double is equal to (it is not rounded)")
-    return number
+def double_of(value: int) -> float:
+    """The float an integer stands for, or `InvalidValueError` if it stands for none.
+
+    An integer stands for a double if it is exactly that double, or if canonical JSON writes the
+    nearest double as that integer (`tumbleweed.core.jcs.double_of_int`): what canonicalisation
+    makes of a double above 2**53 must still be accepted when it is read back.
+    """
+    number = double_of_int(value)
+    if number is not None:
+        return number
+    if value.bit_length() > _DOUBLE_BITS:
+        raise InvalidValueError("an integer too large for a double")
+    raise InvalidValueError(
+        "an integer that no double is equal to and that canonical JSON does not write for one "
+        "(it is not rounded)"
+    )
 
 
 def as_double(value: object) -> object:
     """For a `float` position: an exact integer becomes a float, anything else is unchanged."""
-    return exact_double(value) if type(value) is int else value
+    return double_of(value) if type(value) is int else value
 
 
 def check_scalar(value: object) -> Scalar:
     """One cell of a table or item of a list: a bool, a number or a string, nothing else.
 
     A single check with a single message, so that a wrong value is one clear error and not one
-    per alternative of a union. An integer is accepted if some double equals it (the column or
+    per alternative of a union. An integer is accepted if it stands for a double (the column or
     the list then decides whether it is an `int`, within 2**53 - 1, or a `float`), a float must
     be finite, a string is data text of at most `MAX_CELL_LENGTH` characters.
     """
@@ -144,7 +158,7 @@ def check_scalar(value: object) -> Scalar:
     if kind is bool:
         return bool(value)
     if isinstance(value, int) and kind is int:
-        exact_double(value)
+        double_of(value)
         return value
     if isinstance(value, float) and kind is float:
         if not math.isfinite(value):
@@ -218,6 +232,6 @@ __all__ = [
     "check_data_text",
     "check_line",
     "check_scalar",
-    "exact_double",
+    "double_of",
     "text_bytes",
 ]

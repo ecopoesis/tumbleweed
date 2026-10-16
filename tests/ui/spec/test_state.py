@@ -694,7 +694,7 @@ class TestEveryErrorNamesTheKey:
         assert message.startswith(("k is ", "k: ", "k must", "k has", "k[")), message
 
     def test_an_item_of_a_list_is_named_by_its_position(self) -> None:
-        with pytest.raises(InvalidValueError, match=r"^k\[2\] must be a int, got <float>"):
+        with pytest.raises(InvalidValueError, match=r"^k\[2\] must be a int, got 2.5"):
             value_of("list", [0, 1, 2.5])
         with pytest.raises(InvalidValueError, match=r"^k\[1\]: text must not contain NUL"):
             value_of("list", ["ok", "a\0b"], item_type="string")

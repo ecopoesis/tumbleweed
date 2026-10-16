@@ -8,80 +8,19 @@ subnormals) and check that, for every kind of state.
 """
 
 import json
-import math
-from typing import TYPE_CHECKING
+import random
 
 import pytest
 
-from tests.ui.spec import jcs
-from tests.ui.spec.jcs import canonicalize, double_from_bits, es_number
 from tests.ui.spec.support import STATE_KINDS, Json, build, lit_int
+from tumbleweed.core.jcs import canonicalize, es_number
+from tumbleweed.core.types import JsonValue
 from tumbleweed.ui.spec.errors import SpecError
 from tumbleweed.ui.spec.expr import FloatLit
 from tumbleweed.ui.spec.limits import MAX_SAFE_INT
 from tumbleweed.ui.spec.parse import parse_ui_spec, validate_ui_spec
 from tumbleweed.ui.spec.spec import UiSpec
 from tumbleweed.ui.spec.state import FloatState
-
-if TYPE_CHECKING:
-    from tumbleweed.core.types import JsonValue
-
-# RFC 8785 appendix B: IEEE-754 bit pattern, and the text JCS writes.
-RFC_8785_NUMBERS = [
-    (0x0000000000000000, "0"),
-    (0x8000000000000000, "0"),
-    (0x0000000000000001, "5e-324"),
-    (0x8000000000000001, "-5e-324"),
-    (0x7FEFFFFFFFFFFFFF, "1.7976931348623157e+308"),
-    (0xFFEFFFFFFFFFFFFF, "-1.7976931348623157e+308"),
-    (0x4340000000000000, "9007199254740992"),
-    (0xC340000000000000, "-9007199254740992"),
-    (0x4430000000000000, "295147905179352830000"),
-    (0x44B52D02C7E14AF5, "9.999999999999997e+22"),
-    (0x44B52D02C7E14AF6, "1e+23"),
-    (0x44B52D02C7E14AF7, "1.0000000000000001e+23"),
-    (0x444B1AE4D6E2EF4E, "999999999999999700000"),
-    (0x444B1AE4D6E2EF4F, "999999999999999900000"),
-    (0x444B1AE4D6E2EF50, "1e+21"),
-    (0x3EB0C6F7A0B5ED8C, "9.999999999999997e-7"),
-    (0x3EB0C6F7A0B5ED8D, "0.000001"),
-]
-
-
-class TestTheCanonicaliserIsRight:
-    """The helper is itself checked against the RFC, or the round trips below prove nothing."""
-
-    @pytest.mark.parametrize(("bits", "text"), RFC_8785_NUMBERS, ids=lambda v: str(v)[:22])
-    def test_numbers_as_in_rfc_8785_appendix_b(self, bits: int, text: str) -> None:
-        assert es_number(double_from_bits(bits)) == text
-
-    def test_some_more_numbers(self) -> None:
-        assert es_number(1e16) == "10000000000000000"
-        assert es_number(1e20) == "100000000000000000000"
-        assert es_number(1e21) == "1e+21"
-        assert es_number(5.0) == "5"
-        assert es_number(0.5) == "0.5"
-        assert es_number(123.456) == "123.456"
-        assert es_number(1e-6) == "0.000001"
-        assert es_number(1e-7) == "1e-7"
-        assert es_number(-1.5e-10) == "-1.5e-10"
-
-    def test_objects_are_sorted_by_utf16_code_units_and_text_is_escaped(self) -> None:
-        text = canonicalize(
-            {"b": 1, "a": [True, None, 'x\ny"\u0001'], "\U0001f600": 2, "\uffff": 3}
-        )
-
-        assert text == '{"a":[true,null,"x\\ny\\"\\u0001"],"b":1,"\U0001f600":2,"\uffff":3}'
-
-    def test_an_integer_that_is_no_double_is_refused_here_as_the_real_thing_would_round_it(
-        self,
-    ) -> None:
-        assert canonicalize(2**53) == "9007199254740992"
-        with pytest.raises(ValueError, match="not an IEEE-754 double"):
-            canonicalize(2**53 + 1)
-        with pytest.raises(ValueError, match="no NaN or infinity"):
-            canonicalize(math.nan)
-
 
 # Numbers near the edges, as Python values: ints that are exactly doubles, and floats.
 FLOATS: list[float | int] = [
@@ -257,47 +196,81 @@ class TestExpressionLiteralsSurviveCanonicalisation:
         assert literal.value == 1e16
 
 
+def float_and_json_positions(value: JsonValue) -> dict[str, Json]:
+    """One state entry for each place a number may be that takes an integer-valued double."""
+    columns: list[JsonValue] = [{"name": "f", "type": "float"}]
+    rows: list[JsonValue] = [[value]]
+    items: list[JsonValue] = [value]
+    nested: JsonValue = {"a": [{"b": value}]}
+    return {
+        "float default": {"kind": "float", "key": "x", "default": value},
+        "float minimum": {"kind": "float", "key": "x", "default": value, "minimum": value},
+        "float maximum": {"kind": "float", "key": "x", "default": 0.0, "maximum": value},
+        "float step": {"kind": "float", "key": "x", "default": 0.0, "step": value},
+        "float literal": {
+            "kind": "float",
+            "key": "x",
+            "default": 0.0,
+            "computed": {"kind": "float", "value": value},
+        },
+        "table float cell": {
+            "kind": "table",
+            "key": "x",
+            "default": {"columns": columns, "rows": rows},
+        },
+        "list float item": {"kind": "list", "key": "x", "item_type": "float", "default": items},
+        "json default": {"kind": "json", "key": "x", "default": value},
+        "nested json": {"kind": "json", "key": "x", "default": nested},
+    }
+
+
+POSITIONS = sorted(float_and_json_positions(0))
+
+
 class TestTheOneRuleForNumbers:
-    """Where a number is written as an integer: exactly some double, or it is refused."""
+    """Where a number is written as an integer: it stands for a double, or it is refused."""
 
-    @pytest.mark.parametrize("value", [2**53 + 1, 10**16 + 1, -(2**53) - 1])
-    def test_an_integer_no_double_equals_is_refused_in_every_float_or_json_position(
-        self, value: int
+    @pytest.mark.parametrize(
+        "value",
+        [
+            2**53 + 1,
+            10**16 + 1,
+            -(2**53) - 1,
+            2**60 + 1,
+            1152921504606847001,
+            10**21 - 1,
+            10**23 + 1,
+            10**400,
+        ],
+        ids=lambda v: f"{v.bit_length()}-bits",
+    )
+    @pytest.mark.parametrize("position", POSITIONS)
+    def test_an_integer_no_double_stands_for_is_refused_in_every_position(
+        self, position: str, value: int
     ) -> None:
-        floats: list[JsonValue] = [value]
-        columns: list[JsonValue] = [{"name": "f", "type": "float"}]
-        rows: list[JsonValue] = [[value]]
-        positions: list[Json] = [
-            {"kind": "float", "key": "x", "default": value},
-            {"kind": "float", "key": "x", "default": 0.0, "minimum": value},
-            {
-                "kind": "float",
-                "key": "x",
-                "default": 0.0,
-                "computed": {"kind": "float", "value": value},
-            },
-            {"kind": "list", "key": "x", "item_type": "float", "default": floats},
-            {"kind": "table", "key": "x", "default": {"columns": columns, "rows": rows}},
-            {"kind": "json", "key": "x", "default": floats},
-        ]
+        entry = float_and_json_positions(value)[position]
 
-        for entry in positions:
-            with pytest.raises(SpecError, match="no double is equal"):
-                validate_ui_spec(build(state=[entry]))
+        with pytest.raises(SpecError, match=r"no double is equal|too large for a double"):
+            validate_ui_spec(build(state=[entry]))
 
-    def test_the_same_integers_are_fine_where_a_double_holds_them(self) -> None:
-        for value in (2**53, 10**16, 10**20):
-            floats: list[JsonValue] = [value]
-            columns: list[JsonValue] = [{"name": "f", "type": "float"}]
-            rows: list[JsonValue] = [[value]]
-            positions: list[Json] = [
-                {"kind": "float", "key": "x", "default": value},
-                {"kind": "list", "key": "x", "item_type": "float", "default": floats},
-                {"kind": "table", "key": "x", "default": {"columns": columns, "rows": rows}},
-                {"kind": "json", "key": "x", "default": floats},
-            ]
-            for entry in positions:
-                validate_ui_spec(build(state=[entry]))
+    @pytest.mark.parametrize(
+        "value",
+        [
+            2**53,
+            10**16,
+            10**20,
+            2**100,
+            1152921504606847000,  # 2**60 as canonical JSON writes it
+            295147905179352830000,  # 2**68, the number of RFC 8785 appendix B
+            123456789012345680000,
+        ],
+        ids=lambda v: f"{v.bit_length()}-bits",
+    )
+    @pytest.mark.parametrize("position", POSITIONS)
+    def test_the_same_kinds_of_integer_are_fine_where_they_stand_for_a_double(
+        self, position: str, value: int
+    ) -> None:
+        validate_ui_spec(build(state=[float_and_json_positions(value)[position]]))
 
     def test_nothing_is_silently_rounded(self) -> None:
         spec = validate_ui_spec(build(state=[{"kind": "float", "key": "x", "default": 2**53 + 2}]))
@@ -306,5 +279,88 @@ class TestTheOneRuleForNumbers:
         with pytest.raises(SpecError, match="no double is equal"):
             validate_ui_spec(build(state=[{"kind": "float", "key": "x", "default": 2**53 + 1}]))
 
-    def test_the_module_is_the_one_the_tests_use(self) -> None:
-        assert jcs.canonicalize({"a": 1.0}) == '{"a":1}'
+    def test_an_integer_that_is_the_spelling_of_a_double_is_stored_as_that_double(self) -> None:
+        spec = validate_ui_spec(
+            build(state=[{"kind": "float", "key": "x", "default": 1152921504606847000}])
+        )
+
+        default = getattr(spec.state[0], "default")  # noqa: B009
+        assert type(default) is float
+        assert default == float(2**60)
+        assert int(default) == 2**60  # the double, not the digits that were written
+
+
+def doubles_between_2_53_and_1e21(count: int) -> list[float]:
+    """Random doubles from every binade of [2**53, 1e21), plus the doubles of the reviewers."""
+    rng = random.Random(8785)  # noqa: S311 -- a reproducible sample, nothing secret
+    found = [
+        float(2**60),
+        float(2**68),
+        1.2345678901234568e20,
+        float(2**53),
+        999999999999999700000.0,
+    ]
+    while len(found) < count:
+        exponent = rng.randrange(53, 70)  # 2**69 is 5.9e20; 2**70 is already over 1e21
+        value = float((2**52 + rng.getrandbits(52)) * 2 ** (exponent - 52))
+        if 2**53 <= value < 1e21:
+            found.append(value)
+    return found
+
+
+DOUBLES = doubles_between_2_53_and_1e21(100)
+
+
+class TestDoublesAbove2To53SurviveCanonicalisation:
+    """JCS writes these as their shortest digits padded with zeros (`2**60` as
+    `1152921504606847000`), which is no longer exactly the double: a spec holding one must still
+    validate when it is read back from its canonical form, in every number position (R2-B1)."""
+
+    def test_most_of_them_change_their_digits_which_is_why_this_is_tested(self) -> None:
+        changed = [value for value in DOUBLES if int(es_number(value)) != int(value)]
+
+        assert len(changed) > len(DOUBLES) // 2
+        assert es_number(float(2**60)) == "1152921504606847000"
+        assert es_number(float(2**68)) == "295147905179352830000"
+        assert es_number(1.2345678901234568e20) == "123456789012345680000"
+
+    def test_the_sample_is_in_range_and_varied(self) -> None:
+        assert len(DOUBLES) == 100
+        assert all(2**53 <= value < 1e21 for value in DOUBLES)
+        assert len(set(DOUBLES)) == 100
+        assert len({value.hex()[-6:] for value in DOUBLES}) > 50
+
+    @pytest.mark.parametrize("position", POSITIONS)
+    @pytest.mark.parametrize("form", ["float", "int"])
+    def test_every_position_accepts_what_canonicalisation_writes(
+        self, position: str, form: str
+    ) -> None:
+        for value in DOUBLES:
+            written: JsonValue = value if form == "float" else int(value)
+            entry = float_and_json_positions(written)[position]
+
+            spec, again, canonical = roundtrip(build(state=[entry]))
+
+            assert again == spec, (value.hex(), canonical)
+            assert es_number(value) in canonical
+            assert canonicalize(json.loads(again.model_dump_json())) == canonical
+
+    def test_every_position_at_once_in_one_spec(self) -> None:
+        state: list[Json] = []
+        for number, (name, entry) in enumerate(float_and_json_positions(float(2**60)).items()):
+            state.append({**entry, "key": f"k{number}"})
+            assert name  # the names are the positions of the table above
+
+        assert_survives(build(state=state))
+
+    def test_the_digits_json_text_carries_are_read_as_the_nearest_double(self) -> None:
+        text = (
+            '{"version":"tumbleweed.ui/1","title":"t","root":{"kind":"box"},'
+            '"state":[{"kind":"float","key":"x","default":295147905179352830000},'
+            '{"kind":"json","key":"j","default":[295147905179352830000]}]}'
+        )
+
+        spec = parse_ui_spec(text)
+
+        assert getattr(spec.state[0], "default") == float(2**68)  # noqa: B009
+        assert getattr(spec.state[1], "default") == [float(2**68)]  # noqa: B009

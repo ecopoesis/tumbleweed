@@ -1,6 +1,7 @@
 """Value types: image and file refs, tables, JSON data, port types."""
 
 import json
+import tracemalloc
 import unicodedata
 
 import pytest
@@ -17,6 +18,7 @@ from tumbleweed.ui.spec.limits import (
     MAX_TABLE_CELLS,
     MAX_TABLE_COLUMNS,
     MAX_TABLE_ROWS,
+    MAX_VALUE_TEXT_BYTES,
 )
 from tumbleweed.ui.spec.values import FileRef, ImageRef, JsonData, Table
 
@@ -67,6 +69,25 @@ COLONS_THAT_ARE_JUST_FILE_NAMES = [
     "my_photo:1.png",  # an underscore is not a scheme character
     "caf\u00e9:1.png",  # nor is a letter outside ASCII
     ".hidden:1.png",
+]
+
+
+# Names that an option parser, `expanduser`, a URL decoder, a glob or a shell would each treat as
+# something other than a file name. They are valid references; opening is what must stay plain.
+NAMES_THAT_ARE_SPECIAL_TO_SOMETHING_ELSE = [
+    "-rf.png",  # an option to most programs
+    "--help",
+    "~root/x.png",  # `expanduser` turns it into root's home
+    "~/x.png",
+    "%2e%2e/x.png",  # a URL decoder turns it into `../x.png`
+    "%2fetc%2fpasswd",
+    "$HOME/x.png",
+    "*.png",
+    "a;b.png",
+    "`id`.png",
+    "a b.png",
+    "x.png ",  # the trailing blank survives
+    "dir/-rf.png",
 ]
 
 
@@ -121,6 +142,17 @@ class TestRefsAreWorkspaceRelativeAndNothingElse:
             with pytest.raises(ValidationError, match="URL or a drive"):
                 FileRef.model_validate({"path": url})
         assert ours >= 6  # the rule is what stops most of these
+
+    @pytest.mark.parametrize("path", NAMES_THAT_ARE_SPECIAL_TO_SOMETHING_ELSE)
+    def test_a_name_that_means_something_to_a_shell_or_a_url_is_a_valid_file_name(
+        self, path: str
+    ) -> None:
+        # On purpose: each is a legal Linux file name, so the check that refuses a URL or a
+        # drive must not refuse these. What keeps them harmless is how a reference is opened (a
+        # directory file descriptor, never `expanduser`, a URI or an argv without `--`), which
+        # `docs/ui-spec.md` section 6 states and S11 tests with exactly these names.
+        assert str(FileRef.model_validate({"path": path}).path) == path
+        assert str(FileRef.model_validate_json(json.dumps({"path": path})).path) == path
 
     def test_a_refused_ref_is_refused_before_it_is_ever_a_path(self) -> None:
         for path in ("a\\b.png", "a/b\\c.png"):
@@ -384,6 +416,39 @@ class TestJsonData:
         with pytest.raises(ValidationError, match="too large for a double"):
             JSON.validate_python([10**400])
 
+    @pytest.mark.parametrize(
+        ("spelling", "double"),
+        [
+            (1152921504606847000, float(2**60)),
+            (-1152921504606847000, -float(2**60)),
+            (295147905179352830000, float(2**68)),
+        ],
+    )
+    def test_an_integer_that_is_how_canonical_json_spells_a_double_is_that_double(
+        self, spelling: int, double: float
+    ) -> None:
+        checked = values.check_json([spelling, {"k": spelling}])
+
+        assert checked == [double, {"k": double}]
+        assert isinstance(checked, list)
+        assert type(checked[0]) is float
+        assert JSON.validate_json(f"[{spelling}]") == [double]
+
+    def test_an_integer_beyond_the_safe_range_is_stored_as_a_float_and_the_others_stay_ints(
+        self,
+    ) -> None:
+        checked = values.check_json([2**53 - 1, -(2**53 - 1), 2**53, 2**60, 5, {"k": 2**70}])
+
+        assert isinstance(checked, list)
+        assert [type(item) for item in checked] == [int, int, float, float, int, dict]
+        assert checked[:5] == [2**53 - 1, -(2**53 - 1), 2**53, 2**60, 5]
+        assert checked[5] == {"k": float(2**70)}
+
+    def test_a_value_without_integers_beyond_the_safe_range_is_returned_as_it_came(self) -> None:
+        value: JsonValue = {"a": [1, 2.5, "x", None, True]}
+
+        assert values.check_json(value) is value
+
     def test_floats_are_finite(self) -> None:
         for bad_float in (float("nan"), float("inf"), float("-inf")):
             with pytest.raises(ValidationError, match="finite"):
@@ -404,6 +469,84 @@ class TestJsonData:
         assert values.check_json({"a": [1, None, True, 1.5, "x"]}) == {
             "a": [1, None, True, 1.5, "x"]
         }
+
+
+class TestObjectKeysAreStrings:
+    """A key that is not a string is a refusal, never a crash (R2-F2)."""
+
+    BAD_KEYS: tuple[object, ...] = (1, 1.5, True, None, b"k", (1, 2), frozenset({1}), object())
+
+    @pytest.mark.parametrize("key", BAD_KEYS, ids=lambda k: type(k).__name__)
+    def test_check_json_refuses_a_key_that_is_not_a_string(self, key: object) -> None:
+        for value in ({key: 1}, [{key: 1}], {"a": {"b": [{key: 1}]}}):
+            with pytest.raises(InvalidValueError, match="a key of a JSON object must be a string"):
+                values.check_json(value)
+
+    def test_a_str_subclass_is_not_a_string_key_either(self) -> None:
+        class Key(str):
+            __slots__ = ()
+
+        with pytest.raises(InvalidValueError, match="must be a string"):
+            values.check_json({Key("k"): 1})
+
+    def test_the_message_does_not_echo_what_the_key_was(self) -> None:
+        with pytest.raises(InvalidValueError) as raised:
+            values.check_json({10**5000: 1})
+
+        assert len(str(raised.value)) < 100
+
+    @pytest.mark.parametrize("key", BAD_KEYS, ids=lambda k: type(k).__name__)
+    def test_the_models_refuse_it_with_a_validation_error(self, key: object) -> None:
+        with pytest.raises(ValidationError):
+            JSON.validate_python({key: 1})
+
+
+class TestTheWalkStopsAtTheFirstLimitCrossed:
+    def test_the_text_budget_is_checked_at_each_key_not_after_the_whole_object(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        looked_at = 0
+        real = values._json_text  # noqa: SLF001 -- counting calls of the function under test
+
+        def counting(text: str) -> int:
+            nonlocal looked_at
+            looked_at += 1
+            return real(text)
+
+        monkeypatch.setattr(values, "_json_text", counting)
+        piece = 60_000
+        keys = {f"{number:04d}" + "x" * piece: 0 for number in range(200)}  # 12 MB of keys
+
+        with pytest.raises(InvalidValueError, match="bytes of text"):
+            values.check_json(keys)
+
+        # 18 keys fill the budget and the 19th crosses it: not all 200.
+        assert looked_at == MAX_VALUE_TEXT_BYTES // (piece + 4) + 1
+
+    def test_a_list_that_cannot_fit_is_not_unpacked(self) -> None:
+        huge = [0] * 1_000_000
+        tracemalloc.start()
+        try:
+            with pytest.raises(InvalidValueError, match="more than 10000 nodes"):
+                values.check_json(huge)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        # Unpacking would put a million tuples on the stack: about 100 MB.
+        assert peak < 1_000_000
+
+    def test_an_object_that_cannot_fit_is_not_unpacked_either(self) -> None:
+        huge = dict.fromkeys(map(str, range(300_000)), 0)
+        tracemalloc.start()
+        try:
+            with pytest.raises(InvalidValueError, match="more than 10000 nodes"):
+                values.check_json(huge)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert peak < 2_000_000
 
 
 class TestNormalisationCollisions:
@@ -506,7 +649,21 @@ class TestCellNumbers:
         assert parsed.rows == ((float(value),),)
         assert type(parsed.rows[0][0]) is float
 
-    @pytest.mark.parametrize("value", [2**53 + 1, 10**16 + 1, 10**400])
+    @pytest.mark.parametrize(
+        ("spelling", "double"),
+        [(1152921504606847000, float(2**60)), (295147905179352830000, float(2**68))],
+    )
+    def test_a_float_column_takes_the_spelling_of_a_double_and_stores_the_double(
+        self, spelling: int, double: float
+    ) -> None:
+        parsed = table([("a", "float")], [[spelling]])
+
+        assert parsed.rows == ((double,),)
+        assert type(parsed.rows[0][0]) is float
+        with pytest.raises(ValidationError, match="beyond"):
+            table([("a", "int")], [[spelling]])
+
+    @pytest.mark.parametrize("value", [2**53 + 1, 10**16 + 1, 2**60 + 1, 10**400])
     def test_a_float_column_refuses_an_integer_it_would_round(self, value: int) -> None:
         with pytest.raises(ValidationError):
             table([("a", "float")], [[value]])

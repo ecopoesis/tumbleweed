@@ -26,7 +26,7 @@ Size: a `string` is at most `max_length` characters; a `json`, `table` or `list`
 most `MAX_VALUE_TEXT_BYTES` bytes of text (and its own count limits); a patch at most
 `MAX_PATCH_TEXT_BYTES`; the state of a tool at most `MAX_STATE_TEXT_BYTES` (`value_text_bytes`
 measures a value, `UiSpec` checks the defaults, `UiSpec.validate_patch` a patch and, given the
-current values, the state after it).
+current values, that the patch does not grow the state's text beyond it).
 
 `check_value` is the one function that decides whether a value belongs to a declaration. It is
 used here for defaults and by `UiSpec.validate_patch` for everything that arrives later (from
@@ -80,7 +80,7 @@ from tumbleweed.ui.spec.text import (
     as_tuple,
     canonical_text,
     check_data_text,
-    exact_double,
+    double_of,
     text_bytes,
 )
 from tumbleweed.ui.spec.values import (
@@ -318,7 +318,7 @@ def _scalar_of_type(item_type: ScalarType, label: str, raw: object) -> ScalarVal
         case "float":
             if type(raw) is int:
                 try:
-                    return exact_double(raw)
+                    return double_of(raw)
                 except InvalidValueError:
                     return None
             if type(raw) is float and math.isfinite(raw):
