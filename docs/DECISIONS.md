@@ -165,8 +165,8 @@ runs one asyncio loop on a daemon thread (started on the first reply, stopped wh
 and reports every `ReplyEvent` through a `MainThreadDispatcher` that the shell injects
 (`tumbleweed.shell.dispatch.GlibDispatcher`, a thin wrapper of `GLib.idle_add`); `tumbleweed.agent` never
 imports `gi`. The main thread owns all mutable state (the active reply, the conversation); the worker only
-posts callbacks. A reply is cancelled by cancelling its task on the worker, and the dispatcher drops what a
-cancelled reply posts afterwards. **Consequences.** The shell's thread rule (D9, `WrongThreadError`) holds by
+posts callbacks. A reply is cancelled by cancelling its task on the worker, and `AgentResponder._deliver` (on the main
+thread) drops whatever a cancelled or ended reply posted afterwards; the dispatcher itself drops nothing. **Consequences.** The shell's thread rule (D9, `WrongThreadError`) holds by
 construction. Tool handlers, when they arrive, run on the worker thread and must marshal to the UI through
 the same dispatcher; none may touch a widget. `PyGObject >= 3.50` stays for other reasons (the Gio and
 GStreamer ecosystem), not for `gi.events`. Revisit if #47 is fixed and a single-loop design becomes
@@ -176,13 +176,24 @@ attractive; nothing outside `tumbleweed.agent.runtime` and `tumbleweed.shell.dis
 
 **Context.** A provider, or a proxy in front of it, controls the text of its errors, and an HTTP library's
 exception text can name request details. The SDK logs request bodies (prompts) and exception text at DEBUG.
-**Decision.** Every SDK exception is translated, in `tumbleweed.agent.anthropic_provider`, to a
-`ProviderError` whose message is ours (the status code and a sentence), and the chain to the SDK exception
-is cut. The invocation log holds only validated, closed or length-capped fields (an `ErrorKind`, never
+**Decision.** Everything a call can raise is translated, in `tumbleweed.agent.anthropic_provider`, to a
+`ProviderError` whose message is ours (the status code and a sentence): the SDK's errors, the HTTP
+library's transport errors and timeouts, the SDK's stream-parser errors, and our own validation of what a
+server's numbers and JSON say. The chain to the original exception is cut, and a bug anywhere else is
+logged by type and place, never by message (`describe_unexpected`). A stream that does not end with
+`message_stop` and a stop reason is a failure, and only `end_turn` and `stop_sequence` finish a reply. The invocation log holds only validated, closed or length-capped fields (an `ErrorKind`, never
 text). The SDK's, `httpx2`'s and `httpcore2`'s loggers are held at WARNING, so `ANTHROPIC_LOG=debug`
-cannot put prompts or a hostile error text in the log. **Consequences.** A user debugging a provider
+cannot put prompts or a hostile error text in the log. The client follows no redirects (a 307 would resend the key), ignores the environment's proxy variables
+(a proxy would see the key, or get it in clear text for a loopback `http` base URL), bounds the size of a
+response in the transport, and does not use the SDK's retries, which sleep for whatever `Retry-After` says:
+the provider retries a rate limit, an overload or a dropped connection twice, a capped 10 s apart, and only
+before any of the answer has arrived. **Not done: refusal fallbacks.** The API can re-run a refused request
+on another model server-side (`fallbacks`, a beta header); it is Claude-API-only and would not survive a
+proxy `base_url`, so a refusal is shown as "The model declined to answer." Deferred, tracked in #70.
+**Consequences.** A user debugging a provider
 problem sees the status code and the provider's request ID (in the invocation log), not the provider's
-message; the request ID is what support needs.
+message; the request ID is what support needs. A corporate CA given through `SSL_CERT_FILE` is ignored along
+with the other environment settings.
 
 ## D13 — The sandbox's limits: `prlimit` between systemd-run and bwrap, and a proof that the scope works (2026-10-16, accepted)
 

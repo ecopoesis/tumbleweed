@@ -450,6 +450,14 @@ Each invariant names where it is enforced. Reviews check every change against th
   `regex`, D10), which breaks the grapheme clusters and the unbroken runs that would make a label
   wider than the window or quadratic to measure, and a long message is shown as a column of small
   labels.
+  The agent's limits are enforced in three places: `agent.limits` holds the values and refuses
+  out-of-range settings; `agent.loop` enforces iterations per reply, output tokens per reply, the
+  bytes of reply text (`MAX_REPLY_BYTES`, the hard guarantee that a reply fits a transcript message;
+  tokens do not bound bytes) and the reply timeout around the whole run, tool calls included;
+  `agent.runtime` allows one reply at a time and bounds the user's message. The size of what a
+  server can make the shell read is bounded in the transport (`agent.anthropic_provider`: 2 MiB
+  of a stream, 64 KiB of an error body), and tool inputs, results and runtime are bounded by
+  `agent.tools`.
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input.
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps

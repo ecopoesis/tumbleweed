@@ -146,12 +146,17 @@ chat = "claude-sonnet-5-5"              # one setting per role         (TUMBLEWE
 
 [agent.limits]                          # per reply (ARCHITECTURE I9)
 max_iterations = 8                      # model calls, each tool round trip is one more
-max_turn_output_tokens = 8192           # at most 16384: a reply fits a 64 KiB transcript message
+max_turn_output_tokens = 16000          # up to 128000, thinking included: cost and time, not size
 reply_timeout_seconds = 120             # wall-clock, retries and tools included
 ```
 
-`base_url` must be `https` (plain `http` only to `localhost`, for a local proxy): the key is sent
-there. Errors (no key, no network, rate limit, overload, a timeout, a limit reached) appear under
+`base_url` must be `https` (plain `http` only to `localhost`, for a local proxy) with a valid port: the
+key is sent there. The client follows no redirects and ignores `HTTP_PROXY`, `ALL_PROXY` and
+`SSL_CERT_FILE`, so the key goes only to that URL. A rate limit, an overload or a dropped connection is
+retried twice, a few seconds apart; a response is read up to 2 MiB.
+
+A reply's size is bounded by bytes (64 KiB, the transcript's own cap), not by the token limit, which
+counts thinking tokens and so is about cost and time. Errors (no key, no network, rate limit, overload, a timeout, a limit reached) appear under
 the reply in the chat; the shell keeps running. Every model call is appended to
 `$XDG_DATA_HOME/tumbleweed/shell/invocations.jsonl` (mode 0600, rotated at 10 MiB): its ID, session,
 model, token usage, latency, stop reason, the provider's request ID and how it ended. It holds no
