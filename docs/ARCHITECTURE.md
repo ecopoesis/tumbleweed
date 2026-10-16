@@ -206,9 +206,11 @@ audited.
   included) or opens a saved tool whose package is fs-tainted, and `net`-tainted the moment
   it is issued `net.full`. The broker refuses any grant that would make a task both, and
   refuses `open_tool` of an fs-tainted package in a net-tainted task (the model is told to
-  start a new task). Applying a tool grant to a run counts as issuing it to the task for
+  call `start_task(..., fresh_context=true)`). Applying a tool grant to a run counts as issuing it to the task for
   taint purposes; a tool grant that would conflict with the task's taint is withheld from
-  that run. A task inheriting turns from an fs-tainted task starts fs-tainted (§2). A tool
+  that run. A task inheriting turns from an fs-tainted task starts fs-tainted (§2):
+  `start_task` passes `fresh_context` to the broker, which copies the ended task's taint to
+  the new task unless it is true. The broker's taint state is authoritative. A tool
   package records the taint of the task it was saved from, because its code and defaults
   may embed what that task saw. Data reaches a net-tainted task from an fs-tainted one only
   through a cross-task connection the user approved in a trusted prompt; the model context

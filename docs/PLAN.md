@@ -582,7 +582,9 @@ audit.
 **Scope.**
 - The `tumbleweed-broker` daemon on IPC (S13), using the S16 policy.
 - A grant store (SQLite).
-- Task and workspace management: create, end and revoke; retention of 7 days.
+- Task and workspace management: create, end and revoke; retention of 7 days. Creating a
+  task takes `fresh_context`; unless it is true, the broker copies the ended task's taint to
+  the new task. The broker's taint state is authoritative (I12).
 - A `run_in_sandbox` API that composes a `SandboxPolicy` from the task's grants via S14/S15,
   binding grant paths by verified descriptor.
 - A grant-checked, size-capped `read_file`, plus workspace listing and reads that never
@@ -648,7 +650,8 @@ audit.
   - `start_task(title, fresh_context=false)`; a default task per session; ending on new
     session or restart;
   - a task whose context inherits turns from an fs-tainted task starts fs-tainted, unless
-    `fresh_context=true` (no prior turns in its context);
+    `fresh_context=true` (no prior turns in its context); `start_task` sends
+    `fresh_context` to the broker, which owns taint (S17);
   - the title is shown in chrome as model-supplied text (I5).
 - Task-scoped model context: tool results from earlier tasks are excluded.
 - Tool instances belong to the task that created them. When that task ends they become
@@ -741,7 +744,8 @@ access.
   `/dev/net/tun` (ARCHITECTURE §11).
 - Trusted prompt wording for network grants carries a strong warning.
 - I12 taint enforcement in the broker and in the prompts: an fs-tainted task cannot get
-  `net.full`, and vice versa (sticky); the model is told to start a new task.
+  `net.full`, and vice versa (sticky); the model is told to call
+  `start_task(..., fresh_context=true)`.
 - The model context of a net-tainted task excludes every turn from fs-tainted tasks.
 - DNS via slirp4netns.
 
@@ -798,8 +802,8 @@ access.
   plus model re-ranking).
 - Saved tools run code from the broker's store (I8).
 - Opening an fs-tainted package taints the current task (I12); `open_tool` of an
-  fs-tainted package in a net-tainted task is refused, and the model is told to start a new
-  task.
+  fs-tainted package in a net-tainted task is refused, and the model is told to call
+  `start_task(..., fresh_context=true)`.
 - Tool grants:
   - prompts gain "allow for this tool";
   - tool-scoped grants bind to (ToolId, hash) and apply only to user-triggered handler runs
