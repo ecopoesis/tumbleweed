@@ -7,16 +7,21 @@
 #
 # The image holds the source as of the build, so every run rebuilds it first; Docker's layer
 # cache keeps that fast unless pyproject.toml or uv.lock changed.
+#
+# The run uses the exact image this build produced (--iidfile), never a tag: with a shared tag,
+# two worktrees running this script at once could each test the other's code.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-image=tumbleweed-test
-docker build --tag "$image" .
+iidfile="$(mktemp)"
+trap 'rm -f "$iidfile"' EXIT
+docker build --iidfile "$iidfile" .
+image="$(cat "$iidfile")"
 
 # The flags are ARCHITECTURE section 11: bubblewrap needs user namespaces and a fresh /proc,
-# slirp4netns needs a tap device. Nothing else is relaxed.
-exec docker run --rm \
+# slirp4netns needs a tap device. Nothing else is relaxed. (Not `exec`: the trap must run.)
+docker run --rm \
     --security-opt seccomp=unconfined \
     --security-opt apparmor=unconfined \
     --security-opt systempaths=unconfined \
