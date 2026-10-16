@@ -262,11 +262,21 @@ Each invariant names where it is enforced. Reviews check every change against th
   ruleset and a pids limit (both required on the target; on dev/CI hosts without them the
   run reports their absence), CPU/memory/time/output limits, killed with its parent.
 - **I4 — Generated UI is inert data.** The renderer accepts only the schema. No Pango markup
-  from model text (plain text only). No URIs opened automatically. Images and files only by
+  from model text (plain text only; the shell puts untrusted text into labels through
+  `tumbleweed.shell._widgets.plain_label`, and `tests/shell/test_markup_lint.py` rejects the GTK
+  APIs that parse markup in the GTK packages). No URIs opened automatically. Images and files only by
   workspace reference, never arbitrary paths or remote URLs; images only in allowlisted
   raster formats (PNG, JPEG, WebP; never SVG). Size, depth and count limits.
 - **I5 — Trusted chrome is unspoofable.** Prompts, the picker and other chrome render in a
-  reserved region the canvas cannot draw over, with styling generated specs cannot use.
+  reserved region the canvas cannot draw over, with styling generated specs cannot use. The
+  region is a sibling of the canvas in the window's vertical layout (`tumbleweed.shell.window`),
+  never on an overlay; the canvas hosts its content in a scrolled window that clips what is
+  drawn and picked **on the window's own surface** and does not pass the content's size on, so a
+  hostile widget in the canvas can neither paint over the region, nor take clicks meant for it,
+  nor push it out of the window (`tumbleweed.shell.canvas`; proven with real layout and
+  rendering in `tests/shell/test_chrome_isolation.py`). Clipping does not reach other surfaces:
+  popovers, dialogs, tooltips and drag icons are separate windows, so the renderer must not
+  create them from a spec (tracked in #53, S10).
   **Every model-supplied string** shown in chrome (reasons, task titles, tool names and
   descriptions, spec titles) is plain, length-capped, and labelled as coming from the
   assistant. What is being granted is rendered from the structured capability. While a
@@ -285,7 +295,13 @@ Each invariant names where it is enforced. Reviews check every change against th
   code from its own store, never code supplied by the shell.
 - **I9 — Bounded resources.** Limits on spec size, IPC frame size, file reads, sandbox
   CPU/memory/pids/time/output, agent loop iterations and tokens per turn. At most one
-  sandbox handler run per tool instance in flight; slider-driven handlers are debounced.
+  sandbox handler run per tool instance in flight; slider-driven handlers are debounced. In the
+  shell: a size cap per transcript message and a cap on their number
+  (`tumbleweed.shell.viewmodel.transcript`), and a bound on what a message can cost to lay out:
+  text goes into labels through `tumbleweed.shell.viewmodel.display` (UAX 29 clusters from
+  `regex`, D10), which breaks the grapheme clusters and the unbroken runs that would make a label
+  wider than the window or quadratic to measure, and a long message is shown as a column of small
+  labels.
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input.
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps
@@ -327,7 +343,9 @@ src/tumbleweed/
   ui/runtime/ state store, expression interpreter, bindings, handler dispatch (no GTK)
   ui/gtk/     GTK4 adapter that renders specs
   shell/      Adw application, window, chat panel, trusted prompts, terminal pane
-  agent/      agent loop, tool registry, LLM providers, invocation recorder, prompts
+  shell/viewmodel/  transcript view-model and chat controller (no GTK)
+  agent/      agent loop, tool registry, LLM providers, invocation recorder, prompts;
+              the `Responder` interface the shell is built against (`agent/responder.py`)
   voice/      audio capture, STT, TTS, VAD, wake word
   history/    chat persistence
   broker/     daemon, policy, grants, paths, tasks, workspaces, tool store, snapshots, audit
@@ -341,11 +359,16 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
 - `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
   import `gi`.
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
+- `shell.viewmodel` never imports `gi`, directly or through another module, so it cannot import
+  the GTK adapter modules of `shell` either. `tests/test_import_contracts.py` plants each
+  forbidden import in a copy of the tree and checks that its contract breaks.
 
 ## 11. Environments
 
 - **macOS (development)**: shell, renderer, agent and voice run natively (GTK4 via Homebrew,
-  PyGObject built into the uv venv). whisper.cpp and Piper run natively (Metal) and are
+  PyGObject built into the uv venv). `tumbleweed-shell` finds Homebrew's libraries and data by
+  relaunching itself once with `DYLD_FALLBACK_LIBRARY_PATH` and `XDG_DATA_DIRS` extended (D8, README);
+  nothing of that runs on Linux. whisper.cpp and Piper run natively (Metal) and are
   reachable over HTTP from a VM. Linux-only parts (bubblewrap, Landlock, seccomp, btrfs) are
   exercised through the Docker harness `scripts/test-linux`.
 - **Docker harness**: runs as a non-root user with `--security-opt seccomp=unconfined

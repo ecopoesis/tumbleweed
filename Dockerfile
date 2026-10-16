@@ -9,13 +9,15 @@ FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Runtime: GTK 4 and libadwaita typelibs, weston (headless display), fonts for Pango,
-# bubblewrap, slirp4netns and libseccomp (the sandbox, S14-S22).
+# bubblewrap, slirp4netns and libseccomp (the sandbox, S14-S22), and dbus-daemon (a private session
+# bus for the test that lists what the shell exports on it).
 # Build: a toolchain, Python headers and the -dev packages PyGObject and pycairo compile against.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         bubblewrap \
         build-essential \
         ca-certificates \
+        dbus-daemon \
         fonts-dejavu-core \
         gir1.2-adw-1 \
         gir1.2-gtk-4.0 \

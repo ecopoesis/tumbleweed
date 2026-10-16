@@ -81,3 +81,76 @@ sandbox needs network access in order to think. Tasks within a session are isola
 grants and by excluding earlier tasks' tool results from the context; assistant text still
 carries over (accepted residual risk). Running concurrent per-task agent loops (true
 multi-agent) is post-v1.
+
+## D8 — The shell finds Homebrew's GTK on macOS by relaunching itself (2026-10-16, accepted)
+
+**Context.** On Apple Silicon `/opt/homebrew/lib` is not on dyld's search path, and the GTK
+typelibs name their libraries without a directory, so PyGObject cannot load GTK unless the
+Python has that directory in its rpath (a uv-managed Python does not) or
+`DYLD_FALLBACK_LIBRARY_PATH` names it. S01 documented exporting the variable in the shell profile
+and set it in CI; the `tumbleweed-shell` entry point cannot rely on a profile, and macOS removes
+`DYLD_*` from processes started through `/bin/sh` or `/usr/bin/env`, which includes a console script
+whose uv-written shebang is `/bin/sh`. A terminal that sets `XDG_DATA_DIRS` without
+`/opt/homebrew/share` likewise leaves GTK without its GSettings schemas (Homebrew's GLib defaults
+to that directory only while the variable is unset).
+**Decision.** On macOS, before importing GTK, the entry point `execve`s the same interpreter with
+the same arguments once, with `/opt/homebrew/lib` first on `DYLD_FALLBACK_LIBRARY_PATH` (an unset
+variable gets the default `man dyld` documents for older binaries, `/usr/local/lib:/usr/lib`, since
+setting it replaces that; nothing derived from `$HOME` or the working directory is ever added) and
+`/opt/homebrew/share` appended to `XDG_DATA_DIRS` if that is set. Once GTK is loaded the relaunched
+process puts the user's two variables back into `os.environ` (carried through the relaunch by the
+marker), so the programs the shell starts, and a `tumbleweed-shell` started from it, see the user's
+environment; dyld has read its variable at launch and GLib's directories are pinned first, so
+nothing is lost by it.
+The prefix is the fixed Apple Silicon one, not read from the environment or from `brew`; a marker
+variable prevents a second relaunch; nothing is done on other platforms or when both variables are
+already right. Alternatives rejected: exporting the variable in the profile (fragile: lost through
+SIP-protected shells), a launcher shell script (a second entry point beside the console script that
+`uv run` starts), changing `os.environ` in process
+(dyld has already read it), preloading libraries with `ctypes` (tried: with GLib, GObject, Gio and
+GTK loaded by absolute path, the typelibs' leaf-name `dlopen` still fails), and documenting a specific
+Python build (we do not control the interpreter).
+**Consequences.** One extra `exec` on every macOS start (about 15 ms, measured). The relaunched process
+no longer inherits the two variables (they are put back), and code that starts subprocesses must
+keep passing an explicit, minimal environment (CLAUDE.md) anyway. Linux and the kiosk target are
+unaffected.
+
+## D9 — The shell talks to the agent through a callback `Responder` (2026-10-16, accepted)
+
+**Context.** S02 needs an interface for S03 to implement behind a placeholder, ready for replies
+that stream, fail halfway and are cancelled. `tumbleweed.agent` may not import `gi`, and S03 chooses
+how asyncio meets the GLib loop (D2).
+**Decision.** `Responder.start(request, sink) -> ReplyHandle`. The responder reports a reply
+through `ReplySink.emit` as a discriminated union of events (`ReplyDelta`, then exactly one of
+`ReplyFinished` or `ReplyFailed`), on the thread that called `start`; the handle's `cancel` stops it.
+The sink may be called before `start` returns. All models are strict, frozen pydantic classes. The
+shell's controller is the sink: it validates and bounds everything the responder says before it
+reaches the transcript, and ignores events after a reply has ended.
+**Consequences.** No event loop is needed to use or test it, and S03 can drive it from an asyncio
+task or a worker thread without changing the shell. New kinds of event (tool calls) extend the union.
+Timeouts and per-turn limits stay the responder's job (I9). An `AsyncIterator`-returning interface was
+considered and rejected for S02: it would make the shell choose the asyncio integration S03 owns.
+Events must arrive on the thread that sent the message; the sink raises `WrongThreadError` from
+another one. In the worker-thread fallback of D2 the shell injects a main-thread dispatcher built
+on `GLib.idle_add` and the agent calls it; the agent never imports `gi`.
+
+## D10 — Grapheme clusters are found with `regex`'s UAX 29 segmenter (2026-10-16, accepted)
+
+**Context.** Text that passes every size cap can still wreck the shell's layout: one grapheme
+cluster of thousands of code points (jamo, a ZWJ chain, a conjunct chain) is one unbreakable glyph
+run, and Pango never breaks inside a cluster. The display transform (`tumbleweed.shell.viewmodel.display`)
+has to know where clusters are to cap them. Tables of ours for the Extend, SpacingMark, Prepend,
+Hangul and Indic conjunct (GB9c) rules were tried first and were wrong in the ways the reviews
+found: non-mark Extend characters (U+FF9E, ZWNJ), Hangul syllable sequences, conjunct chains.
+**Decision.** Use `regex` (`\X`, upstream's Unicode data) as a real UAX 29 segmenter. It is a new
+runtime dependency, and `types-regex` a dev one for `mypy --strict`. It is a C extension with
+wheels for every platform the lock covers (macOS arm64, Linux x86_64 and aarch64, Python 3.12 to
+3.14), segments 64 KiB in about 6 ms, and the standard library has nothing equivalent. The
+transform keeps a cap of its own that does not depend on the segmenter (a break every 256 code
+points), so a segmenter that differs from Pango's, or a bug in it, cannot make layout unbounded; it
+only makes the cluster cap less exact. The segmenter never sees anything but text, and its pattern
+is a constant.
+**Consequences.** One more locked dependency to keep current. The transform is exact for new Unicode
+versions as soon as `regex` is. Break opportunities stay our own small set (the UAX 14 spaces and
+U+200B), because `regex` has no line breaker and an over-inserted U+200B is harmless.
+

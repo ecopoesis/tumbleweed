@@ -9,7 +9,16 @@ dependencies = [
     # Built from source against the system GTK (Homebrew on macOS, apt in the Linux image).
     # >=3.50 for `gi.events` (asyncio on the GLib main loop), see DECISIONS D2.
     "PyGObject>=3.50",
+    # Unicode grapheme-cluster segmentation (UAX 29: `\X`) for the transcript's display transform,
+    # which keeps a hostile cluster from wrecking the layout. The data is upstream's, current with
+    # Unicode, and covers rules (Indic conjuncts, Hangul, Extend) that tables of ours would only
+    # approximate and let drift. A C extension with wheels for every platform we lock; stdlib has
+    # no equivalent. See DECISIONS D10.
+    "regex>=2026.9.29",
 ]
+
+[project.scripts]
+tumbleweed-shell = "tumbleweed.shell.launch:main"
 
 [dependency-groups]
 dev = [
@@ -22,6 +31,7 @@ dev = [
     "pytest-timeout>=2.3",
     "ruff>=0.11",
     "types-jsonschema>=4.23",
+    "types-regex>=2026.9.29",
 ]
 
 [build-system]
@@ -180,4 +190,24 @@ forbidden_modules = ["gi"]
 name = "ui.spec never imports gi (ARCHITECTURE section 10)"
 type = "forbidden"
 source_modules = ["tumbleweed.ui.spec"]
+forbidden_modules = ["gi"]
+
+[[tool.importlinter.contracts]]
+name = "agent never imports gi (ARCHITECTURE section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.agent"]
+forbidden_modules = ["gi"]
+
+[[tool.importlinter.contracts]]
+name = "agent never imports shell: the shell depends on the agent through interfaces (section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.agent"]
+forbidden_modules = ["tumbleweed.shell"]
+
+# Indirect imports count: the view-model may not reach gi through any other module either, so it
+# also cannot import the GTK adapter modules of tumbleweed.shell.
+[[tool.importlinter.contracts]]
+name = "the shell view-model never imports gi (section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.shell.viewmodel"]
 forbidden_modules = ["gi"]
