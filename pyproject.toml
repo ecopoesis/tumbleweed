@@ -22,6 +22,7 @@ tumbleweed-shell = "tumbleweed.shell.launch:main"
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.130",
     "import-linter>=2.3",
     "jsonschema>=4.23",
     "mypy>=1.15",
@@ -210,4 +211,10 @@ forbidden_modules = ["tumbleweed.shell"]
 name = "the shell view-model never imports gi (section 10)"
 type = "forbidden"
 source_modules = ["tumbleweed.shell.viewmodel"]
+forbidden_modules = ["gi"]
+
+[[tool.importlinter.contracts]]
+name = "ipc never imports gi (ARCHITECTURE section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.ipc"]
 forbidden_modules = ["gi"]

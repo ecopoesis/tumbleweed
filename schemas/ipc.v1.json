@@ -1,0 +1,264 @@
+{
+  "$defs": {
+    "Echo": {
+      "additionalProperties": false,
+      "description": "Send back this text. Answered with `Echoed`. A diagnostic and a test vehicle.",
+      "properties": {
+        "kind": {
+          "const": "echo",
+          "title": "Kind",
+          "type": "string"
+        },
+        "text": {
+          "maxLength": 1024,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "text"
+      ],
+      "title": "Echo",
+      "type": "object"
+    },
+    "Echoed": {
+      "additionalProperties": false,
+      "description": "The answer to `Echo`: the same text.",
+      "properties": {
+        "kind": {
+          "const": "echoed",
+          "title": "Kind",
+          "type": "string"
+        },
+        "text": {
+          "maxLength": 1024,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "text"
+      ],
+      "title": "Echoed",
+      "type": "object"
+    },
+    "ErrorCode": {
+      "description": "Why a peer refused a request, or the whole connection. Part of the wire format.",
+      "enum": [
+        "incompatible_protocol",
+        "bad_handshake",
+        "protocol_violation",
+        "unsupported_request",
+        "too_many_requests",
+        "timeout",
+        "internal"
+      ],
+      "title": "ErrorCode",
+      "type": "string"
+    },
+    "ErrorFrame": {
+      "additionalProperties": false,
+      "description": "The failed answer to the request `id`, or (`id` null) the end of the connection.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "pattern": "^req_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Id"
+        },
+        "kind": {
+          "const": "error",
+          "title": "Kind",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 256,
+          "title": "Message",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "code",
+        "message"
+      ],
+      "title": "ErrorFrame",
+      "type": "object"
+    },
+    "Hello": {
+      "additionalProperties": false,
+      "description": "The handshake: the protocol version the sender speaks.",
+      "properties": {
+        "kind": {
+          "const": "hello",
+          "title": "Kind",
+          "type": "string"
+        },
+        "version": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "version"
+      ],
+      "title": "Hello",
+      "type": "object"
+    },
+    "Ping": {
+      "additionalProperties": false,
+      "description": "Are you there? Answered with `Pong`.",
+      "properties": {
+        "kind": {
+          "const": "ping",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Ping",
+      "type": "object"
+    },
+    "Pong": {
+      "additionalProperties": false,
+      "description": "The answer to `Ping`.",
+      "properties": {
+        "kind": {
+          "const": "pong",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Pong",
+      "type": "object"
+    },
+    "RequestFrame": {
+      "additionalProperties": false,
+      "description": "A request: `body` is for the receiver to handle, and to answer under the same `id`.",
+      "properties": {
+        "body": {
+          "discriminator": {
+            "mapping": {
+              "echo": "#/$defs/Echo",
+              "ping": "#/$defs/Ping"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Ping"
+            },
+            {
+              "$ref": "#/$defs/Echo"
+            }
+          ],
+          "title": "Body"
+        },
+        "id": {
+          "pattern": "^req_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "request",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "body"
+      ],
+      "title": "RequestFrame",
+      "type": "object"
+    },
+    "ResponseFrame": {
+      "additionalProperties": false,
+      "description": "The successful answer to the request with the same `id`.",
+      "properties": {
+        "body": {
+          "discriminator": {
+            "mapping": {
+              "echoed": "#/$defs/Echoed",
+              "pong": "#/$defs/Pong"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Pong"
+            },
+            {
+              "$ref": "#/$defs/Echoed"
+            }
+          ],
+          "title": "Body"
+        },
+        "id": {
+          "pattern": "^req_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "response",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "body"
+      ],
+      "title": "ResponseFrame",
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One frame of the Tumbleweed IPC protocol: the UTF-8 JSON payload of a record that is prefixed with its length as 4 bytes, big endian. Generated from tumbleweed.ipc; do not edit.",
+  "discriminator": {
+    "mapping": {
+      "error": "#/$defs/ErrorFrame",
+      "hello": "#/$defs/Hello",
+      "request": "#/$defs/RequestFrame",
+      "response": "#/$defs/ResponseFrame"
+    },
+    "propertyName": "kind"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Hello"
+    },
+    {
+      "$ref": "#/$defs/RequestFrame"
+    },
+    {
+      "$ref": "#/$defs/ResponseFrame"
+    },
+    {
+      "$ref": "#/$defs/ErrorFrame"
+    }
+  ],
+  "title": "tumbleweed.ipc/1"
+}

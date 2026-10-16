@@ -14,6 +14,15 @@ outside core carries a real comment `# forgery-ok: <reason>` (a non-empty reason
 a string does not count) on a line of the statement. The escape is never accepted for
 `model_construct` in `src/`. Private access is ruff's SLF001, whose configuration is pinned
 here.
+
+One more guard of the same kind, for a value that is not a model: `ipc.sockdir.SocketPath`
+cannot be built by calling the class, only by `SocketDirectory.socket_path`, because the class
+wants a private token, `_MINT`, that only `sockdir` holds. Importing or reading `_MINT` anywhere
+else would hand that token to code that can then make a `SocketPath` for any path, so the scan
+at the end of this file rejects every reference to it outside `sockdir.py` and the one test
+helper that needs a path no directory vouches for. It sees an import, an attribute
+(`sockdir._MINT`) and the name as a string constant (`getattr(m, "_MINT")`,
+`vars(m)["_MINT"]`); it cannot see a name built at run time.
 """
 
 import ast
@@ -237,3 +246,74 @@ def test_private_access_is_banned_outside_core() -> None:
         if "SLF001" in ignored or "SLF" in ignored
     )
     assert allowed_in == ["src/tumbleweed/core/**", "tests/core/**"]
+
+
+MINT_HOMES = (
+    ROOT / "src" / "tumbleweed" / "ipc" / "sockdir.py",
+    ROOT / "tests" / "ipc" / "paths.py",
+)
+# This file names the token in order to look for it.
+MINT_EXEMPT = (*MINT_HOMES, Path(__file__).resolve())
+
+
+def mint_references(source: str) -> list[str]:
+    """Where `source` reaches for `_MINT`, the token that makes a `SocketPath`."""
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.ImportFrom) and any(alias.name == "_MINT" for alias in node.names):
+            found.append(f"line {line}: imports _MINT")
+        elif isinstance(node, ast.Attribute) and node.attr == "_MINT":
+            found.append(f"line {line}: reads _MINT off a module")
+        elif isinstance(node, ast.Constant) and node.value == "_MINT":
+            found.append(f"line {line}: looks _MINT up by name")
+    return found
+
+
+MINT_CASES = {
+    "a from-import": ("from tumbleweed.ipc.sockdir import _MINT\n", 1),
+    "a from-import among others": (
+        "from tumbleweed.ipc.sockdir import SocketPath, _MINT as m\n",
+        1,
+    ),
+    "an attribute": ("import tumbleweed.ipc.sockdir as s\nx = s._MINT\n", 1),
+    "a getattr": ('import m\nx = getattr(m, "_MINT")\n', 1),
+    "a vars lookup": ('import m\nx = vars(m)["_MINT"]\n', 1),
+    "a __dict__ lookup": ('import m\nx = m.__dict__["_MINT"]\n', 1),
+    "two references": ("from a import _MINT\nx = b._MINT\n", 2),
+    "the public names are fine": (
+        "from tumbleweed.ipc.sockdir import SocketDirectory, SocketPath\n",
+        0,
+    ),
+    "a longer name is fine": ("from a import _MINTED\nx = b._MINTED\n", 0),
+    "text that mentions it is fine": ('x = "do not import _MINT"\n', 0),
+    "a comment is fine": ("x = 1  # _MINT\n", 0),
+    "known limit: a name built at run time is not seen": (
+        'import m\nx = getattr(m, "_MI" + "NT")\n',
+        0,
+    ),
+}
+
+
+@pytest.mark.parametrize(("snippet", "count"), MINT_CASES.values(), ids=list(MINT_CASES))
+def test_the_scan_for_the_socket_path_token_finds_each_kind_of_reference(
+    snippet: str, count: int
+) -> None:
+    assert len(mint_references(snippet)) == count
+
+
+@pytest.mark.parametrize(
+    "path",
+    [path for path in python_files() if path not in MINT_EXEMPT],
+    ids=lambda p: str(p.relative_to(ROOT)),
+)
+def test_only_the_socket_directory_and_one_test_helper_hold_the_socket_path_token(
+    path: Path,
+) -> None:
+    assert not mint_references(path.read_text()), path
+
+
+def test_the_two_files_that_may_hold_the_socket_path_token_do_hold_it() -> None:
+    # Guards the allowlist: a file that no longer uses the token should be taken off it.
+    for home in MINT_HOMES:
+        assert "_MINT" in home.read_text(), home

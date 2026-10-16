@@ -162,6 +162,26 @@ scripts/test-linux uv run pytest -k bwrap   # any other command, in the same env
 TUMBLEWEED_CI=1 scripts/test-linux          # as CI: a skipped or xfailed gtk/linux test fails
 ```
 
+### IPC
+
+The shell and the broker talk over a typed, bounded, authenticated Unix-socket protocol
+(`src/tumbleweed/ipc`, [ARCHITECTURE: IPC](docs/ARCHITECTURE.md)). Its messages are pydantic
+models, and `schemas/ipc.v1.json` is generated from them; a test fails when the file is stale:
+
+```sh
+uv run python -m tumbleweed.ipc.schema > schemas/ipc.v1.json
+```
+
+Sockets live in `$XDG_RUNTIME_DIR/tumbleweed/`. macOS has no `XDG_RUNTIME_DIR`, so there the
+per-user temporary directory is used instead (`confstr(_CS_DARWIN_USER_TEMP_DIR)`), and the
+server keeps its socket and lock file young there, because macOS purges files nobody has
+accessed for three days. Some of the framing and codec tests are property tests (hypothesis, run
+with a fixed seed so that CI and a laptop test the same examples). The tests that a different
+user is refused, as a client and as a server, need a second uid: the Linux image has one
+(`tumbleweed-peer`, with a sudo rule that lets the test user run commands as it and nothing
+more), so those tests run in `scripts/test-linux` and are skipped on a Mac, where the same rule
+is covered with a fake credentials provider.
+
 ### Test markers
 
 | Marker | Needs | Notes |
