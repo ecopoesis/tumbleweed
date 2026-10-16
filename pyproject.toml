@@ -1,0 +1,152 @@
+[project]
+name = "tumbleweed"
+version = "0.0.0"
+description = "An AI-first OS shell: voice and chat in, generated tools out."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.11",
+    # Built from source against the system GTK (Homebrew on macOS, apt in the Linux image).
+    # >=3.50 for `gi.events` (asyncio on the GLib main loop), see DECISIONS D2.
+    "PyGObject>=3.50",
+]
+
+[dependency-groups]
+dev = [
+    "import-linter>=2.3",
+    "mypy>=1.15",
+    "pygobject-stubs>=2.13",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.11",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv]
+# The lock covers exactly the platforms we support, so an unresolvable dependency on any of
+# them fails `uv lock` instead of surfacing on someone's machine later.
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+# Stubs for one GTK major version only (both are imported as `Gtk`): we target GTK4.
+[tool.uv.config-settings-package]
+pygobject-stubs = { config = "Gtk4,Gdk4" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "A",      # shadowed builtins
+    "ANN",    # annotations everywhere; ANN401 bans `Any`
+    "ASYNC",  # blocking calls in async code
+    "B",      # bugbear
+    "BLE",    # no blind `except Exception`
+    "C4",     # comprehensions
+    "D100",   # every module says what it owns
+    "D104",   # ... and every package
+    "DTZ",    # no naive datetimes
+    "E",
+    "F",
+    "I",
+    "ISC",
+    "N",
+    "PGH",    # no blanket `# type: ignore` / `# noqa`
+    "PIE",
+    "PT",     # pytest style
+    "PTH",    # pathlib over os.path
+    "RUF",
+    "S",      # bandit
+    "SIM",
+    "T20",    # no print
+    "TC",     # typing-only imports under TYPE_CHECKING
+    "TID",
+    "UP",
+    "W",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "D100",
+    "D104",
+    "S101",  # assert is how tests assert
+]
+"scripts/**" = ["T20"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["tumbleweed"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["src", "tests"]
+mypy_path = "src"
+# The negative fixtures contain deliberate type errors; tests/typing runs mypy on them.
+exclude = ["^tests/typing/fixtures/"]
+warn_unreachable = true
+# `Any` is banned in our code (CLAUDE.md typing rule 1), also implicitly via missing stubs.
+disallow_any_explicit = true
+disallow_any_unimported = true
+enable_error_code = [
+    "ignore-without-code",
+    "possibly-undefined",
+    "redundant-expr",
+    "truthy-bool",
+    "truthy-iterable",
+    "unused-awaitable",
+]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+minversion = "8.3"
+testpaths = ["tests"]
+addopts = [
+    "-ra",
+    "--strict-config",
+    "--strict-markers",
+    "--cov",
+    "--cov-report=term-missing:skip-covered",
+]
+filterwarnings = ["error"]
+xfail_strict = true
+markers = [
+    "gtk: needs a display; runs under the headless compositor in the Linux container",
+    "linux: needs Linux kernel features (bwrap, Landlock, seccomp)",
+    "btrfs: needs a btrfs mount; exempt from the TUMBLEWEED_CI skip-guard (covered by S27)",
+    "live: talks to real external services; never run in CI",
+]
+
+[tool.coverage.run]
+source = ["tumbleweed"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "assert_never",
+    "raise NotImplementedError",
+]
+
+[tool.importlinter]
+root_package = "tumbleweed"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "core never imports gi (ARCHITECTURE section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.core"]
+forbidden_modules = ["gi"]
