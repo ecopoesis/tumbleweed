@@ -98,20 +98,30 @@ def expr_type_of(decl: StateDecl) -> ExprType | None:
             assert_never(unreachable)
 
 
+def _direct_values(expr: Expr) -> list[Expr]:
+    """The expressions `expr` can evaluate to directly: itself, or the leaves of its `if`s."""
+    found: list[Expr] = []
+    stack: list[Expr] = [expr]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, If):
+            stack.extend((node.otherwise, node.then))
+        else:
+            found.append(node)
+    return found
+
+
 def string_literals(expr: Expr) -> list[str]:
     """The string literals `expr` can evaluate to directly: itself, or through `if` branches.
 
     Anything else (a reference, a `concat`) is not known until it runs and contributes nothing.
     """
-    found: list[str] = []
-    stack: list[Expr] = [expr]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, StrLit):
-            found.append(node.value)
-        elif isinstance(node, If):
-            stack.extend((node.otherwise, node.then))
-    return found
+    return [node.value for node in _direct_values(expr) if isinstance(node, StrLit)]
+
+
+def referenced_keys(expr: Expr) -> list[StateKey]:
+    """The entries `expr` can evaluate to directly: itself if a `ref`, or through `if` branches."""
+    return [node.key for node in _direct_values(expr) if isinstance(node, Ref)]
 
 
 def _arithmetic_type(types: Sequence[ExprType]) -> ExprType:

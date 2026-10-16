@@ -6,6 +6,7 @@ entry builds something that is exactly `n` big in the way the limit counts; `n =
 accepted and `n = limit + 1` refused, so what is refused is refused for being one too many.
 """
 
+import inspect
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -40,7 +41,7 @@ from tumbleweed.ui.spec.limits import (
 from tumbleweed.ui.spec.names import StateKey
 from tumbleweed.ui.spec.parse import parse_ui_spec, validate_ui_spec
 from tumbleweed.ui.spec.spec import UiSpec
-from tumbleweed.ui.spec.state import check_value
+from tumbleweed.ui.spec.state import StateValue, check_value, value_text_bytes
 from tumbleweed.ui.spec.values import JsonData, Table
 
 REFUSED = (ValidationError, SpecError, InvalidValueError)
@@ -223,7 +224,7 @@ def number_slider(kind: str, **fields: JsonValue) -> Json:
 def check_patch(sizes: list[int], current_sizes: list[int] | None = None) -> None:
     spec = patch_spec()
     patch: dict[str, object] = {f"s{i}": "x" * size for i, size in enumerate(sizes)}
-    current = None
+    current: dict[StateKey, StateValue] = {}
     if current_sizes is not None:
         first = 40  # the patch writes s40.. and the state holds s0.. already
         patch = {f"s{first + i}": "x" * size for i, size in enumerate(sizes)}
@@ -573,9 +574,13 @@ BOUNDARIES = [
         ),
     ),
     c(
-        "MAX_WIDGET_STEPS",
-        "steps of a float slider",
-        lambda n: valid(number_slider("float", minimum=0, maximum=n, step=1)),
+        "MAX_OBJECT_MEMBERS",
+        "members of an object in the text of a spec",
+        lambda n: parse_ui_spec(
+            json.dumps(
+                one_state({"kind": "json", "key": "x", "default": {f"k{i}": 0 for i in range(n)}})
+            )
+        ),
     ),
     c(
         "MAX_SAFE_INT",
@@ -609,15 +614,114 @@ def test_the_budgets_nest() -> None:
     assert limits.MAX_PATCH_TEXT_BYTES <= limits.MAX_STATE_TEXT_BYTES
 
 
-def test_a_patch_replaces_the_text_it_overwrites() -> None:
-    # The state after a patch holds the patch's text and the text of what the patch leaves alone:
-    # an entry that is overwritten is not counted twice (here the state is at its budget).
-    spec = patch_spec()
-    full = {StateKey(f"s{i}"): "x" * 65_536 for i in range(64)}  # exactly MAX_STATE_TEXT_BYTES
-    assert sum(len(text) for text in full.values()) == limits.MAX_STATE_TEXT_BYTES
-    spec.validate_patch({"s0": "y" * 65_536}, current=full)
-    with pytest.raises(SpecError, match="the state would hold"):
-        spec.validate_patch({"s64": "y"}, current=full)
+PIECE = 65_536  # the `max_length` of every string of `budget_spec`
+
+
+def budget_spec() -> UiSpec:
+    """70 strings that may each hold PIECE bytes: 70 * PIECE is over MAX_STATE_TEXT_BYTES.
+
+    An ordinary spec (every default is empty) that ordinary typing can fill beyond the budget:
+    nothing in it is wrong, so a state that is over its budget has to be able to recover.
+    """
+    state: list[Json] = [*string_entries(70), {"kind": "int", "key": "n", "default": 0}]
+    state.append(
+        {
+            "kind": "string",
+            "key": "c",
+            "default": "",
+            "computed": {"kind": "concat", "args": [lit_str("a"), lit_str("b")]},
+        }
+    )
+    return validate_ui_spec(build(state=state))
+
+
+def full_state(*, missing: int = 0) -> dict[StateKey, StateValue]:
+    """Every string at its largest, but `missing` bytes short of that in `s0`."""
+    state: dict[StateKey, StateValue] = {StateKey(f"s{i}"): "x" * PIECE for i in range(70)}
+    state[StateKey("s0")] = "x" * (PIECE - missing)
+    state[StateKey("n")] = 0
+    state[StateKey("c")] = "ab"
+    return state
+
+
+class TestAPatchOnAStateOverItsBudget:
+    """The budget refuses growth, not every patch: a state over it can still shrink (R2-B2)."""
+
+    def test_the_state_of_the_tests_is_over_its_budget(self) -> None:
+        total = sum(value_text_bytes(value) for value in full_state().values())
+
+        assert total > limits.MAX_STATE_TEXT_BYTES
+
+    def test_a_patch_that_shrinks_the_text_is_accepted(self) -> None:
+        result = budget_spec().validate_patch({"s0": ""}, current=full_state())
+
+        assert result == {StateKey("s0"): ""}
+
+    def test_a_patch_without_text_is_accepted(self) -> None:
+        assert budget_spec().validate_patch({"n": 5}, current=full_state()) == {StateKey("n"): 5}
+
+    def test_a_patch_that_replaces_text_with_as_much_is_accepted(self) -> None:
+        patch = {"s0": "y" * PIECE, "s1": "z" * PIECE}
+
+        assert len(budget_spec().validate_patch(patch, current=full_state())) == 2
+
+    def test_a_patch_that_grows_the_text_is_refused(self) -> None:
+        current = full_state(missing=1)
+
+        with pytest.raises(SpecError, match="would grow the text of the state"):
+            budget_spec().validate_patch({"s0": "y" * PIECE}, current=current)
+
+    def test_a_patch_that_grows_one_entry_and_shrinks_more_elsewhere_is_accepted(self) -> None:
+        current = full_state(missing=10)
+        patch = {"s0": "y" * PIECE, "s1": "z" * (PIECE - 100)}  # +10 and -100
+
+        assert len(budget_spec().validate_patch(patch, current=current)) == 2
+
+    def test_a_patch_that_grows_one_entry_and_shrinks_less_elsewhere_is_refused(self) -> None:
+        current = full_state(missing=100)
+        patch = {"s0": "y" * PIECE, "s1": "z" * (PIECE - 10)}  # +100 and -10
+
+        with pytest.raises(SpecError, match="would grow the text of the state"):
+            budget_spec().validate_patch(patch, current=current)
+
+    def test_growth_is_refused_only_over_the_budget_so_below_it_a_patch_may_grow(self) -> None:
+        under: dict[StateKey, StateValue] = {StateKey(f"s{i}"): "x" * PIECE for i in range(60)}
+
+        assert budget_spec().validate_patch({"s69": "y" * PIECE}, current=under)
+
+    def test_growing_exactly_to_the_budget_is_accepted_and_one_byte_more_is_not(self) -> None:
+        spec = budget_spec()
+        current: dict[StateKey, StateValue] = {StateKey(f"s{i}"): "x" * PIECE for i in range(63)}
+        current[StateKey("s63")] = "x" * (PIECE - 1)  # one byte under 64 * PIECE
+
+        assert spec.validate_patch({"s63": "x" * PIECE}, current=current)  # exactly the budget
+        with pytest.raises(SpecError, match="would grow the text of the state"):
+            spec.validate_patch({"s63": "x" * PIECE, "s64": "y"}, current=current)
+
+    def test_computed_entries_count_toward_the_state_like_any_other(self) -> None:
+        spec = budget_spec()
+        current: dict[StateKey, StateValue] = {StateKey(f"s{i}"): "x" * PIECE for i in range(63)}
+        current[StateKey("s63")] = "x" * (PIECE - 2)  # 2 bytes under 64 * PIECE...
+        assert spec.validate_patch({"s63": "x" * PIECE}, current=current)  # ...fits exactly
+
+        current[StateKey("c")] = "ab"  # ...but the computed entry holds 2 bytes of the state too
+        with pytest.raises(SpecError, match="would grow the text of the state"):
+            spec.validate_patch({"s63": "x" * PIECE}, current=current)
+
+    def test_a_patch_over_its_own_budget_is_refused_whatever_the_state(self) -> None:
+        patch = {f"s{i}": "x" * PIECE for i in range(33)}  # 33 * PIECE > MAX_PATCH_TEXT_BYTES
+
+        with pytest.raises(SpecError, match="the patch holds"):
+            budget_spec().validate_patch(patch, current={})
+
+    def test_the_state_is_a_required_argument(self) -> None:
+        parameter = inspect.signature(UiSpec.validate_patch).parameters["current"]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
+
+    def test_an_empty_state_is_written_as_an_empty_mapping(self) -> None:
+        assert budget_spec().validate_patch({"s0": "x" * PIECE}, current={})
 
 
 def test_the_limits_are_the_documented_ones() -> None:

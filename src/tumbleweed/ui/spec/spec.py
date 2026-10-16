@@ -31,7 +31,13 @@ from typing import Annotated, Final, Literal, Self, assert_never, final
 from pydantic import BeforeValidator, Field, model_validator
 
 from tumbleweed.core.errors import InvalidValueError, excerpt
-from tumbleweed.ui.spec.check import ExprType, check_expr, computed_order, string_literals
+from tumbleweed.ui.spec.check import (
+    ExprType,
+    check_expr,
+    computed_order,
+    referenced_keys,
+    string_literals,
+)
 from tumbleweed.ui.spec.components import (
     Box,
     Button,
@@ -65,7 +71,6 @@ from tumbleweed.ui.spec.limits import (
     MAX_STATE_ENTRIES,
     MAX_STATE_TEXT_BYTES,
     MAX_TOTAL_EXPR_NODES,
-    MAX_WIDGET_STEPS,
 )
 from tumbleweed.ui.spec.model import SpecModel
 from tumbleweed.ui.spec.names import HandlerName, StateKey
@@ -114,20 +119,29 @@ def _accepts(decl: StateDecl, value_type: ExprType) -> bool:
 
 
 def _budget_problems(
-    patch: Mapping[StateKey, StateValue], current: Mapping[StateKey, StateValue] | None
+    patch: Mapping[StateKey, StateValue], current: Mapping[StateKey, StateValue]
 ) -> list[str]:
-    """The patch's text against `MAX_PATCH_TEXT_BYTES`; the state after it against the state's."""
+    """The patch's text against `MAX_PATCH_TEXT_BYTES`; the text of the state after it against
+    `MAX_STATE_TEXT_BYTES`, but only if the patch makes the state's text grow.
+
+    A state that is over its budget already (a tool whose strings were allowed to grow until they
+    filled it, or whose spec declares many large strings) must still be able to shrink and to
+    change what does not hold text, or the tool would be wedged: so only a patch that raises the
+    state's text, and ends over the budget, is refused.
+    """
     size = sum(value_text_bytes(value) for value in patch.values())
     if size > MAX_PATCH_TEXT_BYTES:
         return [f"the patch holds {size} bytes of text, the limit is {MAX_PATCH_TEXT_BYTES}"]
-    if current is not None:
-        total = size + sum(
-            value_text_bytes(value) for key, value in current.items() if key not in patch
-        )
-        if total > MAX_STATE_TEXT_BYTES:
-            return [
-                f"the state would hold {total} bytes of text, the limit is {MAX_STATE_TEXT_BYTES}"
-            ]
+    before = sum(value_text_bytes(value) for value in current.values())
+    replaced = sum(value_text_bytes(current[key]) for key in patch if key in current)
+    after = before - replaced + size
+    if after > MAX_STATE_TEXT_BYTES and after > before:
+        return [
+            (
+                f"the patch would grow the text of the state from {before} to {after} bytes, "
+                f"over the limit of {MAX_STATE_TEXT_BYTES}"
+            )
+        ]
     return []
 
 
@@ -226,18 +240,22 @@ class UiSpec(SpecModel):
         self,
         patch: Mapping[str, object],
         *,
+        current: Mapping[StateKey, StateValue],
         only: Collection[StateKey] | None = None,
-        current: Mapping[StateKey, StateValue] | None = None,
     ) -> dict[StateKey, StateValue]:
         """Check a patch of state values (from `patch_state` or a sandbox) against the spec.
 
         Every key must be a declared, non-computed entry (and in `only`, when given: a sandbox
         handler's declared outputs), and every value must pass `check_value` for its entry. The
-        text in the patch is at most `MAX_PATCH_TEXT_BYTES` bytes, and, when `current` gives the
-        values the state holds now, the state after the patch (these values, with the patch's
-        replacing theirs) at most `MAX_STATE_TEXT_BYTES`: a tool cannot grow its state without
-        limit by patching it again and again. All or nothing: if anything is wrong, `SpecError`
-        lists the problems and no value is returned, so a caller never applies half a patch.
+        text in the patch is at most `MAX_PATCH_TEXT_BYTES` bytes, and the state after the patch
+        may not grow its text beyond `MAX_STATE_TEXT_BYTES`: a tool cannot grow its state without
+        limit by patching it again and again. `current` is the whole live state, computed
+        entries included (their values are text in the state like any other, and the check of
+        the defaults counts them), with the patch's values replacing theirs; pass `{}` for an
+        empty state. A patch that does not raise the text of the state is never refused for the
+        budget, even over it, so that a state that got there can still shrink. All or nothing:
+        if anything is wrong, `SpecError` lists the problems and no value is returned, so a
+        caller never applies half a patch.
         """
         declarations = self.declarations()
         allowed = None if only is None else set(only)
@@ -357,11 +375,23 @@ class UiSpec(SpecModel):
                             f"expression of type {value_type}{hint}"
                         )
                     elif isinstance(target, EnumState):
-                        # A literal the expression can produce, directly or through `if`.
+                        # A literal or an enum entry the expression can produce, directly or
+                        # through `if`: a literal must be an option, an enum entry must share
+                        # one (as `eq` of two enums must), or the assignment never takes effect.
                         for literal in string_literals(assignment.value):
                             if literal not in target.options:
                                 problems.add(
                                     f"{where}: {excerpt(literal)} is not one of its options"
+                                )
+                                break
+                        for key in referenced_keys(assignment.value):
+                            source = decls.get(key)
+                            if isinstance(source, EnumState) and set(source.options).isdisjoint(
+                                target.options
+                            ):
+                                problems.add(
+                                    f"{where}: {key} is an enum with no option in common with "
+                                    f"{assignment.target}"
                                 )
                                 break
             case SandboxHandler():
@@ -403,14 +433,16 @@ class UiSpec(SpecModel):
             )
 
 
-def _range_problem(decl: IntState | FloatState) -> str | None:
+def _range_problem(decl: IntState | FloatState, *, stepped: bool) -> str | None:
     """Why `decl` cannot be the range of a slider, spin button or progress bar, or None.
 
-    The widget needs both bounds, finite and within +-`MAX_SAFE_INT`, with `minimum` below
-    `maximum` (a zero-width range has no positions, and a progress bar divides by it) and a range
-    at most `MAX_SAFE_INT` wide. A `float` entry's `step` must be a normal float, and the range
-    must hold at most `MAX_WIDGET_STEPS` of it: a step that is subnormal, or tiny beside the
-    range, makes a widget of billions of positions and arithmetic that underflows.
+    These are rules of numeric safety, not of taste. The widget needs both bounds, finite and
+    within +-`MAX_SAFE_INT`, with `minimum` below `maximum` (a zero-width range has no positions,
+    and a progress bar divides by it) and a range at most `MAX_SAFE_INT` wide, so that nothing
+    the widget computes overflows or loses its integers. A slider or spin button (`stepped`)
+    also needs a `step` that is a normal float (not subnormal, whose arithmetic underflows) and
+    no wider than the range. How many positions that makes is the author's business: a step of
+    0.01 over a range of a million is a fine slider. A progress bar has no step.
     """
     minimum, maximum = decl.minimum, decl.maximum
     if minimum is None or maximum is None:
@@ -421,11 +453,11 @@ def _range_problem(decl: IntState | FloatState) -> str | None:
         return "needs a minimum below its maximum"
     if maximum - minimum > MAX_SAFE_INT:
         return f"needs a range at most {MAX_SAFE_INT} wide"
-    if isinstance(decl, FloatState) and decl.step is not None:
+    if stepped and decl.step is not None:
         if decl.step < sys.float_info.min:
             return "needs a step that is not subnormal"
-        if (maximum - minimum) / decl.step > MAX_WIDGET_STEPS:
-            return f"needs a step of at least 1/{MAX_WIDGET_STEPS} of its range"
+        if decl.step > maximum - minimum:
+            return "needs a step no wider than its range"
     return None
 
 
@@ -438,6 +470,7 @@ def _bind(
     kinds: tuple[str, ...],
     writes: bool = False,
     bounded: bool = False,
+    stepped: bool = False,
 ) -> None:
     decl = decls.get(key)
     if decl is None:
@@ -451,7 +484,7 @@ def _bind(
     if writes and _computed_expr(decl) is not None:
         problems.add(f"{where}: binds {key} two-way, but it is computed and cannot be written")
     if bounded and isinstance(decl, IntState | FloatState):
-        problem = _range_problem(decl)
+        problem = _range_problem(decl, stepped=stepped)
         if problem is not None:
             problems.add(f"{where}: {key} {problem}")
 
@@ -473,9 +506,22 @@ def _check_component(
     handler_names: Mapping[HandlerName, Handler],
     problems: _Problems,
 ) -> None:
-    def bind(key: StateKey, *kinds: str, writes: bool = False, bounded: bool = False) -> None:
+    def bind(
+        key: StateKey,
+        *kinds: str,
+        writes: bool = False,
+        bounded: bool = False,
+        stepped: bool = False,
+    ) -> None:
         _bind(
-            where, key, decls=decls, problems=problems, kinds=kinds, writes=writes, bounded=bounded
+            where,
+            key,
+            decls=decls,
+            problems=problems,
+            kinds=kinds,
+            writes=writes,
+            bounded=bounded,
+            stepped=stepped,
         )
 
     def handler(name: HandlerName | None) -> None:
@@ -503,7 +549,7 @@ def _check_component(
             bind(component.bind, "bool", writes=True)
             handler(component.on_change)
         case Slider() | Spin():
-            bind(component.bind, "int", "float", writes=True, bounded=True)
+            bind(component.bind, "int", "float", writes=True, bounded=True, stepped=True)
             handler(component.on_change)
         case Dropdown():
             bind(component.bind, "enum", writes=True)

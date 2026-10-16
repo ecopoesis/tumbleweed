@@ -255,12 +255,14 @@ class TestBindings:
 # The components that can bind a kind of entry that can be computed, and a number.
 COMPUTABLE_BINDERS = [c for c, (_, kinds, _, _) in BOUND.items() if kinds & set(FITS)]
 NUMBER_BINDERS = [c for c, (_, kinds, _, _) in BOUND.items() if kinds & {"int", "float"}]
+STEPPED = [c for c in NUMBER_BINDERS if c != "progress"]  # a progress bar has no step
 
 
 def test_the_components_that_cannot_bind_a_computed_entry_are_these() -> None:
     # No computed image, table or enum exists, so there is no computed entry to bind to them.
     assert set(BOUND) - set(COMPUTABLE_BINDERS) == {"image", "table", "dropdown"}
     assert set(NUMBER_BINDERS) == {"progress", "slider", "spin"}
+    assert set(STEPPED) == {"slider", "spin"}
 
 
 @pytest.mark.parametrize("component", COMPUTABLE_BINDERS)
@@ -463,6 +465,81 @@ class TestEnumLiteralsThroughIf:
         assert mentions(problems, "x and y are enums with no option in common")
 
 
+class TestEnumAssignedFromAnEnum:
+    """`set x := ref(y)` is refused when no option of `y` is one of `x`, like `eq(x, y)` is."""
+
+    X: ClassVar[Json] = TARGETS["enum"]  # options a, b
+    DISJOINT: ClassVar[Json] = {"kind": "enum", "key": "y", "options": ["p", "q"], "default": "p"}
+    OVERLAPPING: ClassVar[Json] = {
+        "kind": "enum",
+        "key": "y",
+        "options": ["b", "c"],
+        "default": "b",
+    }
+    SAME: ClassVar[Json] = {"kind": "enum", "key": "y", "options": ["b", "a"], "default": "a"}
+    FLAG: ClassVar[Json] = {"kind": "bool", "key": "flag", "default": True}
+
+    def assigned(self, source: Json, value: Json) -> Json:
+        return build(state=[self.X, source, self.FLAG], handlers=[set_handler("h", ("x", value))])
+
+    @staticmethod
+    def choose(then: Json, otherwise: Json) -> Json:
+        return {"kind": "if", "condition": ref("flag"), "then": then, "otherwise": otherwise}
+
+    def test_an_enum_with_no_option_in_common_is_refused(self) -> None:
+        problems = refused(self.assigned(self.DISJOINT, ref("y")))
+
+        assert mentions(problems, "handler h: assigning x", "y is an enum with no option in common")
+
+    def test_it_is_refused_through_an_if_in_either_branch(self) -> None:
+        for value in (
+            self.choose(ref("y"), lit_str("a")),
+            self.choose(lit_str("a"), ref("y")),
+            self.choose(self.choose(lit_str("b"), ref("y")), lit_str("a")),
+        ):
+            problems = refused(self.assigned(self.DISJOINT, value))
+
+            assert mentions(problems, "y is an enum with no option in common with x")
+
+    def test_it_is_the_same_rule_as_eq_and_ne_of_two_enums(self) -> None:
+        derived: Json = {
+            "kind": "bool",
+            "key": "d",
+            "default": False,
+            "computed": binary("ne", ref("x"), ref("y")),
+        }
+
+        problems = refused(build(state=[self.X, self.DISJOINT, derived]))
+
+        assert mentions(problems, "x and y are enums with no option in common")
+
+    def test_an_enum_that_shares_an_option_is_accepted(self) -> None:
+        # What `y` holds when it is `c` is for the runtime: `x` keeps its value then.
+        accepted(self.assigned(self.OVERLAPPING, ref("y")))
+        accepted(self.assigned(self.OVERLAPPING, self.choose(ref("y"), lit_str("a"))))
+        accepted(self.assigned(self.SAME, ref("y")))
+
+    def test_an_enum_assigned_from_itself_is_fine(self) -> None:
+        accepted(
+            build(
+                state=[self.X, self.FLAG],
+                handlers=[set_handler("h", ("x", self.choose(ref("x"), lit_str("b"))))],
+            )
+        )
+
+    def test_a_string_entry_is_not_guessed_at(self) -> None:
+        text: Json = {"kind": "string", "key": "y", "default": "zzz"}
+
+        accepted(self.assigned(text, ref("y")))
+
+    def test_one_bad_reference_is_reported_once_per_assignment(self) -> None:
+        problems = refused(
+            self.assigned(self.DISJOINT, self.choose(ref("y"), self.choose(ref("y"), ref("y"))))
+        )
+
+        assert len([p for p in problems if "no option in common" in p]) == 1
+
+
 class TestTextViewEvents:
     VIEW: ClassVar[Json] = {"kind": "text_view", "bind": "x", "on_change": "h"}
 
@@ -528,7 +605,7 @@ class TestWidgetRanges:
         for entry in (wide, widest):
             assert mentions(refused(build(template, [entry])), "needs a range at most")
 
-    @pytest.mark.parametrize("component", NUMBER_BINDERS)
+    @pytest.mark.parametrize("component", STEPPED)
     @pytest.mark.parametrize("step", [5e-324, 1e-320, 1e-310, 2.2e-308])
     def test_a_subnormal_step_is_refused(self, component: str, step: float) -> None:
         template = BOUND[component][0]
@@ -536,12 +613,54 @@ class TestWidgetRanges:
 
         assert mentions(refused(build(template, [entry])), "not subnormal")
 
-    @pytest.mark.parametrize("component", NUMBER_BINDERS)
-    def test_a_step_tiny_beside_the_range_is_refused(self, component: str) -> None:
+    @pytest.mark.parametrize("component", STEPPED)
+    @pytest.mark.parametrize("kind", ["int", "float"])
+    def test_a_step_wider_than_the_range_is_refused(self, component: str, kind: str) -> None:
         template = BOUND[component][0]
-        entry = number_entry("float", minimum=0, maximum=1000, step=1e-9)
+        entry = number_entry(kind, minimum=0, maximum=10, step=11)
 
-        assert mentions(refused(build(template, [entry])), "a step of at least 1/10000000")
+        assert mentions(refused(build(template, [entry])), "a step no wider than its range")
+
+    @pytest.mark.parametrize("component", STEPPED)
+    @pytest.mark.parametrize("kind", ["int", "float"])
+    def test_a_step_exactly_as_wide_as_the_range_is_fine(self, component: str, kind: str) -> None:
+        template = BOUND[component][0]
+
+        accepted(build(template, [number_entry(kind, minimum=0, maximum=10, step=10)]))
+
+    @pytest.mark.parametrize("component", STEPPED)
+    @pytest.mark.parametrize(
+        ("maximum", "step"),
+        [(1_000_000, 0.01), (1000, 1e-9), (1, 1e-300), (MAX_SAFE_INT // 2, 1e-12)],
+    )
+    def test_how_many_positions_the_step_makes_is_not_checked(
+        self, component: str, maximum: float, step: float
+    ) -> None:
+        # A step of 0.01 over a million is a fine slider; the range and step are only required
+        # to be numbers a widget can compute with.
+        template = BOUND[component][0]
+
+        accepted(build(template, [number_entry("float", minimum=0, maximum=maximum, step=step)]))
+
+    def test_a_progress_bar_has_no_step_so_the_step_of_its_entry_is_not_checked(self) -> None:
+        template = BOUND["progress"][0]
+        subnormal = number_entry("float", minimum=0, maximum=1e-300, step=5e-324)
+        too_wide = number_entry("float", minimum=0, maximum=10, step=11)
+
+        accepted(build(template, [subnormal]))
+        accepted(build(template, [too_wide]))
+
+    def test_the_other_range_rules_still_apply_to_a_progress_bar(self) -> None:
+        template = BOUND["progress"][0]
+
+        assert mentions(
+            refused(build(template, [number_entry("int", minimum=5, maximum=5, default=5)])),
+            "needs a minimum below its maximum",
+        )
+        assert mentions(
+            refused(build(template, [number_entry("int", minimum=0, maximum=None)])),
+            "needs both a minimum and a maximum",
+        )
 
     @pytest.mark.parametrize("component", NUMBER_BINDERS)
     def test_the_normal_smallest_step_of_a_tiny_range_is_fine(self, component: str) -> None:
@@ -913,7 +1032,7 @@ class TestValidatePatch:
             "ls": [1, 2],
         }
 
-        result = patch_spec().validate_patch(patch)
+        result = patch_spec().validate_patch(patch, current={})
 
         assert result[StateKey("n")] == 7
         assert result[StateKey("s")] == "abc"
@@ -923,19 +1042,19 @@ class TestValidatePatch:
         assert set(result) == set(patch)
 
     def test_an_empty_patch_is_valid(self) -> None:
-        assert patch_spec().validate_patch({}) == {}
+        assert patch_spec().validate_patch({}, current={}) == {}
 
     def test_an_unknown_key_is_refused(self) -> None:
         with pytest.raises(SpecError, match="nope is not declared in the spec"):
-            patch_spec().validate_patch({"nope": 1})
+            patch_spec().validate_patch({"nope": 1}, current={})
 
     def test_a_malformed_key_is_refused(self) -> None:
         with pytest.raises(SpecError, match="StateKey"):
-            patch_spec().validate_patch({"Not A Key": 1})
+            patch_spec().validate_patch({"Not A Key": 1}, current={})
 
     def test_a_computed_key_cannot_be_patched(self) -> None:
         with pytest.raises(SpecError, match="c is computed and cannot be written"):
-            patch_spec().validate_patch({"c": 1})
+            patch_spec().validate_patch({"c": 1}, current={})
 
     @pytest.mark.parametrize(
         ("patch", "message"),
@@ -954,11 +1073,11 @@ class TestValidatePatch:
         self, patch: dict[str, object], message: str
     ) -> None:
         with pytest.raises(SpecError, match=message):
-            patch_spec().validate_patch(patch)
+            patch_spec().validate_patch(patch, current={})
 
     def test_all_or_nothing_and_every_problem_is_listed(self) -> None:
         with pytest.raises(SpecError) as raised:
-            patch_spec().validate_patch({"n": 1, "s": 5, "e": "zzz", "c": 1, "nope": 1})
+            patch_spec().validate_patch({"n": 1, "s": 5, "e": "zzz", "c": 1, "nope": 1}, current={})
 
         assert len(raised.value.problems) == 4
 
@@ -966,23 +1085,23 @@ class TestValidatePatch:
         spec = patch_spec()
         outputs = [StateKey("n"), StateKey("s")]
 
-        assert spec.validate_patch({"n": 1}, only=outputs) == {StateKey("n"): 1}
+        assert spec.validate_patch({"n": 1}, current={}, only=outputs) == {StateKey("n"): 1}
         with pytest.raises(SpecError, match="e is not one of the entries this may write"):
-            spec.validate_patch({"n": 1, "e": "a"}, only=outputs)
+            spec.validate_patch({"n": 1, "e": "a"}, current={}, only=outputs)
         with pytest.raises(SpecError, match="c is computed"):
-            spec.validate_patch({"c": 1}, only=[StateKey("c")])
+            spec.validate_patch({"c": 1}, current={}, only=[StateKey("c")])
         with pytest.raises(SpecError, match="not declared"):
-            spec.validate_patch({"nope": 1}, only=[StateKey("nope")])
+            spec.validate_patch({"nope": 1}, current={}, only=[StateKey("nope")])
 
     def test_an_empty_only_allows_nothing(self) -> None:
         with pytest.raises(SpecError, match="not one of the entries"):
-            patch_spec().validate_patch({"n": 1}, only=[])
+            patch_spec().validate_patch({"n": 1}, current={}, only=[])
 
     def test_a_huge_hostile_patch_is_refused_after_a_bounded_amount_of_work(self) -> None:
         patch: dict[str, object] = {f"k{i}": i for i in range(100_000)}
 
         with pytest.raises(SpecError) as raised:
-            patch_spec().validate_patch(patch)
+            patch_spec().validate_patch(patch, current={})
 
         assert len(raised.value.problems) == MAX_REPORTED_PROBLEMS + 1
         assert len(str(raised.value)) < 4000
@@ -1005,13 +1124,33 @@ class TestValidatePatch:
                     yield f"k{i}"
 
         with pytest.raises(SpecError):
-            patch_spec().validate_patch(Endless())
+            patch_spec().validate_patch(Endless(), current={})
 
         assert len(looked_at) <= MAX_REPORTED_PROBLEMS + 2
+
+    @pytest.mark.parametrize(
+        "key", [1, 1.5, True, None, b"k", (1, 2), frozenset({1})], ids=lambda k: type(k).__name__
+    )
+    @pytest.mark.parametrize("shape", ["flat", "nested"])
+    def test_a_json_value_with_a_key_that_is_not_a_string_is_refused_not_a_crash(
+        self, key: object, shape: str
+    ) -> None:
+        spec = validate_ui_spec(build(state=[{"kind": "json", "key": "j", "default": None}]))
+        value: object = {key: 1} if shape == "flat" else {"a": [{key: 1}]}
+
+        with pytest.raises(SpecError, match="j: a key of a JSON object must be a string"):
+            spec.validate_patch({"j": value}, current={})
+
+    def test_a_json_value_with_string_keys_is_accepted(self) -> None:
+        spec = validate_ui_spec(build(state=[{"kind": "json", "key": "j", "default": None}]))
+
+        assert spec.validate_patch({"j": {"a": [{"b": 1}]}}, current={}) == {
+            StateKey("j"): {"a": [{"b": 1}]}
+        }
 
     def test_the_patch_is_not_modified(self) -> None:
         patch: dict[str, object] = {"ls": [1, 2]}
 
-        patch_spec().validate_patch(patch)
+        patch_spec().validate_patch(patch, current={})
 
         assert json.dumps(patch) == '{"ls": [1, 2]}'

@@ -21,7 +21,9 @@ from tumbleweed.ui.spec.check import (
     check_expr,
     computed_order,
     expr_type_of,
+    referenced_keys,
     references,
+    string_literals,
 )
 from tumbleweed.ui.spec.expr import Expr
 from tumbleweed.ui.spec.names import StateKey
@@ -353,3 +355,28 @@ class TestComputedOrder:
 
         with pytest.raises(InvalidValueError, match="computed state has a cycle"):
             computed_order(decls_of(*entries))
+
+
+class TestWhatAnExpressionCanEvaluateToDirectly:
+    """Literals and references reached through `if` branches: what an assignment is checked on."""
+
+    def test_string_literals_through_nested_ifs(self) -> None:
+        expression = EXPR.validate_python(choose(choose(lit_str("a"), lit_str("b")), lit_str("c")))
+
+        assert sorted(string_literals(expression)) == ["a", "b", "c"]
+
+    def test_references_through_nested_ifs(self) -> None:
+        expression = EXPR.validate_python(choose(choose(ref("e"), ref("e2")), lit_str("c")))
+
+        assert sorted(referenced_keys(expression)) == ["e", "e2"]
+
+    def test_what_is_computed_is_not_known_before_it_runs(self) -> None:
+        concatenated = EXPR.validate_python(variadic("concat", ref("s"), lit_str("x")))
+
+        assert string_literals(concatenated) == []
+        assert referenced_keys(concatenated) == []
+
+    def test_a_plain_reference_or_literal_is_itself(self) -> None:
+        assert referenced_keys(EXPR.validate_python(ref("e"))) == ["e"]
+        assert string_literals(EXPR.validate_python(lit_str("t"))) == ["t"]
+        assert string_literals(EXPR.validate_python(ref("e"))) == []
