@@ -13,7 +13,15 @@ from pathlib import Path
 import pytest
 
 from tests.ui.spec import docgen
-from tests.ui.spec.docgen import DESCRIPTIONS, DOC, REGION, regenerate, render
+from tests.ui.spec.docgen import (
+    DESCRIPTIONS,
+    DOC,
+    INLINE,
+    REGION,
+    numbers,
+    regenerate,
+    render,
+)
 from tests.ui.spec.support import BOUND, EVENTS, GOLDEN_DIR, UNBOUND, golden, golden_text
 from tumbleweed.ui.spec.limits import all_limits
 from tumbleweed.ui.spec.parse import parse_ui_spec
@@ -179,3 +187,74 @@ def test_every_anchor_link_on_the_page_has_a_heading() -> None:
     assert len(anchors) >= 3
     for anchor in anchors:
         assert anchor in headings, anchor
+
+
+# --- the numbers in the prose -------------------------------------------------------------
+
+
+def prose(text: str) -> str:
+    """The sentences of the page: no generated parts, code, links, headings, or inline numbers."""
+    text = REGION.sub("", text)
+    text = INLINE.sub("", text)
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"\[[^\]]*\]\([^)]*\)", "", text)  # links, with their text
+    text = re.sub(r"`[^`\n]*`", "", text)  # code spans
+    text = re.sub(r"^#+ .*$", "", text, flags=re.MULTILINE)  # headings
+    return re.sub(r"\b(?:sections?|RFC|I|S)\s?\d+\b", "", text)  # section 4, RFC 8785, I9, S10
+
+
+def bare_numbers(text: str) -> list[int]:
+    found = re.findall(r"(?<![\w.*+-])\d[\d,]*(?![\w])", prose(text))
+    return [int(token.replace(",", "")) for token in found if token.replace(",", "")]
+
+
+def test_the_marked_numbers_are_the_values_of_the_limits() -> None:
+    marked = {match["name"]: match["value"] for match in INLINE.finditer(TEXT)}
+
+    assert len(marked) >= 20  # the page quotes most of its limits
+    for name, value in marked.items():
+        assert value == f"{numbers()[name]:,}", name
+
+
+def test_every_limit_of_the_code_is_quoted_somewhere_on_the_page() -> None:
+    # In the generated table, or in the prose as a marked number.
+    in_table = {name for name in all_limits() if f"| `{name}` |" in TEXT}
+
+    assert in_table == set(all_limits())
+
+
+def test_no_number_in_the_prose_is_a_limit_that_is_not_marked() -> None:
+    values = set(numbers().values())
+    assert len(bare_numbers(TEXT)) >= 5  # the scan does see numbers in the prose
+    bare = [number for number in bare_numbers(TEXT) if number in values]
+
+    assert bare == [], (
+        f"these numbers in docs/ui-spec.md are limits: write them between `limit` comments: {bare}"
+    )
+
+
+def test_the_scan_finds_a_bare_limit_and_leaves_the_rest() -> None:
+    sample = (
+        "# 65,536 in a heading\n"
+        "A string is at most 65,536 characters (section 16, RFC 8785, I9).\n"
+        "<!-- limit: MAX_STRING_LENGTH -->65,536<!-- /limit --> is marked, `65,536` is code,\n"
+        "[65,536](link) is a link, and 2**53 - 1 and 5e0 and v65 are not limits.\n"
+    )
+
+    assert bare_numbers(sample) == [65536, 2, 1]
+
+
+def test_an_unknown_limit_in_the_prose_is_an_error() -> None:
+    with pytest.raises(ValueError, match="unknown limit"):
+        regenerate("<!-- limit: MAX_NOTHING -->1<!-- /limit -->\n")
+
+
+def test_a_changed_limit_changes_the_prose(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(docgen, "all_limits", lambda: {**all_limits(), "MAX_NAME_LENGTH": 99})
+
+    changed = regenerate(TEXT)
+
+    assert changed != TEXT
+    assert "<!-- limit: MAX_NAME_LENGTH -->99<!-- /limit -->" in changed
+    assert "<!-- limit: MAX_NAME_LENGTH -->64<!-- /limit -->" not in changed

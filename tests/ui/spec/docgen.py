@@ -15,6 +15,11 @@ The reference has hand-written prose and generated regions:
 - `ports`: the port type of each kind of state;
 - `fixture NAME`: the golden spec `tests/ui/spec/golden/NAME.json`, verbatim;
 - `fragment NAME /json/pointer`: a part of a golden spec, pretty-printed.
+
+Numbers in the prose are written as `<!-- limit: NAME -->value<!-- /limit -->` and regenerated
+from `limits` (and the defaults and report sizes beside it), so that a limit cannot change
+without the prose changing. `test_docs.py` fails on a bare number in the prose that is the value
+of a limit.
 """
 
 import json
@@ -36,6 +41,7 @@ from tests.ui.spec.support import (
     STATE_KINDS,
     golden_text,
 )
+from tumbleweed.ui.spec import errors, limits
 from tumbleweed.ui.spec.limits import all_limits
 from tumbleweed.ui.spec.state import StateDecl, port_type_of
 from tumbleweed.ui.spec.values import PORT_TYPES
@@ -48,6 +54,7 @@ DOC = ROOT / "docs" / "ui-spec.md"
 REGION = re.compile(
     r"<!-- generated: (?P<name>[^>]+?) -->\n(?P<body>.*?)<!-- /generated -->\n", re.DOTALL
 )
+INLINE = re.compile(r"<!-- limit: (?P<name>[A-Z_]+) -->(?P<value>[^<]*)<!-- /limit -->")
 
 DESCRIPTIONS = {
     "MAX_SPEC_BYTES": "bytes of the raw JSON text (`parse_ui_spec`)",
@@ -82,8 +89,23 @@ DESCRIPTIONS = {
     "MAX_TABLE_CELLS": "rows times columns of a table value",
     "MAX_JSON_DEPTH": "levels of a `json` value",
     "MAX_JSON_NODES": "nodes of a `json` value (containers, scalars and keys)",
-    "MAX_SAFE_INT": "magnitude of an integer anywhere in a spec (exact in canonical JSON)",
+    "MAX_SAFE_INT": "magnitude of an integer in an `int` position; width of a widget's range",
+    "MAX_VALUE_TEXT_BYTES": "UTF-8 bytes of text in one `json`, `table` or `list` value",
+    "MAX_PATCH_TEXT_BYTES": "UTF-8 bytes of text in all the values of one patch",
+    "MAX_STATE_TEXT_BYTES": "UTF-8 bytes of text in the whole state of a tool",
+    "MAX_WIDGET_STEPS": "steps of a `float` step across the range of a slider or spin button",
 }
+
+
+def numbers() -> dict[str, int]:
+    """Every number the prose may quote: the limits, the defaults beside them, the report sizes."""
+    defaults = {name: value for name, value in vars(limits).items() if name.startswith("DEFAULT_")}
+    reports = {
+        "MAX_REPORTED_PROBLEMS": errors.MAX_REPORTED_PROBLEMS,
+        "MAX_PROBLEM_LENGTH": errors.MAX_PROBLEM_LENGTH,
+        "MAX_LOCATION_PART": errors.MAX_LOCATION_PART,
+    }
+    return {**all_limits(), **defaults, **reports}
 
 
 def render_limits() -> str:
@@ -157,13 +179,20 @@ def render(region: str) -> str:
 
 
 def regenerate(text: str) -> str:
-    """`text` with every generated region rewritten from the code."""
+    """`text` with every generated region and every number in the prose rewritten from the code."""
 
     def rewrite(match: Match[str]) -> str:
         name = match["name"]
         return f"<!-- generated: {name} -->\n{render(name)}<!-- /generated -->\n"
 
-    return REGION.sub(rewrite, text)
+    def renumber(match: Match[str]) -> str:
+        name = match["name"]
+        known = numbers()
+        if name not in known:
+            raise ValueError(f"unknown limit {name!r}")
+        return f"<!-- limit: {name} -->{known[name]:,}<!-- /limit -->"
+
+    return INLINE.sub(renumber, REGION.sub(rewrite, text))
 
 
 def main(argv: Sequence[str]) -> int:
