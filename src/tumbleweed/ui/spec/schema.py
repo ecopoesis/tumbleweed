@@ -5,12 +5,22 @@ test fails when it no longer matches the models. After a change to the models, r
 
     uv run python -m tumbleweed.ui.spec.schema --write
 
-and `--check` (the default) says whether the committed file is current. The schema describes
-shape, types and numeric and length bounds, and anything it rejects the models reject. It is
-looser than the models: JSON Schema cannot express the cross-reference rules (names that exist,
-expression types, cycles) or the character rules of text and workspace paths. Those are in
-`docs/ui-spec.md` and enforced by the models, so the schema is a guide for writing a spec and
-never a substitute for validating one.
+and `--check` (the default) says whether the committed file is current.
+
+**The schema is looser than the models, and is not a validator.** It describes shape, types and
+numeric and length bounds, and anything it rejects the models reject, but JSON Schema cannot
+express the cross-reference rules (names that exist, expression types, cycles), the character
+rules of text and workspace paths, or the size budgets. Those are in `docs/ui-spec.md` and
+enforced by the models. It is a guide for writing a spec. Untrusted text, from the model, a
+file or another process, must go through `parse_ui_spec` (and parsed JSON through
+`validate_ui_spec`), never be checked against this schema alone.
+
+**A tagged union is dispatched on its `kind`.** pydantic describes `Expr`, `StateDecl`,
+`Component` and `Handler` as a `oneOf` of every kind plus a `discriminator`, which is an OpenAPI
+keyword that generic validators (the `jsonschema` library, editors) ignore: they then try every
+branch at every level, and a nest of 16 `not` nodes costs 25**16 steps. Here each is rewritten
+as `if` `kind` is `x` `then` the schema of `x`, with the set of kinds in an `enum`, which a
+validator checks in a single pass; the `discriminator` stays for tools that read it.
 """
 
 import json
@@ -28,9 +38,34 @@ SCHEMA_FILE: Final = Path("schemas") / "ui-spec.v1.json"  # relative to the repo
 _JSON_OBJECT: Final = TypeAdapter(dict[str, JsonValue])
 
 
+def _dispatch_on_kind(schema: dict[str, JsonValue]) -> None:
+    """Rewrite each `oneOf` + `discriminator` definition to `if`/`then` on the `kind`."""
+    definitions = schema["$defs"]
+    assert isinstance(definitions, dict)  # noqa: S101  (pydantic always writes $defs here)
+    for definition in definitions.values():
+        if not isinstance(definition, dict) or "discriminator" not in definition:
+            continue
+        discriminator = definition["discriminator"]
+        assert isinstance(discriminator, dict)  # noqa: S101
+        mapping = discriminator["mapping"]
+        assert isinstance(mapping, dict)  # noqa: S101
+        definition.pop("oneOf")
+        definition["type"] = "object"
+        definition["required"] = ["kind"]
+        definition["properties"] = {"kind": {"enum": list(mapping)}}
+        definition["allOf"] = [
+            {
+                "if": {"properties": {"kind": {"const": kind}}, "required": ["kind"]},
+                "then": {"$ref": reference},
+            }
+            for kind, reference in mapping.items()
+        ]
+
+
 def ui_spec_schema() -> dict[str, JsonValue]:
     """The JSON Schema (validation mode) of a spec."""
     schema = _JSON_OBJECT.validate_python(UiSpec.model_json_schema(mode="validation"))
+    _dispatch_on_kind(schema)
     schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
     schema["$id"] = "urn:tumbleweed:ui-spec:v1"
     schema["title"] = SPEC_VERSION

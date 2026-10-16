@@ -4,18 +4,28 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
+from jsonschema import Draft202012Validator
+from pydantic import BaseModel
 
 from tests.ui.spec.support import (
     COMPONENT_KINDS,
     EXPR_KINDS,
     HANDLER_KINDS,
+    MINIMAL_STATE,
     STATE_KINDS,
+    build,
+    golden,
+    minimal,
 )
 from tumbleweed.core.types import JsonValue
 from tumbleweed.ui.spec import limits, schema
+from tumbleweed.ui.spec.errors import SpecError
+from tumbleweed.ui.spec.parse import parse_ui_spec
 from tumbleweed.ui.spec.schema import SCHEMA_FILE, main, schema_text, ui_spec_schema
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -175,8 +185,9 @@ class TestTheSchemaDescribesTheModels:
                 assert "kind" in (defs[cls.__name__]["required"] or [])  # type: ignore[operator]  # a list
 
     def test_every_model_is_closed(self) -> None:
+        tagged_unions = {"Expr", "StateDecl", "Component", "Handler"}
         for name, definition in definitions().items():
-            if definition.get("type") == "object":
+            if definition.get("type") == "object" and name not in tagged_unions:
                 assert definition["additionalProperties"] is False, name
 
     def test_arrays_are_bounded_with_item_keywords_not_string_keywords(self) -> None:
@@ -265,3 +276,159 @@ class TestTheSchemaDescribesTheModels:
 
     def test_the_module_exposes_what_the_system_prompt_needs(self) -> None:
         assert schema.ui_spec_schema() == json.loads(schema_text())
+
+
+class TestTaggedUnionsDispatchOnTheirKind:
+    """pydantic writes `oneOf` + `discriminator`, which generic validators do not understand."""
+
+    UNIONS: ClassVar[dict[str, dict[str, type[BaseModel]]]] = {
+        "Expr": EXPR_KINDS,
+        "StateDecl": STATE_KINDS,
+        "Component": COMPONENT_KINDS,
+        "Handler": HANDLER_KINDS,
+    }
+
+    @pytest.mark.parametrize("union", UNIONS)
+    def test_the_definition_is_if_then_on_the_kind_not_one_of(self, union: str) -> None:
+        definition = definitions()[union]
+        kinds = self.UNIONS[union]
+
+        assert "oneOf" not in definition
+        assert "anyOf" not in definition
+        assert definition["required"] == ["kind"]
+        assert definition["properties"] == {"kind": {"enum": sorted(kinds)}}  # as pydantic sorts
+        branches = definition["allOf"]
+        assert isinstance(branches, list)
+        assert len(branches) == len(kinds)
+        for branch, kind in zip(branches, sorted(kinds), strict=True):
+            cls = kinds[kind]
+            assert branch == {
+                "if": {"properties": {"kind": {"const": kind}}, "required": ["kind"]},
+                "then": {"$ref": f"#/$defs/{cls.__name__}"},
+            }
+
+    def test_no_definition_still_has_a_oneof_or_an_anyof_of_models(self) -> None:
+        # What remains are anyOf of a scalar and null, or of scalars: never of two or more refs
+        # to models, which a generic validator would try one by one.
+        def walk(node: JsonValue, path: str) -> None:
+            if isinstance(node, dict):
+                for keyword in ("oneOf", "anyOf"):
+                    branches = node.get(keyword)
+                    if isinstance(branches, list):
+                        refs = [b for b in branches if isinstance(b, dict) and "$ref" in b]
+                        assert len(refs) <= 1, f"{path}/{keyword} tries {len(refs)} models"
+                for key, value in node.items():
+                    walk(value, f"{path}/{key}")
+            elif isinstance(node, list):
+                for index, item in enumerate(node):
+                    walk(item, f"{path}/{index}")
+
+        walk(ui_spec_schema(), "#")
+
+
+def validator() -> Draft202012Validator:
+    return Draft202012Validator(ui_spec_schema())
+
+
+def chain(depth: int, wrap: str = "not") -> dict[str, JsonValue]:
+    node: dict[str, JsonValue] = {"kind": "bool", "value": True}
+    for _ in range(depth - 1):
+        node = {"kind": wrap, "operand": node}
+    return node
+
+
+def with_expression(expression: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    entry: dict[str, JsonValue] = {
+        "kind": "bool",
+        "key": "b",
+        "default": True,
+        "computed": expression,
+    }
+    return build(state=[entry])
+
+
+class TestAGenericValidatorCanUseTheSchema:
+    """With `jsonschema` (a dev dependency): the schema is valid, quick and agrees on shape."""
+
+    def test_it_is_a_valid_draft_2020_12_schema(self) -> None:
+        Draft202012Validator.check_schema(ui_spec_schema())
+
+    @pytest.mark.parametrize("name", ["tip_calculator", "photo_adjuster", "csv_viewer"])
+    def test_the_golden_specs_pass(self, name: str) -> None:
+        assert list(validator().iter_errors(golden(name))) == []
+
+    def test_a_spec_of_every_kind_of_state_passes(self) -> None:
+        for kind, fields in MINIMAL_STATE.items():
+            entry: dict[str, JsonValue] = {"kind": kind, "key": "k", **fields}
+
+            assert list(validator().iter_errors(build(state=[entry]))) == [], kind
+
+    def test_a_nest_of_sixteen_nodes_is_validated_at_once(self) -> None:
+        # With `oneOf` and an ignored `discriminator` each level tries all 25 kinds, and this
+        # takes 25**15 steps: hours.
+        started = time.perf_counter()
+        errors = list(validator().iter_errors(with_expression(chain(16))))
+        elapsed = time.perf_counter() - started
+
+        assert errors == []
+        assert elapsed < 1.0
+
+    def test_a_wrong_kind_at_the_bottom_of_a_deep_nest_is_found_at_once_too(self) -> None:
+        bad = chain(16)
+        node = bad
+        while node.get("operand") is not None:
+            node = node["operand"]  # type: ignore[assignment]  # the nest is made of dicts
+        node["kind"] = "nope"
+        started = time.perf_counter()
+        errors = list(validator().iter_errors(with_expression(bad)))
+        elapsed = time.perf_counter() - started
+
+        assert errors
+        assert elapsed < 1.0
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            build({"kind": "nope"}),
+            build({"kind": "box", "children": [{"kind": "nope"}]}),
+            build(state=[{"kind": "nope", "key": "x", "default": 0}]),
+            build(handlers=[{"kind": "nope", "name": "h"}]),
+            with_expression({"kind": "nope"}),
+            minimal(extra=1),
+            build({"kind": "slider", "bind": "x", "extra": 1}),
+            build(state=[{"kind": "int", "key": "x", "default": 1.5}]),
+            build(state=[{"kind": "int", "key": "x", "default": 0, "computed": "1+1"}]),
+        ],
+        ids=[
+            "unknown component",
+            "unknown nested component",
+            "unknown state kind",
+            "unknown handler kind",
+            "unknown expression kind",
+            "extra top-level field",
+            "extra field of a component",
+            "float default of an int",
+            "an expression written as a string",
+        ],
+    )
+    def test_what_the_schema_can_see_is_wrong_is_refused(self, data: dict[str, JsonValue]) -> None:
+        assert list(validator().iter_errors(data))
+
+    def test_each_kind_dispatches_to_its_own_model_and_no_other(self) -> None:
+        # A component with the fields of a button but the kind of a switch is not valid.
+        wrong = build({"kind": "switch", "label": "Go", "on_click": "h"})
+
+        assert list(validator().iter_errors(wrong))
+
+    def test_the_schema_is_looser_than_the_models_where_it_says_it_is(self) -> None:
+        # Documented in the module: JSON Schema cannot say what a workspace path may be.
+        entry: dict[str, JsonValue] = {
+            "kind": "image",
+            "key": "i",
+            "default": {"path": "/etc/x.png"},
+        }
+        data = build(state=[entry])
+
+        assert list(validator().iter_errors(data)) == []
+        with pytest.raises(SpecError):
+            parse_ui_spec(json.dumps(data))

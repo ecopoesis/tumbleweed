@@ -229,25 +229,6 @@
       "title": "Button",
       "type": "object"
     },
-    "CellValue": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "maximum": 9007199254740991,
-          "minimum": -9007199254740991,
-          "type": "integer"
-        },
-        {
-          "type": "number"
-        },
-        {
-          "maxLength": 1000,
-          "type": "string"
-        }
-      ]
-    },
     "Check": {
       "additionalProperties": false,
       "description": "A check box with a label, two-way bound to a `bool` entry.",
@@ -329,60 +310,304 @@
         },
         "propertyName": "kind"
       },
-      "oneOf": [
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "box",
+            "button",
+            "check",
+            "dropdown",
+            "entry",
+            "expander",
+            "grid",
+            "heading",
+            "image",
+            "label",
+            "progress",
+            "separator",
+            "slider",
+            "spin",
+            "switch",
+            "table",
+            "tabs",
+            "text_view"
+          ]
+        }
+      },
+      "allOf": [
         {
-          "$ref": "#/$defs/Box"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "box"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Box"
+          }
         },
         {
-          "$ref": "#/$defs/Grid"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "button"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Button"
+          }
         },
         {
-          "$ref": "#/$defs/Label"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "check"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Check"
+          }
         },
         {
-          "$ref": "#/$defs/Heading"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "dropdown"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Dropdown"
+          }
         },
         {
-          "$ref": "#/$defs/Button"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "entry"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Entry"
+          }
         },
         {
-          "$ref": "#/$defs/Entry"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "expander"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Expander"
+          }
         },
         {
-          "$ref": "#/$defs/Switch"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "grid"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Grid"
+          }
         },
         {
-          "$ref": "#/$defs/Check"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "heading"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Heading"
+          }
         },
         {
-          "$ref": "#/$defs/Slider"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "image"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Image"
+          }
         },
         {
-          "$ref": "#/$defs/Spin"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "label"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Label"
+          }
         },
         {
-          "$ref": "#/$defs/Dropdown"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "progress"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Progress"
+          }
         },
         {
-          "$ref": "#/$defs/Progress"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "separator"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Separator"
+          }
         },
         {
-          "$ref": "#/$defs/Separator"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "slider"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Slider"
+          }
         },
         {
-          "$ref": "#/$defs/Image"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "spin"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Spin"
+          }
         },
         {
-          "$ref": "#/$defs/TableView"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "switch"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Switch"
+          }
         },
         {
-          "$ref": "#/$defs/TextView"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "table"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/TableView"
+          }
         },
         {
-          "$ref": "#/$defs/Tabs"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "tabs"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Tabs"
+          }
         },
         {
-          "$ref": "#/$defs/Expander"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "text_view"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/TextView"
+          }
         }
       ]
     },
@@ -646,81 +871,416 @@
         },
         "propertyName": "kind"
       },
-      "oneOf": [
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "abs",
+            "add",
+            "and",
+            "bool",
+            "concat",
+            "div",
+            "eq",
+            "float",
+            "format_number",
+            "ge",
+            "gt",
+            "if",
+            "int",
+            "le",
+            "lt",
+            "max",
+            "min",
+            "mul",
+            "ne",
+            "not",
+            "or",
+            "ref",
+            "round",
+            "string",
+            "sub"
+          ]
+        }
+      },
+      "allOf": [
         {
-          "$ref": "#/$defs/BoolLit"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "abs"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Abs"
+          }
         },
         {
-          "$ref": "#/$defs/IntLit"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "add"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Add"
+          }
         },
         {
-          "$ref": "#/$defs/FloatLit"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "and"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/And"
+          }
         },
         {
-          "$ref": "#/$defs/StrLit"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "bool"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/BoolLit"
+          }
         },
         {
-          "$ref": "#/$defs/Ref"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "concat"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Concat"
+          }
         },
         {
-          "$ref": "#/$defs/Add"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "div"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Div"
+          }
         },
         {
-          "$ref": "#/$defs/Sub"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "eq"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Eq"
+          }
         },
         {
-          "$ref": "#/$defs/Mul"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "float"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/FloatLit"
+          }
         },
         {
-          "$ref": "#/$defs/Div"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "format_number"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/FormatNumber"
+          }
         },
         {
-          "$ref": "#/$defs/Min"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ge"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Ge"
+          }
         },
         {
-          "$ref": "#/$defs/Max"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "gt"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Gt"
+          }
         },
         {
-          "$ref": "#/$defs/Abs"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "if"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/If"
+          }
         },
         {
-          "$ref": "#/$defs/Round"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "int"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/IntLit"
+          }
         },
         {
-          "$ref": "#/$defs/Eq"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "le"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Le"
+          }
         },
         {
-          "$ref": "#/$defs/Ne"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "lt"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Lt"
+          }
         },
         {
-          "$ref": "#/$defs/Lt"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "max"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Max"
+          }
         },
         {
-          "$ref": "#/$defs/Le"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "min"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Min"
+          }
         },
         {
-          "$ref": "#/$defs/Gt"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "mul"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Mul"
+          }
         },
         {
-          "$ref": "#/$defs/Ge"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ne"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Ne"
+          }
         },
         {
-          "$ref": "#/$defs/And"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "not"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Not"
+          }
         },
         {
-          "$ref": "#/$defs/Or"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "or"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Or"
+          }
         },
         {
-          "$ref": "#/$defs/Not"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "ref"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Ref"
+          }
         },
         {
-          "$ref": "#/$defs/If"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "round"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Round"
+          }
         },
         {
-          "$ref": "#/$defs/Concat"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/StrLit"
+          }
         },
         {
-          "$ref": "#/$defs/FormatNumber"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "sub"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/Sub"
+          }
         }
       ]
     },
@@ -994,15 +1554,64 @@
         },
         "propertyName": "kind"
       },
-      "oneOf": [
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "agent",
+            "sandbox",
+            "set"
+          ]
+        }
+      },
+      "allOf": [
         {
-          "$ref": "#/$defs/SetHandler"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "agent"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/AgentHandler"
+          }
         },
         {
-          "$ref": "#/$defs/SandboxHandler"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "sandbox"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/SandboxHandler"
+          }
         },
         {
-          "$ref": "#/$defs/AgentHandler"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "set"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/SetHandler"
+          }
         }
       ]
     },
@@ -1352,25 +1961,6 @@
       "title": "Le",
       "type": "object"
     },
-    "ListItem": {
-      "anyOf": [
-        {
-          "type": "boolean"
-        },
-        {
-          "maximum": 9007199254740991,
-          "minimum": -9007199254740991,
-          "type": "integer"
-        },
-        {
-          "type": "number"
-        },
-        {
-          "maxLength": 1000,
-          "type": "string"
-        }
-      ]
-    },
     "ListState": {
       "additionalProperties": false,
       "description": "A list of scalars of one type.",
@@ -1398,8 +1988,20 @@
         "default": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/ListItem"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "maxLength": 1000,
+                "type": "string"
+              }
+            ]
           },
+          "maxItems": 1000,
           "default": [],
           "title": "Default"
         }
@@ -1635,6 +2237,24 @@
       "title": "Round",
       "type": "object"
     },
+    "Row": {
+      "items": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "maxLength": 1000,
+            "type": "string"
+          }
+        ]
+      },
+      "maxItems": 32,
+      "type": "array"
+    },
     "SandboxHandler": {
       "additionalProperties": false,
       "description": "Call a function of one of the tool's code modules in a sandbox.",
@@ -1869,36 +2489,176 @@
         },
         "propertyName": "kind"
       },
-      "oneOf": [
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "bool",
+            "enum",
+            "file",
+            "float",
+            "image",
+            "int",
+            "json",
+            "list",
+            "string",
+            "table"
+          ]
+        }
+      },
+      "allOf": [
         {
-          "$ref": "#/$defs/BoolState"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "bool"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/BoolState"
+          }
         },
         {
-          "$ref": "#/$defs/IntState"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "enum"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/EnumState"
+          }
         },
         {
-          "$ref": "#/$defs/FloatState"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "file"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/FileState"
+          }
         },
         {
-          "$ref": "#/$defs/StringState"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "float"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/FloatState"
+          }
         },
         {
-          "$ref": "#/$defs/EnumState"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "image"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/ImageState"
+          }
         },
         {
-          "$ref": "#/$defs/ImageState"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "int"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/IntState"
+          }
         },
         {
-          "$ref": "#/$defs/FileState"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "json"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/JsonState"
+          }
         },
         {
-          "$ref": "#/$defs/TableState"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "list"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/ListState"
+          }
         },
         {
-          "$ref": "#/$defs/ListState"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/StringState"
+          }
         },
         {
-          "$ref": "#/$defs/JsonState"
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "table"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/TableState"
+          }
         }
       ]
     },
@@ -2051,7 +2811,7 @@
     },
     "Table": {
       "additionalProperties": false,
-      "description": "Typed columns and rows of cells. A table value carries its own columns.\n\nA state declaration of kind `table` bounds the value (`max_rows`) but does not fix its\ncolumns, because a CSV viewer cannot know the headers of a file it has not read. Every row\nhas one cell per column, of that column's type; an `int` is accepted in a `float` column.\nRows are bounded by `MAX_TABLE_ROWS` and, with the columns, by `MAX_TABLE_CELLS`.",
+      "description": "Typed columns and rows of cells. A table value carries its own columns.\n\nA state declaration of kind `table` bounds the value (`max_rows`) but does not fix its\ncolumns, because a CSV viewer cannot know the headers of a file it has not read. Every row\nhas one cell per column, of that column's type; an `int` is accepted in a `float` column\nand stored as a float. Rows are bounded by `MAX_TABLE_ROWS` and, with the columns, by\n`MAX_TABLE_CELLS`; the text in it by `MAX_VALUE_TEXT_BYTES`. Column names are distinct once\nnormalised as the tool store does (NFC, line feeds).",
       "properties": {
         "columns": {
           "default": [],
@@ -2065,10 +2825,7 @@
         "rows": {
           "default": [],
           "items": {
-            "items": {
-              "$ref": "#/$defs/CellValue"
-            },
-            "type": "array"
+            "$ref": "#/$defs/Row"
           },
           "maxItems": 10000,
           "title": "Rows",
