@@ -33,25 +33,29 @@ type ShellBuilder = Callable[[Responder], Shell]
 type AgentShellBuilder = Callable[[list[FakeTurn]], tuple[Shell, FakeProvider]]
 
 
-def escape_controller(shell: Shell) -> "Gtk.EventControllerKey":
-    from tumbleweed.shell._gi import Gtk
+def escape_shortcuts(widget: "Gtk.Widget") -> list["Gtk.Shortcut"]:
+    """The shortcuts on `widget` that Esc triggers."""
+    from tumbleweed.shell._gi import Gdk, Gtk
 
-    found = [
-        controller
-        for controller in shell.window.chat_panel.observe_controllers()
-        if isinstance(controller, Gtk.EventControllerKey)
-        and controller.get_propagation_phase() == Gtk.PropagationPhase.BUBBLE
-    ]
-    assert len(found) == 1
-    return found[0]
+    found = []
+    for controller in widget.observe_controllers():
+        if not isinstance(controller, Gtk.ShortcutController):
+            continue
+        for shortcut in controller:
+            trigger = shortcut.get_trigger()
+            if isinstance(trigger, Gtk.KeyvalTrigger) and trigger.get_keyval() == Gdk.KEY_Escape:
+                found.append(shortcut)
+    return found
 
 
 def press_escape(shell: Shell) -> bool:
-    from tumbleweed.shell._gi import Gdk
+    """Esc, as the window's shortcut handles it; True if the key was consumed."""
+    from tumbleweed.shell._gi import Gtk
 
-    return bool(
-        escape_controller(shell).emit("key-pressed", Gdk.KEY_Escape, 0, Gdk.ModifierType(0))
-    )
+    (shortcut,) = escape_shortcuts(shell.window)
+    action = shortcut.get_action()
+    assert action is not None
+    return bool(action.activate(Gtk.ShortcutActionFlags(0), shell.window, None))
 
 
 class TestGlibDispatcher:
@@ -101,6 +105,26 @@ class TestGlibDispatcher:
 
 
 class TestEscape:
+    def test_the_handler_is_on_the_window_not_on_the_chat_panel(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        shell = build_shell(ManualResponder())
+
+        assert len(escape_shortcuts(shell.window)) == 1  # so it works wherever the focus is
+        assert escape_shortcuts(shell.window.chat_panel) == []
+        assert escape_shortcuts(shell.window.canvas) == []
+
+    def test_esc_works_with_the_focus_on_the_canvas_too(self, build_shell: ShellBuilder) -> None:
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        type_text(shell, "question")
+        click_send(shell)
+        shell.window.set_focus(shell.window.canvas)  # not the chat panel
+
+        assert press_escape(shell)
+
+        assert responder.handle.cancelled
+
     def test_esc_cancels_the_reply_in_flight(self, build_shell: ShellBuilder) -> None:
         responder = ManualResponder()
         shell = build_shell(responder)
@@ -161,6 +185,25 @@ def agent_shell(build_shell: ShellBuilder) -> Iterator[AgentShellBuilder]:
     yield build
     for responder in responders:
         responder.close()
+
+
+class TestModelTextThatWouldWedgeTheChat:
+    def test_a_lone_surrogate_and_a_nul_show_as_replacement_characters_and_the_chat_stays_usable(
+        self, agent_shell: AgentShellBuilder
+    ) -> None:
+        shell, _ = agent_shell(
+            [FakeTurn(chunks=("bad \ud800 and \x00 text",)), FakeTurn(chunks=("fine",))]
+        )
+        type_text(shell, "one")
+        click_send(shell)
+
+        assert pump_until(lambda: not shell.window.controller.busy)
+        assert rows(shell)[1] == ("Assistant", "bad \ufffd and \ufffd text", "")
+
+        type_text(shell, "two")
+        click_send(shell)
+        assert pump_until(lambda: not shell.window.controller.busy)
+        assert rows(shell)[3] == ("Assistant", "fine", "")
 
 
 class TestAgentReplyThroughGtk:

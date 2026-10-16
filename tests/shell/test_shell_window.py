@@ -20,6 +20,7 @@ from tests.shell.gtk_support import (
     input_text,
     labels_in,
     press,
+    primary_text,
     pump,
     pump_until,
     rows,
@@ -1079,6 +1080,121 @@ class TestCopying:
         pump(0.1)
 
         assert clipboard_text(label) == label.get_text()[:300].replace("\u200b", "")
+
+    def test_selecting_puts_the_source_text_on_the_primary_selection_not_the_display_text(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        _shell, row = self.long_reply(build_shell, "ab" * 600)
+        label = row.paragraphs[0]
+        shown = label.get_text()
+        assert "\u200b" in shown[250:270]
+
+        label.grab_focus()  # selecting with the pointer or the keyboard focuses the label
+        label.select_region(250, 270)
+        pump(0.1)
+
+        assert primary_text(label) == shown[250:270].replace("\u200b", "")
+
+    def test_the_primary_selection_follows_the_selection(self, build_shell: ShellBuilder) -> None:
+        _shell, row = self.long_reply(build_shell, "ab" * 600)
+        label = row.paragraphs[0]
+        label.grab_focus()
+
+        label.select_region(0, 10)
+        pump(0.1)
+        assert primary_text(label) == "ab" * 5
+        label.select_region(20, 24)
+        pump(0.1)
+
+        assert primary_text(label) == "abab"
+
+    def test_a_click_that_clears_the_selection_drops_what_we_put_on_the_primary_selection(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        _shell, row = self.long_reply(build_shell, "ab" * 600)
+        label = row.paragraphs[0]
+        label.grab_focus()
+        label.select_region(0, 10)
+        pump(0.1)
+        assert primary_text(label) == "ab" * 5
+
+        label.select_region(3, 3)  # what a click inside the selection does
+        (click,) = (
+            c
+            for c in label.observe_controllers()
+            if isinstance(c, Gtk.GestureClick)
+            and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
+        )
+        click.emit("released", 1, 0.0, 0.0)
+        pump(0.1)
+
+        assert row.primary is None
+        assert primary_text(label) in {None, ""}
+
+    def test_a_selection_of_a_label_without_the_focus_is_left_to_gtk(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        # Not reachable by a user (every way of selecting focuses the label), and harmless: GTK's
+        # own text goes on the primary selection, as it did before.
+        shell, row = self.long_reply(build_shell, "ab" * 600)
+        label = row.paragraphs[0]
+        shell.window.chat_panel.input_view.grab_focus()
+
+        label.select_region(0, 10)
+        pump(0.1)
+
+        assert row.primary is None
+
+    def _drag_prepare(self, label: "Gtk.Label", x: float, y: float) -> str | None:
+        from tumbleweed.shell._gi import Gdk, Gtk
+
+        (source,) = (c for c in label.observe_controllers() if isinstance(c, Gtk.DragSource))
+        provider = source.emit("prepare", x, y)
+        if provider is None:
+            return None
+        assert isinstance(provider, Gdk.ContentProvider)
+        # What a drop target would read: through a (local) clipboard, which asks the provider.
+        label.get_clipboard().set_content(provider)
+        return clipboard_text(label)
+
+    def test_dragging_the_selected_text_carries_its_source_text(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        _shell, row = self.long_reply(build_shell, "ab" * 600)
+        label = row.paragraphs[0]
+        shown = label.get_text()
+        assert "\u200b" in shown[250:270]
+        label.select_region(250, 270)
+        offset_x, offset_y = label.get_layout_offsets()
+        layout = label.get_layout()
+        position = layout.index_to_pos(len(shown[:255].encode("utf-8")))
+
+        carried = self._drag_prepare(
+            label, offset_x + position.x / 1024 + 1, offset_y + position.y / 1024 + 1
+        )
+
+        assert carried == shown[250:270].replace("\u200b", "")
+
+    def test_a_press_outside_the_selection_does_not_start_our_drag(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        _shell, row = self.long_reply(build_shell, "ab" * 600)
+        label = row.paragraphs[0]
+        label.select_region(250, 270)
+        offset_x, offset_y = label.get_layout_offsets()
+
+        assert self._drag_prepare(label, offset_x + 1, offset_y + 1) is None  # the first character
+
+    def test_with_nothing_selected_there_is_nothing_to_drag(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        _shell, row = self.long_reply(build_shell, "ab" * 600)
+        label = row.paragraphs[0]
+        label.select_region(5, 5)
+
+        assert self._drag_prepare(label, 3.0, 3.0) is None
 
     def test_with_nothing_selected_the_clipboard_is_left_alone(
         self, build_shell: ShellBuilder

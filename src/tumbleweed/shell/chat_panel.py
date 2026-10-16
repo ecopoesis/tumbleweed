@@ -7,6 +7,13 @@ text is untrusted (model output), so it only ever goes into labels through `plai
 bounded (a huge grapheme cluster, or text with no break opportunity, would wreck the window: I5,
 I9). The transcript scrolls in both directions as needed and never passes its content's size on
 to the window.
+
+What the user takes out of a message is the message's own text, not the text as it is laid out
+(which has zero-width spaces added where a long run could not break): through Copy (Ctrl+C, the
+context menu), through the primary selection (select, then middle-click paste elsewhere) and by
+dragging the selection out. GTK offers its own laid-out text on the last two and gives no hook
+for it, so the panel watches the primary selection and replaces what a label put there, and puts
+a drag source of its own over the selected text.
 """
 
 import logging
@@ -14,7 +21,7 @@ from typing import assert_never, final
 
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import MessageId
-from tumbleweed.shell._gi import Gdk, Gtk
+from tumbleweed.shell._gi import Gdk, GLib, Gtk, Pango
 from tumbleweed.shell._widgets import plain_label
 from tumbleweed.shell.viewmodel.chat import ChatController, describe_error
 from tumbleweed.shell.viewmodel.display import DisplayChunks, display_text
@@ -62,6 +69,7 @@ class MessageRow(Gtk.Box):
         self.status = plain_label("", wrap=True, css_classes=["caption"])
         self._source = ""  # the message text shown so far
         self._chunks = DisplayChunks()
+        self.primary: Gdk.ContentProvider | None = None  # what we put on the primary selection
         self.append(self.role_label)
         self.append(self._body)
         self.append(self.status)
@@ -94,6 +102,13 @@ class MessageRow(Gtk.Box):
                 # Copying (Ctrl+C and the context menu both emit this) puts the message's own text
                 # on the clipboard, without the zero-width spaces that were added for display.
                 label.connect("copy-clipboard", self._on_copy, index)
+                drag = Gtk.DragSource(actions=Gdk.DragAction.COPY)
+                drag.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+                drag.connect("prepare", self._on_drag_prepare, label)
+                label.add_controller(drag)
+                click = Gtk.GestureClick(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+                click.connect("released", self._on_label_released, label)
+                label.add_controller(click)
                 self.paragraphs.append(label)
                 self._body.append(label)
             self.paragraphs[index].set_text(chunks[index])
@@ -103,6 +118,47 @@ class MessageRow(Gtk.Box):
         if selected:
             label.get_clipboard().set(self._chunks.source_text(index, start, end))
         label.stop_emission_by_name("copy-clipboard")  # the default would copy what is shown
+
+    def selected_source(self, label: Gtk.Label) -> str | None:
+        """The source text of what is selected in one of this row's labels, if anything is."""
+        selected, start, end = label.get_selection_bounds()
+        if not selected or label not in self.paragraphs:
+            return None
+        return self._chunks.source_text(self.paragraphs.index(label), start, end)
+
+    def _on_drag_prepare(
+        self, _source: Gtk.DragSource, x: float, y: float, label: Gtk.Label
+    ) -> Gdk.ContentProvider | None:
+        """A drag that starts on the selected text carries its source text; elsewhere, none of ours
+        (the label's own gestures select)."""
+        text = self.selected_source(label)
+        if text is None:
+            return None
+        selected, start, end = label.get_selection_bounds()
+        offset_x, offset_y = label.get_layout_offsets()
+        scale = Pango.SCALE
+        _inside, byte_index, _trailing = label.get_layout().xy_to_index(
+            int((x - offset_x) * scale), int((y - offset_y) * scale)
+        )
+        position = len(label.get_text().encode("utf-8")[:byte_index].decode("utf-8", "ignore"))
+        if not (selected and start <= position < end):
+            return None
+        return Gdk.ContentProvider.new_for_value(text)
+
+    def _on_label_released(
+        self, _gesture: Gtk.GestureClick, _presses: int, _x: float, _y: float, label: Gtk.Label
+    ) -> None:
+        # A click inside a selection clears it; GTK then clears only the primary selection it set
+        # itself, so ours is dropped here, after GTK has handled the click.
+        GLib.idle_add(self.drop_primary_if_unselected, label)
+
+    def drop_primary_if_unselected(self, label: Gtk.Label) -> bool:
+        clipboard = label.get_primary_clipboard()
+        if self.primary is not None and not label.get_selection_bounds()[0]:
+            if clipboard.get_content() is self.primary:
+                clipboard.set_content(None)
+            self.primary = None
+        return GLib.SOURCE_REMOVE
 
     def _show_state(self, message: TranscriptMessage) -> None:
         match message.state:
@@ -192,12 +248,7 @@ class ChatPanel(Gtk.Box):
         self.append(self.notice)
         self.append(entry_row)
 
-        # Esc cancels the reply in flight. On the panel, in the bubble phase: after whatever
-        # inside it wants Esc first, and only while a reply is streaming, so that it is otherwise
-        # left to everyone else (a popover, the text view).
-        escape = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.BUBBLE)
-        escape.connect("key-pressed", self._on_escape)
-        self.add_controller(escape)
+        self.get_primary_clipboard().connect("changed", self._on_primary_changed)
 
         for message in transcript.messages:
             self.message_added(message)
@@ -210,6 +261,26 @@ class ChatPanel(Gtk.Box):
     def transcript_list_rows(self) -> list[MessageRow]:
         """The rows in the order shown."""
         return list(self._rows.values())
+
+    def _on_primary_changed(self, clipboard: Gdk.Clipboard) -> None:
+        """Replace what a message label just put on the primary selection (its laid-out text,
+        with added zero-width spaces) by the message's own text.
+
+        The label is the one with the focus: selecting grabs it, and so does every way of
+        selecting, with the pointer or the keyboard.
+        """
+        content = clipboard.get_content()
+        if content is None or type(content).__name__ != "GtkLabelContent":
+            return
+        root = self.get_root()
+        focus = root.get_focus() if root is not None else None
+        row = focus.get_ancestor(MessageRow) if isinstance(focus, Gtk.Label) else None
+        if not isinstance(row, MessageRow) or not isinstance(focus, Gtk.Label):
+            return
+        text = row.selected_source(focus)
+        if text is not None:
+            row.primary = Gdk.ContentProvider.new_for_value(text)
+            clipboard.set_content(row.primary)
 
     def focus_input(self) -> None:
         self.input_view.grab_focus()
@@ -288,19 +359,6 @@ class ChatPanel(Gtk.Box):
         if state & Gtk.accelerator_get_default_mod_mask():
             return False
         self.send()
-        return True
-
-    def _on_escape(
-        self,
-        _controller: Gtk.EventControllerKey,
-        keyval: int,
-        _keycode: int,
-        _state: Gdk.ModifierType,
-    ) -> bool:
-        """Esc stops the reply that is streaming; with none, it does nothing and is not consumed."""
-        if keyval != Gdk.KEY_Escape or not self._controller.busy:
-            return False
-        self._controller.cancel()
         return True
 
     def _on_input_changed(self, _buffer: Gtk.TextBuffer) -> None:

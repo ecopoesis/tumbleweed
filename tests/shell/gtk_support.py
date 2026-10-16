@@ -277,3 +277,21 @@ def clipboard_text(widget: "Gtk.Widget") -> str | None:
 def set_clipboard_text(widget: "Gtk.Widget", text: str) -> None:
     widget.get_clipboard().set(text)
     pump(0.05)
+
+
+def primary_text(widget: "Gtk.Widget") -> str | None:
+    """What the widget's primary selection (middle-click paste) holds as text."""
+    from tumbleweed.shell._gi import GLib
+
+    clipboard = widget.get_primary_clipboard()
+    result: list[str | None] = []
+
+    def done(_source: object, outcome: "Gio.AsyncResult") -> None:
+        try:
+            result.append(clipboard.read_text_finish(outcome))
+        except GLib.Error:
+            result.append(None)
+
+    clipboard.read_text_async(None, done)
+    pump_until(lambda: bool(result), timeout=DEADLINE_SECONDS)
+    return result[0] if result else None
