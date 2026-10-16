@@ -771,10 +771,15 @@ class TestPydantic:
 
         assert [error["loc"] for error in raised.value.errors()] == [("task",)]
 
-    def test_optional_ids_accept_null(self) -> None:
-        record = fresh_record().model_copy(update={"maybe_task": TaskId.new()})
+    def test_optional_ids_accept_null_and_an_id(self) -> None:
+        without = fresh_record()
+        with_task = Record.model_validate({**without.model_dump(), "maybe_task": TaskId.new()})
 
-        assert Record.model_validate_json(record.model_dump_json()).maybe_task == record.maybe_task
+        assert Record.model_validate_json(without.model_dump_json()).maybe_task is None
+        assert (
+            Record.model_validate_json(with_task.model_dump_json()).maybe_task
+            == with_task.maybe_task
+        )
 
     def test_a_frozen_model_holding_ids_is_hashable_and_deep_copies(self) -> None:
         record = fresh_record()

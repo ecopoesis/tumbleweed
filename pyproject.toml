@@ -66,6 +66,7 @@ select = [
     "RUF",
     "S",      # bandit
     "SIM",
+    "SLF",    # no private access (SLF001); only tumbleweed.core may, see per-file-ignores
     "T20",    # no print
     "TC",     # typing-only imports under TYPE_CHECKING
     "TID",
@@ -78,6 +79,10 @@ select = [
 exclude = ["tests/type_safety/fixtures/*.py"]
 
 [tool.ruff.lint.per-file-ignores]
+# The scalars in tumbleweed.core build validated values by writing their private slot, and
+# compare through each other's private text. Nobody else may: that is how a value is forged.
+"src/tumbleweed/core/**" = ["SLF001"]
+"tests/core/**" = ["SLF001"]  # tests of core's internals
 "tests/**" = [
     "D100",
     "D104",
