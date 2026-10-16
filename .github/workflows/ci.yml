@@ -40,9 +40,20 @@ jobs:
         run: scripts/test-linux
 
   macos:
-    name: macOS (platform-neutral subset)
+    name: macOS (platform-neutral subset, Python ${{ matrix.python }})
     runs-on: macos-15 # Apple Silicon, like the development machines
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the newest Python the dependencies support. 3.14 waits for PyGObject:
+        # its gi.events uses asyncio.AbstractEventLoopPolicy, deprecated there, and warnings are
+        # errors in our tests. Behaviour that differs between versions (Path.resolve on a symlink
+        # loop or an unsearchable directory) is why more than one version runs.
+        python: ["3.12", "3.13"]
+    env:
+      # Beats .python-version for every uv command in the job, `uv run` included.
+      UV_PYTHON: ${{ matrix.python }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,6 +75,9 @@ jobs:
 
       - name: Install the locked dependencies
         run: uv sync --locked
+
+      - name: Python version
+        run: uv run python --version
 
       # Needs no display: proves the README's setup produced a working PyGObject and GTK 4.
       - name: PyGObject loads GTK 4

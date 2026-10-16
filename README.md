@@ -56,7 +56,8 @@ uv run pytest                    # tests runnable on this Mac; others skip with 
 scripts/test-linux               # all of the above in the Linux container
 ```
 
-CI runs the same commands. `uv run pytest` includes a coverage report.
+CI runs the same commands (the macOS job on Python 3.12 and 3.13; the container has 3.12).
+`uv run pytest` includes a coverage report.
 
 ### Dependencies
 
