@@ -132,8 +132,9 @@ way on macOS, in Docker, and in GitHub Actions, with a single shared type vocabu
 **Out of scope.** Application code beyond `core` and a GTK smoke test.
 **Acceptance.**
 - Every `CLAUDE.md` command passes on macOS and in `scripts/test-linux`, and CI is green.
-- The CI log shows `bwrap --unshare-all --die-with-parent true` succeeding and a headless GTK
-  widget being created.
+- The CI log shows `bwrap --unshare-all --die-with-parent --ro-bind / / true` succeeding and a
+  headless GTK widget being created. (Without the `--ro-bind / /` the command cannot work:
+  bwrap's new root is empty, so there is no `true` to exec.)
 - A fixture proves mypy rejects passing a `ToolId` where a `TaskId` is expected, and a bare
   `str` where any ID is expected.
 - The `TUMBLEWEED_CI` skip-guard is itself tested.

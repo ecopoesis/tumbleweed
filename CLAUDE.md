@@ -39,9 +39,12 @@ All of these must pass before a commit is pushed. CI runs the same commands.
    type (`NewType` when the type exists only for the checker, a validating wrapper class
    when it must hold at runtime). A function that needs a canonical path takes
    `CanonicalPath`, not `str` or `Path`. A `CanonicalPath` comes only from
-   `CanonicalPath.resolve()` and is never parsed from stored or received text: keep the text
-   and resolve it again. `WorkspaceRelPath(text)` validates; every other primitive in
-   `tumbleweed.core.types` validates on construction too.
+   `CanonicalPath.resolve()`, to make a new decision about a path, and is never parsed from
+   stored or received text. A decision already made is used by opening the stored path
+   component by component with `O_NOFOLLOW` and verifying its identity (ARCHITECTURE section
+   7), never by resolving the text again; S16 defines the typed stored-path record (#16).
+   `WorkspaceRelPath(text)` validates; every other primitive in `tumbleweed.core.types`
+   validates on construction too.
 4. **Closed sets are enums or `Literal`s**, matched exhaustively with `assert_never`.
 5. **Everything that crosses a boundary is a pydantic v2 model**: IPC, disk, LLM tool
    calls, sandbox I/O, UI specs. Use `ConfigDict(strict=True, extra="forbid", frozen=True)`
