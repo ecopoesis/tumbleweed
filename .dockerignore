@@ -1,0 +1,15 @@
+# Keep the build context small and the image independent of the host's state: the macOS .venv
+# in particular must never reach a Linux image.
+.git
+.venv
+.worktrees
+.omc
+.claude
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.coverage
+coverage.xml
+htmlcov
+**/__pycache__
+docs

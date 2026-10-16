@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run the full check suite in the Linux container (GTK under headless weston, bubblewrap, ...).
+#
+#   scripts/test-linux                       format, lint, mypy, import contracts, pytest
+#   scripts/test-linux uv run pytest -k foo  any other command, in the same environment
+#   TUMBLEWEED_CI=1 scripts/test-linux       what CI does: a skipped gtk/linux test fails
+#
+# The image holds the source as of the build, so every run rebuilds it first; Docker's layer
+# cache keeps that fast unless pyproject.toml or uv.lock changed.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+image=tumbleweed-test
+docker build --tag "$image" .
+
+# The flags are ARCHITECTURE section 11: bubblewrap needs user namespaces and a fresh /proc,
+# slirp4netns needs a tap device. Nothing else is relaxed.
+exec docker run --rm \
+    --security-opt seccomp=unconfined \
+    --security-opt apparmor=unconfined \
+    --security-opt systempaths=unconfined \
+    --device /dev/net/tun \
+    --env TUMBLEWEED_CI \
+    "$image" "$@"

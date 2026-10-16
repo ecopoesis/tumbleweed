@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# The default command of the Linux image: the commands in CLAUDE.md, preceded by evidence that
+# the sandbox and display prerequisites work (they are visible in the CI log).
+set -euo pipefail
+
+step() { printf '\n==> %s\n' "$*"; }
+
+# `bwrap --unshare-all --die-with-parent true` alone fails with "execvp true: No such file or
+# directory": bwrap's new root is empty, so the host root is bound read-only to give it a `true`.
+step "bubblewrap: bwrap --unshare-all --die-with-parent --ro-bind / / true"
+bwrap --unshare-all --die-with-parent --ro-bind / / true
+echo "bwrap OK: created all namespaces as uid $(id -u) and ran a command in them"
+
+# -rP prints what the passing smoke tests printed, e.g. the display the GTK widget was made on.
+step "sandbox and display smoke tests (verbose, so the log shows each one ran)"
+uv run pytest --no-cov -v -rP -m "linux or gtk"
+
+step "ruff format --check ."
+uv run ruff format --check .
+
+step "ruff check ."
+uv run ruff check .
+
+step "mypy"
+uv run mypy
+
+step "lint-imports"
+uv run lint-imports
+
+step "pytest"
+uv run pytest

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Container entrypoint: start a headless Wayland compositor, then run the given command in it.
+#
+# GTK needs a display to create widgets. weston's headless backend gives it one with no GPU, and
+# GSK_RENDERER=cairo keeps GTK on the software renderer, as in CI.
+set -euo pipefail
+
+XDG_RUNTIME_DIR="$(mktemp --directory)"
+export XDG_RUNTIME_DIR  # weston and GTK require it to be private (0700); mktemp makes it so
+
+socket=tumbleweed-test
+log="$XDG_RUNTIME_DIR/weston.log"
+weston --backend=headless --renderer=pixman --socket="$socket" --idle-time=0 >"$log" 2>&1 &
+weston_pid=$!
+
+for _ in $(seq 100); do
+    [ -S "$XDG_RUNTIME_DIR/$socket" ] && break
+    if ! kill -0 "$weston_pid" 2>/dev/null; then
+        echo "weston exited before creating its socket:" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+if [ ! -S "$XDG_RUNTIME_DIR/$socket" ]; then
+    echo "weston did not create $XDG_RUNTIME_DIR/$socket within 10 s:" >&2
+    cat "$log" >&2
+    exit 1
+fi
+
+export WAYLAND_DISPLAY="$socket"
+export GDK_BACKEND=wayland
+export GSK_RENDERER=cairo
+# No session bus, accessibility bus or dconf in a container: do not wait for them.
+export GTK_A11Y=none
+export GSETTINGS_BACKEND=memory
+
+# Not exec: the compositor must be stopped when the command is done.
+trap 'kill "$weston_pid" 2>/dev/null || true' EXIT
+"$@"
