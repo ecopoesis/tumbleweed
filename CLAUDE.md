@@ -73,7 +73,8 @@ All of these must pass before a commit is pushed. CI runs the same commands.
   workspace-relative path.
 - Secrets (API keys) never reach logs, model context, sandboxes, workspaces or tool
   packages. Config files holding secrets are created with mode 0600 and checked on load.
-- Every external input has a size limit. Every wait has a timeout.
+- Every external input has a size limit. Every wait has a timeout. (One documented exception:
+  the IPC idle timeout defaults to none, see ARCHITECTURE section 2 "IPC" and #59.)
 - When content is passed to the model, frame it as untrusted data, never as instructions.
 
 ## Testing rules

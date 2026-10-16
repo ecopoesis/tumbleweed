@@ -93,12 +93,16 @@ concurrently, on that one connection.
   soon as the header is read, before any of the body. From the first byte of a frame the rest
   has to arrive within 5 s, so a peer that trickles bytes is dropped however slowly it goes.
   Waiting for the next frame to begin is unbounded unless an idle timeout is set, which it is
-  not by default: the connection lasts the session and is legitimately quiet.
+  not by default: the connection lasts the session and is legitimately quiet. This is the one
+  documented exception to "every wait has a timeout" (CLAUDE.md, #59). When set, the timeout
+  never fires while a request of either peer is in progress.
 - **Messages.** A frame is a pydantic model from one closed discriminated union on `kind`:
   `hello`, `request`, `response`, `error`. The bodies of requests and responses are two more
   closed unions, which each later step extends (`tumbleweed.ipc.messages`). Everything is strict:
-  exact JSON types, typed IDs, no unknown fields, no duplicate keys. `schemas/ipc.v1.json` is
-  generated from the models, and a test fails when it drifts.
+  exact JSON types, typed IDs, no unknown fields, no duplicate keys, finite numbers.
+  `schemas/ipc.v1.json` is generated from the models, and a test fails when it drifts.
+  `ping` and `echo` are in protocol v1 as the transport's own diagnostics: the connection
+  answers them itself, so a broker or shell `RequestHandler` never sees them.
 - **Handshake.** The client sends `hello` with its protocol version; the server answers with its
   own `hello`, or with an `error` frame (`incompatible_protocol`, `bad_handshake`) and closes.
   Versions must be equal. Before the handshake a server reads one frame of at most 4 KiB within 5 s.
@@ -108,12 +112,17 @@ concurrently, on that one connection.
   connection the prompt was sent on" relies on. An answer that matches no waiting request is
   ignored (it may have lost a race with a timeout), and a peer that reuses an id still in
   progress ends the connection.
-- **Bounds (I9).** Per connection and direction, 32 requests in flight; callers wait 30 s for an
-  answer, handlers get 30 s to produce one, and a stalled write is given up after 10 s; a server
-  keeps at most 16 connections. All of it is configurable (`IpcLimits`), never above the frame
-  limit. When a connection ends, for any reason, every request waiting on it fails at once and
-  running handlers are cancelled. A peer that breaks the protocol is sent a last `error` frame
-  and disconnected.
+- **Bounds (I9).** Per connection and direction, 32 requests in flight; a request counts until
+  its reply has been written. Callers wait 30 s for an answer, writing the request included;
+  handlers get 25 s to produce one, so that the callee's `timeout` error reaches the caller. At
+  most twice the frame limit waits in the transport: senders wait for room (a call within its
+  timeout), and the reader, which answers refusals and diagnostics and never waits for a peer,
+  drops a connection whose peer lets that much pile up. A peer that takes not one byte for 10 s
+  while data waits for it is dropped, even if every call that wrote to it has long given up. A
+  server keeps at most 16 connections (an `IpcServer` argument; the rest are `IpcLimits`,
+  configurable, never above the frame limit). When a connection ends, for any reason, every
+  request waiting on it fails at once and running handlers are cancelled. A peer that breaks
+  the protocol is sent a last `error` frame and disconnected.
 - **Authentication (I2, D4).** Each end reads the other's uid from the kernel, before reading a
   byte from it, and drops the connection unless it is its own: `SO_PEERCRED` on Linux,
   `LOCAL_PEERCRED` (what `getpeereid(3)` wraps) on macOS. If the uid cannot be read the peer is
@@ -373,11 +382,16 @@ within the grants a task already holds (which is why grants are narrow and snaps
 
 **Sockets.** `$XDG_RUNTIME_DIR/tumbleweed/` is created with mode 0700 and owned by the user. An
 existing one that is a symlink, has another owner or has any mode but 0700 is refused, never
-repaired; so is a base directory that group or others can enter. Where `XDG_RUNTIME_DIR` is
+repaired; so is a base directory with any group or other permission bit set (0740 included).
+On macOS a base or directory with an extended ACL is refused too, since an ACL entry can let
+others in whatever the mode says. Where `XDG_RUNTIME_DIR` is
 unset, which is the case on macOS, the base is the per-user temporary directory the system
 provides (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, `/var/folders/.../T/`: the user's own, 0700,
 cleared at reboot); on any other platform an unset variable is an error. Socket names are 1 to
-24 characters from `a-z0-9-`, and the whole path must fit a socket address (103 bytes). A server
+24 characters from `a-z0-9-`, starting with a letter, and the whole path must fit a socket
+address (103 bytes). macOS also purges files in that temporary directory that were not accessed
+for three days, which a quiet server's socket and lock file are, so a server touches them (and
+the directory) every six hours; if they are gone anyway it logs that clients cannot reach it. A server
 holds an exclusive lock on `<name>.sock.lock` while it runs, so the kernel releases it if the
 server dies; a socket file found at its path is then removed only if it is a socket owned by the
 user, and any other file (a regular file, a directory, a symlink, another user's socket) is left
@@ -425,7 +439,10 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device
   /dev/net/tun`, so bubblewrap can create user namespaces and mount a fresh `/proc`, and
   slirp4netns can create its tap device. GTK tests run under weston's headless
-  backend with `GSK_RENDERER=cairo`.
+  backend with `GSK_RENDERER=cairo`. The image also has a second unprivileged user,
+  `tumbleweed-peer`, and one sudo rule that lets the test user run commands as that user and
+  as no one else, so that the IPC tests can use a real second uid (S13); it adds no other
+  privilege.
 - **CI**: GitHub Actions on Linux runs the full suite in the same container image, after
   `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` on the runner. CI sets
   `TUMBLEWEED_CI=1`, under which any skipped or xfailed `gtk` or `linux` test fails the run
