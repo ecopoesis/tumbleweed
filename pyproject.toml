@@ -103,6 +103,7 @@ exclude = ["tests/type_safety/fixtures/*.py"]
     "D104",
     "S101",  # assert is how tests assert
 ]
+"tests/sandbox/**" = ["S108"]  # the paths of a sandbox are the subject: /tmp, /dev/shm, /workspace
 "tests/type_safety/fixtures/*.py" = [
     "E501",    # marker comments make lines long
     "F841",    # the misuse is the point, not the variables
