@@ -158,6 +158,13 @@ class ByteCount(_BoundedInt, minimum=0):
 
 
 @final
+class TokenCount(_BoundedInt, minimum=0):
+    """A number of LLM tokens (usage, limits): never negative."""
+
+    __slots__ = ()
+
+
+@final
 class ToolVersion(_BoundedInt, minimum=1):
     """The version of a saved tool: 1 for the first save, then 2, 3, ..."""
 
@@ -373,6 +380,7 @@ __all__ = [
     "ModelName",
     "PatternStr",
     "ProviderRequestId",
+    "TokenCount",
     "ToolVersion",
     "WorkspaceRelPath",
 ]
