@@ -1,16 +1,20 @@
 """A headless GTK widget can be created (S01 acceptance), on macOS natively or under weston."""
 
-import gi
 import pytest
-
-gi.require_version("Gtk", "4.0")
-gi.require_version("Gdk", "4.0")
-from gi.repository import Gdk, GLib, Gtk  # noqa: E402  (PyGObject needs require_version first)
 
 pytestmark = pytest.mark.gtk
 
 
 def test_a_widget_tree_is_created_on_the_display() -> None:
+    # Imported here, not at module level: on a host where PyGObject cannot load, the gate in
+    # tests/plugins/host.py skips this test with the reason, instead of breaking collection of
+    # every other test.
+    import gi
+
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gdk", "4.0")
+    from gi.repository import Gdk, GLib, Gtk
+
     display = Gdk.Display.get_default()
     assert display is not None
 

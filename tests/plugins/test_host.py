@@ -7,6 +7,7 @@ an error once the guard turns it into a failure; a skip raised inside the test b
 
 import subprocess
 import sys
+from types import ModuleType
 
 import pytest
 
@@ -290,3 +291,38 @@ def test_the_gtk_gate_notices_a_missing_display_for_real() -> None:
     assert (
         "REASON: no usable display" in result.stdout or "GTK 4 is not importable" in result.stdout
     )
+
+
+def test_the_gtk_gate_reports_pygobject_failing_to_load_a_library(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CI failure on macOS: importing Gtk raised a bare AssertionError, which broke collection.
+
+    The gate must turn it into a skip reason instead.
+    """
+
+    class UnloadableRepository(ModuleType):
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError  # what gi.overrides raises when libgobject cannot be dlopen'ed
+
+    class FakeGi(ModuleType):
+        @staticmethod
+        def require_version(namespace: str, version: str) -> None:
+            return None
+
+    monkeypatch.setitem(sys.modules, "gi", FakeGi("gi"))
+    monkeypatch.setitem(sys.modules, "gi.repository", UnloadableRepository("gi.repository"))
+
+    reason = host._gtk_unavailable_reason.__wrapped__()  # bypass functools.cache
+
+    assert reason is not None
+    assert reason.startswith("GTK 4 is not importable: AssertionError")
+
+
+def test_the_gtk_gate_reports_a_missing_pygobject(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "gi", None)  # makes `import gi` raise ImportError
+
+    reason = host._gtk_unavailable_reason.__wrapped__()  # bypass functools.cache
+
+    assert reason is not None
+    assert "not importable" in reason

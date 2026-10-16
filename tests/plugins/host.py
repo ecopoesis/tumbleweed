@@ -49,8 +49,15 @@ def _gtk_unavailable_reason() -> str | None:
         # Importing Gtk makes PyGObject initialise it. `Gtk.init_check()` is no use afterwards:
         # it returns True even when that initialisation found no display.
         from gi.repository import Gdk, Gtk  # noqa: F401
-    except (ImportError, ValueError) as exc:
-        return f"GTK 4 is not importable: {exc}"
+    except (ImportError, ValueError, AssertionError) as exc:
+        # AssertionError: PyGObject's way of saying a shared library the typelib names could not
+        # be loaded. On Apple Silicon that is Homebrew's /opt/homebrew/lib missing from dyld's path.
+        hint = (
+            " (macOS: see the README on DYLD_FALLBACK_LIBRARY_PATH)"
+            if sys.platform == "darwin"
+            else ""
+        )
+        return f"GTK 4 is not importable: {type(exc).__name__}: {exc}{hint}"
     if Gdk.Display.get_default() is None:
         return "no usable display: run scripts/test-linux (headless weston) or start a session"
     return None

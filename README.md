@@ -19,9 +19,31 @@ brew install gtk4 libadwaita gobject-introspection pkg-config cairo uv
 uv sync
 ```
 
-`uv sync` downloads Python 3.12 (see `.python-version`), installs the locked dependencies
-into `.venv`, and builds PyGObject from source against Homebrew's GTK. If that build fails,
-check that `pkg-config --modversion girepository-2.0` prints a version.
+`uv sync` uses Python 3.12 (see `.python-version`), installs the locked dependencies into
+`.venv`, and builds PyGObject from source against Homebrew's GTK. If that build fails, check
+that `pkg-config --modversion girepository-2.0` prints a version.
+
+On Apple Silicon, Homebrew's libraries (`/opt/homebrew/lib`) are not on the dynamic linker's
+search path, and the GTK typelibs name their libraries without a path. So that PyGObject can
+load them, put this in your shell profile (`~/.zshrc`):
+
+```sh
+export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix)/lib"
+```
+
+Without it, importing GTK fails with a bare `AssertionError` from `gi/overrides` and a
+`Failed to load shared library 'libgobject-2.0.0.dylib'` warning, unless your Python happens
+to be built with Homebrew's lib directory in its rpath. gtk tests then skip, with that reason.
+macOS strips `DYLD_*` variables from processes started through system shells and
+`/usr/bin/env`; `uv run ...` from your own shell is fine. One catch: when the path of the
+venv is long (over 127 characters), uv gives console scripts such as `pytest` a `/bin/sh`
+shebang, and the variable is lost. Run `uv run python -m pytest` then.
+
+Check the setup:
+
+```sh
+uv run python -c "import gi; gi.require_version('Gtk', '4.0'); from gi.repository import Gtk; print(Gtk.get_major_version())"
+```
 
 ### Checks
 
