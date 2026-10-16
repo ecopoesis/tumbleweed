@@ -22,8 +22,11 @@ import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
+
+from tests.plugins import host
 
 ROOT = Path(__file__).resolve().parents[1]
 MINIMUM_COOLDOWN = dt.timedelta(days=7)
@@ -129,6 +132,13 @@ def git_output(git: str, root: Path, *args: str) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
+def skip_unless_history_required(why: NoLockHistory) -> NoReturn:
+    """Skip the age check, or fail it where CI says the git history must be there."""
+    if host.read_flag(host.REQUIRE_GIT_ENV_VAR):
+        pytest.fail(f"{host.REQUIRE_GIT_ENV_VAR}=1 but uv.lock cannot be dated from git: {why}")
+    pytest.skip(f"uv.lock cannot be dated from git here ({why}): the macOS CI jobs run this")
+
+
 def lock_written_at(root: Path) -> dt.datetime:
     """When uv.lock was last written: now if uncommitted, else the time of its last commit.
 
@@ -190,7 +200,7 @@ def test_no_locked_artifact_is_younger_than_its_cutoff_when_the_lock_was_written
     try:
         written = lock_written_at(ROOT)
     except NoLockHistory as why:
-        pytest.skip(f"uv.lock cannot be dated from git here ({why}): the macOS CI jobs run this")
+        skip_unless_history_required(why)
     uv_settings = table(pyproject["uv"])
     setting = uv_settings["exclude-newer"]
     assert isinstance(setting, str)
@@ -426,6 +436,10 @@ class TestLockWrittenAt:
             env = kwargs.get("env")
             assert isinstance(env, dict)
             seen.append(env)
+            # The spy takes `object` arguments so that it can stand in for any call, and
+            # `subprocess.run` is overloaded on its arguments: mypy cannot pick an overload for
+            # `object` (call-overload) and so types the result as Any (no-any-return). The spy only
+            # forwards the call unchanged.
             return real_run(*args, **kwargs)  # type: ignore[no-any-return,call-overload]
 
         monkeypatch.setattr(subprocess, "run", spying_run)
@@ -447,3 +461,25 @@ class TestLockWrittenAt:
         lock_written_at(repo)
 
         assert (index.read_bytes(), index.stat().st_mtime_ns) == before
+
+
+def test_a_missing_git_history_skips_unless_the_run_requires_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(host.REQUIRE_GIT_ENV_VAR, raising=False)
+    with pytest.raises(pytest.skip.Exception, match="cannot be dated from git"):
+        skip_unless_history_required(NoLockHistory("shallow"))
+
+    monkeypatch.setenv(host.REQUIRE_GIT_ENV_VAR, "1")
+    with pytest.raises(pytest.fail.Exception, match="TUMBLEWEED_REQUIRE_GIT=1"):
+        skip_unless_history_required(NoLockHistory("shallow"))
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "2", " 1"])
+def test_a_misspelt_require_git_flag_is_an_error_not_a_quiet_skip(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv(host.REQUIRE_GIT_ENV_VAR, value)
+
+    with pytest.raises(pytest.UsageError, match="TUMBLEWEED_REQUIRE_GIT must be 0 or 1"):
+        skip_unless_history_required(NoLockHistory("shallow"))

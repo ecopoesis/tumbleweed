@@ -486,8 +486,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   for tests of the btrfs backend, and the backend is instead exercised end to end in the S27
   NixOS VM test. Any other skip of such a test still fails the run. Live tests never run in CI
   either: `TUMBLEWEED_LIVE` is refused when `TUMBLEWEED_CI` is set, and under the guard a
-  `live` test may not also be marked `gtk` or `linux`, so none is ever a guarded test. Landlock tests are required in CI (Ubuntu kernel); they may skip on Docker
-  Desktop kernels without Landlock. A macOS job runs the platform-neutral subset.
+  `live` test may not also be marked `gtk` or `linux`, so none is ever a guarded test. Landlock
+  tests are required in CI (Ubuntu kernel); they may skip on Docker Desktop kernels without
+  Landlock. A macOS job runs the platform-neutral subset.
 - **Target**: NixOS (aarch64 and x86_64) booting into Cage running `tumbleweed-shell`, with a
   fallback Sway session, a VT2 login, and btrfs home snapshots, as a VM image for
   UTM/Parallels (S26–S27).

@@ -35,6 +35,7 @@ import pytest
 CI_ENV_VAR = "TUMBLEWEED_CI"
 LIVE_ENV_VAR = "TUMBLEWEED_LIVE"
 REQUIRE_DOCKER_ENV_VAR = "TUMBLEWEED_REQUIRE_DOCKER"
+REQUIRE_GIT_ENV_VAR = "TUMBLEWEED_REQUIRE_GIT"
 GUARDED_MARKERS = frozenset({"gtk", "linux"})
 XFAIL_ALLOWED_MARKER = "xfail_allowed_in_ci"
 _ISSUE_REFERENCE = re.compile(r"#\d+")
@@ -104,7 +105,9 @@ def gtk_unavailable_reason() -> str | None:
 def pytest_configure(config: pytest.Config) -> None:
     config.stash[_GUARD_ACTIVE] = read_flag(CI_ENV_VAR)
     config.stash[_LIVE_ENABLED] = read_flag(LIVE_ENV_VAR)
-    read_flag(REQUIRE_DOCKER_ENV_VAR)  # read by tests/test_docker_context.py: a typo is an error
+    # Read by tests/test_docker_context.py and tests/test_lock.py: a typo is an error.
+    read_flag(REQUIRE_DOCKER_ENV_VAR)
+    read_flag(REQUIRE_GIT_ENV_VAR)
     if config.stash[_GUARD_ACTIVE] and config.stash[_LIVE_ENABLED]:
         raise pytest.UsageError(
             f"{LIVE_ENV_VAR}=1 cannot be combined with {CI_ENV_VAR}=1: live tests never run in CI"

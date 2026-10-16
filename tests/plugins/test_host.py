@@ -907,6 +907,19 @@ def test_a_misspelt_require_docker_flag_is_a_usage_error(
     result.stderr.fnmatch_lines([f"*{host.REQUIRE_DOCKER_ENV_VAR} must be 0 or 1*"])
 
 
+@pytest.mark.parametrize("value", ["true", "yes", "2", " 1"])
+def test_a_misspelt_require_git_flag_is_a_usage_error(
+    inner: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv(host.REQUIRE_GIT_ENV_VAR, value)
+    inner.makepyfile("def test_x():\n    pass\n")
+
+    result = inner.runpytest()
+
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines([f"*{host.REQUIRE_GIT_ENV_VAR} must be 0 or 1*"])
+
+
 @pytest.mark.parametrize(("value", "expected"), [("", False), ("0", False), ("1", True)])
 def test_read_flag_accepts_only_empty_zero_and_one(
     monkeypatch: pytest.MonkeyPatch, value: str, expected: bool
