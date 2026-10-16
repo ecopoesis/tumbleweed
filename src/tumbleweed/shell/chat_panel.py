@@ -192,6 +192,13 @@ class ChatPanel(Gtk.Box):
         self.append(self.notice)
         self.append(entry_row)
 
+        # Esc cancels the reply in flight. On the panel, in the bubble phase: after whatever
+        # inside it wants Esc first, and only while a reply is streaming, so that it is otherwise
+        # left to everyone else (a popover, the text view).
+        escape = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.BUBBLE)
+        escape.connect("key-pressed", self._on_escape)
+        self.add_controller(escape)
+
         for message in transcript.messages:
             self.message_added(message)
         transcript.subscribe(self)
@@ -281,6 +288,19 @@ class ChatPanel(Gtk.Box):
         if state & Gtk.accelerator_get_default_mod_mask():
             return False
         self.send()
+        return True
+
+    def _on_escape(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        _state: Gdk.ModifierType,
+    ) -> bool:
+        """Esc stops the reply that is streaming; with none, it does nothing and is not consumed."""
+        if keyval != Gdk.KEY_Escape or not self._controller.busy:
+            return False
+        self._controller.cancel()
         return True
 
     def _on_input_changed(self, _buffer: Gtk.TextBuffer) -> None:

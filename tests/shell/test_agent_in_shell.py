@@ -1,0 +1,210 @@
+"""The agent inside the real shell: the GLib dispatcher, Esc, and a streamed reply through GTK.
+
+The responder is the real `AgentResponder` on its worker thread with a scripted model, and the
+dispatcher is the shell's own (`GLib.idle_add`), so a reply crosses from the worker thread to the
+main loop exactly as it does in the running shell.
+"""
+
+import logging
+import threading
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING
+
+import pytest
+
+from tests.agent.support import MemoryLog
+from tests.shell.fakes import ManualResponder
+from tests.shell.gtk_support import Shell, click_send, pump_until, rows, type_text
+from tumbleweed.agent.fake import FakeProvider, FakeTurn
+from tumbleweed.agent.limits import AgentLimits
+from tumbleweed.agent.recorder import InvocationRecorder
+from tumbleweed.agent.responder import Responder
+from tumbleweed.agent.runtime import AgentResponder
+from tumbleweed.agent.tools import ToolRegistry
+from tumbleweed.core.types import ModelName
+from tumbleweed.shell.viewmodel.transcript import MessageState
+
+if TYPE_CHECKING:
+    from tumbleweed.shell._gi import Gtk
+
+pytestmark = pytest.mark.gtk
+
+type ShellBuilder = Callable[[Responder], Shell]
+type AgentShellBuilder = Callable[[list[FakeTurn]], tuple[Shell, FakeProvider]]
+
+
+def escape_controller(shell: Shell) -> "Gtk.EventControllerKey":
+    from tumbleweed.shell._gi import Gtk
+
+    found = [
+        controller
+        for controller in shell.window.chat_panel.observe_controllers()
+        if isinstance(controller, Gtk.EventControllerKey)
+        and controller.get_propagation_phase() == Gtk.PropagationPhase.BUBBLE
+    ]
+    assert len(found) == 1
+    return found[0]
+
+
+def press_escape(shell: Shell) -> bool:
+    from tumbleweed.shell._gi import Gdk
+
+    return bool(
+        escape_controller(shell).emit("key-pressed", Gdk.KEY_Escape, 0, Gdk.ModifierType(0))
+    )
+
+
+class TestGlibDispatcher:
+    def test_a_callback_posted_from_another_thread_runs_on_the_main_thread(self) -> None:
+        from tumbleweed.shell.dispatch import GlibDispatcher
+
+        ran: list[int] = []
+        thread = threading.Thread(
+            target=lambda: GlibDispatcher().post(lambda: ran.append(threading.get_ident()))
+        )
+
+        thread.start()
+        thread.join(5)
+
+        assert pump_until(lambda: bool(ran))
+        assert ran == [threading.get_ident()]
+
+    def test_callbacks_run_in_the_order_posted(self) -> None:
+        from tumbleweed.shell.dispatch import GlibDispatcher
+
+        order: list[int] = []
+        dispatcher = GlibDispatcher()
+        for number in range(20):
+            dispatcher.post(lambda n=number: order.append(n))  # type: ignore[misc]  # bound per loop
+
+        assert pump_until(lambda: len(order) == 20)
+        assert order == list(range(20))
+
+    def test_a_callback_that_raises_is_logged_and_does_not_stop_the_next(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from tumbleweed.shell.dispatch import GlibDispatcher
+
+        ran: list[str] = []
+        dispatcher = GlibDispatcher()
+
+        def broken() -> None:
+            raise RuntimeError("callback bug")
+
+        with caplog.at_level(logging.ERROR):
+            dispatcher.post(broken)
+            dispatcher.post(lambda: ran.append("next"))
+            assert pump_until(lambda: bool(ran))
+
+        assert "failed" in caplog.text
+        assert ran == ["next"]
+
+
+class TestEscape:
+    def test_esc_cancels_the_reply_in_flight(self, build_shell: ShellBuilder) -> None:
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        type_text(shell, "question")
+        click_send(shell)
+
+        handled = press_escape(shell)
+
+        assert handled
+        assert responder.handle.cancelled
+        message = shell.window.transcript.messages[1]
+        assert (message.state, message.error) == (MessageState.FAILED, "Cancelled.")
+
+    def test_esc_with_no_reply_does_nothing_and_is_left_to_others(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        responder = ManualResponder()
+        shell = build_shell(responder)
+
+        assert not press_escape(shell)
+
+        assert shell.window.transcript.messages == ()
+        assert responder.handles == []
+
+    def test_esc_after_the_reply_ended_is_left_to_others(self, build_shell: ShellBuilder) -> None:
+        from tumbleweed.agent.responder import ReplyFinished
+
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        type_text(shell, "q")
+        click_send(shell)
+        responder.sink.emit(ReplyFinished())
+
+        assert not press_escape(shell)
+        assert not responder.handle.cancelled
+
+
+@pytest.fixture
+def agent_shell(build_shell: ShellBuilder) -> Iterator[AgentShellBuilder]:
+    from tumbleweed.shell.dispatch import GlibDispatcher
+
+    responders: list[AgentResponder] = []
+
+    def build(script: list[FakeTurn]) -> tuple[Shell, FakeProvider]:
+        provider = FakeProvider(script)
+        responder = AgentResponder(
+            provider=provider,
+            recorder=InvocationRecorder(MemoryLog(), prompt_version="test"),
+            registry=ToolRegistry(),
+            model=ModelName("claude-test-1"),
+            system_prompt="test",
+            limits=AgentLimits(),
+            dispatcher=GlibDispatcher(),
+        )
+        responders.append(responder)
+        return build_shell(responder), provider
+
+    yield build
+    for responder in responders:
+        responder.close()
+
+
+class TestAgentReplyThroughGtk:
+    def test_a_reply_streams_into_the_window_from_the_worker_thread(
+        self, agent_shell: AgentShellBuilder
+    ) -> None:
+        shell, _ = agent_shell([FakeTurn(chunks=("Hello", ", ", "world"))])
+        type_text(shell, "hi")
+
+        click_send(shell)
+
+        assert pump_until(lambda: not shell.window.controller.busy)
+        assert rows(shell) == [("You", "hi", ""), ("Assistant", "Hello, world", "")]
+
+    def test_a_failure_shows_in_the_window_and_the_shell_takes_the_next_message(
+        self, agent_shell: AgentShellBuilder
+    ) -> None:
+        shell, _ = agent_shell([FakeTurn(), FakeTurn(chunks=("fine",))])  # an empty reply fails
+        type_text(shell, "one")
+        click_send(shell)
+        assert pump_until(lambda: not shell.window.controller.busy)
+        assert rows(shell)[1][2] == "The model sent an empty reply."
+
+        type_text(shell, "two")
+        click_send(shell)
+
+        assert pump_until(lambda: not shell.window.controller.busy)
+        assert rows(shell)[3] == ("Assistant", "fine", "")
+
+    def test_esc_stops_a_streaming_reply_and_the_provider_is_released(
+        self, agent_shell: AgentShellBuilder
+    ) -> None:
+        shell, provider = agent_shell([FakeTurn(chunks=("partial",), hang=True)])
+        type_text(shell, "hi")
+        click_send(shell)
+        assert pump_until(lambda: shell.window.transcript.messages[1].text == "partial")
+
+        assert press_escape(shell)
+
+        message = shell.window.transcript.messages[1]
+        assert (message.text, message.state, message.error) == (
+            "partial",
+            MessageState.FAILED,
+            "Cancelled.",
+        )
+        assert pump_until(lambda: provider.calls_cancelled == 1)
+        assert not shell.window.controller.busy

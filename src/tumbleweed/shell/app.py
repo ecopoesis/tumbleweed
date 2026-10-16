@@ -1,14 +1,16 @@
 """The Adw application: creates the window, owns the shortcuts and runs the main loop."""
 
 import logging
+import os
 import signal
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import final
 
-from tumbleweed.agent.echo import EchoResponder
+from tumbleweed.agent.factory import build_agent
 from tumbleweed.agent.responder import Responder
 from tumbleweed.shell._gi import Adw, Gdk, Gio, GLib, GLibUnix
+from tumbleweed.shell.dispatch import GlibDispatcher
 from tumbleweed.shell.window import ShellWindow
 
 logger = logging.getLogger(__name__)
@@ -110,7 +112,10 @@ def quit_on_signals(app: ShellApplication) -> Iterator[tuple[int, ...]]:
 
 
 def run(argv: Sequence[str] = (PROGRAM,)) -> int:
-    """Run the shell with the placeholder responder until it quits; returns the exit status.
+    """Run the shell with the configured responder until it quits; returns the exit status.
+
+    The responder is the agent (a model) or the echo placeholder, per the configuration
+    (`tumbleweed.agent.config`); the API key is taken out of the process environment on the way.
 
     Without a display it says so in one line and returns 1: GTK would otherwise print criticals
     and fail inside `do_activate` with a traceback, then exit 0.
@@ -121,6 +126,15 @@ def run(argv: Sequence[str] = (PROGRAM,)) -> int:
             "pointing at a running compositor or X server)."
         )
         return 1
-    app = ShellApplication(EchoResponder())
-    with quit_on_signals(app):
-        return app.run(list(argv))
+    agent = build_agent(os.environ, GlibDispatcher())
+    app = ShellApplication(agent.responder)
+    try:
+        with quit_on_signals(app):
+            return app.run(list(argv))
+    finally:
+        # However the shell ended (Ctrl+Q, the window's close button, a signal): stop the agent's
+        # thread. It is idempotent, and the window has already cancelled the reply in flight.
+        try:
+            agent.close()
+        except Exception:
+            logger.exception("stopping the agent failed")
