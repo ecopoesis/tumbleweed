@@ -89,11 +89,11 @@ DESCRIPTIONS = {
     "MAX_TABLE_CELLS": "rows times columns of a table value",
     "MAX_JSON_DEPTH": "levels of a `json` value",
     "MAX_JSON_NODES": "nodes of a `json` value (containers, scalars and keys)",
+    "MAX_OBJECT_MEMBERS": "members of one object in the text of a spec",
     "MAX_SAFE_INT": "magnitude of an integer in an `int` position; width of a widget's range",
     "MAX_VALUE_TEXT_BYTES": "UTF-8 bytes of text in one `json`, `table` or `list` value",
     "MAX_PATCH_TEXT_BYTES": "UTF-8 bytes of text in all the values of one patch",
     "MAX_STATE_TEXT_BYTES": "UTF-8 bytes of text in the whole state of a tool",
-    "MAX_WIDGET_STEPS": "steps of a `float` step across the range of a slider or spin button",
 }
 
 

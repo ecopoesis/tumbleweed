@@ -258,3 +258,78 @@ def test_a_changed_limit_changes_the_prose(monkeypatch: pytest.MonkeyPatch) -> N
     assert changed != TEXT
     assert "<!-- limit: MAX_NAME_LENGTH -->99<!-- /limit -->" in changed
     assert "<!-- limit: MAX_NAME_LENGTH -->64<!-- /limit -->" not in changed
+
+
+def section(heading: str) -> str:
+    """The text under a heading, up to the next heading of the same or a higher level, with its
+    line breaks and runs of blanks made single spaces (so a needle may span a line)."""
+    level = heading.split(" ", 1)[0]
+    start = TEXT.index(f"\n{heading}\n") + 1
+    rest = TEXT[start + len(heading) :]
+    end = re.search(rf"\n#{{1,{len(level)}}} ", rest)
+    return " ".join((rest[: end.start()] if end else rest).split())
+
+
+class TestTheRulesForTheCodeThatOpensAReference:
+    """The spec accepts `-rf.png`, `~root/x.png` and `%2e%2e/x.png`: the page must say how
+    they are opened, because the spec cannot make them safe (R2-F9; S11 tests the names)."""
+
+    TEXT_OF_THE_SECTION = section("## 6. Value types and ports")
+
+    @pytest.mark.parametrize(
+        "needle",
+        [
+            "dirfd",
+            "O_NOFOLLOW",
+            "expanduser",
+            "URI builder",
+            "percent decoder",
+            "`--`",
+            "`./`",
+            "-rf.png",
+            "~root/x.png",
+            "%2e%2e/x.png",
+        ],
+    )
+    def test_the_rule_is_on_the_page(self, needle: str) -> None:
+        assert needle in self.TEXT_OF_THE_SECTION
+
+    def test_the_names_are_valid_references(self) -> None:
+        for name in ("-rf.png", "~root/x.png", "%2e%2e/x.png"):
+            assert parse_ref(name) == name
+
+
+def parse_ref(path: str) -> str:
+    from tumbleweed.ui.spec.values import ImageRef
+
+    return str(ImageRef.model_validate({"path": path}).path)
+
+
+class TestTheEvaluationRules:
+    EVALUATION = section("### Evaluation")
+
+    def test_a_write_that_grows_a_state_over_its_budget_is_not_applied(self) -> None:
+        assert "MAX_STATE_TEXT_BYTES" in self.EVALUATION
+        assert "makes that text grow is not applied: the entry keeps its" in self.EVALUATION
+        assert "shrinks the text, or leaves it the same size, is applied" in self.EVALUATION
+
+    def test_the_state_counts_computed_entries(self) -> None:
+        assert "computed ones included" in self.EVALUATION
+
+    def test_the_budget_section_says_current_is_required_and_whole(self) -> None:
+        state = section("## 5. State")
+
+        assert "`current` is required" in state
+        assert "computed entries included" in state
+
+
+def test_validate_ui_spec_is_documented_to_refuse_not_convert() -> None:
+    how = section("## 1. How a spec is accepted")
+
+    for needle in ("tuple", "enum member", "key that is not a string", "never converted"):
+        assert needle in how
+
+
+def test_the_page_no_longer_has_a_limit_on_how_many_positions_a_step_makes() -> None:
+    assert "MAX_WIDGET_STEPS" not in TEXT
+    assert "how many positions the step makes is up to the author" in section("## 8. Components")

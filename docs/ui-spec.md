@@ -34,7 +34,10 @@ spec = validate_ui_spec(data)  # JSON already parsed, such as a tool call's argu
 Untrusted text, from the model, a file or another process, goes through one of these two and
 nothing else. `validate_ui_spec` writes the data out as JSON text and gives that to
 `parse_ui_spec`, so the two have the same size limit, the same refusals and the same messages;
-data that is not JSON (bytes, a set, `NaN`, a cycle) is a `SpecError`.
+the data must be what `json.loads` would give: a `dict` with `str` keys, a `list`, `str`, `int`,
+`float`, `bool` or `None`, exactly. A tuple, a set, `bytes`, an enum member, a subclass of any of
+these, a key that is not a string (`json.dumps` would quietly write `{1: "a"}` as `{"1": "a"}`),
+`NaN` and a cycle are a `SpecError`, never converted.
 
 Both return an immutable `UiSpec` or raise `SpecError`, never anything else. `SpecError.problems`
 lists at most <!-- limit: MAX_REPORTED_PROBLEMS -->10<!-- /limit --> problems (then a note that there are more), each at most
@@ -44,8 +47,9 @@ character that is not printable (a control character, a bidirectional override, 
 paragraph separator, a lone surrogate) is written `\uXXXX`, so what the model sent cannot forge a
 line or reorder text in a log, a terminal or the chat; an unknown field name is cut to
 <!-- limit: MAX_LOCATION_PART -->40<!-- /limit --> characters and an unknown `kind` is not echoed at all. Collecting the problems
-is bounded too: the sequences of a spec stop at their first error, so a spec of the largest size
-costs a few tens of megabytes at most to refuse (a test holds it to a fixed budget).
+costs in proportion to the size of the spec and no more: the sequences of a spec stop at their
+first error, and an object of more than <!-- limit: MAX_OBJECT_MEMBERS -->4,999<!-- /limit --> members is refused while the text is parsed, so a spec of the largest
+size costs a few tens of megabytes at most to refuse (a test holds it to a fixed budget).
 
 Four properties hold for everything below:
 
@@ -53,7 +57,7 @@ Four properties hold for everything below:
   field or `kind` is an error. There is no extension point, no code, no CSS, no markup and no URL.
 - **Strict.** A value has exactly the type that is written: `"5"` is not a number, `1` is not a
   `true`, `5.0` is not an integer, a string is not a list. Nothing is converted, except that a
-  float position accepts an integer that is exactly a double (`5` means `5.0`,
+  float position accepts an integer that stands for a double (`5` means `5.0`,
   [section 4](#4-names-text-and-numbers)).
 - **Immutable.** A validated spec cannot be edited; sequences are tuples. (The one exception is
   the content of a `json` state value, which is arbitrary JSON.)
@@ -61,7 +65,8 @@ Four properties hold for everything below:
   it is not.
 
 `parse_ui_spec` also refuses text over <!-- limit: MAX_SPEC_BYTES -->262,144<!-- /limit --> bytes (`MAX_SPEC_BYTES`), text that is
-not UTF-8 or not JSON, `NaN` and `Infinity`, and an object that repeats a key (a parser would
+not UTF-8 or not JSON, `NaN` and `Infinity`, an object of more than `MAX_OBJECT_MEMBERS`
+members, and an object that repeats a key (a parser would
 silently keep the last one, so `{"root": A, "root": B}` would mean `B` to us and `A` to a reader of
 the text; found in one pass, so a huge object costs no more than its size). `UiSpec.model_validate`
 and `UiSpec.model_validate_json` neither limit the size nor notice a repeated key: use them only on
@@ -287,19 +292,27 @@ surrogate, because a CSV can contain anything and GTK cannot hold a NUL.
 
 **Numbers** are IEEE-754 doubles, as in I-JSON and RFC 8785 (JCS), the canonical JSON that the
 tool store hashes. One rule covers every place a number can be, so that a spec is still valid
-after canonicalisation, which writes `1e16` as `10000000000000000` and `5.0` as `5`:
+after canonicalisation, which writes `1e16` as `10000000000000000`, `5.0` as `5` and `2**60` as
+`1152921504606847000`:
 
 - in an `int` position (an `int` entry, `minimum`, `maximum`, `step` and `default`; an `int`
   literal; an `int` cell of a table; an item of a list of ints) a number is a whole number
   within +-(2**53 - 1), and is never written with a fraction (`5.0` is not an `int`);
 - in a `float` position (a `float` entry, bound and step; a `float` literal; a `float` column;
   an item of a list of floats) a number is a finite double. It may be written as an integer of
-  any size that is exactly a double (`5`, `10000000000000000`, 2**100), and is then stored as a
-  float, so `5`, `5.0` and `5e0` are one value;
-- in a `json` value a number is a finite double, an integer being accepted by the same test.
+  any size that stands for a double (see below), and is then stored as a float, so `5`, `5.0`
+  and `5e0` are one value;
+- in a `json` value a number is a finite double, an integer being accepted by the same test (and
+  stored as a float if it is beyond 2**53 - 1, so that it reads back as the same value).
 
-No type is inferred from how a number is written. An integer that no double equals, such as
-2**53 + 1, is refused in a float or JSON position, not rounded in silence.
+An integer **stands for a double** if it is exactly that double (`5`, `10000000000000000`,
+2**100) or if it is how canonical JSON writes the nearest one: JCS writes a double from 2**53 up
+to 1e21 as its shortest digits padded with zeros, so 2**60 becomes `1152921504606847000` and
+2**68 becomes `295147905179352830000` (the number in RFC 8785 appendix B), which are not
+exactly those doubles but are what canonicalisation makes of them, and so must be accepted when a
+saved spec is read back. No type is inferred from how a number is written. An integer that is
+neither, such as 2**53 + 1, 2**60 + 1 or an integer of 400 digits, is refused in a float or JSON position, not
+rounded in silence. The formatter and the canonicaliser are `tumbleweed.core.jcs`.
 
 ## 5. State
 
@@ -340,9 +353,13 @@ composition (NFC, as the tool store normalises) count as the same option.
 most <!-- limit: MAX_VALUE_TEXT_BYTES -->1,048,576<!-- /limit --> bytes of text (the UTF-8 bytes of every string, key and column name in it;
 numbers and flags are bounded by the count limits). A patch holds at most <!-- limit: MAX_PATCH_TEXT_BYTES -->2,097,152<!-- /limit --> bytes of
 text, and the state of a tool at most <!-- limit: MAX_STATE_TEXT_BYTES -->4,194,304<!-- /limit -->. `UiSpec` checks the defaults against the last,
-`UiSpec.validate_patch` a patch against the second and, given the values the state holds now,
-the state after the patch against the third (`value_text_bytes` measures a value; the runtime
-keeps the sum within the budget as values change). The checks stop at the first limit crossed, and
+`UiSpec.validate_patch` a patch against the second and, given `current`, the values the state
+holds now, the state after the patch against the third, but only if the patch makes the text of
+the state grow: a state that is over its budget can still shrink and still change what holds no
+text, or a tool would be wedged. `current` is required and is the whole state, computed entries
+included (their values are text too, as the defaults of computed entries are in the check of the
+defaults); pass `{}` for an empty state. `value_text_bytes` measures a value; the runtime keeps
+the sum within the budget as values change ([evaluation](#evaluation)). The checks stop at the first limit crossed, and
 run in C for text, so a hostile value costs little.
 
 **Computed state.** An entry of kind `bool`, `int`, `float` or `string` may have a `computed`
@@ -356,7 +373,7 @@ An `enum` entry cannot be computed: its value must be one of its options, which 
 expression cannot guarantee before it runs. To derive a choice, compute a `string`.
 
 **Checking a value.** `check_value(declaration, value)` decides whether a value belongs to an
-entry. It is how defaults are checked, and `UiSpec.validate_patch(patch, only=..., current=...)`
+entry. It is how defaults are checked, and `UiSpec.validate_patch(patch, current=..., only=...)`
 uses it for everything that arrives later, from `patch_state` or from a sandbox: every key must be
 a declared, non-computed entry (and in `only`, a sandbox handler's declared outputs), every value
 must fit, the size budgets above must hold, and a patch with any problem is refused whole. Every
@@ -373,11 +390,19 @@ first component may not begin with a URL scheme or a drive letter (a letter, the
 digits, `+`, `.` or `-`, then a colon, after any blanks, as URL parsers skip them: `https:/x`,
 `file:/etc/passwd`, `data:image/png;...`, `c:/x`). A colon that ends no scheme is a file name:
 `report 12:30.png` and `2024-01-01T10:30:00.png` are fine. An `ImageRef` must end in `.png`,
-`.jpg`, `.jpeg` or `.webp`, in any case, never `.svg` (I4). These checks are lexical, and a
-reference is never used as a URI. It cannot see symlinks, so the renderer and the broker open a
-reference only through directory file descriptors, component by component, without following
-links (I11), and still sniff an image's bytes before decoding it (S11). A name may start with
-`-`, so a reference that is ever put on a command line goes after `--` or with `./` in front.
+`.jpg`, `.jpeg` or `.webp`, in any case, never `.svg` (I4). These checks are lexical: they
+cannot see symlinks.
+
+**A reference is a file name and nothing else.** Trusted code opens it only through a directory
+file descriptor (`dirfd`: `openat`, component by component, with `O_NOFOLLOW`), without following
+links (I11), and still sniffs an image's bytes before decoding it (S11). It is never passed to
+anything that interprets a string: not `expanduser` (`~root/x.png` is a directory called `~root`,
+not a home), not a URI builder or a URL or percent decoder (`%2e%2e/x.png` is a directory called
+`%2e%2e`, not `..`, and a `file:` URI is never made from one), not a glob or a shell, and not an
+argument of a command unless it goes after `--` or has `./` in front (`-rf.png` is a valid
+reference, and an option to most programs). The spec accepts all three of those names on purpose,
+each being a legal file name; the code that opens a reference is what has to treat them as
+plain names (S11 tests `-rf.png`, `~root/x.png` and `%2e%2e/x.png`).
 
 **`Table`** is `{"columns": [{"name": ..., "type": ...}], "rows": [[...], ...]}`. A column type is
 `string`, `int`, `float` or `bool`, and every row has one cell of that type per column (an
@@ -555,6 +580,11 @@ implements it:
   `enum` entry given a string that is not one of its options keeps its old value. Values that
   arrive from `patch_state` or a sandbox are not clamped: they are checked by `check_value` and
   refused whole.
+- A write (by a widget, a `set` handler or a computed value) that would take the text of the
+  state over `MAX_STATE_TEXT_BYTES` and makes that text grow is not applied: the entry keeps its
+  old value. A write that shrinks the text, or leaves it the same size, is applied even when the
+  state is over the budget, so that a state that got there can recover. The state is all its
+  entries, computed ones included, as `validate_patch(current=...)` counts them.
 - Computed entries are evaluated in `computed_order()` and re-evaluated, in that order,
   whenever an entry they read changes.
 
@@ -615,9 +645,12 @@ options and limits, so they are written once. Which kinds of entry a component a
 never target a computed entry. "Needs both bounds" means the entry must declare both `minimum` and
 `maximum`, and the range must be one a widget can work with: both bounds within +-(2**53 - 1),
 `minimum` below `maximum` (a zero-width range has no positions, and a progress bar divides by it),
-the range at most 2**53 - 1 wide, and, for a `float` entry that has a `step`, the step at least the
-smallest normal float (about 2.2e-308) and at most <!-- limit: MAX_WIDGET_STEPS -->10,000,000<!-- /limit --> steps in the range. A `float` entry without a
-`step` leaves the step to the renderer.
+the range at most 2**53 - 1 wide, and, for a `slider` or `spin` bound to an entry that has a
+`step`, a step that is at least the smallest normal float (about 2.2e-308) and no wider than the
+range. These are rules of numeric safety, not of taste: how many positions the step makes is up
+to the author (a range of a million in steps of 0.01 is a fine slider). A `progress` has no step,
+so the step of its entry is not checked for it. A `float` entry without a `step` leaves the step
+to the renderer.
 
 A component's events name a handler, or none:
 
@@ -729,11 +762,11 @@ kind (`root.children[2] (slider)`), or the entry or handler.
 | `MAX_TABLE_CELLS` | 20,000 | rows times columns of a table value |
 | `MAX_JSON_DEPTH` | 16 | levels of a `json` value |
 | `MAX_JSON_NODES` | 10,000 | nodes of a `json` value (containers, scalars and keys) |
+| `MAX_OBJECT_MEMBERS` | 4,999 | members of one object in the text of a spec |
 | `MAX_VALUE_TEXT_BYTES` | 1,048,576 | UTF-8 bytes of text in one `json`, `table` or `list` value |
 | `MAX_PATCH_TEXT_BYTES` | 2,097,152 | UTF-8 bytes of text in all the values of one patch |
 | `MAX_STATE_TEXT_BYTES` | 4,194,304 | UTF-8 bytes of text in the whole state of a tool |
 | `MAX_SAFE_INT` | 9,007,199,254,740,991 | magnitude of an integer in an `int` position; width of a widget's range |
-| `MAX_WIDGET_STEPS` | 10,000,000 | steps of a `float` step across the range of a slider or spin button |
 <!-- /generated -->
 
 ## 12. Canonical form and compatibility
@@ -743,8 +776,9 @@ normalised to NFC and LF line endings) when a tool is saved, and keeps the saved
 models are built so that this needs no change to the spec:
 
 - every number follows the one rule of [section 4](#4-names-text-and-numbers): a spec that is valid
-  stays valid, with the same meaning, after canonicalisation writes `1e16` as `10000000000000000`
-  or `5.0` as `5`, and no type depends on how a number is written;
+  stays valid, with the same meaning, after canonicalisation writes `1e16` as `10000000000000000`,
+  `5.0` as `5` or `2**60` as `1152921504606847000`, and no type depends on how a number is
+  written (`tumbleweed.core.jcs` is the canonicaliser, checked against the RFC's own vectors);
 - the dump of a spec (`model_dump_json`) writes every field, so a default that is written and one
   that is left out dump to the same bytes, and an integer given for a float (a float field, a
   float column of a table, an item of a list of floats) is stored as a float, so `5` and `5.0`
@@ -773,10 +807,11 @@ one means, is `tumbleweed.ui/2`.
   return `SpecError.problems` to the model; `UiSpec.validate_patch(patch, current=...)` for
   `patch_state`; the system prompt section is generated from `schemas/ui-spec.v1.json` and this
   page, and must carry the rules the schema cannot (section 4's text and numbers, paths).
-- **Sandboxed code (S20).** `validate_patch(result, only=handler.outputs, current=...)` on every
+- **Sandboxed code (S20).** `validate_patch(result, current=..., only=handler.outputs)` on every
   result; the debounce floor and the one call in flight of [section 9](#9-handlers).
 - **Tool store and composition (S23, S25).** `PortType` and `port_type_of`, `ImageRef`, `FileRef`,
-  `Table`, and the canonical form above.
+  `Table`, and the canonical form above (`tumbleweed.core.jcs.canonicalize`, which refuses an
+  integer that stands for no double instead of rounding it).
 
 ## 14. More examples
 
