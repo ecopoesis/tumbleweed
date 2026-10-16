@@ -58,6 +58,21 @@ scripts/test-linux               # all of the above in the Linux container
 
 CI runs the same commands. `uv run pytest` includes a coverage report.
 
+### Dependencies
+
+`uv.lock` is resolved for macOS arm64, Linux x86_64 and Linux aarch64 only (`[tool.uv]
+environments`), and with a cooldown: `exclude-newer = "7 days"` keeps uv from choosing a release
+younger than a week, because a compromised release is usually noticed within days. The window is
+relative and recorded in the lock (`exclude-newer-span`), so the lock does not go stale as time
+passes. `tests/test_lock.py` checks that nothing in the lock is younger.
+
+- To update: `uv lock --upgrade`, which re-resolves with the window as of today.
+- To take a newer release of one package before its week is up (a security fix), add
+  `exclude-newer-package = { name = "2026-10-16T00:00:00Z" }` to `[tool.uv]` in `pyproject.toml`
+  with a comment saying why and linking the issue, run `uv lock --upgrade-package name`, and
+  remove the entry once the window has caught up.
+- To change the cooldown, edit `exclude-newer` in `pyproject.toml` and run `uv lock`.
+
 ### Linux tests
 
 Parts of Tumbleweed only exist on Linux: the sandbox (bubblewrap, Landlock, seccomp). Tests
@@ -67,7 +82,9 @@ also need a btrfs mount that the CI container cannot provide. `scripts/test-linu
 container (the `Dockerfile`) as a non-root user, with GTK on a headless Wayland compositor
 (weston, `GSK_RENDERER=cairo`) and the security options that bubblewrap needs to create
 user namespaces (see [ARCHITECTURE section 11](docs/ARCHITECTURE.md)). It needs Docker
-running. It builds the image first, which is fast once Docker's layer cache is warm.
+running. It builds the image first, which is fast once Docker's layer cache is warm, and runs
+exactly the image that build produced (by ID, not by tag), so that two worktrees testing at once
+cannot run each other's code.
 
 ```sh
 scripts/test-linux                          # format, lint, mypy, import contracts, pytest
