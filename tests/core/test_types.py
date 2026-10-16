@@ -7,7 +7,7 @@ import os
 import pickle
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
@@ -24,6 +24,9 @@ from tumbleweed.core.types import (
     ToolVersion,
     WorkspaceRelPath,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 SHA256_OF_EMPTY = hashlib.sha256(b"").hexdigest()
 
@@ -796,3 +799,22 @@ class TestDictKeys:
         mapping = {ContentHash("a" * 64): 1}
 
         assert adapter.validate_json(adapter.dump_json(mapping)) == mapping
+
+
+class TestHugeNumbersThroughPydantic:
+    """A huge int must surface as a short ValidationError, not as the int-to-str ValueError."""
+
+    @pytest.mark.parametrize("digits", [5000, 100_000])
+    def test_json_and_python_mode_answer_with_a_validation_error(self, digits: int) -> None:
+        adapter = TypeAdapter(ByteCount)
+        attempts: list[Callable[[], object]] = [
+            lambda: adapter.validate_json("9" * digits),
+            lambda: adapter.validate_json("-" + "9" * digits),
+            lambda: adapter.validate_python(10**digits),
+            lambda: adapter.validate_python(-(10**digits)),
+        ]
+
+        for attempt in attempts:
+            with pytest.raises(ValidationError) as raised:
+                attempt()
+            assert len(str(raised.value)) < 600
