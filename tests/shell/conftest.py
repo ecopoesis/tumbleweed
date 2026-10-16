@@ -14,8 +14,9 @@ def build_shell() -> Iterator[Callable[[Responder], Shell]]:
     """Builds shells and destroys every one of them when the test ends.
 
     The window is created but not presented: a test that needs a layout presents it itself.
-    NON_UNIQUE keeps the application off the session bus, so that tests cannot talk to each other
-    or to a running shell.
+    NON_UNIQUE: the application claims no well-known name, so a test's application never forwards
+    to another instance or to a running shell. (It does not keep GLib from exporting the
+    application's action groups on a session bus, if there is one: `test_session_bus.py`.)
     """
     built: list[Shell] = []
 

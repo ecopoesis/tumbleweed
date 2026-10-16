@@ -9,6 +9,9 @@ widgets; this keeps the next change from reaching for an API that parses what it
   `set_markup_with_mnemonic`, `set_text_with_mnemonic`, `new_with_mnemonic`, ...), except
   `use_markup` and its `*_use_markup` forms (`body_use_markup=`, `set_title_use_markup`) when they
   are the constant `False`. `use_underline` is held to the same rule;
+- `set_property` and `bind_property` with a property name given as a string literal that contains
+  "markup" or "mnemonic", or is `use-underline`, unless it is `set_property("use-markup", False)`
+  or `set_property("use-underline", False)` (a name held in a variable is not seen);
 - the libadwaita widgets that read markup in a title, a subtitle or a description by default:
   every `Adw.*Row`, `PreferencesGroup`, `PreferencesPage`, `StatusPage`, `Toast` and `Banner`. Use
   `plain_label`.
@@ -44,6 +47,34 @@ def _suspect(name: str) -> bool:
 def _false_only(name: str) -> bool:
     """`use_markup`, `use_underline` and their prefixed forms may be used, set to False."""
     return name.endswith(("use_markup", "use_underline"))
+
+
+def _literal(node: ast.expr) -> str | None:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _suspect_property(name: str) -> bool:
+    lowered = name.lower().replace("_", "-")
+    return _suspect(lowered) or lowered.endswith("use-underline")
+
+
+def _property_findings(node: ast.Call) -> list[str]:
+    """`set_property("use-markup", True)`, `bind_property("label", other, "use-markup")`, ..."""
+    if not isinstance(node.func, ast.Attribute):
+        return []
+    found: list[str] = []
+    if node.func.attr == "set_property" and node.args:
+        name = _literal(node.args[0])
+        if name is not None and _suspect_property(name):
+            plain = name.lower().replace("_", "-").endswith(("use-markup", "use-underline"))
+            if not (plain and len(node.args) > 1 and _is_false(node.args[1])):
+                found.append(f'set_property("{name}", ...) may parse markup or mnemonics')
+    if node.func.attr == "bind_property":
+        for position in (0, 2):  # the source property and the target property
+            name = _literal(node.args[position]) if len(node.args) > position else None
+            if name is not None and _suspect_property(name):
+                found.append(f'bind_property of "{name}" may parse markup or mnemonics')
+    return found
 
 
 def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
@@ -87,6 +118,7 @@ def _findings(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> list[str]:
         )
         if isinstance(node.func, ast.Name) and _suspect(node.func.id):
             found.append(f"{node.func.id}() may parse markup or mnemonics")
+        found.extend(_property_findings(node))
     return found
 
 
@@ -166,6 +198,34 @@ CASES = {
     "markup by default: Banner": ("Adw.Banner()\n", 1),
     "other Adw widgets are fine": ("Adw.HeaderBar()\nAdw.ApplicationWindow()\n", 0),
     "a name that only ends like Row is not Adw": ("Gtk.ListBoxRow()\n", 0),
+    "set_property use-markup true": ('label.set_property("use-markup", True)\n', 1),
+    "set_property use-markup false": ('label.set_property("use-markup", False)\n', 0),
+    "set_property use_markup with underscore, true": (
+        'label.set_property("use_markup", True)\n',
+        1,
+    ),
+    "set_property use-underline true": ('label.set_property("use-underline", True)\n', 1),
+    "set_property use-underline false": ('label.set_property("use-underline", False)\n', 0),
+    "set_property tooltip-markup": ('widget.set_property("tooltip-markup", text)\n', 1),
+    "set_property tooltip-markup false is still not allowed": (
+        'widget.set_property("tooltip-markup", False)\n',
+        1,
+    ),
+    "set_property mnemonic-widget": ('label.set_property("mnemonic-widget", w)\n', 1),
+    "set_property of something else": ('label.set_property("label", text)\n', 0),
+    "set_property with a name in a variable is not seen": ("label.set_property(name, text)\n", 0),
+    "bind_property to use-markup": (
+        'model.bind_property("flag", label, "use-markup", flags)\n',
+        1,
+    ),
+    "bind_property from use-underline": (
+        'label.bind_property("use-underline", other, "label", flags)\n',
+        1,
+    ),
+    "bind_property of other properties": (
+        'model.bind_property("text", label, "label", flags)\n',
+        0,
+    ),
     "known limit: an alias is not seen": ("f = label.set_text\nf(text)\n", 0),
 }
 

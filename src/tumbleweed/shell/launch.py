@@ -173,14 +173,16 @@ def relaunch_if_needed() -> None:
         logger.warning("could not relaunch (%s); going on without", exc.strerror or "OSError")
 
 
-def finish_relaunch() -> None:
+def finish_relaunch(*, platform: str = sys.platform) -> None:
     """In a relaunched process, once GTK is loaded: put the user's environment back.
 
     GLib reads `XDG_DATA_DIRS` once and caches it, and GSettings builds its schema source from it
     once, so both are forced first; only then is the variable put back, or the cached directories
     would be the user's and not the ones GTK needs. Does nothing in a process that is not a
-    relaunch.
+    relaunch, and nothing at all off macOS: a marker found elsewhere was not made by us.
     """
+    if platform != "darwin":
+        return
     restored = restored_environment(os.environ)
     if restored is None:
         return

@@ -29,9 +29,14 @@ ACCELERATORS = {
 class ShellApplication(Adw.Application):
     """The `tumbleweed-shell` application: one window, with `responder` answering the chat.
 
-    NON_UNIQUE, so that the application does not register on the session bus: it would export its
-    actions there (`app.quit`, `win.*`) to any process of the same user (#54). A second
-    `tumbleweed-shell` is a second shell, not a request to the first.
+    NON_UNIQUE: no well-known name is claimed on the session bus, and a second `tumbleweed-shell`
+    is a second shell, not a request to the first. It does **not** keep the shell off the bus:
+    GLib exports the application's and the window's action groups there before it returns for a
+    non-unique application, so any process of the same user that can reach the bus can activate
+    them (`quit`, `focus-input`, `toggle-side-panel`: low harm). The bus cannot be turned off,
+    because GTK's portals need it. So nothing security-relevant (a permission prompt, a picker
+    result, a grant change) may ever be a GAction (I5, I10), and
+    `tests/shell/test_session_bus.py` pins the exported set against a real bus (#54).
     """
 
     def __init__(

@@ -7,6 +7,7 @@ platforms, with the reason.
 """
 
 import importlib.metadata
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ from tumbleweed.shell.launch import (
     LIBRARY_VARIABLE,
     RELAUNCHED_MARKER,
     RelaunchOrigin,
+    finish_relaunch,
     parse_arguments,
     relaunch_environment,
     restored_environment,
@@ -337,6 +339,57 @@ class TestCommandLine:
 
         assert raised.value.code == 0
         assert "--version" in capsys.readouterr().out
+
+
+class TestMainAnswersBeforeAnyRelaunch:
+    """`--help`, `--version` and a bad argument are settled before the process is prepared."""
+
+    @pytest.mark.parametrize("argv", [["--version"], ["--help"], ["notes.txt"], ["--bogus"]])
+    def test_the_command_line_is_parsed_before_the_relaunch(
+        self, argv: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def relaunched() -> None:
+            raise AssertionError("main() relaunched before it had parsed the command line")
+
+        monkeypatch.setattr(launch, "relaunch_if_needed", relaunched)
+        monkeypatch.setattr("tumbleweed.shell.launch.os.execve", lambda *_: relaunched())
+
+        with pytest.raises(SystemExit):
+            launch.main(argv)
+
+
+class TestOffMacOs:
+    """A marker found off macOS was not made by us: leave the environment alone."""
+
+    @pytest.mark.parametrize("platform", ["linux", "win32", "freebsd14", ""])
+    def test_finish_relaunch_does_nothing_even_with_a_marker_planted(
+        self, monkeypatch: pytest.MonkeyPatch, platform: str
+    ) -> None:
+        monkeypatch.setenv(RELAUNCHED_MARKER, origin_marker("/original/lib", "/original/share"))
+        monkeypatch.setenv(LIBRARY_VARIABLE, "/ours/lib")
+        monkeypatch.setenv(DATA_VARIABLE, "/ours/share")
+        before = dict(os.environ)
+
+        finish_relaunch(platform=platform)
+
+        assert dict(os.environ) == before  # marker still there, variables as they were
+
+    def test_finish_relaunch_on_macos_without_a_marker_does_nothing_either(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(RELAUNCHED_MARKER, raising=False)
+        before = dict(os.environ)
+
+        finish_relaunch(platform="darwin")
+
+        assert dict(os.environ) == before
+
+    def test_the_default_is_this_platform(self) -> None:
+        import inspect
+
+        default = inspect.signature(finish_relaunch).parameters["platform"].default
+
+        assert default == sys.platform
 
 
 def test_the_console_script_resolves_to_main() -> None:
