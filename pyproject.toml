@@ -184,3 +184,23 @@ name = "ui.spec never imports gi (ARCHITECTURE section 10)"
 type = "forbidden"
 source_modules = ["tumbleweed.ui.spec"]
 forbidden_modules = ["gi"]
+
+[[tool.importlinter.contracts]]
+name = "agent never imports gi (ARCHITECTURE section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.agent"]
+forbidden_modules = ["gi"]
+
+[[tool.importlinter.contracts]]
+name = "agent never imports shell: the shell depends on the agent through interfaces (section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.agent"]
+forbidden_modules = ["tumbleweed.shell"]
+
+# Indirect imports count: the view-model may not reach gi through any other module either, so it
+# also cannot import the GTK adapter modules of tumbleweed.shell.
+[[tool.importlinter.contracts]]
+name = "the shell view-model never imports gi (section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.shell.viewmodel"]
+forbidden_modules = ["gi"]
