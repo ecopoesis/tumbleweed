@@ -9,8 +9,8 @@ FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Runtime: GTK 4 and libadwaita typelibs, weston (headless display), fonts for Pango,
-# bubblewrap, slirp4netns and libseccomp (the sandbox, S14-S22), and dbus-daemon (a private session
-# bus for the test that lists what the shell exports on it).
+# bubblewrap, slirp4netns and libseccomp (the sandbox, S14-S22), dbus-daemon (a private session
+# bus for the test that lists what the shell exports on it), and sudo (for the second user below).
 # Build: a toolchain, Python headers and the -dev packages PyGObject and pycairo compile against.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -28,6 +28,7 @@ RUN apt-get update \
         python3 \
         python3-dev \
         slirp4netns \
+        sudo \
         weston \
     && rm -rf /var/lib/apt/lists/*
 
@@ -36,6 +37,15 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.1@sha256:cf4eedcaa81655197f625739489effcbe
 # Not root: bubblewrap must work for an unprivileged user, which is the case that matters.
 RUN userdel --remove ubuntu \
     && useradd --create-home --uid 1000 --shell /bin/bash tumbleweed
+
+# A second unprivileged user, and a sudo rule that lets `tumbleweed` run commands as it and nothing
+# else, so that the IPC tests can connect to a socket from a real different uid (S13,
+# tests/ipc/test_real_uid.py). The rule is checked at build time.
+RUN useradd --uid 1001 --no-create-home --shell /usr/sbin/nologin tumbleweed-peer \
+    && echo 'tumbleweed ALL=(tumbleweed-peer) NOPASSWD: ALL' > /etc/sudoers.d/tumbleweed-peer \
+    && chmod 0440 /etc/sudoers.d/tumbleweed-peer \
+    && visudo --check --file /etc/sudoers.d/tumbleweed-peer
+
 USER tumbleweed
 WORKDIR /home/tumbleweed/tumbleweed
 

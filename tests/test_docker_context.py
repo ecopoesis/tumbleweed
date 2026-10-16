@@ -163,6 +163,7 @@ def test_a_secret_file_is_excluded_from_the_context(path: str) -> None:
         "scripts/linux-checks",
         "docs/ARCHITECTURE.md",
         "schemas/ui-spec.v1.json",
+        "schemas/ipc.v1.json",
         ".gitignore",  # the tests of the context itself read these three
         ".dockerignore",
         "Dockerfile",
