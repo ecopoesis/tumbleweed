@@ -4,7 +4,7 @@ The canvas is the one part of the window that will hold content derived from mod
 it is built to stay inside its own allocation (I5): the content sits in a scrolled window whose
 minimum size does not follow the content (a huge tool cannot grow the window or push the chrome
 and status strip out of it), and the canvas and its scrolled window clip what is drawn and picked
-to their bounds. `tests/shell/test_shell_window.py` proves it with a widget that tries to paint
+to their bounds. `tests/shell/test_chrome_isolation.py` proves it with a widget that tries to paint
 over the chrome region.
 """
 

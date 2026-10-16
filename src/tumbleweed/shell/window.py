@@ -85,6 +85,9 @@ class ShellWindow(Adw.ApplicationWindow):
 
     def _toggle_side_panel(self) -> None:
         self._side.set_visible(not self._side.get_visible())
+        if self._side.get_visible() and self.get_focus() is None:
+            # Hiding the panel took the focus with it; do not leave the window with none.
+            self.chat_panel.focus_input()
 
     def shutdown(self) -> None:
         """Stop the reply in flight, and stop observing it, before the widgets go away.

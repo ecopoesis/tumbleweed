@@ -4,6 +4,8 @@ work, text is plain, and the transcript follows the view-model.
 They run natively on a Mac with a desktop session and under weston in the Linux container.
 """
 
+import logging
+import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -13,12 +15,16 @@ from tests.shell.fakes import ManualResponder
 from tests.shell.gtk_support import (
     Shell,
     ancestor_of,
-    descendants,
+    click_send,
+    input_text,
     labels_in,
     press,
     pump,
     pump_until,
+    rows,
+    show,
     solid,
+    type_text,
 )
 from tumbleweed.agent.responder import ReplyDelta, ReplyFailed, ReplyFinished, Responder
 from tumbleweed.core.errors import InvalidValueError
@@ -34,21 +40,6 @@ type ShellBuilder = Callable[[Responder], Shell]
 MARKUP = '<b>bold</b> & <span foreground="red">red</span> <unclosed &amp; _under_score_'
 
 
-def rows(shell: Shell) -> list[tuple[str, str, str]]:
-    """(who, text, status) of each message row, in the order shown."""
-    from tumbleweed.shell.chat_panel import MessageRow
-
-    return [
-        (
-            w.role_label.get_text(),
-            w.body.get_text(),
-            w.status.get_text() if w.status.get_visible() else "",
-        )
-        for w in descendants(shell.window.chat_panel.transcript_list)
-        if isinstance(w, MessageRow)
-    ]
-
-
 def side_panel_visible(shell: Shell) -> bool:
     return shell.window.side_panel_visible
 
@@ -59,25 +50,6 @@ def placeholder_visible(shell: Shell) -> bool:
 
 def canvas_content(shell: Shell) -> "Gtk.Widget | None":
     return shell.window.canvas.content
-
-
-def type_text(shell: Shell, text: str) -> None:
-    shell.window.chat_panel.input_view.get_buffer().set_text(text)
-
-
-def input_text(shell: Shell) -> str:
-    buffer = shell.window.chat_panel.input_view.get_buffer()
-    return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
-
-
-def click_send(shell: Shell) -> None:
-    shell.window.chat_panel.send_button.emit("clicked")
-
-
-def show(shell: Shell) -> None:
-    """Present the window and wait until it has been laid out."""
-    shell.window.present()
-    assert pump_until(lambda: shell.window.get_mapped() and shell.window.chat_panel.get_width() > 0)
 
 
 class TestTheWindowBuilds:
@@ -294,6 +266,32 @@ class TestShortcuts:
             assert len(registered) == 1
             assert Gtk.accelerator_parse(registered[0]) == parsed, action
 
+    def test_each_accelerator_maps_to_exactly_its_action(self, echo_shell: Shell) -> None:
+        for action, accelerator in EXPECTED_ACCELERATORS.items():
+            assert echo_shell.app.get_actions_for_accel(accelerator) == [action]
+
+    def test_the_windows_shortcut_controller_binds_each_key_to_its_action(
+        self, echo_shell: Shell
+    ) -> None:
+        """The key-to-action path itself: what GTK consults when a key is pressed."""
+        from tumbleweed.shell._gi import Gtk
+
+        bound: dict[tuple[int, int], list[str]] = {}
+        for controller in echo_shell.window.observe_controllers():
+            if not isinstance(controller, Gtk.ShortcutController):
+                continue
+            for shortcut in controller:
+                trigger, action = shortcut.get_trigger(), shortcut.get_action()
+                if isinstance(trigger, Gtk.KeyvalTrigger) and isinstance(action, Gtk.NamedAction):
+                    key = (trigger.get_keyval(), int(trigger.get_modifiers()))
+                    bound.setdefault(key, []).append(action.get_action_name())
+
+        for action, accelerator in EXPECTED_ACCELERATORS.items():
+            _ok, keyval, modifiers = Gtk.accelerator_parse(accelerator)
+            # GTK may list a shortcut in more than one controller; what matters is that the key
+            # reaches this action and no other.
+            assert set(bound.get((keyval, int(modifiers)), [])) == {action}, accelerator
+
     def test_every_accelerated_action_exists(self, echo_shell: Shell) -> None:
         assert echo_shell.window.lookup_action("focus-input") is not None
         assert echo_shell.window.lookup_action("toggle-side-panel") is not None
@@ -333,6 +331,35 @@ class TestShortcuts:
         window.activate_action("win.toggle-side-panel", None)
         assert side_panel_visible(echo_shell)
         assert pump_until(lambda: window.chat_panel.get_mapped())
+
+    def test_f9_twice_leaves_the_input_focused(self, echo_shell: Shell) -> None:
+        window = echo_shell.window
+        show(echo_shell)
+        window.set_focus(window.chat_panel.input_view)
+
+        window.activate_action("win.toggle-side-panel", None)  # hide: the input is unmapped
+        # GTK clears the focus of a widget that goes away, on the next turn of the main loop.
+        lost = pump_until(lambda: window.get_focus() is None, timeout=1.0)
+        if sys.platform.startswith("linux"):
+            assert lost, "this host no longer drops the focus: the check below proves nothing"
+        window.activate_action("win.toggle-side-panel", None)  # show
+
+        assert side_panel_visible(echo_shell)
+        assert window.get_focus() is window.chat_panel.input_view
+
+    def test_showing_the_panel_leaves_a_focus_that_is_somewhere_else_alone(
+        self, echo_shell: Shell
+    ) -> None:
+        window = echo_shell.window
+        show(echo_shell)
+        window.canvas.set_focusable(True)
+        window.activate_action("win.toggle-side-panel", None)
+        window.set_focus(window.canvas)
+
+        window.activate_action("win.toggle-side-panel", None)  # hides the panel
+        window.activate_action("win.toggle-side-panel", None)  # shows it again
+
+        assert window.get_focus() is window.canvas
 
     def test_the_canvas_takes_the_space_of_a_hidden_side_panel(self, echo_shell: Shell) -> None:
         window = echo_shell.window
@@ -399,12 +426,12 @@ class TestStreaming:
         type_text(shell, "question")
         click_send(shell)
 
-        assert rows(shell) == [("You", "question", ""), ("Assistant", "", "Writing…")]
+        assert rows(shell) == [("You", "question", ""), ("Assistant", "", "Writing\u2026")]
         type_text(shell, "next")
         assert not panel.send_button.get_sensitive()  # one reply at a time
 
         responder.sink.emit(ReplyDelta(text="Hel"))
-        assert rows(shell)[1] == ("Assistant", "Hel", "Writing…")
+        assert rows(shell)[1] == ("Assistant", "Hel", "Writing\u2026")
         responder.sink.emit(ReplyDelta(text="lo"))
         responder.sink.emit(ReplyFinished())
 
@@ -535,11 +562,9 @@ class TestPlainText:
 
         click_send(echo_shell)
 
-        body = echo_shell.window.chat_panel.row_for(
-            echo_shell.window.transcript.messages[0].id
-        ).body
-        assert body.get_text() == "_a_b_ and __c"
-        assert body.get_mnemonic_keyval() == Gdk.KEY_VoidSymbol
+        row = echo_shell.window.chat_panel.row_for(echo_shell.window.transcript.messages[0].id)
+        assert row.shown_text == "_a_b_ and __c"
+        assert row.paragraphs[0].get_mnemonic_keyval() == Gdk.KEY_VoidSymbol
 
     def test_text_gtk_cannot_take_is_replaced_instead_of_crashing_the_shell(
         self, build_shell: ShellBuilder
@@ -554,7 +579,7 @@ class TestPlainText:
 
         assert rows(shell) == [
             ("You", "user text", ""),
-            ("Assistant", "reply � end�", ""),
+            ("Assistant", "reply \ufffd end\ufffd", ""),
         ]
 
     def test_a_reply_too_large_for_a_message_fails_instead_of_filling_the_window(
@@ -629,3 +654,270 @@ class TestVoiceIndicator:
             voice.set_state(bad)  # type: ignore[arg-type]  # the point
 
         assert voice.text == "Voice: idle"
+
+
+class TestNotices:
+    def test_the_still_streaming_notice_goes_when_the_reply_ends(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        type_text(shell, "question")
+        click_send(shell)
+        type_text(shell, "impatient")
+        assert press(shell.window.chat_panel.input_view, Gdk.KEY_Return)
+        panel = shell.window.chat_panel
+        assert panel.notice.get_visible()
+        assert "still streaming" in panel.notice.get_text()
+
+        responder.sink.emit(ReplyFinished())
+
+        assert not panel.notice.get_visible()
+        assert panel.send_button.get_sensitive()  # and the typed text can go
+
+    def test_it_goes_when_the_reply_fails_too(self, build_shell: ShellBuilder) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        type_text(shell, "question")
+        click_send(shell)
+        type_text(shell, "impatient")
+        press(shell.window.chat_panel.input_view, Gdk.KEY_Return)
+
+        responder.sink.emit(ReplyFailed(reason="no network"))
+
+        assert not shell.window.chat_panel.notice.get_visible()
+
+    def test_a_notice_about_something_else_is_not_removed_by_a_reply_ending(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        panel = shell.window.chat_panel
+        type_text(shell, "question")
+        click_send(shell)
+        # A notice that is not about the streaming reply (the size of an input).
+        panel.input_view.get_buffer().set_text("x" * (MAX_USER_BYTES + 1))
+        shell.window.controller.cancel()  # frees the controller: now the size is the problem
+        click_send(shell)
+        assert "bytes" in panel.notice.get_text()
+
+        panel.message_changed(shell.window.transcript.messages[1])  # an unrelated change
+
+        assert panel.notice.get_visible()
+        assert "bytes" in panel.notice.get_text()
+
+    def test_only_send_is_disabled_while_a_reply_streams_the_input_stays_editable(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        type_text(shell, "question")
+        click_send(shell)
+
+        type_text(shell, "the next message, typed while waiting")
+
+        panel = shell.window.chat_panel
+        assert not panel.send_button.get_sensitive()
+        assert panel.input_view.get_sensitive()
+        assert panel.input_view.get_editable()
+        assert input_text(shell) == "the next message, typed while waiting"
+
+
+class TestTheUiBoundary:
+    """Nothing a responder or the controller raises escapes the handlers of Enter and Send."""
+
+    @pytest.mark.parametrize("how", ["enter", "button"])
+    def test_a_bug_in_the_responder_is_shown_and_logged_and_enter_is_still_consumed(
+        self, build_shell: ShellBuilder, caplog: pytest.LogCaptureFixture, how: str
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        responder = ManualResponder(raises=RuntimeError("responder bug"))
+        shell = build_shell(responder)
+        type_text(shell, "question")
+
+        with caplog.at_level(logging.ERROR):
+            if how == "enter":
+                handled = press(shell.window.chat_panel.input_view, Gdk.KEY_Return)
+                assert handled  # consumed: no newline falls through into the input
+            else:
+                click_send(shell)
+
+        panel = shell.window.chat_panel
+        assert "Something went wrong" in panel.notice.get_text()
+        assert "responder bug" in caplog.text  # logged with its traceback
+        assert input_text(shell) == ""  # the message was sent: it is in the transcript
+        assert rows(shell) == [
+            ("You", "question", ""),
+            ("Assistant", "", "The reply could not be started."),
+        ]
+        assert not shell.window.controller.busy
+
+    def test_a_bug_before_anything_was_added_keeps_the_text_for_editing(
+        self, build_shell: ShellBuilder, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        shell = build_shell(ManualResponder())
+
+        def broken(text: str) -> None:
+            raise RuntimeError("controller bug")
+
+        monkeypatch.setattr(shell.window.controller, "send", broken)
+        type_text(shell, "keep me")
+
+        assert press(shell.window.chat_panel.input_view, Gdk.KEY_Return)
+
+        assert input_text(shell) == "keep me"
+        assert "Something went wrong" in shell.window.chat_panel.notice.get_text()
+        assert rows(shell) == []
+
+    def test_a_domain_error_whose_str_raises_is_shown_by_its_type(
+        self, build_shell: ShellBuilder, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tumbleweed.core.errors import TumbleweedError
+
+        class OddError(TumbleweedError):
+            def __str__(self) -> str:
+                raise RuntimeError("no str")
+
+        shell = build_shell(ManualResponder())
+
+        def refuse(text: str) -> None:
+            raise OddError
+
+        monkeypatch.setattr(shell.window.controller, "send", refuse)
+        type_text(shell, "q")
+
+        click_send(shell)
+
+        assert shell.window.chat_panel.notice.get_text() == "OddError"
+
+
+class TestThePanelAndTheTranscript:
+    def test_after_shutdown_the_panel_no_longer_follows_the_transcript(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        responder = ManualResponder()
+        shell = build_shell(responder)
+        type_text(shell, "question")
+        click_send(shell)
+        panel = shell.window.chat_panel
+        before = rows(shell)
+
+        panel.shutdown()
+        shell.window.transcript.add_user("added behind the panel's back")  # cancelled: not busy
+
+        assert rows(shell) == [
+            ("You", "question", ""),
+            ("Assistant", "", "Writing\u2026"),  # still as it was: the update did not arrive
+        ]
+        assert before == rows(shell)
+        assert len(shell.window.transcript.messages) == 3  # the transcript did change
+
+    def test_a_panel_built_on_a_transcript_that_already_has_messages_shows_them(
+        self, echo_shell: Shell
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+        from tumbleweed.shell.chat_panel import ChatPanel
+        from tumbleweed.shell.viewmodel.chat import ChatController
+        from tumbleweed.shell.viewmodel.transcript import Transcript
+
+        transcript = Transcript()
+        transcript.add_user("restored question")
+        reply = transcript.begin_assistant().id
+        transcript.append(reply, "restored ")
+        transcript.append(reply, "answer")
+        transcript.finish(reply)
+        controller = ChatController(transcript, ManualResponder())
+
+        panel = ChatPanel(controller, transcript)
+
+        assert [
+            (row.role_label.get_text(), row.shown_text) for row in panel.transcript_list_rows()
+        ] == [("You", "restored question"), ("Assistant", "restored answer")]
+        transcript.add_user("and a new one")  # and it is subscribed
+        assert len(panel.transcript_list_rows()) == 3
+        assert isinstance(panel, Gtk.Box)
+
+
+class TestApplication:
+    def test_the_application_does_not_register_on_the_session_bus(self) -> None:
+        from tumbleweed.agent.echo import EchoResponder
+        from tumbleweed.shell._gi import Gio
+        from tumbleweed.shell.app import ShellApplication
+
+        app = ShellApplication(EchoResponder())
+
+        assert app.get_flags() & Gio.ApplicationFlags.NON_UNIQUE
+        app.register(None)
+        assert app.get_dbus_connection() is None  # nothing exported: no app.* or win.* actions
+        assert app.get_dbus_object_path() is None
+
+    def test_quit_on_signals_installs_and_removes_its_sources(self, echo_shell: Shell) -> None:
+        from tumbleweed.shell._gi import GLib
+        from tumbleweed.shell.app import quit_on_signals
+
+        context = GLib.MainContext.default()
+
+        with quit_on_signals(echo_shell.app) as sources:
+            assert len(sources) == 2  # SIGINT and SIGTERM, added without a deprecation warning
+            assert all(context.find_source_by_id(source) is not None for source in sources)
+
+        assert all(context.find_source_by_id(source) is None for source in sources)
+
+    def test_run_without_a_display_says_so_in_one_line_and_returns_1(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+        from tumbleweed.shell.app import run
+
+        monkeypatch.setattr(Gdk.Display, "get_default", staticmethod(lambda: None))
+
+        with caplog.at_level(logging.ERROR):
+            status = run()
+
+        assert status == 1
+        (record,) = caplog.records
+        assert "No display" in record.getMessage()
+        assert "\n" not in record.getMessage()
+
+
+class TestQuitting:
+    def test_quit_ends_the_application_even_if_the_responders_cancel_raises(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        responder = ManualResponder(cancel_raises=RuntimeError("cancel is broken"))
+        shell = build_shell(responder)
+        type_text(shell, "question")
+        click_send(shell)
+
+        assert TestShortcuts().run_until_quit(shell, "quit")  # quits, not the watchdog
+
+        assert responder.handle.cancel_calls == 1
+        assert shell.window.get_application() is None
+
+    def test_quit_ends_the_application_even_if_a_windows_shutdown_raises(
+        self, echo_shell: Shell, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def broken() -> None:
+            raise RuntimeError("shutdown is broken")
+
+        monkeypatch.setattr(echo_shell.window, "shutdown", broken)
+
+        assert TestShortcuts().run_until_quit(echo_shell, "quit")  # the first Ctrl+Q quits
+
+        assert echo_shell.window.get_application() is None
+
+
+class TestGeometry:
+    def test_the_side_panel_is_its_configured_width(self, echo_shell: Shell) -> None:
+        from tumbleweed.shell.window import SIDE_PANEL_WIDTH
+
+        show(echo_shell)
+
+        assert echo_shell.window.chat_panel.get_width() == SIDE_PANEL_WIDTH

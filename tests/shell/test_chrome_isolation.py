@@ -18,6 +18,7 @@ import pytest
 from tests.shell.gtk_support import (
     Shell,
     ancestor_of,
+    bounds,
     pump,
     pump_until,
     render,
@@ -29,22 +30,6 @@ pytestmark = pytest.mark.gtk
 BLUE = (0, 0, 255)  # what the chrome shows
 RED = (255, 0, 0)  # what the hostile canvas content paints
 CHROME_HEIGHT = 40
-
-
-def bounds(widget: object, relative_to: object) -> tuple[float, float, float, float]:
-    """(left, top, right, bottom) of `widget` in the coordinates of `relative_to`."""
-    from tumbleweed.shell._gi import Gtk
-
-    assert isinstance(widget, Gtk.Widget)
-    assert isinstance(relative_to, Gtk.Widget)
-    found, rect = widget.compute_bounds(relative_to)
-    assert found
-    return (
-        rect.get_x(),
-        rect.get_y(),
-        rect.get_x() + rect.get_width(),
-        rect.get_y() + rect.get_height(),
-    )
 
 
 def overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
@@ -117,6 +102,29 @@ def test_content_that_asks_for_a_huge_size_does_not_grow_the_window_or_move_the_
     assert bounds(window.chrome, window) == chrome_before
     assert bounds(window.status_strip, window) == status_before
     assert bounds(window.status_strip, window)[3] <= window.get_height()  # still inside
+
+
+def test_content_does_not_change_the_natural_or_minimum_size_of_the_canvas_or_the_window(
+    echo_shell: Shell,
+) -> None:
+    from tumbleweed.shell._gi import Gtk
+
+    window = echo_shell.window
+    window.chrome.append(solid((0.0, 0.0, 1.0), size=(10, CHROME_HEIGHT)))
+    laid_out(echo_shell)
+    sizes = {
+        (widget_name, orientation): widget.measure(orientation, -1)[:2]
+        for widget_name, widget in (("window", window), ("canvas", window.canvas))
+        for orientation in (Gtk.Orientation.HORIZONTAL, Gtk.Orientation.VERTICAL)
+    }
+
+    window.canvas.set_content(solid((1.0, 0.0, 0.0), size=(6000, 6000)))
+    pump(0.3)
+
+    for (widget_name, orientation), before in sizes.items():
+        widget = window if widget_name == "window" else window.canvas
+        # (minimum, natural): neither follows the content, so it cannot push the chrome around.
+        assert widget.measure(orientation, -1)[:2] == before, (widget_name, orientation)
 
 
 def test_content_that_paints_far_outside_itself_leaves_the_chrome_and_the_panel_alone(

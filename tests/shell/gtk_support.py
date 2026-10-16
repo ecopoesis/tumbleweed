@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
     from tumbleweed.shell._gi import Gtk
     from tumbleweed.shell.app import ShellApplication
+    from tumbleweed.shell.chat_panel import MessageRow
     from tumbleweed.shell.window import ShellWindow
 
 DEADLINE_SECONDS = 5.0
@@ -198,4 +199,58 @@ def render(window: "Gtk.Window") -> Pixels:
         stride=stride,
         data=bytes(raw),
         scale=texture.get_width() / width,
+    )
+
+
+def rows(shell: Shell) -> list[tuple[str, str, str]]:
+    """(who, text, status) of each message row, in the order shown."""
+    from tumbleweed.shell.chat_panel import MessageRow
+
+    return [
+        (
+            w.role_label.get_text(),
+            w.shown_text,
+            w.status.get_text() if w.status.get_visible() else "",
+        )
+        for w in descendants(shell.window.chat_panel.transcript_list)
+        if isinstance(w, MessageRow)
+    ]
+
+
+def body_laid_out(row: "MessageRow") -> bool:
+    """Whether every paragraph label of the row has been given a size."""
+    return bool(row.paragraphs) and all(label.get_height() > 0 for label in row.paragraphs)
+
+
+def type_text(shell: Shell, text: str) -> None:
+    shell.window.chat_panel.input_view.get_buffer().set_text(text)
+
+
+def input_text(shell: Shell) -> str:
+    buffer = shell.window.chat_panel.input_view.get_buffer()
+    return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
+
+
+def click_send(shell: Shell) -> None:
+    shell.window.chat_panel.send_button.emit("clicked")
+
+
+def show(shell: Shell) -> None:
+    """Present the window and wait until it has been laid out."""
+    shell.window.present()
+    assert pump_until(lambda: shell.window.get_mapped() and shell.window.chat_panel.get_width() > 0)
+
+
+type Bounds = tuple[float, float, float, float]
+
+
+def bounds(widget: "Gtk.Widget", relative_to: "Gtk.Widget") -> Bounds:
+    """(left, top, right, bottom) of `widget` in the coordinates of `relative_to`."""
+    found, area = widget.compute_bounds(relative_to)
+    assert found
+    return (
+        area.get_x(),
+        area.get_y(),
+        area.get_x() + area.get_width(),
+        area.get_y() + area.get_height(),
     )
