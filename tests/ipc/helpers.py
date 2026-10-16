@@ -35,7 +35,7 @@ SMALL_FRAMES = IpcLimits(max_frame_bytes=ByteCount(4096))
 BIG_TEXT = "\U0001f600" * 1024  # 4 bytes each in UTF-8: with the JSON around it, over 4096 bytes
 
 
-SHORT = timedelta(seconds=0.4)
+SHORT = timedelta(seconds=1)
 
 
 def fast(

@@ -8,12 +8,12 @@ security claims of the IPC layer, so each states what it would take to break it.
 
 import asyncio
 import struct
-from datetime import timedelta
 
 import pytest
 
 from tests.ipc.bounded import run
 from tests.ipc.helpers import (
+    SHORT,
     SMALL_FRAMES,
     RawPeer,
     connected,
@@ -366,7 +366,7 @@ class TestSlowAndSilentPeers:
         self, sock_path: SocketPath
     ) -> None:
         async def scenario() -> None:
-            limits = fast(idle_timeout=timedelta(seconds=0.4))
+            limits = fast(idle_timeout=SHORT)
             async with (
                 serving(sock_path, limits=limits) as (server, _handler),
                 raw_peer(sock_path) as peer,
@@ -387,7 +387,8 @@ class TestSlowAndSilentPeers:
 
         async def scenario() -> None:
             async with serving(sock_path), connected(sock_path) as client:
-                await asyncio.sleep(0.6)  # longer than any other timeout in these tests
+                # Longer than the idle timeout that the test above shows ending a connection.
+                await asyncio.sleep(SHORT.total_seconds() * 1.5)
 
                 assert await client.call(Ping(kind="ping"), Pong) == Pong(kind="pong")
 

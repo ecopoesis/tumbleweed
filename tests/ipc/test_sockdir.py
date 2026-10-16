@@ -18,6 +18,7 @@ from tumbleweed.ipc.peercred import Uid
 from tumbleweed.ipc.sockdir import (
     DIRECTORY_NAME,
     SocketDirectory,
+    _verify_leaf,
     runtime_base,
 )
 
@@ -171,6 +172,23 @@ class TestRefusal:
         for create in (True, False):
             with pytest.raises(SocketError, match="owned by uid"):
                 SocketDirectory(base, create=create, owner=NOT_ME)
+
+    def test_a_leaf_owned_by_someone_else_is_refused_even_in_a_base_that_is_ours(
+        self, base: CanonicalPath
+    ) -> None:
+        # Only a user who can enter the base could have made it, and the base check refuses a
+        # base anyone else can enter. So the leaf check stands alone here, against the base fd:
+        # it is what protects a broker running as root, which can open anything.
+        leaf = Path(str(base)) / DIRECTORY_NAME
+        leaf.mkdir(mode=0o700)
+        fd = os.open(str(base), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for create in (True, False):
+                with pytest.raises(SocketError, match=r"socket directory .* is owned by uid"):
+                    _verify_leaf(fd, leaf, create=create, owner=NOT_ME)
+            _verify_leaf(fd, leaf, create=False, owner=MY_UID)  # the control
+        finally:
+            os.close(fd)
 
     def test_a_symlink_is_refused_even_to_a_perfectly_good_directory(
         self, base: CanonicalPath

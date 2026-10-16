@@ -12,7 +12,10 @@ What is refused, never repaired. The base must be a directory of ours that group
 cannot enter. The `tumbleweed` directory in it is created 0700 if missing; if it exists it must
 be a real directory (not a symlink, even to a good one) owned by us with mode exactly 0700,
 otherwise `SocketError` says what is wrong and nothing is touched. Both are opened with
-`O_NOFOLLOW` and judged by `fstat` on the descriptor, so what was checked is what is used.
+`O_NOFOLLOW` and judged by `fstat` on the opened descriptor, so there is no gap between a `stat`
+and an `open` for anyone to slip a symlink into. (The socket itself is later bound and connected
+to by path. Nobody but the user can change a private directory of the user's; a process of the
+same user can, and is out of scope: ARCHITECTURE section 8.)
 
 One server per socket. A server takes an exclusive `flock` on `<name>.sock.lock` for as long as
 it runs. The kernel drops the lock when the holder dies, however it dies, so holding it proves
@@ -101,6 +104,34 @@ def _open_directory(name: str, *, dir_fd: int | None, what: str) -> int:
         raise SocketError(f"cannot open {what}: {_reason(exc)}") from None
 
 
+def _verify_leaf(base_fd: int, path: Path, *, create: bool, owner: Uid) -> None:
+    """Create (if asked) and check the `tumbleweed` directory inside the open `base_fd`."""
+    created = False
+    if create:
+        # The umask may only remove bits; with 077 in place the mode below is exact.
+        previous = os.umask(0o077)
+        try:
+            os.mkdir(DIRECTORY_NAME, 0o700, dir_fd=base_fd)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise SocketError(f"cannot create {path}: {_reason(exc)}") from None
+        finally:
+            os.umask(previous)
+    fd = _open_directory(DIRECTORY_NAME, dir_fd=base_fd, what=f"the socket directory {path}")
+    try:
+        if created:
+            os.fchmod(fd, 0o700)  # a setgid parent would have passed its bit on
+        info = os.fstat(fd)
+        if info.st_uid != owner:
+            raise SocketError(f"the socket directory {path} is owned by uid {info.st_uid}")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            raise SocketError(f"the socket directory {path} has mode {_mode(info)}, not 0700")
+    finally:
+        os.close(fd)
+
+
 @final
 class SocketDirectory:
     """A verified private directory for sockets: it exists only if every check passed.
@@ -126,37 +157,10 @@ class SocketDirectory:
                     "must not be able to enter it"
                 )
             path = Path(str(base)) / DIRECTORY_NAME
-            self._verify(base_fd, path, create=create, owner=uid)
+            _verify_leaf(base_fd, path, create=create, owner=uid)
         finally:
             os.close(base_fd)
         self._path = path
-
-    @staticmethod
-    def _verify(base_fd: int, path: Path, *, create: bool, owner: Uid) -> None:
-        created = False
-        if create:
-            # The umask may only remove bits; with 077 in place the mode below is exact.
-            previous = os.umask(0o077)
-            try:
-                os.mkdir(DIRECTORY_NAME, 0o700, dir_fd=base_fd)
-                created = True
-            except FileExistsError:
-                pass
-            except OSError as exc:
-                raise SocketError(f"cannot create {path}: {_reason(exc)}") from None
-            finally:
-                os.umask(previous)
-        fd = _open_directory(DIRECTORY_NAME, dir_fd=base_fd, what=f"the socket directory {path}")
-        try:
-            if created:
-                os.fchmod(fd, 0o700)  # a setgid parent would have passed its bit on
-            info = os.fstat(fd)
-            if info.st_uid != owner:
-                raise SocketError(f"the socket directory {path} is owned by uid {info.st_uid}")
-            if stat.S_IMODE(info.st_mode) != 0o700:
-                raise SocketError(f"the socket directory {path} has mode {_mode(info)}, not 0700")
-        finally:
-            os.close(fd)
 
     @classmethod
     def from_environment(
