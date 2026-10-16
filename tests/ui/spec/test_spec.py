@@ -30,6 +30,7 @@ from tests.ui.spec.support import (
 )
 from tumbleweed.core.types import JsonValue
 from tumbleweed.ui.spec.errors import MAX_REPORTED_PROBLEMS, SpecError
+from tumbleweed.ui.spec.limits import MAX_SAFE_INT
 from tumbleweed.ui.spec.names import HandlerName, StateKey
 from tumbleweed.ui.spec.parse import validate_ui_spec
 from tumbleweed.ui.spec.spec import SPEC_VERSION, UiSpec
@@ -401,6 +402,165 @@ def test_the_widgets_that_need_a_range_are_exactly_these() -> None:
     }
 
 
+class TestEnumLiteralsThroughIf:
+    CHOOSE: ClassVar[Json] = {"kind": "bool", "key": "flag", "default": True}
+
+    def assigned(self, value: Json) -> Json:
+        return build(
+            state=[TARGETS["enum"], self.CHOOSE], handlers=[set_handler("h", ("x", value))]
+        )
+
+    @staticmethod
+    def choose(then: Json, otherwise: Json) -> Json:
+        return {"kind": "if", "condition": ref("flag"), "then": then, "otherwise": otherwise}
+
+    def test_an_if_of_options_may_be_assigned(self) -> None:
+        accepted(self.assigned(self.choose(lit_str("a"), lit_str("b"))))
+        accepted(self.assigned(self.choose(self.choose(lit_str("a"), lit_str("b")), lit_str("a"))))
+
+    def test_an_if_with_a_literal_that_is_no_option_is_refused(self) -> None:
+        problems = refused(self.assigned(self.choose(lit_str("a"), lit_str("zzz"))))
+
+        assert mentions(problems, "handler h: assigning x", "'zzz' is not one of its options")
+
+    def test_a_deeper_branch_is_checked_too(self) -> None:
+        nested = self.choose(self.choose(lit_str("a"), lit_str("zzz")), lit_str("b"))
+
+        assert mentions(refused(self.assigned(nested)), "'zzz' is not one of its options")
+
+    def test_a_branch_that_cannot_be_known_is_not_guessed_at(self) -> None:
+        other: Json = {"kind": "string", "key": "s", "default": ""}
+        spec = build(
+            state=[TARGETS["enum"], self.CHOOSE, other],
+            handlers=[set_handler("h", ("x", self.choose(ref("s"), lit_str("a"))))],
+        )
+
+        accepted(spec)  # what `s` holds is for the runtime to check: the entry keeps its value
+
+    def test_a_computed_comparison_through_if_is_checked_the_same_way(self) -> None:
+        compared: Json = {
+            "kind": "eq",
+            "left": ref("x"),
+            "right": self.choose(lit_str("a"), lit_str("nope")),
+        }
+        derived: Json = {"kind": "bool", "key": "d", "default": False, "computed": compared}
+
+        problems = refused(build(state=[TARGETS["enum"], self.CHOOSE, derived]))
+
+        assert mentions(problems, "state d (computed)", "'nope' is not an option of x")
+
+    def test_two_enums_with_no_option_in_common_are_refused_in_a_computed_entry(self) -> None:
+        other: Json = {"kind": "enum", "key": "y", "options": ["p", "q"], "default": "p"}
+        derived: Json = {
+            "kind": "bool",
+            "key": "d",
+            "default": False,
+            "computed": binary("eq", ref("x"), ref("y")),
+        }
+
+        problems = refused(build(state=[TARGETS["enum"], other, derived]))
+
+        assert mentions(problems, "x and y are enums with no option in common")
+
+
+class TestTextViewEvents:
+    VIEW: ClassVar[Json] = {"kind": "text_view", "bind": "x", "on_change": "h"}
+
+    def test_a_read_only_view_has_no_edits_to_report(self) -> None:
+        problems = refused(build(self.VIEW, [TARGETS["string"]], [AGENT]))
+
+        assert mentions(problems, "(text_view)", "on_change needs editable")
+
+    def test_an_editable_view_may_have_on_change(self) -> None:
+        accepted(build({**self.VIEW, "editable": True}, [TARGETS["string"]], [AGENT]))
+
+    def test_a_read_only_view_without_on_change_is_fine(self) -> None:
+        accepted(build({"kind": "text_view", "bind": "x"}, [TARGETS["string"]]))
+
+    def test_an_unknown_handler_and_a_read_only_view_are_both_reported(self) -> None:
+        view = {**self.VIEW, "on_change": "nope"}
+
+        problems = refused(build(view, [TARGETS["string"]]))
+
+        assert mentions(problems, "unknown handler nope")
+        assert mentions(problems, "on_change needs editable")
+
+
+def number_entry(kind: str, **fields: JsonValue) -> Json:
+    default: JsonValue = 0 if kind == "int" else 0.0
+    return {"kind": kind, "key": "x", "default": default, **fields}
+
+
+class TestWidgetRanges:
+    """A slider, spin button or progress bar needs a range and a step it can work with."""
+
+    @pytest.mark.parametrize("component", NUMBER_BINDERS)
+    def test_a_sane_range_is_fine(self, component: str) -> None:
+        template = BOUND[component][0]
+
+        accepted(build(template, [number_entry("float", minimum=0, maximum=1, step=0.01)]))
+        accepted(build(template, [number_entry("int", minimum=-100, maximum=100, step=5)]))
+
+    @pytest.mark.parametrize("component", NUMBER_BINDERS)
+    @pytest.mark.parametrize("kind", ["int", "float"])
+    def test_the_range_may_not_be_empty(self, component: str, kind: str) -> None:
+        template = BOUND[component][0]
+        entry = number_entry(kind, minimum=5, maximum=5, default=5)
+
+        assert mentions(refused(build(template, [entry])), "needs a minimum below its maximum")
+
+    @pytest.mark.parametrize("component", NUMBER_BINDERS)
+    def test_float_bounds_stay_within_the_safe_integer_range(self, component: str) -> None:
+        template = BOUND[component][0]
+        for minimum, maximum in [(-1e300, 0.0), (0.0, 1e300), (-1e300, 1e300), (-1e16, 1.0)]:
+            entry = number_entry("float", minimum=minimum, maximum=maximum)
+
+            assert mentions(
+                refused(build(template, [entry])), f"needs bounds within +-{MAX_SAFE_INT}"
+            )
+
+    @pytest.mark.parametrize("component", NUMBER_BINDERS)
+    def test_a_range_wider_than_the_safe_integers_is_refused(self, component: str) -> None:
+        template = BOUND[component][0]
+        wide = number_entry("int", minimum=-(2**52), maximum=2**52)  # 2**53 wide
+        widest = number_entry("float", minimum=-float(MAX_SAFE_INT), maximum=float(MAX_SAFE_INT))
+
+        for entry in (wide, widest):
+            assert mentions(refused(build(template, [entry])), "needs a range at most")
+
+    @pytest.mark.parametrize("component", NUMBER_BINDERS)
+    @pytest.mark.parametrize("step", [5e-324, 1e-320, 1e-310, 2.2e-308])
+    def test_a_subnormal_step_is_refused(self, component: str, step: float) -> None:
+        template = BOUND[component][0]
+        entry = number_entry("float", minimum=0, maximum=1e-300, step=step)
+
+        assert mentions(refused(build(template, [entry])), "not subnormal")
+
+    @pytest.mark.parametrize("component", NUMBER_BINDERS)
+    def test_a_step_tiny_beside_the_range_is_refused(self, component: str) -> None:
+        template = BOUND[component][0]
+        entry = number_entry("float", minimum=0, maximum=1000, step=1e-9)
+
+        assert mentions(refused(build(template, [entry])), "a step of at least 1/10000000")
+
+    @pytest.mark.parametrize("component", NUMBER_BINDERS)
+    def test_the_normal_smallest_step_of_a_tiny_range_is_fine(self, component: str) -> None:
+        template = BOUND[component][0]
+
+        accepted(build(template, [number_entry("float", minimum=0, maximum=2e-303, step=2.3e-308)]))
+
+    def test_a_float_without_a_step_has_no_step_to_check(self) -> None:
+        accepted(
+            build({"kind": "slider", "bind": "x"}, [number_entry("float", minimum=0, maximum=1)])
+        )
+
+    def test_the_rules_apply_where_the_entry_is_bound_not_where_it_is_declared(self) -> None:
+        odd = number_entry("float", minimum=5, maximum=5, default=5)
+
+        accepted(build(state=[odd]))  # nothing binds it to a widget with a range
+        accepted(build({"kind": "label", "bind": "s"}, [odd, {**TARGETS["string"], "key": "s"}]))
+
+
 class TestTextView:
     def test_an_editable_view_writes_so_it_cannot_bind_computed_state(self) -> None:
         entry: Json = {**TARGETS["string"], "computed": lit_str("s")}
@@ -443,6 +603,8 @@ class TestEventHandlers:
         if component in BOUND:
             template, kinds, _, _ = BOUND[component]
             state = [TARGETS[next(iter(kinds))]]
+            if component == "text_view":
+                template = {**template, "editable": True}  # a read-only view has no edits
         else:
             template, state = UNBOUND[component], []
 

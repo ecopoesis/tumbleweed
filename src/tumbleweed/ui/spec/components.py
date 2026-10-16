@@ -49,7 +49,9 @@ type Component = Annotated[
     Field(discriminator="kind"),
 ]
 type Children = Annotated[
-    tuple[Component, ...], Field(max_length=MAX_CONTAINER_CHILDREN), BeforeValidator(as_tuple)
+    tuple[Component, ...],
+    Field(max_length=MAX_CONTAINER_CHILDREN, fail_fast=True),
+    BeforeValidator(as_tuple),
 ]
 type Spacing = Annotated[int, Field(ge=0, le=MAX_SPACING)]
 
@@ -93,7 +95,7 @@ class Tabs(SpecModel):
     kind: Literal["tabs"]
     pages: Annotated[
         tuple[TabPage, ...],
-        Field(min_length=1, max_length=MAX_CONTAINER_CHILDREN),
+        Field(min_length=1, max_length=MAX_CONTAINER_CHILDREN, fail_fast=True),
         BeforeValidator(as_tuple),
     ]
 

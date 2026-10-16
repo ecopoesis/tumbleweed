@@ -20,8 +20,10 @@
 A number is an `int` or a `float`. There is no implicit conversion between a number and a
 string, a bool and a number, or a float and an int (`round` is how a float becomes an int). An
 entry of kind `image`, `file`, `table`, `list` or `json` cannot be read by an expression.
-Comparing an enum entry with a string literal also checks that the literal is one of its options,
-because `eq(ref(size), "Large")` with no such option would be silently always false.
+Comparing an enum entry with a string literal also checks that the literal is one of its options
+(a literal reached through the branches of an `if` counts too), and comparing two enum entries
+needs an option in common, because `eq(ref(size), "Large")` with no such option, or `eq` of two
+enums with no option in common, would be silently always false (and `ne` always true).
 
 Computed state is evaluated in dependency order; `computed_order` finds that order, and refuses
 a cycle (including an entry that refers to itself).
@@ -63,10 +65,15 @@ from tumbleweed.ui.spec.names import StateKey
 from tumbleweed.ui.spec.state import (
     BoolState,
     EnumState,
+    FileState,
     FloatState,
+    ImageState,
     IntState,
+    JsonState,
+    ListState,
     StateDecl,
     StringState,
+    TableState,
 )
 
 type ExprType = Literal["bool", "int", "float", "string"]
@@ -85,8 +92,26 @@ def expr_type_of(decl: StateDecl) -> ExprType | None:
             return "float"
         case StringState() | EnumState():
             return "string"
-        case _:
+        case ImageState() | FileState() | TableState() | ListState() | JsonState():
             return None
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def string_literals(expr: Expr) -> list[str]:
+    """The string literals `expr` can evaluate to directly: itself, or through `if` branches.
+
+    Anything else (a reference, a `concat`) is not known until it runs and contributes nothing.
+    """
+    found: list[str] = []
+    stack: list[Expr] = [expr]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, StrLit):
+            found.append(node.value)
+        elif isinstance(node, If):
+            stack.extend((node.otherwise, node.then))
+    return found
 
 
 def _arithmetic_type(types: Sequence[ExprType]) -> ExprType:
@@ -121,14 +146,28 @@ class _Checker:
             raise InvalidValueError(f"{name}: expected {wanted}, got {left_type} and {right_type}")
         return left_type
 
-    def _enum_literal(self, left: Expr, right: Expr, name: str) -> None:
-        for reference, literal in ((left, right), (right, left)):
-            if isinstance(reference, Ref) and isinstance(literal, StrLit):
-                decl = self._decls[reference.key]  # the operands were visited, so it exists
-                if isinstance(decl, EnumState) and literal.value not in decl.options:
-                    raise InvalidValueError(
-                        f"{name}: {excerpt(literal.value)} is not an option of {reference.key}"
-                    )
+    def _enum_comparison(self, left: Expr, right: Expr, name: str) -> None:
+        """An enum entry compared with literals it cannot have, or with another enum."""
+        if isinstance(left, Ref) and isinstance(right, Ref):
+            first, second = self._decls[left.key], self._decls[right.key]
+            if (
+                isinstance(first, EnumState)
+                and isinstance(second, EnumState)
+                and set(first.options).isdisjoint(second.options)
+            ):
+                raise InvalidValueError(
+                    f"{name}: {left.key} and {right.key} are enums with no option in common"
+                )
+        for reference, other in ((left, right), (right, left)):
+            if not isinstance(reference, Ref):
+                continue
+            decl = self._decls[reference.key]  # the operands were visited, so it exists
+            if isinstance(decl, EnumState):
+                for literal in string_literals(other):
+                    if literal not in decl.options:
+                        raise InvalidValueError(
+                            f"{name}: {excerpt(literal)} is not an option of {reference.key}"
+                        )
 
     def visit(self, expr: Expr, path: str) -> ExprType:
         # `path` names the node for the error message: `add.left`, `if.then`, `and[1]`.
@@ -165,7 +204,7 @@ class _Checker:
                 return "int"
             case Eq() | Ne():
                 self._pair(expr.left, expr.right, expr.kind, numbers_only=False)
-                self._enum_literal(expr.left, expr.right, expr.kind)
+                self._enum_comparison(expr.left, expr.right, expr.kind)
                 return "bool"
             case Lt() | Le() | Gt() | Ge():
                 self._pair(expr.left, expr.right, expr.kind, numbers_only=True)

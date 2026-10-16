@@ -16,7 +16,19 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC_DIR = ROOT / "src" / "tumbleweed" / "ui" / "spec"
-BANNED_CALLS = {"eval", "exec", "compile", "__import__", "breakpoint"}
+BANNED_CALLS = {
+    "eval",
+    "exec",
+    "compile",
+    "__import__",
+    "breakpoint",
+    # Ways to reach an attribute or a method by a name that is data, or to format with a template:
+    "getattr",
+    "format",
+    "format_map",
+    "attrgetter",
+    "methodcaller",
+}
 BANNED_MODULES = {
     "ast",  # literal_eval parses text, and so does everything else in it
     "builtins",
@@ -25,6 +37,7 @@ BANNED_MODULES = {
     "ctypes",
     "importlib",
     "marshal",
+    "operator",  # attrgetter and methodcaller
     "os",
     "pickle",
     "re",  # a tokenizer for expression text would start here
@@ -75,6 +88,14 @@ def violations(source: str) -> list[str]:
         "import re",
         "from string import Template",
         "import subprocess as sp",
+        "getattr(node, name)",
+        "'{} {}'.format(a, b)",
+        "template.format_map(values)",
+        "from operator import attrgetter",
+        "import operator",
+        "operator.attrgetter('x')",
+        "operator.methodcaller('upper')",
+        "format(value, spec)",
     ],
 )
 def test_the_scan_finds_each_route(snippet: str) -> None:
@@ -88,6 +109,9 @@ def test_the_scan_finds_each_route(snippet: str) -> None:
         "x = evaluate(1)\ny = compiled\n",
         "from tumbleweed.core.types import JsonValue\n",
         "text.encode('utf-8')\n",
+        "x = f'{value!r} and {other}'\n",
+        "formatted = 1\nreformat(2)\n",
+        "self.attribute\nsetattribute\n",
     ],
 )
 def test_the_scan_leaves_ordinary_code_alone(snippet: str) -> None:

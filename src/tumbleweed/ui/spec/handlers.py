@@ -53,7 +53,7 @@ class SetHandler(SpecModel):
     name: HandlerName
     assignments: Annotated[
         tuple[SetAssignment, ...],
-        Field(min_length=1, max_length=MAX_HANDLER_ITEMS),
+        Field(min_length=1, max_length=MAX_HANDLER_ITEMS, fail_fast=True),
         BeforeValidator(as_tuple),
     ]
 
@@ -72,11 +72,13 @@ class SandboxHandler(SpecModel):
     module: ModuleName
     function: FunctionName
     inputs: Annotated[
-        tuple[StateKey, ...], Field(max_length=MAX_HANDLER_ITEMS), BeforeValidator(as_tuple)
+        tuple[StateKey, ...],
+        Field(max_length=MAX_HANDLER_ITEMS, fail_fast=True),
+        BeforeValidator(as_tuple),
     ] = ()
     outputs: Annotated[
         tuple[StateKey, ...],
-        Field(min_length=1, max_length=MAX_HANDLER_ITEMS),
+        Field(min_length=1, max_length=MAX_HANDLER_ITEMS, fail_fast=True),
         BeforeValidator(as_tuple),
     ]
     debounce_ms: Annotated[int, Field(ge=0, le=MAX_DEBOUNCE_MS)] = 0

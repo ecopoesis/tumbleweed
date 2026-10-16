@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from tests.ui.spec.support import (
     Json,
@@ -26,17 +26,22 @@ from tumbleweed.core.types import JsonValue
 from tumbleweed.ui.spec import limits
 from tumbleweed.ui.spec.errors import SpecError
 from tumbleweed.ui.spec.limits import (
+    MAX_CELL_LENGTH,
     MAX_COMPONENT_DEPTH,
     MAX_CONTAINER_CHILDREN,
     MAX_EXPR_NODES,
+    MAX_LIST_ITEMS,
     MAX_SAFE_INT,
+    MAX_STRING_LENGTH,
     MAX_TABLE_COLUMNS,
     MAX_TABLE_ROWS,
     all_limits,
 )
+from tumbleweed.ui.spec.names import StateKey
 from tumbleweed.ui.spec.parse import parse_ui_spec, validate_ui_spec
+from tumbleweed.ui.spec.spec import UiSpec
 from tumbleweed.ui.spec.state import check_value
-from tumbleweed.ui.spec.values import Table
+from tumbleweed.ui.spec.values import JsonData, Table
 
 REFUSED = (ValidationError, SpecError, InvalidValueError)
 
@@ -138,6 +143,92 @@ def check_decl_value(kind: str, raw: object, **fields: JsonValue) -> None:
 
     decl = TypeAdapter(StateDecl).validate_python({"kind": kind, "key": "x", **fields})
     check_value(decl, raw)
+
+
+WIDE = "\U0001f600"  # four bytes in UTF-8
+
+
+def ascii_pieces(total: int, piece: int) -> list[str]:
+    """Strings of at most `piece` characters holding exactly `total` bytes (ASCII: one each)."""
+    full, rest = divmod(total, piece)
+    return ["x" * piece] * full + (["x" * rest] if rest else [])
+
+
+def wide_pieces(total: int, piece: int) -> list[str]:
+    """Strings of at most `piece` characters holding exactly `total` bytes, mostly 4 bytes each."""
+    text = WIDE * (total // 4) + "x" * (total % 4)
+    return [text[i : i + piece] for i in range(0, len(text), piece)]
+
+
+def string_entries(count: int, **fields: JsonValue) -> list[Json]:
+    return [
+        {"kind": "string", "key": f"s{i}", "default": "", "max_length": 65_536, **fields}
+        for i in range(count)
+    ]
+
+
+def string_spec(defaults: list[str]) -> Json:
+    """A spec whose string entries hold these defaults (built for `UiSpec.model_validate`)."""
+    return build(
+        state=[
+            {"kind": "string", "key": f"s{i}", "default": text, "max_length": 65_536}
+            for i, text in enumerate(defaults)
+        ]
+    )
+
+
+def patch_spec(entries: int = 70) -> UiSpec:
+    return validate_ui_spec(build(state=string_entries(entries)))
+
+
+def table_of_text(cells: list[str]) -> Json:
+    return {
+        "columns": [{"name": "c", "type": "string"}],
+        "rows": [[cell] for cell in cells],
+    }
+
+
+def node_sizes(total: int) -> list[int]:
+    """Sizes, each at most `MAX_EXPR_NODES`, of expressions that add up to `total` nodes."""
+    full, rest = divmod(total, MAX_EXPR_NODES)
+    return [MAX_EXPR_NODES] * full + ([rest] if rest else [])
+
+
+def set_handler_of(sizes: list[int], first_target: int = 0) -> Json:
+    assignments: list[JsonValue] = [
+        {"target": f"s{first_target + i}", "value": tree(size)} for i, size in enumerate(sizes)
+    ]
+    return {"kind": "set", "name": "h", "assignments": assignments}
+
+
+def nodes_in_set_handler(total: int) -> Json:
+    sizes = node_sizes(total)
+    return build(state=ints(len(sizes)), handlers=[set_handler_of(sizes)])
+
+
+def nodes_in_computed_and_set(total: int) -> Json:
+    sizes = node_sizes(total)
+    computed = sizes[: len(sizes) // 2]
+    assigned = sizes[len(sizes) // 2 :]
+    state = [computed_int(f"c{i}", tree(size)) for i, size in enumerate(computed)]
+    state += ints(len(assigned))
+    return build(state=state, handlers=[set_handler_of(assigned)])
+
+
+def number_slider(kind: str, **fields: JsonValue) -> Json:
+    entry: Json = {"kind": kind, "key": "x", "default": 0 if kind == "int" else 0.0, **fields}
+    return build({"kind": "slider", "bind": "x"}, [entry])
+
+
+def check_patch(sizes: list[int], current_sizes: list[int] | None = None) -> None:
+    spec = patch_spec()
+    patch: dict[str, object] = {f"s{i}": "x" * size for i, size in enumerate(sizes)}
+    current = None
+    if current_sizes is not None:
+        first = 40  # the patch writes s40.. and the state holds s0.. already
+        patch = {f"s{first + i}": "x" * size for i, size in enumerate(sizes)}
+        current = {StateKey(f"s{i}"): "x" * size for i, size in enumerate(current_sizes)}
+    spec.validate_patch(patch, current=current)
 
 
 @dataclass(frozen=True)
@@ -422,6 +513,80 @@ BOUNDARIES = [
         "negative int default",
         lambda n: valid(one_state({"kind": "int", "key": "x", "default": -n})),
     ),
+    c(
+        "MAX_TOTAL_EXPR_NODES",
+        "nodes in the assignments of a set handler",
+        lambda n: valid(nodes_in_set_handler(n)),
+    ),
+    c(
+        "MAX_TOTAL_EXPR_NODES",
+        "nodes in computed entries and set assignments together",
+        lambda n: valid(nodes_in_computed_and_set(n)),
+    ),
+    c(
+        "MAX_VALUE_TEXT_BYTES",
+        "text in a json value",
+        lambda n: check_decl_value("json", ascii_pieces(n, MAX_STRING_LENGTH)),
+    ),
+    c(
+        "MAX_VALUE_TEXT_BYTES",
+        "text in a json value, in four-byte characters",
+        lambda n: check_decl_value("json", wide_pieces(n, MAX_STRING_LENGTH)),
+    ),
+    c(
+        "MAX_VALUE_TEXT_BYTES",
+        "text in a json default",
+        lambda n: TypeAdapter(JsonData).validate_python(ascii_pieces(n, MAX_STRING_LENGTH)),
+    ),
+    c(
+        "MAX_VALUE_TEXT_BYTES",
+        "text in the cells of a table (and the column name)",
+        lambda n: Table.model_validate(table_of_text(ascii_pieces(n - 1, MAX_CELL_LENGTH))),
+    ),
+    c(
+        "MAX_VALUE_TEXT_BYTES",
+        "text in the cells of a table, in four-byte characters",
+        lambda n: Table.model_validate(table_of_text(wide_pieces(n - 1, MAX_CELL_LENGTH))),
+    ),
+    c(
+        "MAX_VALUE_TEXT_BYTES",
+        "text in the items of a list",
+        lambda n: check_decl_value(
+            "list", wide_pieces(n, MAX_CELL_LENGTH), item_type="string", max_items=MAX_LIST_ITEMS
+        ),
+    ),
+    c(
+        "MAX_PATCH_TEXT_BYTES",
+        "text in the values of a patch",
+        lambda n: check_patch([len(piece) for piece in ascii_pieces(n, 65_536)]),
+    ),
+    c(
+        "MAX_STATE_TEXT_BYTES",
+        "text in the defaults of a spec",
+        lambda n: UiSpec.model_validate(string_spec(ascii_pieces(n, 65_536))),
+    ),
+    c(
+        "MAX_STATE_TEXT_BYTES",
+        "text in the state after a patch",
+        lambda n: check_patch(
+            [len(piece) for piece in ascii_pieces(n - 40 * 65_536, 65_536)], [65_536] * 40
+        ),
+    ),
+    c(
+        "MAX_WIDGET_STEPS",
+        "steps of a float slider",
+        lambda n: valid(number_slider("float", minimum=0, maximum=n, step=1)),
+    ),
+    c(
+        "MAX_SAFE_INT",
+        "width of the range of an int slider",
+        lambda n: valid(number_slider("int", minimum=-(n // 2), maximum=n - n // 2)),
+    ),
+    c(
+        "MAX_SAFE_INT",
+        "width of the range of a float slider",
+        lambda n: valid(number_slider("float", minimum=-(n // 2), maximum=n - n // 2)),
+    ),
 ]
 
 
@@ -434,6 +599,25 @@ def test_every_limit_has_a_boundary_test() -> None:
 @pytest.mark.parametrize("count", [1, 2, 3, 64, 65, 66, 100, 511, 512, 513, 2000])
 def test_the_component_builder_builds_exactly_that_many(count: int) -> None:
     assert count_components(components(count)) == count
+
+
+def test_the_budgets_nest() -> None:
+    # A value fits in a patch, a patch in the state: and the longest string, in four-byte
+    # characters, fits in a value, so `string` needs no budget of its own.
+    assert limits.MAX_STRING_LENGTH * 4 <= limits.MAX_VALUE_TEXT_BYTES
+    assert limits.MAX_VALUE_TEXT_BYTES <= limits.MAX_PATCH_TEXT_BYTES
+    assert limits.MAX_PATCH_TEXT_BYTES <= limits.MAX_STATE_TEXT_BYTES
+
+
+def test_a_patch_replaces_the_text_it_overwrites() -> None:
+    # The state after a patch holds the patch's text and the text of what the patch leaves alone:
+    # an entry that is overwritten is not counted twice (here the state is at its budget).
+    spec = patch_spec()
+    full = {StateKey(f"s{i}"): "x" * 65_536 for i in range(64)}  # exactly MAX_STATE_TEXT_BYTES
+    assert sum(len(text) for text in full.values()) == limits.MAX_STATE_TEXT_BYTES
+    spec.validate_patch({"s0": "y" * 65_536}, current=full)
+    with pytest.raises(SpecError, match="the state would hold"):
+        spec.validate_patch({"s64": "y"}, current=full)
 
 
 def test_the_limits_are_the_documented_ones() -> None:

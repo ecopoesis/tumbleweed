@@ -351,7 +351,7 @@ MUTATIONS = [
         "tip_calculator",
         "a string where an expression goes",
         set_computed("total", "bill + tip_amount"),
-        "valid dictionary or object",
+        "Input should be an object",
     ),
     Mutation(
         "photo_adjuster",

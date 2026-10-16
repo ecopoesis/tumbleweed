@@ -37,6 +37,8 @@ DECLARATIONS: dict[str, Json] = {
     "s": {"kind": "string", "key": "s", "default": "x"},
     "b": {"kind": "bool", "key": "b", "default": True},
     "e": {"kind": "enum", "key": "e", "options": ["red", "green"], "default": "red"},
+    "e2": {"kind": "enum", "key": "e2", "options": ["x", "y"], "default": "x"},
+    "e3": {"kind": "enum", "key": "e3", "options": ["green", "blue"], "default": "blue"},
     "table": {"kind": "table", "key": "table"},
     "list": {"kind": "list", "key": "list", "item_type": "int"},
     "image": {"kind": "image", "key": "image"},
@@ -48,6 +50,18 @@ DECLS: dict[StateKey, StateDecl] = {
 }
 N, F, S, B, E = ref("n"), ref("f"), ref("s"), ref("b"), ref("e")
 I1, F1, T, TRUE = lit_int(1), lit_float(1.5), lit_str("t"), lit_bool(value=True)
+
+
+def choose(then: Json, otherwise: Json) -> Json:
+    return {"kind": "if", "condition": B, "then": then, "otherwise": otherwise}
+
+
+# Expressions that can only produce string literals (and one that cannot be known).
+IF_OPTIONS = choose(lit_str("red"), lit_str("green"))
+NESTED_IF_OPTIONS = choose(choose(lit_str("red"), lit_str("green")), lit_str("red"))
+IF_UNKNOWN = choose(S, lit_str("red"))
+IF_BAD = choose(lit_str("red"), lit_str("blue"))
+NESTED_IF_BAD = choose(choose(lit_str("red"), lit_str("zzz")), lit_str("green"))
 
 
 def type_of(data: Json) -> ExprType:
@@ -97,6 +111,13 @@ OK: list[tuple[str, Json, ExprType]] = [
     ("ne strings", binary("ne", S, S), "bool"),
     ("ne bools", binary("ne", B, B), "bool"),
     ("eq enum with an option", binary("eq", E, lit_str("green")), "bool"),
+    ("eq an enum with itself", binary("eq", E, E), "bool"),
+    ("eq enums that share an option", binary("eq", E, ref("e3")), "bool"),
+    ("ne enums that share an option", binary("ne", ref("e3"), E), "bool"),
+    ("eq enum with an if of its options", binary("eq", E, IF_OPTIONS), "bool"),
+    ("eq an if of its options with the enum", binary("eq", IF_OPTIONS, E), "bool"),
+    ("eq enum with a nested if of its options", binary("eq", E, NESTED_IF_OPTIONS), "bool"),
+    ("eq enum with an if that has a reference branch", binary("eq", E, IF_UNKNOWN), "bool"),
     ("ne an option with the enum", binary("ne", lit_str("red"), E), "bool"),
     ("lt", binary("lt", N, F), "bool"),
     ("le", binary("le", N, I1), "bool"),
@@ -152,6 +173,19 @@ BAD: list[tuple[str, Json, str]] = [
     ("a bad leaf deep inside", node("round", operand=binary("add", N, ref("nope"))), "nope"),
     ("enum compared with a non-option", binary("eq", E, lit_str("blue")), "'blue' is not an opt"),
     ("a non-option compared with the enum", binary("ne", lit_str("Red"), E), "'Red' is not an opt"),
+    ("an if with a non-option branch", binary("eq", E, IF_BAD), "'blue' is not an option of e"),
+    ("an if with a non-option, reversed", binary("ne", IF_BAD, E), "'blue' is not an option of e"),
+    (
+        "a nested if with a non-option",
+        binary("eq", E, NESTED_IF_BAD),
+        "'zzz' is not an option of e",
+    ),
+    ("enums with no option in common", binary("eq", E, ref("e2")), "e and e2 are enums with no"),
+    (
+        "enums with no option in common, ne",
+        binary("ne", ref("e2"), E),
+        "e2 and e are enums with no",
+    ),
 ]
 
 
@@ -207,6 +241,8 @@ def test_every_state_kind_has_an_expression_type_or_none() -> None:
         "s": "string",
         "b": "bool",
         "e": "string",
+        "e2": "string",
+        "e3": "string",
         "table": None,
         "list": None,
         "image": None,

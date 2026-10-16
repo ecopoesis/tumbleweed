@@ -16,19 +16,22 @@ models; what only the whole can check is checked here, when the spec is built, s
 - every `on_click`, `on_change` and `on_activate` names a declared handler;
 - `set` targets and `sandbox` outputs are declared, non-computed entries; `sandbox` inputs are
   declared entries;
-- the component tree and the expressions are within their limits.
+- sliders, spin buttons and progress bars have a sane range and step (`_range_problem`);
+- the component tree and the expressions are within their limits, and the text in the defaults of
+  all the state is within `MAX_STATE_TEXT_BYTES`.
 
 The problems found are all reported (up to `MAX_REPORTED_PROBLEMS`), one per line, each naming
 the component (`root.children[2] (slider)`), state entry or handler it is about.
 """
 
+import sys
 from collections.abc import Collection, Iterator, Mapping
 from typing import Annotated, Final, Literal, Self, assert_never, final
 
 from pydantic import BeforeValidator, Field, model_validator
 
 from tumbleweed.core.errors import InvalidValueError, excerpt
-from tumbleweed.ui.spec.check import ExprType, check_expr, computed_order
+from tumbleweed.ui.spec.check import ExprType, check_expr, computed_order, string_literals
 from tumbleweed.ui.spec.components import (
     Box,
     Button,
@@ -51,26 +54,36 @@ from tumbleweed.ui.spec.components import (
     TextView,
 )
 from tumbleweed.ui.spec.errors import MAX_REPORTED_PROBLEMS, SpecError
-from tumbleweed.ui.spec.expr import Expr, StrLit, measure
+from tumbleweed.ui.spec.expr import Expr, measure
 from tumbleweed.ui.spec.handlers import AgentHandler, Handler, SandboxHandler, SetHandler
 from tumbleweed.ui.spec.limits import (
     MAX_COMPONENT_DEPTH,
     MAX_COMPONENTS,
     MAX_HANDLERS,
+    MAX_PATCH_TEXT_BYTES,
+    MAX_SAFE_INT,
     MAX_STATE_ENTRIES,
+    MAX_STATE_TEXT_BYTES,
     MAX_TOTAL_EXPR_NODES,
+    MAX_WIDGET_STEPS,
 )
 from tumbleweed.ui.spec.model import SpecModel
 from tumbleweed.ui.spec.names import HandlerName, StateKey
 from tumbleweed.ui.spec.state import (
     BoolState,
     EnumState,
+    FileState,
     FloatState,
+    ImageState,
     IntState,
+    JsonState,
+    ListState,
     StateDecl,
     StateValue,
     StringState,
+    TableState,
     check_value,
+    value_text_bytes,
 )
 from tumbleweed.ui.spec.text import Title, as_tuple
 
@@ -94,8 +107,28 @@ def _accepts(decl: StateDecl, value_type: ExprType) -> bool:
             return value_type in {"int", "float"}
         case StringState() | EnumState():
             return value_type == "string"
-        case _:
+        case ImageState() | FileState() | TableState() | ListState() | JsonState():
             return False
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def _budget_problems(
+    patch: Mapping[StateKey, StateValue], current: Mapping[StateKey, StateValue] | None
+) -> list[str]:
+    """The patch's text against `MAX_PATCH_TEXT_BYTES`; the state after it against the state's."""
+    size = sum(value_text_bytes(value) for value in patch.values())
+    if size > MAX_PATCH_TEXT_BYTES:
+        return [f"the patch holds {size} bytes of text, the limit is {MAX_PATCH_TEXT_BYTES}"]
+    if current is not None:
+        total = size + sum(
+            value_text_bytes(value) for key, value in current.items() if key not in patch
+        )
+        if total > MAX_STATE_TEXT_BYTES:
+            return [
+                f"the state would hold {total} bytes of text, the limit is {MAX_STATE_TEXT_BYTES}"
+            ]
+    return []
 
 
 @final
@@ -137,8 +170,25 @@ def _walk(root: Component) -> Iterator[tuple[Component, str, int]]:
                 ]
             case Expander():
                 children = [(component.child, f"{path}.child")]
-            case _:
+            case (
+                Label()
+                | Heading()
+                | Button()
+                | Entry()
+                | Switch()
+                | Check()
+                | Slider()
+                | Spin()
+                | Dropdown()
+                | Progress()
+                | Separator()
+                | Image()
+                | TableView()
+                | TextView()
+            ):
                 pass
+            case _ as unreachable:
+                assert_never(unreachable)
         stack.extend((c, p, depth + 1) for c, p in reversed(children))
 
 
@@ -149,11 +199,15 @@ class UiSpec(SpecModel):
     version: Literal["tumbleweed.ui/1"]
     title: Title
     state: Annotated[
-        tuple[StateDecl, ...], Field(max_length=MAX_STATE_ENTRIES), BeforeValidator(as_tuple)
+        tuple[StateDecl, ...],
+        Field(max_length=MAX_STATE_ENTRIES, fail_fast=True),
+        BeforeValidator(as_tuple),
     ] = ()
     root: Component
     handlers: Annotated[
-        tuple[Handler, ...], Field(max_length=MAX_HANDLERS), BeforeValidator(as_tuple)
+        tuple[Handler, ...],
+        Field(max_length=MAX_HANDLERS, fail_fast=True),
+        BeforeValidator(as_tuple),
     ] = ()
 
     def declarations(self) -> dict[StateKey, StateDecl]:
@@ -169,14 +223,21 @@ class UiSpec(SpecModel):
         return computed_order(self.state)
 
     def validate_patch(
-        self, patch: Mapping[str, object], *, only: Collection[StateKey] | None = None
+        self,
+        patch: Mapping[str, object],
+        *,
+        only: Collection[StateKey] | None = None,
+        current: Mapping[StateKey, StateValue] | None = None,
     ) -> dict[StateKey, StateValue]:
         """Check a patch of state values (from `patch_state` or a sandbox) against the spec.
 
         Every key must be a declared, non-computed entry (and in `only`, when given: a sandbox
-        handler's declared outputs), and every value must pass `check_value` for its entry. All
-        or nothing: if anything is wrong, `SpecError` lists the problems and no value is
-        returned, so a caller never applies half a patch.
+        handler's declared outputs), and every value must pass `check_value` for its entry. The
+        text in the patch is at most `MAX_PATCH_TEXT_BYTES` bytes, and, when `current` gives the
+        values the state holds now, the state after the patch (these values, with the patch's
+        replacing theirs) at most `MAX_STATE_TEXT_BYTES`: a tool cannot grow its state without
+        limit by patching it again and again. All or nothing: if anything is wrong, `SpecError`
+        lists the problems and no value is returned, so a caller never applies half a patch.
         """
         declarations = self.declarations()
         allowed = None if only is None else set(only)
@@ -202,6 +263,8 @@ class UiSpec(SpecModel):
                     checked[key] = check_value(decl, raw_value)
                 except InvalidValueError as error:
                     problems.append(str(error))
+        if not problems:
+            problems.extend(_budget_problems(checked, current))
         if problems:
             raise SpecError(problems)
         return checked
@@ -219,6 +282,13 @@ class UiSpec(SpecModel):
             if handler.name in handler_names:
                 problems.add(f"handler {handler.name} is declared twice")
             handler_names.setdefault(handler.name, handler)
+
+        text = sum(value_text_bytes(decl.default) for decl in self.state)
+        if text > MAX_STATE_TEXT_BYTES:
+            problems.add(
+                f"the defaults of the state hold {text} bytes of text, the limit is "
+                f"{MAX_STATE_TEXT_BYTES}"
+            )
 
         nodes = 0
         for decl in self.state:
@@ -286,14 +356,14 @@ class UiSpec(SpecModel):
                             f"{where}: an entry of kind {target.kind} cannot be assigned an "
                             f"expression of type {value_type}{hint}"
                         )
-                    elif (
-                        isinstance(target, EnumState)
-                        and isinstance(assignment.value, StrLit)
-                        and assignment.value.value not in target.options
-                    ):
-                        problems.add(
-                            f"{where}: {excerpt(assignment.value.value)} is not one of its options"
-                        )
+                    elif isinstance(target, EnumState):
+                        # A literal the expression can produce, directly or through `if`.
+                        for literal in string_literals(assignment.value):
+                            if literal not in target.options:
+                                problems.add(
+                                    f"{where}: {excerpt(literal)} is not one of its options"
+                                )
+                                break
             case SandboxHandler():
                 for key in handler.inputs:
                     if key not in decls:
@@ -333,6 +403,32 @@ class UiSpec(SpecModel):
             )
 
 
+def _range_problem(decl: IntState | FloatState) -> str | None:
+    """Why `decl` cannot be the range of a slider, spin button or progress bar, or None.
+
+    The widget needs both bounds, finite and within +-`MAX_SAFE_INT`, with `minimum` below
+    `maximum` (a zero-width range has no positions, and a progress bar divides by it) and a range
+    at most `MAX_SAFE_INT` wide. A `float` entry's `step` must be a normal float, and the range
+    must hold at most `MAX_WIDGET_STEPS` of it: a step that is subnormal, or tiny beside the
+    range, makes a widget of billions of positions and arithmetic that underflows.
+    """
+    minimum, maximum = decl.minimum, decl.maximum
+    if minimum is None or maximum is None:
+        return "needs both a minimum and a maximum"
+    if abs(minimum) > MAX_SAFE_INT or abs(maximum) > MAX_SAFE_INT:
+        return f"needs bounds within +-{MAX_SAFE_INT}"
+    if not minimum < maximum:
+        return "needs a minimum below its maximum"
+    if maximum - minimum > MAX_SAFE_INT:
+        return f"needs a range at most {MAX_SAFE_INT} wide"
+    if isinstance(decl, FloatState) and decl.step is not None:
+        if decl.step < sys.float_info.min:
+            return "needs a step that is not subnormal"
+        if (maximum - minimum) / decl.step > MAX_WIDGET_STEPS:
+            return f"needs a step of at least 1/{MAX_WIDGET_STEPS} of its range"
+    return None
+
+
 def _bind(
     where: str,
     key: StateKey,
@@ -354,12 +450,10 @@ def _bind(
         return
     if writes and _computed_expr(decl) is not None:
         problems.add(f"{where}: binds {key} two-way, but it is computed and cannot be written")
-    if bounded and not (
-        isinstance(decl, IntState | FloatState)
-        and decl.minimum is not None
-        and decl.maximum is not None
-    ):
-        problems.add(f"{where}: {key} needs both a minimum and a maximum")
+    if bounded and isinstance(decl, IntState | FloatState):
+        problem = _range_problem(decl)
+        if problem is not None:
+            problems.add(f"{where}: {key} {problem}")
 
 
 def _handler(
@@ -417,5 +511,7 @@ def _check_component(
         case TextView():
             bind(component.bind, "string", writes=component.editable)
             handler(component.on_change)
+            if component.on_change is not None and not component.editable:
+                problems.add(f"{where}: on_change needs editable: a read-only view has no edits")
         case _ as unreachable:
             assert_never(unreachable)

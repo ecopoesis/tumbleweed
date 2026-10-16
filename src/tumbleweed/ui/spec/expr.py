@@ -60,7 +60,9 @@ type Expr = Annotated[
     Field(discriminator="kind"),
 ]
 type Args = Annotated[
-    tuple[Expr, ...], Field(min_length=2, max_length=MAX_EXPR_ARGS), BeforeValidator(as_tuple)
+    tuple[Expr, ...],
+    Field(min_length=2, max_length=MAX_EXPR_ARGS, fail_fast=True),
+    BeforeValidator(as_tuple),
 ]
 
 
