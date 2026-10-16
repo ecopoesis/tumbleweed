@@ -57,7 +57,7 @@ def run_mypy(path: Path) -> list[Diagnostic]:
         capture_output=True,
         text=True,
         check=False,
-        timeout=300,
+        timeout=100,
     )
     # 0: clean, 1: type errors found. Anything else is mypy failing, not the code under test.
     assert completed.returncode in {0, 1}, completed.stderr or completed.stdout

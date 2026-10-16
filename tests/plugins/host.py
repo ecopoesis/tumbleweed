@@ -4,11 +4,19 @@ Two halves of one rule from CLAUDE.md. A test that needs something the host lack
 explicit reason, never passes vacuously. And under `TUMBLEWEED_CI=1` (set in CI) a skipped `gtk`
 or `linux` test is a failure, so the sandbox and GTK tests can never pass by skipping. An xfail
 is no better than a skip (an imperative `pytest.xfail()` or a failing `xfail` test would hide
-the same thing), so under CI it fails too, unless the test carries `xfail_allowed_in_ci`.
+the same thing), so under CI it fails too, unless the test carries
+`xfail_allowed_in_ci(reason="... #<issue> ...")`.
 
-Exempt from that guard, whatever else a test is marked: `btrfs` (loopback btrfs needs privileges
-CI containers lack; the S27 VM test covers it) and `live`. `live` tests talk to real services and
-run only when `TUMBLEWEED_LIVE=1` is set explicitly, in every environment; CI never sets it.
+The guard exempts exactly two skips, and only when raised by the gate that owns them, not
+whatever else the test is marked with:
+
+- the `btrfs` gate (`btrfs_unavailable_reason`): a loopback btrfs needs root, which CI
+  containers lack, and the S27 VM test covers the btrfs backend end to end;
+- the `live` gate: live tests talk to real services and run only with `TUMBLEWEED_LIVE=1`,
+  which is refused together with `TUMBLEWEED_CI=1`, so they never run in CI.
+
+A `linux` + `btrfs` test that skips for any other reason ("Landlock is not available") still
+fails the run in CI.
 
 Registered by `tests/conftest.py`, and by the pytester tests in `tests/plugins/` so that they
 exercise this very code.
@@ -16,16 +24,35 @@ exercise this very code.
 
 import functools
 import os
+import re
+import shutil
 import sys
 from collections.abc import Generator
 
 import pytest
+from _pytest.outcomes import Skipped
 
 CI_ENV_VAR = "TUMBLEWEED_CI"
 LIVE_ENV_VAR = "TUMBLEWEED_LIVE"
 GUARDED_MARKERS = frozenset({"gtk", "linux"})
-EXEMPT_MARKERS = frozenset({"btrfs", "live"})
 XFAIL_ALLOWED_MARKER = "xfail_allowed_in_ci"
+_ISSUE_REFERENCE = re.compile(r"#\d+")
+
+
+class GateSkip(Skipped):
+    """A skip raised by one of this plugin's gates, as opposed to by a test or a mark."""
+
+
+class BtrfsGateSkip(GateSkip):
+    """The `btrfs` gate: no loopback btrfs can be made here."""
+
+
+class LiveGateSkip(GateSkip):
+    """The `live` gate: live tests run only with TUMBLEWEED_LIVE=1."""
+
+
+# Marker -> the only skip that exempts a guarded test carrying that marker from the guard.
+EXEMPT_GATES: dict[str, type[GateSkip]] = {"btrfs": BtrfsGateSkip, "live": LiveGateSkip}
 
 _GUARD_ACTIVE = pytest.StashKey[bool]()
 _LIVE_ENABLED = pytest.StashKey[bool]()
@@ -43,6 +70,17 @@ def _read_flag(name: str) -> bool:
 
 def is_linux() -> bool:
     return sys.platform.startswith("linux")
+
+
+def btrfs_unavailable_reason() -> str | None:
+    """Why a loopback btrfs cannot be made here, or None if it can."""
+    if not is_linux():
+        return f"btrfs needs Linux; this host is {sys.platform}"
+    if shutil.which("mkfs.btrfs") is None:
+        return "mkfs.btrfs (btrfs-progs) is not installed"
+    if os.geteuid() != 0:
+        return "a loopback btrfs mount needs root (CAP_SYS_ADMIN); CI containers run unprivileged"
+    return None
 
 
 @functools.cache
@@ -74,6 +112,10 @@ def gtk_unavailable_reason() -> str | None:
 def pytest_configure(config: pytest.Config) -> None:
     config.stash[_GUARD_ACTIVE] = _read_flag(CI_ENV_VAR)
     config.stash[_LIVE_ENABLED] = _read_flag(LIVE_ENV_VAR)
+    if config.stash[_GUARD_ACTIVE] and config.stash[_LIVE_ENABLED]:
+        raise pytest.UsageError(
+            f"{LIVE_ENV_VAR}=1 cannot be combined with {CI_ENV_VAR}=1: live tests never run in CI"
+        )
 
 
 def pytest_report_header(config: pytest.Config) -> list[str]:
@@ -87,23 +129,40 @@ def pytest_report_header(config: pytest.Config) -> list[str]:
     return [f"tumbleweed: {CI_ENV_VAR} guard {guard}; live tests {live}"]
 
 
-def _host_skip_reason(item: pytest.Item) -> str | None:
+def _check_xfail_allowance(item: pytest.Item) -> None:
+    """Under the guard, `xfail_allowed_in_ci` must say which issue tracks the xfail."""
+    mark = item.get_closest_marker(XFAIL_ALLOWED_MARKER)
+    if mark is None:
+        return
+    reason = mark.kwargs.get("reason")
+    if not isinstance(reason, str) or _ISSUE_REFERENCE.search(reason) is None:
+        pytest.fail(
+            f"{XFAIL_ALLOWED_MARKER} needs a reason that references an issue, such as "
+            f'{XFAIL_ALLOWED_MARKER}(reason="tracked in #123"), got {reason!r}',
+            pytrace=False,
+        )
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    if item.config.stash[_GUARD_ACTIVE]:
+        _check_xfail_allowance(item)
+    if item.get_closest_marker("btrfs") is not None:
+        reason = btrfs_unavailable_reason()
+        if reason is not None:
+            raise BtrfsGateSkip(reason)
     if item.get_closest_marker("live") is not None and not item.config.stash[_LIVE_ENABLED]:
-        return f"live test: talks to real services, runs only with {LIVE_ENV_VAR}=1 (never in CI)"
+        raise LiveGateSkip(
+            f"live test: talks to real services, runs only with {LIVE_ENV_VAR}=1 (never in CI)"
+        )
     if item.get_closest_marker("linux") is not None and not is_linux():
-        return (
+        pytest.skip(
             "needs Linux kernel features (bwrap, Landlock, seccomp); "
             f"this host is {sys.platform}, use scripts/test-linux"
         )
     if item.get_closest_marker("gtk") is not None:
-        return gtk_unavailable_reason()
-    return None
-
-
-def pytest_runtest_setup(item: pytest.Item) -> None:
-    reason = _host_skip_reason(item)
-    if reason is not None:
-        pytest.skip(reason)
+        reason = gtk_unavailable_reason()
+        if reason is not None:
+            pytest.skip(reason)
 
 
 def _skip_reason(report: pytest.TestReport | pytest.CollectReport) -> str:
@@ -124,8 +183,11 @@ def pytest_runtest_makereport(
         return report
     marks = {mark.name for mark in item.iter_markers()}
     guarded = sorted(GUARDED_MARKERS & marks)
-    if not guarded or EXEMPT_MARKERS & marks:
+    if not guarded:
         return report
+    raised = call.excinfo.value if call.excinfo is not None else None
+    if any(marker in marks and isinstance(raised, gate) for marker, gate in EXEMPT_GATES.items()):
+        return report  # skipped by the btrfs or live gate itself, the two exempt skips
     xfailed = hasattr(report, "wasxfail")
     if xfailed and XFAIL_ALLOWED_MARKER in marks:
         return report

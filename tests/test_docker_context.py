@@ -177,6 +177,7 @@ def docker_daemon_available() -> bool:
     return probe.returncode == 0
 
 
+@pytest.mark.timeout(300)  # a Docker build, which has its own limit below
 def test_the_model_agrees_with_what_docker_really_sends(tmp_path: Path) -> None:
     """Build a scratch context holding every candidate file and see what Docker copies."""
     if not docker_daemon_available():
@@ -218,7 +219,7 @@ def test_the_model_agrees_with_what_docker_really_sends(tmp_path: Path) -> None:
         ],
         capture_output=True,
         check=True,
-        timeout=300,
+        timeout=200,
     )
 
     sent = {str(p.relative_to(exported)) for p in exported.rglob("*") if p.is_file()}

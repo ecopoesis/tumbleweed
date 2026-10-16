@@ -99,8 +99,8 @@ TUMBLEWEED_CI=1 scripts/test-linux          # as CI: a skipped or xfailed gtk/li
 |---|---|---|
 | `gtk` | a display | runs natively on a Mac with a desktop session, and under weston in the container |
 | `linux` | Linux kernel features | skips on macOS |
-| `btrfs` | a btrfs mount | exempt from the `TUMBLEWEED_CI` guard, also on a test that carries `linux` or `gtk` too; covered by the S27 VM test |
-| `live` | real external services | skipped unless `TUMBLEWEED_LIVE=1` (also exempt from the guard); CI never sets it |
-| `xfail_allowed_in_ci` | | lets a `gtk`/`linux` test xfail under `TUMBLEWEED_CI=1`, where an xfail fails the run like a skip does; use it only with a linked issue |
+| `btrfs` | a btrfs mount | the `btrfs` gate skips (no loopback btrfs: not Linux, no `mkfs.btrfs`, not root) and that skip alone is exempt from the `TUMBLEWEED_CI` guard, also on a test that carries `linux` or `gtk` too; any other skip of it fails the run; covered by the S27 VM test |
+| `live` | real external services | the `live` gate skips unless `TUMBLEWEED_LIVE=1`, and that skip alone is exempt from the guard; `TUMBLEWEED_LIVE=1` together with `TUMBLEWEED_CI=1` is an error, so they never run in CI |
+| `xfail_allowed_in_ci(reason=...)` | | lets a `gtk`/`linux` test xfail under `TUMBLEWEED_CI=1`, where an xfail fails the run like a skip does; the reason must reference an issue, such as `reason="tracked in #123"` |
 
 The first lines of a pytest run say whether the `TUMBLEWEED_CI` guard is active.

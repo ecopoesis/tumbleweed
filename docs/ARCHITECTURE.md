@@ -354,12 +354,15 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   backend with `GSK_RENDERER=cairo`.
 - **CI**: GitHub Actions on Linux runs the full suite in the same container image, after
   `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` on the runner. CI sets
-  `TUMBLEWEED_CI=1`, under which any skipped `gtk` or `linux` test fails the run, so the
-  sandbox tests can never pass by skipping. The only exemption is the `btrfs` marker
-  (loopback btrfs needs privileges CI containers lack); the btrfs backend is instead
-  exercised end to end in the S27 NixOS VM test. Landlock tests are required in CI (Ubuntu
-  kernel); they may skip on Docker Desktop kernels without Landlock. A macOS job runs the
-  platform-neutral subset.
+  `TUMBLEWEED_CI=1`, under which any skipped or xfailed `gtk` or `linux` test fails the run
+  (an xfail needs an explicit `xfail_allowed_in_ci(reason="#<issue>")`), so the sandbox tests
+  can never pass by skipping. The guard exempts only the skips raised by two gates, not
+  whatever else a test is marked with: the `btrfs` gate (a loopback btrfs needs root, which CI
+  containers lack; the btrfs backend is instead exercised end to end in the S27 NixOS VM
+  test) and the `live` gate (live tests never run in CI: `TUMBLEWEED_LIVE` is refused when
+  `TUMBLEWEED_CI` is set). A `linux` + `btrfs` test that skips for any other reason still
+  fails the run. Landlock tests are required in CI (Ubuntu kernel); they may skip on Docker
+  Desktop kernels without Landlock. A macOS job runs the platform-neutral subset.
 - **Target**: NixOS (aarch64 and x86_64) booting into Cage running `tumbleweed-shell`, with a
   fallback Sway session, a VT2 login, and btrfs home snapshots, as a VM image for
   UTM/Parallels (S26–S27).

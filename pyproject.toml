@@ -18,6 +18,7 @@ dev = [
     "pygobject-stubs>=2.13",
     "pytest>=8.3",
     "pytest-cov>=6.0",
+    "pytest-timeout>=2.3",
     "ruff>=0.11",
 ]
 
@@ -138,12 +139,17 @@ addopts = [
 ]
 filterwarnings = ["error"]
 xfail_strict = true
+# No test may hang a run. The slowest tests (a cold mypy over a fixture, a Docker build of a
+# scratch context) take 5 to 25 seconds, so 120 leaves a wide margin while a hang costs two
+# minutes instead of the job's 30-minute limit. A test with a legitimate reason to take longer
+# says so with @pytest.mark.timeout(n).
+timeout = 120
 markers = [
     "gtk: needs a display; runs under the headless compositor in the Linux container",
     "linux: needs Linux kernel features (bwrap, Landlock, seccomp)",
-    "btrfs: needs a btrfs mount; exempt from the TUMBLEWEED_CI skip-guard (covered by S27)",
-    "live: talks to real external services; runs only with TUMBLEWEED_LIVE=1, never in CI",
-    "xfail_allowed_in_ci: lets a gtk/linux test xfail under TUMBLEWEED_CI=1, which fails it otherwise",
+    "btrfs: needs a btrfs mount; the btrfs gate's own skip is exempt from the TUMBLEWEED_CI guard (covered by S27)",
+    "live: talks to real external services; runs only with TUMBLEWEED_LIVE=1, refused under TUMBLEWEED_CI",
+    "xfail_allowed_in_ci(reason): lets a gtk/linux test xfail under TUMBLEWEED_CI=1, which fails it otherwise; the reason must reference an issue (#123)",
 ]
 
 [tool.coverage.run]

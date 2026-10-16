@@ -7,6 +7,7 @@ import os
 import pickle
 import re
 import secrets
+import signal
 import threading
 import time
 import warnings
@@ -236,7 +237,9 @@ class TestMonotonicGenerator:
 
         generator.reset()
 
-        assert generator.next() == (1000 << 80) | 1  # does not deadlock
+        # Asserted before next() is called, so that a regression fails here and cannot hang.
+        assert not generator._lock.locked()
+        assert generator.next() == (1000 << 80) | 1
 
     def test_encoding_is_26_big_endian_base32_characters(self) -> None:
         assert _encode(0) == "0" * 26
@@ -248,6 +251,20 @@ class TestMonotonicGenerator:
     def test_decode_in_these_tests_inverts_the_encoding(self) -> None:
         for value in (0, 1, 31, 32, 2**80, (1 << 128) - 1):
             assert decode(f"tsk_{_encode(value)}") == value
+
+
+def wait_for_child(pid: int, *, seconds: float) -> int:
+    """The wait status of a child, polled against a deadline so that a stuck child cannot hang."""
+    deadline = time.monotonic() + seconds
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done == pid:
+            return status
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            pytest.fail(f"the forked child did not finish within {seconds} seconds")
+        time.sleep(0.01)
 
 
 class TestUnpredictability:
@@ -323,7 +340,7 @@ class TestUnpredictability:
             finally:
                 os._exit(status)  # no atexit handlers, no pytest teardown in the child
         parent_ids = [str(TaskId.new()) for _ in range(2000)]
-        _, wait_status = os.waitpid(pid, 0)
+        wait_status = wait_for_child(pid, seconds=30)
 
         assert os.waitstatus_to_exitcode(wait_status) == 0, "the child did not reset its generator"
         child_ids = report.read_text().splitlines()
