@@ -69,7 +69,7 @@ class TestTheSlotOfARequest:
                 assert len(handler.calls) > IpcLimits().max_inflight_handlers  # it did flood
                 assert handler.peak_tasks <= IpcLimits().max_inflight_handlers
                 assert isinstance(server_side.close_reason, ConnectionClosedError)
-                assert "not reading" in str(server_side.close_reason)
+                assert "pile up" in str(server_side.close_reason)
 
         run(scenario)
 

@@ -16,61 +16,22 @@ from time import monotonic
 import pytest
 
 from tests.ipc.bounded import run
-from tests.ipc.helpers import (
-    SHORT,
-    SMALL_FRAMES,
-    fake_server,
-    fast,
-    next_connection,
-    raw_peer,
-    serving,
+from tests.ipc.helpers import SMALL_FRAMES, fake_server, next_connection, raw_peer, serving
+from tests.ipc.stalled import (
+    CAP,
+    FRAME,
+    limits_for_a_stalled_peer,
+    never_reads,
+    round_of_calls,
+    shake_hands,
 )
 from tumbleweed.core.ids import IpcRequestId
-from tumbleweed.core.types import ByteCount
 from tumbleweed.ipc.client import connect
-from tumbleweed.ipc.connection import Connection
 from tumbleweed.ipc.errors import ConnectionClosedError, RequestTimeoutError
 from tumbleweed.ipc.framing import CLOSE_TIMEOUT, encode_frame
-from tumbleweed.ipc.limits import IpcLimits
 from tumbleweed.ipc.messages import Echo, Echoed, Ping
 from tumbleweed.ipc.sockdir import SocketPath
-from tumbleweed.ipc.wire import PROTOCOL_VERSION, Hello, RequestFrame, encode_message
-
-FRAME = 4096
-CAP = 2 * FRAME
-HELLO = Hello(kind="hello", version=PROTOCOL_VERSION)
-BIG = "\u20ac" * 1000  # 3 bytes each: a request of about 3 KB, inside the 4096-byte limit
-
-
-async def never_reads(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    """A server that shakes hands and then reads nothing, ever."""
-    await reader.readexactly(4 + len(encode_message(HELLO)))
-    writer.write(encode_frame(encode_message(HELLO)))
-    await writer.drain()
-    while not writer.transport.is_closing():  # noqa: ASYNC110  (until the test drops it)
-        await asyncio.sleep(0.05)
-
-
-def limits_for_a_stalled_peer(write_timeout: timedelta = SHORT) -> IpcLimits:
-    return replace(
-        fast(),
-        max_frame_bytes=ByteCount(FRAME),
-        max_inflight_calls=1024,
-        write_timeout=write_timeout,
-    )
-
-
-async def round_of_calls(client: Connection, count: int) -> list[object]:
-    """`count` calls at once, each with a very short timeout, so that all of them give up."""
-    return await asyncio.gather(
-        *(
-            client.call(
-                Echo(kind="echo", text=BIG), Echoed, request_timeout=timedelta(seconds=0.05)
-            )
-            for _ in range(count)
-        ),
-        return_exceptions=True,
-    )
+from tumbleweed.ipc.wire import RequestFrame, encode_message
 
 
 class TestASenderIsBoundedByItsOwnTimeout:
@@ -202,9 +163,7 @@ class TestAPeerThatStopsReadingIsDropped:
             async def slow_reader(
                 reader: asyncio.StreamReader, writer: asyncio.StreamWriter
             ) -> None:
-                await reader.readexactly(4 + len(encode_message(HELLO)))
-                writer.write(encode_frame(encode_message(HELLO)))
-                await writer.drain()
+                await shake_hands(reader, writer)
                 # Takes a little every so often, always inside the write timeout: far less than
                 # the callers send, so the queue is full, yet the peer is reading.
                 while await reader.read(65536):  # noqa: ASYNC110  (pacing a slow reader)
@@ -270,6 +229,6 @@ class TestTheReaderNeverWaitsForThePeer:
                     await server_side.wait_closed()
 
                 assert monotonic() - started < 30
-                assert "not reading" in str(server_side.close_reason)
+                assert "pile up" in str(server_side.close_reason)
 
         run(scenario, deadline=60)

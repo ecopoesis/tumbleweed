@@ -28,6 +28,7 @@ from tests.ipc.helpers import (
     serving,
 )
 from tumbleweed.ipc import connection as connection_module
+from tumbleweed.ipc import server as server_module
 from tumbleweed.ipc.client import connect
 from tumbleweed.ipc.connection import Connection
 from tumbleweed.ipc.errors import (
@@ -367,6 +368,28 @@ class TestClosing:
 
         run(scenario)
 
+    def test_a_shutdown_that_raises_still_releases_the_socket_claim(
+        self, sock_path: SocketPath, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def failing_wait_closed(self: asyncio.Server) -> None:
+            raise RuntimeError("the listener failed to close")
+
+        async def scenario() -> None:
+            server = IpcServer(sock_path, ScriptedHandler())
+            await server.start()
+            with monkeypatch.context() as patch:
+                patch.setattr(asyncio.base_events.Server, "wait_closed", failing_wait_closed)
+                with pytest.raises(RuntimeError, match="listener failed"):
+                    await server.close()  # the failure is not hidden ...
+
+            assert server.is_closed
+            await server.wait_closed()  # ... and the server is down all the same
+            assert not sock_path.path.exists()
+            async with serving(sock_path):  # the lock was released too: the path is free again
+                pass
+
+        run(scenario)
+
     def test_closers_that_arrive_while_a_close_is_under_way_wait_for_it(
         self, sock_path: SocketPath, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -562,17 +585,64 @@ class TestKeepingTheSocketYoung:
 
         run(scenario)
 
-    def test_a_server_whose_socket_file_is_gone_says_so(
-        self, sock_path: SocketPath, caplog: pytest.LogCaptureFixture
+    def test_the_interval_is_wall_clock_time_not_the_event_loops(
+        self, sock_path: SocketPath, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        async def scenario() -> None:
-            async with serving(sock_path, refresh_interval=timedelta(seconds=0.1)):
-                sock_path.path.unlink()  # as a purge would
+        # The loop's clock stops while a Mac sleeps, so six hours on it can be days. The refresher
+        # wakes often and asks the wall clock; here the wall clock jumps, as it does over a sleep.
+        wall = [1_000_000.0]
+        monkeypatch.setattr(server_module, "_wall_clock", lambda: wall[0])
+        monkeypatch.setattr(server_module, "_WAKE_INTERVAL", timedelta(seconds=0.05))
 
-                while "gone or was replaced" not in caplog.text:  # noqa: ASYNC110  (a log line)
+        async def scenario() -> None:
+            async with serving(sock_path, refresh_interval=timedelta(hours=6)):
+                long_ago = time.time() - 4 * 24 * 3600
+                files = (sock_path.path, sock_path.lock_path, sock_path.path.parent)
+                for path in files:
+                    os.utime(path, (long_ago, long_ago))
+
+                await asyncio.sleep(0.5)  # ten wake-ups on the loop's clock, none on the wall's
+                assert all(path.stat().st_mtime < long_ago + 3600 for path in files)
+
+                wall[0] += 6 * 3600 + 1  # the machine slept
+                while any(path.stat().st_mtime < long_ago + 3600 for path in files):  # noqa: ASYNC110
                     await asyncio.sleep(0.05)
 
         run(scenario)
+
+    @pytest.mark.parametrize("loss", ["socket removed", "socket replaced", "lock replaced"])
+    def test_a_server_that_lost_its_files_closes_itself_so_that_a_supervisor_can_restart_it(
+        self, sock_path: SocketPath, caplog: pytest.LogCaptureFixture, loss: str
+    ) -> None:
+        # Two servers must never share a store, and a server nobody can reach is no server.
+        async def scenario() -> None:
+            server = IpcServer(
+                sock_path, ScriptedHandler(), refresh_interval=timedelta(seconds=0.1)
+            )
+            await server.start()
+            client = await connect(sock_path)
+            try:
+                if loss == "socket removed":
+                    sock_path.path.unlink()  # as a purge would
+                elif loss == "socket replaced":
+                    sock_path.path.unlink()
+                    with socket.socket(socket.AF_UNIX) as other:
+                        other.bind(str(sock_path))
+                else:
+                    sock_path.lock_path.unlink()
+                    sock_path.lock_path.write_text("a new lock file, for another server")
+
+                await server.wait_closed()  # it does so by itself
+
+                assert server.is_closed
+                await client.wait_closed()  # and it took its connections with it
+                async with serving(sock_path):  # the claim is free again: a new one can start
+                    pass
+            finally:
+                await client.close()
+
+        run(scenario)
+        assert "gone or was replaced" in caplog.text
 
     @pytest.mark.parametrize("bad", [timedelta(0), timedelta(seconds=-1), 5, None])
     def test_a_refresh_interval_that_is_not_a_positive_timedelta_is_refused(

@@ -169,6 +169,100 @@ class TestTouching:
             claim.release()
 
 
+class TestTouchingFollowsNoLinks:
+    """What a same-user process could do to make `touch` stamp a file it was never meant to."""
+
+    @staticmethod
+    def age(path: Path) -> float:
+        long_ago = time.time() - 4 * 24 * 3600
+        os.utime(path, (long_ago, long_ago), follow_symlinks=False)
+        return long_ago
+
+    def test_a_symlink_in_place_of_the_socket_is_refused_and_its_target_untouched(
+        self, sock_path: SocketPath
+    ) -> None:
+        claim = claim_socket(sock_path)
+        try:
+            victim = sock_path.path.parent / "victim"
+            victim.write_text("precious")
+            long_ago = self.age(victim)
+            sock_path.path.unlink()
+            sock_path.path.symlink_to(victim)
+
+            assert claim.touch() is False
+            assert victim.stat().st_mtime < long_ago + 3600
+        finally:
+            claim.release()
+
+    def test_a_symlink_in_place_of_the_lock_file_is_refused_and_its_target_untouched(
+        self, sock_path: SocketPath
+    ) -> None:
+        claim = claim_socket(sock_path)
+        try:
+            victim = sock_path.path.parent / "victim"
+            victim.write_text("precious")
+            long_ago = self.age(victim)
+            sock_path.lock_path.unlink()
+            sock_path.lock_path.symlink_to(victim)
+
+            assert claim.touch() is False
+            assert victim.stat().st_mtime < long_ago + 3600
+        finally:
+            claim.release()
+
+    def test_a_lock_file_that_was_replaced_by_another_file_is_refused(
+        self, sock_path: SocketPath
+    ) -> None:
+        # The path names a file, but not the one whose lock this claim holds.
+        claim = claim_socket(sock_path)
+        try:
+            sock_path.lock_path.unlink()
+            sock_path.lock_path.write_text("another server's lock")
+            long_ago = self.age(sock_path.lock_path)
+
+            assert claim.touch() is False
+            assert sock_path.lock_path.stat().st_mtime < long_ago + 3600
+        finally:
+            claim.release()
+
+    def test_the_lock_file_itself_is_stamped_whatever_name_it_is_looked_at_by(
+        self, sock_path: SocketPath
+    ) -> None:
+        # The claim stamps the file it holds (through its descriptor, after checking that the
+        # path names it); a second name for that file shows the stamp. (That the descriptor and
+        # not the path is used cannot be told from outside: the two are the same file here.)
+        claim = claim_socket(sock_path)
+        try:
+            long_ago = self.age(sock_path.lock_path)
+            alias = sock_path.path.parent / "alias"
+            os.link(sock_path.lock_path, alias)  # a hard link: same file, another name
+
+            assert claim.touch() is True
+
+            assert alias.stat().st_mtime > long_ago + 3600  # the file was stamped, not a name
+        finally:
+            claim.release()
+
+    def test_a_directory_replaced_by_a_symlink_has_the_link_stamped_not_its_target(
+        self, sock_path: SocketPath
+    ) -> None:
+        claim = claim_socket(sock_path)
+        try:
+            directory = sock_path.path.parent
+            moved = directory.parent / "moved"
+            directory.rename(moved)
+            directory.symlink_to(moved)  # the socket is still reachable by its path, through it
+            long_ago = self.age(moved)
+
+            assert claim.touch() is True
+
+            assert moved.stat().st_mtime < long_ago + 3600  # the target was not stamped
+        finally:
+            claim.release()
+            directory.unlink()
+            moved.rename(directory)
+
+
 class TestStaleSockets:
     def test_the_control_a_path_with_nothing_on_it_is_claimed(self, sock_path: SocketPath) -> None:
         claim_socket(sock_path).release()

@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import logging
+import time
 from datetime import timedelta
 from types import TracebackType
 from typing import Self, final
@@ -31,6 +32,13 @@ DEFAULT_REFRESH_INTERVAL = timedelta(hours=6)
 Well inside the three days after which macOS purges untouched files from its per-user temporary
 directory (see `sockdir`).
 """
+_WAKE_INTERVAL = timedelta(minutes=10)
+"""How often the refresher wakes to look at the wall clock.
+
+The event loop's clock does not run while a Mac sleeps, so a sleep of six hours on it can last
+days of wall-clock time; waking often and asking `time.time()` cannot.
+"""
+_wall_clock = time.time
 
 
 @final
@@ -45,9 +53,11 @@ class IpcServer:
     which holds what is bounded on one connection. Every request on every connection goes to
     `handler`, which is given the connection the request came from; the diagnostics
     (`ping`, `echo`) are answered by the connection and never reach it, unless
-    `answer_diagnostics` is `False` (for tests, and for a proxy that must see everything).
-    Every `refresh_interval` the server touches its socket, lock file and directory, so that a
-    cleaner of old files in a temporary directory does not take them.
+    `answer_diagnostics` is `False` (a seam for tests, which have no other request to give a
+    handler). Every `refresh_interval` of wall-clock time the server touches its socket, lock
+    file and directory, so that a cleaner of old files in a temporary directory does not take
+    them; if they are gone or were replaced anyway it closes itself (see `wait_closed`), so
+    that whatever supervises it starts a new one: two servers must never share a store.
     """
 
     def __init__(
@@ -80,6 +90,7 @@ class IpcServer:
         self._refresher: asyncio.Task[None] | None = None
         self._closing = False
         self._close_task: asyncio.Task[None] | None = None
+        self._closed = asyncio.Event()
         self._handshaking: dict[asyncio.Task[None], asyncio.StreamWriter] = {}
         self._connections: set[Connection] = set()
 
@@ -87,6 +98,19 @@ class IpcServer:
     def connections(self) -> frozenset[Connection]:
         """The connections that are open now."""
         return frozenset(c for c in self._connections if not c.is_closed)
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether the server is closed or closing, for whatever reason."""
+        return self._closing
+
+    async def wait_closed(self) -> None:
+        """Wait until the server has been closed, by `close` or by itself, and is fully down.
+
+        A server closes itself when its socket file or lock file is gone or replaced. A
+        supervisor waits here and starts a new server when this returns.
+        """
+        await self._closed.wait()
 
     async def start(self) -> None:
         """Claim the socket path and start accepting connections.
@@ -135,6 +159,7 @@ class IpcServer:
         claim, server, refresher = self._claim, self._server, self._refresher
         self._claim = self._server = self._refresher = None
         if claim is None or server is None:
+            self._closed.set()
             return
         try:
             if refresher is not None:
@@ -163,16 +188,28 @@ class IpcServer:
                 _logger.warning("the IPC server's listener did not close in time")
         finally:
             claim.release()
+            self._closed.set()
 
     async def _keep_fresh(self, claim: SocketClaim) -> None:
+        """Touch the claim's files once the refresh interval has passed on the wall clock.
+
+        Wakes every few minutes instead of sleeping the whole interval, because the loop's clock
+        stops while a Mac sleeps. If the claim has been lost the server closes itself.
+        """
+        last = _wall_clock()
         while True:
-            await asyncio.sleep(self._refresh_interval.total_seconds())
+            await asyncio.sleep(min(self._refresh_interval, _WAKE_INTERVAL).total_seconds())
+            if _wall_clock() - last < self._refresh_interval.total_seconds():
+                continue
+            last = _wall_clock()
             if not claim.touch():
                 _logger.error(
-                    "the socket file of the IPC server is gone or was replaced: clients cannot "
-                    "reach this server (%s)",
+                    "the socket file or lock file of the IPC server is gone or was replaced, so "
+                    "clients cannot reach it and another server could start: closing %s",
                     claim.path,
                 )
+                await self.close()  # cancels this task, which is fine: it has nothing left to do
+                return
 
     def _is_closing(self) -> bool:
         return self._closing

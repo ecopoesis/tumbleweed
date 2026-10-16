@@ -113,13 +113,24 @@ concurrently, on that one connection.
   ignored (it may have lost a race with a timeout), and a peer that reuses an id still in
   progress ends the connection.
 - **Bounds (I9).** Per connection and direction, 32 requests in flight; a request counts until
-  its reply has been written. Callers wait 30 s for an answer, writing the request included;
-  handlers get 25 s to produce one, so that the callee's `timeout` error reaches the caller. At
-  most twice the frame limit waits in the transport: senders wait for room (a call within its
-  timeout), and the reader, which answers refusals and diagnostics and never waits for a peer,
-  drops a connection whose peer lets that much pile up. A peer that takes not one byte for 10 s
-  while data waits for it is dropped, even if every call that wrote to it has long given up. A
-  server keeps at most 16 connections (an `IpcServer` argument; the rest are `IpcLimits`,
+  its reply has been written to the transport. Callers wait 30 s for an answer, writing the
+  request included; handlers get 25 s to produce one, so that the callee's `timeout` error
+  reaches the caller. What waits to be written is bounded:
+  - Senders (calls, handler replies) wait while more than twice the frame limit is queued, and
+    check again after each wake-up (asyncio wakes them all at once), so they never leave more
+    than twice the frame limit plus the frame that crossed it. A request is sent once its frame
+    is in the transport: a call that has its answer cannot time out on the queue.
+  - The reader answers refusals and diagnostics and never waits for a peer. Those are small, so
+    it may queue them up to a further frame limit plus 256 KiB; a peer that lets even that pile
+    up is dropped.
+  - Who is "not reading" is the stall watch's decision alone: a peer that takes not one byte
+    for 10 s while data waits for it is dropped, however the calls that wrote to it ended. It is
+    judged at our transport, after the kernel's and the peer's own buffers have filled, so the
+    slowest reading that passes depends on the peer's buffering, and the drop comes between 10
+    and 20 s after the peer stops. A peer that reads a few bytes per 10 s is not dropped and can
+    keep handler slots busy: a deadline for a whole reply is tracked in #60.
+
+  A server keeps at most 16 connections (an `IpcServer` argument; the rest are `IpcLimits`,
   configurable, never above the frame limit). When a connection ends, for any reason, every
   request waiting on it fails at once and running handlers are cancelled. A peer that breaks
   the protocol is sent a last `error` frame and disconnected.
@@ -391,7 +402,10 @@ cleared at reboot); on any other platform an unset variable is an error. Socket 
 24 characters from `a-z0-9-`, starting with a letter, and the whole path must fit a socket
 address (103 bytes). macOS also purges files in that temporary directory that were not accessed
 for three days, which a quiet server's socket and lock file are, so a server touches them (and
-the directory) every six hours; if they are gone anyway it logs that clients cannot reach it. A server
+the directory) every six hours of wall-clock time (the event loop's clock stops while a Mac
+sleeps, so it wakes every ten minutes and asks the wall clock); if the socket file or the lock
+file is gone or was replaced anyway, the server logs it and closes itself, so that whatever
+supervises it starts a new one: two servers must never share a store. A server
 holds an exclusive lock on `<name>.sock.lock` while it runs, so the kernel releases it if the
 server dies; a socket file found at its path is then removed only if it is a socket owned by the
 user, and any other file (a regular file, a directory, a symlink, another user's socket) is left

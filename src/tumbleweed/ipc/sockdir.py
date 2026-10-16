@@ -29,10 +29,12 @@ lock file itself stays: removing it would let two servers each lock a different 
 Staying put. macOS's `dirhelper` empties `/var/folders/.../T` of files not accessed for three
 days, and neither a socket nor a lock file is accessed while a server idles, so a long-running
 server would lose both, and with them its claim: a second server could then start on the same
-path. `SocketClaim.touch`, which `IpcServer` calls every six hours by default, refreshes the
-timestamps of the socket, the lock file and the directory. That keeps a running server's files
-young; it cannot bring back files a purge took while the machine slept through the timer, in
-which case `touch` returns `False` and the server logs that clients can no longer reach it.
+path. `SocketClaim.touch`, which `IpcServer` calls every six hours by default (by the wall
+clock, which keeps running while a Mac sleeps), refreshes the timestamps of the socket, the lock
+file and the directory, without following a link. That keeps a running server's files young; it
+cannot bring back files a purge took anyway, and then `touch` returns `False` and the server
+closes itself, so that whatever supervises it starts a new one: two servers must never share a
+store.
 """
 
 import contextlib
@@ -316,16 +318,29 @@ class SocketClaim:
         Cleaners of old files in temporary directories go by age: macOS's `dirhelper` removes
         what in `/var/folders/.../T` was not accessed for three days, and a server that runs for
         weeks touches neither its socket nor its lock file. A server calls this periodically.
-        Returns `False` if the socket file is no longer the one this claim bound (it was
-        removed or replaced, and clients cannot reach this server any more); a purge that
-        already happened cannot be undone.
+
+        Nothing here follows a symlink. The lock file is touched through the descriptor that
+        holds the lock, after checking that the path still names that very file; the socket and
+        the directory are touched without following a link in their last component.
+
+        Returns `False` if the socket file or the lock file is no longer the one this claim
+        holds (removed or replaced): clients cannot reach this server any more, or another
+        server could claim the path, so the server must stop. A purge that already happened
+        cannot be undone.
         """
         try:
-            info = self._path.path.lstat()
-            if not stat.S_ISSOCK(info.st_mode) or (info.st_dev, info.st_ino) != self._identity:
+            socket_info = self._path.path.lstat()
+            if not stat.S_ISSOCK(socket_info.st_mode):
                 return False
-            for path in (self._path.path, self._path.lock_path, self._path.path.parent):
-                os.utime(path)
+            if (socket_info.st_dev, socket_info.st_ino) != self._identity:
+                return False
+            held = os.fstat(self._lock_fd)
+            named = self._path.lock_path.lstat()
+            if (named.st_dev, named.st_ino) != (held.st_dev, held.st_ino):
+                return False
+            os.utime(self._lock_fd)
+            os.utime(self._path.path, follow_symlinks=False)
+            os.utime(self._path.path.parent, follow_symlinks=False)
         except OSError:
             return False
         return True

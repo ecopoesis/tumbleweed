@@ -33,7 +33,13 @@ class IpcLimits:
     - `frame_timeout`: how long one frame may take from its first byte to its last. This is what
       drops a peer that sends a frame a byte at a time (slowloris).
     - `write_timeout`: how long a peer may take not one byte while data waits for it, before the
-      connection is dropped. The bound on what waits (twice `max_frame_bytes`) is not tunable.
+      connection is dropped, which happens between this long and twice as long after the peer
+      stops reading. Progress is judged at our transport, after the kernel's and the peer's own
+      buffers have filled, so the slowest reading that passes depends on how much the peer
+      buffers. What may wait is not tunable: senders leave at most twice `max_frame_bytes` plus
+      one frame queued, and the reader may add `max_frame_bytes` plus 256 KiB of small replies.
+      A peer that reads a few bytes per `write_timeout` is not dropped, and can keep handler
+      slots busy: a deadline for a whole reply is tracked in #60.
     - `idle_timeout`: how long a connection may receive nothing at all between frames while no
       request of either peer is in progress (a window that ends with one in progress starts
       again, so a connection closes between one and two timeouts after it falls quiet); `None`

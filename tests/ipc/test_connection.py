@@ -596,7 +596,7 @@ class StubTransport:
         pass
 
     def get_write_buffer_size(self) -> int:
-        return 0
+        return 10**9  # far over any cap, so that a sender has to ask the writer whether it may go
 
     def abort(self) -> None:
         pass
@@ -640,3 +640,63 @@ def test_a_reset_that_only_the_writer_has_noticed_is_a_closed_connection_not_an_
             await connection.close()
 
     run(scenario)
+
+
+class DrainingTransport:
+    """A transport that is over its cap until it is drained once, and has a little queued after."""
+
+    def __init__(self) -> None:
+        self.size = 10**9
+        self.aborted = False
+
+    def set_write_buffer_limits(self, high: int | None = None, low: int | None = None) -> None:
+        pass
+
+    def get_write_buffer_size(self) -> int:
+        return self.size
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
+class DrainingWriter:
+    def __init__(self) -> None:
+        self.transport = DrainingTransport()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        pass
+
+    async def drain(self) -> None:
+        self.transport.size = 100  # the peer read; a little is still queued for it
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+def test_closing_flushes_what_is_queued_when_no_sender_is_waiting_any_more() -> None:
+    # A sender that had to wait, and has been let through, no longer counts as blocked: closing
+    # then lets the transport send what is queued for a peer that is reading, instead of
+    # aborting it and losing the replies.
+    async def scenario() -> DrainingWriter:
+        writer = DrainingWriter()
+        connection = Connection(
+            asyncio.StreamReader(),
+            writer,  # type: ignore[arg-type]  # a stand-in writer
+            limits=IpcLimits(),
+            handler=None,
+        )
+        with pytest.raises(RequestTimeoutError):  # waits for room, writes, and gets no answer
+            await connection.call(Ping(kind="ping"), Pong, request_timeout=timedelta(seconds=0.1))
+        assert writer.transport.size == 100  # something is queued for the peer
+
+        await connection.close()
+        return writer
+
+    writer = run(scenario)
+
+    assert writer.closed  # closed gracefully ...
+    assert not writer.transport.aborted  # ... which flushes, where an abort would not

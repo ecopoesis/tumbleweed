@@ -6,10 +6,10 @@ other's requests with its `RequestHandler`, concurrently and in any order: reque
 apart by their `IpcRequestId`, which only has meaning on the connection it was sent on.
 
 The connection answers the transport's own diagnostics, `ping` and `echo`, itself: a
-`RequestHandler` never sees them (unless the connection is made with `answer_diagnostics=False`,
-which exists for tests and for a proxy that must see every request), so a handler matches on
-the requests of its own step only. A handler type is still `RequestBody`, which lists the
-diagnostics too, until the registry is split per direction (#61).
+`RequestHandler` never sees them, so a handler matches on the requests of its own step only.
+(`answer_diagnostics=False` hands them to the handler. It is a seam for tests, which have no
+other request to hand a handler, and not an extension point.) A handler type is still
+`RequestBody`, which lists the diagnostics too, until the registry is split per direction (#61).
 
 What is bounded, and what happens at the bound (I9):
 
@@ -22,11 +22,20 @@ What is bounded, and what happens at the bound (I9):
   request included, and raises `RequestTimeoutError`; a handler gets `handler_timeout` and the
   caller is told `timeout`. An answer that arrives after its caller gave up is dropped. Reads
   are bounded by `frame_timeout`, and waiting for the next frame by `idle_timeout` if set.
-- Writes. Nothing is written once more than twice `max_frame_bytes` wait in the transport: the
-  sender waits (a call within its timeout), and refusals and diagnostics, which the reader sends
-  and must not wait for, end the connection instead. If the peer takes no byte for
-  `write_timeout` while data waits, the connection ends. This holds however the senders are
-  cancelled or time out meanwhile.
+- Writes. Senders (calls and handler replies) wait while more than twice `max_frame_bytes` waits
+  in the transport, and look again after every wake-up (asyncio wakes them all at once), so
+  they never leave more than twice `max_frame_bytes` plus the frame that crossed it queued. A
+  request is sent once its frame is in the transport: a call whose answer has arrived cannot
+  time out waiting for the queue, and a handler's slot is freed once its reply is written. The
+  reader sends refusals and diagnostics and never waits: those are small, and it may queue them
+  up to a further `max_frame_bytes` plus 256 KiB, past which the connection ends. Whether a peer
+  is "not reading" is decided by the stall watch alone: it ends the connection when not one byte
+  has been taken for `write_timeout` while data waits, however the senders were cancelled or
+  timed out. Progress is judged at our transport, after the kernel's and the peer's own buffers
+  have filled, so the slowest reading that passes depends on how much the peer buffers, and a
+  peer that stops reading is dropped between `write_timeout` and twice that later. What is not
+  bounded is how long one reply may take to be accepted by a peer that reads a few bytes per
+  `write_timeout`: it can keep handler slots; a deadline for the whole reply is tracked in #60.
 - Disconnect: when the peer closes, the stream breaks, the peer violates the protocol or either
   end calls `close`, every request waiting on the connection fails at once with
   `ConnectionClosedError`, every running handler is cancelled and the transport is closed.
@@ -83,6 +92,10 @@ from tumbleweed.ipc.wire import (
 )
 
 _logger = logging.getLogger(__name__)
+
+# Replies the reader writes (refusals, diagnostics) may queue this much beyond what senders may:
+# room for 64 echo answers of 4 KiB, or thousands of pongs.
+_REPLY_ALLOWANCE = 256 * 1024
 
 # How long closing waits for cancelled handlers to unwind, and for a last error frame to go out.
 _HANDLER_UNWIND = timedelta(seconds=2)
@@ -142,6 +155,7 @@ class Connection:
         self._inflight: set[IpcRequestId] = set()
         self._tasks: set[asyncio.Task[None]] = set()
         self._buffer_cap = 2 * limits.max_frame_bytes
+        self._reply_cap = self._buffer_cap + limits.max_frame_bytes + _REPLY_ALLOWANCE
         # `drain` then waits only while more than the cap is queued, which is when senders wait.
         self._transport.set_write_buffer_limits(high=self._buffer_cap)
         self._written = 0
@@ -249,28 +263,38 @@ class Connection:
             ) from self._close_reason
 
     # Writing. `write` on the transport is synchronous and takes a whole frame, so frames never
-    # interleave and no lock is needed. What bounds the queue is `_wait_for_room` (senders
-    # wait), `_reply_now` (the reader's sends never wait: past the cap they end the connection)
-    # and the stall watch, which does not depend on any sender still being there.
+    # interleave and no lock is needed. What bounds the queue is `_wait_for_room` (senders wait
+    # until the queue is at or under the cap, and write only then), `_reply_now` (the reader's
+    # sends never wait: past their own, larger, cap they end the connection) and the stall watch,
+    # which decides who is not reading and does not depend on any sender still being there.
 
     async def _send(self, frame: Frame) -> None:
         """Write a frame, waiting while the peer is far behind; raises when the connection ends."""
         # Encoded before anything is written, so a frame over the limit is refused cleanly.
         data = encode_frame(encode_message(frame), max_bytes=self._limits.max_frame_bytes)
         await self._wait_for_room()
-        self._write(data)
-        await self._wait_for_room()
+        self._write(data)  # sent: its frame is in the transport. There is nothing to wait for
 
     async def _wait_for_room(self) -> None:
+        """Wait until no more than the cap is queued, and only then let the caller write.
+
+        The check is made again after every wake-up: when the queue drains, asyncio wakes every
+        sender at once, and each of them would write without it (the bound was exceeded
+        tenfold). Only the writes that find the queue at or under the cap go ahead, so a write
+        leaves at most the cap plus its own frame queued.
+        """
         self._raise_if_closed()
+        if self.buffered_bytes <= self._buffer_cap:
+            return
         self._blocked += 1
         try:
-            await self._writer.drain()
+            while self.buffered_bytes > self._buffer_cap:
+                await self._writer.drain()  # returns once the transport has drained to its low mark
+                self._raise_if_closed()
         except OSError as exc:
             self._lost(exc)
         finally:
             self._blocked -= 1
-        self._raise_if_closed()
 
     def _lost(self, exc: OSError) -> NoReturn:
         error = ConnectionClosedError(f"the connection was lost: {exc.strerror}")
@@ -284,8 +308,8 @@ class Connection:
         except FrameTooLargeError:
             unsendable = _error(frame.id, ErrorCode.INTERNAL, "the response is unsendable")
             data = encode_frame(encode_message(unsendable), max_bytes=self._limits.max_frame_bytes)
-        if self.buffered_bytes > self._buffer_cap:
-            raise ConnectionClosedError("the peer is not reading from the connection")
+        if self.buffered_bytes > self._reply_cap:
+            raise ConnectionClosedError("the peer lets replies pile up without reading them")
         self._write(data)
 
     def _write(self, data: bytes) -> None:

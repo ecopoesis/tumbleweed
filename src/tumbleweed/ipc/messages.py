@@ -17,7 +17,8 @@ To add a message (S17 and later steps do this; nothing else in `ipc` changes):
 
 The messages below are the transport's own diagnostics (liveness and an echo that carries
 text). They are not business messages, and `Connection` answers them itself: a request handler
-never sees them. The broker's and the shell's messages come with S17 and S18. A request is
+never sees them (unless the connection is made with `answer_diagnostics=False`, a seam that
+tests use). The broker's and the shell's messages come with S17 and S18. A request is
 always answered by exactly one response body or one error, and which response type a request
 gets is the caller's expectation, checked by `Connection.call`.
 """
