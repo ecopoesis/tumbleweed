@@ -93,12 +93,17 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
     "the agent loop imports the Anthropic SDK": (
         "agent/loop.py",
         "import anthropic",
-        "the Anthropic SDK is imported only by",
+        "the Anthropic SDK and its HTTP library are imported only by",
+    ),
+    "the loop imports the HTTP library": (
+        "agent/loop.py",
+        "import httpx2",
+        "the Anthropic SDK and its HTTP library are imported only by",
     ),
     "the shell imports the Anthropic SDK": (
         "shell/window.py",
         "import anthropic",
-        "the Anthropic SDK is imported only by",
+        "the Anthropic SDK and its HTTP library are imported only by",
     ),
 }
 

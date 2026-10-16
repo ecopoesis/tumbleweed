@@ -22,6 +22,7 @@ from tumbleweed.agent.llm import (
     ToolUseBlock,
     ToolUseId,
     Usage,
+    UsageUpdate,
 )
 from tumbleweed.core.types import ProviderRequestId, TokenCount
 
@@ -66,7 +67,11 @@ class FakeProvider:
         if not self._script:
             raise ProviderError("The fake provider has no more scripted turns.")
         turn = self._script.pop(0)
+        input_tokens = TokenCount(len(self.requests) * 5)
         try:
+            # What a real stream says first (`message_start`): the input is known, the output
+            # has begun.
+            yield UsageUpdate(usage=Usage(input_tokens=input_tokens, output_tokens=TokenCount(1)))
             for chunk in turn.chunks:
                 await asyncio.sleep(0)  # a real stream yields to the loop between chunks
                 yield TextDelta(text=chunk)
@@ -94,7 +99,7 @@ class FakeProvider:
             content=tuple(content),
             stop_reason=stop,
             usage=Usage(
-                input_tokens=TokenCount(len(self.requests) * 5),
+                input_tokens=input_tokens,
                 output_tokens=turn.output_tokens,
             ),
             request_id=ProviderRequestId(f"req_fake_{len(self.requests)}"),

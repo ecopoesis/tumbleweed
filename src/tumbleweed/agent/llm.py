@@ -4,10 +4,11 @@ These models are what the agent loop and a provider (the Anthropic SDK, the scri
 on, so nothing of an SDK's types leaks past the provider, and a proxy or another vendor can be put
 behind the same protocol (DECISIONS D3).
 
-A provider streams one model call: any number of `TextDelta`s, then exactly one `LlmDone` with the
-complete assistant turn (text, tool calls, and whatever the provider needs to see again on the
-next call), why it stopped and what it cost. A provider reports failures by raising a
-`ProviderError`; it never lets an SDK exception, whose text it does not control, escape.
+A provider streams one model call: any number of `TextDelta`s and `UsageUpdate`s, then exactly one
+`LlmDone` with the complete assistant turn (text, tool calls, and whatever the provider needs to
+see again on the next call), why it stopped and what it cost. A stream that ends without its
+`LlmDone` is a failure, not a short answer: the provider raises. It reports every failure by raising
+a `ProviderError`; it never lets an SDK or HTTP exception, whose text it does not control, escape.
 
 Cancellation: the caller cancels the asyncio task that is consuming the stream (or closes the
 generator). The provider must then release its connection, which an `async with` around the SDK
@@ -18,6 +19,7 @@ validated against the tool's schema before anything runs (`tumbleweed.agent.tool
 """
 
 import enum
+import re
 from collections.abc import AsyncIterator
 from typing import Annotated, Literal, Protocol, final
 
@@ -26,6 +28,28 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from tumbleweed.core.types import ModelName, PatternStr, ProviderRequestId, TokenCount
 
 MAX_TOOL_NAME_CHARS = 128
+
+# NUL ends a C string, and a lone surrogate (U+D800..U+DFFF) cannot be encoded as UTF-8 (JSON from
+# a model can carry one as an escape). The transcript replaces both with U+FFFD, and so does
+# everything that takes model text in here, once, at the edge (the same rule as
+# `tumbleweed.shell.viewmodel.transcript`, so that byte counts agree).
+_UNSAFE_TEXT = re.compile("[\x00\ud800-\udfff]")
+
+
+def sanitize_text(text: str) -> str:
+    """`text` with NUL and lone surrogates replaced by U+FFFD."""
+    return _UNSAFE_TEXT.sub("\ufffd", text)
+
+
+def sanitize_json(value: JsonValue) -> JsonValue:
+    """`value` with every string in it, keys included, passed through `sanitize_text`."""
+    if isinstance(value, str):
+        return sanitize_text(value)
+    if isinstance(value, list):
+        return [sanitize_json(item) for item in value]
+    if isinstance(value, dict):
+        return {sanitize_text(key): sanitize_json(item) for key, item in value.items()}
+    return value
 
 
 @final
@@ -48,6 +72,7 @@ class StopReason(enum.StrEnum):
     TOOL_USE = "tool_use"
     PAUSE_TURN = "pause_turn"
     REFUSAL = "refusal"
+    CONTEXT_WINDOW_EXCEEDED = "model_context_window_exceeded"
     OTHER = "other"
 
 
@@ -167,7 +192,17 @@ class LlmDone(BaseModel):
     request_id: ProviderRequestId | None = None
 
 
-type LlmEvent = Annotated[TextDelta | LlmDone, Field(discriminator="kind")]
+@final
+class UsageUpdate(BaseModel):
+    """What the provider has reported of the cost so far, while the call is still running."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    kind: Literal["usage"] = "usage"
+    usage: Usage
+
+
+type LlmEvent = Annotated[TextDelta | UsageUpdate | LlmDone, Field(discriminator="kind")]
 
 
 class LlmProvider(Protocol):

@@ -8,8 +8,10 @@ what happened without any text.
 """
 
 import enum
+import traceback
 from typing import ClassVar
 
+from tumbleweed.agent.llm import Usage
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.types import ProviderRequestId
 
@@ -30,6 +32,17 @@ class ErrorKind(enum.StrEnum):
     LIMIT = "limit"
     BUSY = "busy"
     INTERNAL = "internal"
+
+
+def describe_unexpected(error: BaseException) -> str:
+    """Where an unexpected exception came from and its type, never its message.
+
+    For the log: such a message can hold anything a server or a model said (the API key, if a
+    hostile server put it there), so a bug is logged by type and place, not by `logger.exception`.
+    """
+    frames = traceback.extract_tb(error.__traceback__)
+    where = f"{frames[-1].filename.rsplit('/', 1)[-1]}:{frames[-1].lineno}" if frames else "?"
+    return f"{type(error).__name__} at {where}"
 
 
 class AgentError(TumbleweedError):
@@ -69,13 +82,24 @@ class ReplyTimeoutError(LimitError):
 
 
 class ProviderError(AgentError):
-    """The model provider could not give an answer. `request_id` is the provider's, if known."""
+    """The model provider could not give an answer.
+
+    `request_id` is the provider's, and `usage` what the provider had reported when the call
+    failed, if they are known: the invocation log records both.
+    """
 
     kind = ErrorKind.PROVIDER
 
-    def __init__(self, message: str, *, request_id: ProviderRequestId | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: ProviderRequestId | None = None,
+        usage: Usage | None = None,
+    ) -> None:
         super().__init__(message)
         self.request_id = request_id
+        self.usage = usage
 
 
 class ProviderAuthError(ProviderError):
@@ -92,6 +116,16 @@ class ProviderTimeoutError(ProviderError):
 
 class ProviderRateLimitedError(ProviderError):
     kind = ErrorKind.RATE_LIMITED
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: ProviderRequestId | None = None,
+        retry_after: int | None = None,
+    ) -> None:
+        super().__init__(message, request_id=request_id)
+        self.retry_after = retry_after
 
 
 class ProviderOverloadedError(ProviderError):

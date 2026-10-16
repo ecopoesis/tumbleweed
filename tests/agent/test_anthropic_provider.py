@@ -13,7 +13,7 @@ from tests.agent import sse
 from tests.agent.support import MODEL
 from tumbleweed.agent.anthropic_provider import (
     CONNECT_TIMEOUT,
-    MAX_RETRIES,
+    MAX_ATTEMPTS,
     READ_TIMEOUT,
     AnthropicProvider,
     build_client,
@@ -66,8 +66,12 @@ async def collect(
     server: sse.Server, req: LlmRequest, *, effort: str | None = None
 ) -> list[LlmEvent]:
     client = server.client(KEY)
+
+    async def no_sleep(seconds: float) -> None:
+        return
+
     try:
-        provider = AnthropicProvider(client, effort=effort)  # type: ignore[arg-type]  # a test string
+        provider = AnthropicProvider(client, effort=effort, sleep=no_sleep)  # type: ignore[arg-type]  # a test string
         return [event async for event in provider.stream(req)]
     finally:
         await client.close()
@@ -77,13 +81,40 @@ def run(server: sse.Server, req: LlmRequest, **kwargs: str | None) -> list[LlmEv
     return asyncio.run(collect(server, req, **kwargs))
 
 
+def run_with(server: sse.Server, req: LlmRequest, *, delays: list[float]) -> list[LlmEvent]:
+    """Like `run`, with the retry delays recorded instead of slept."""
+
+    async def no_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    async def scenario() -> list[LlmEvent]:
+        client = server.client(KEY)
+        try:
+            provider = AnthropicProvider(client, sleep=no_sleep)
+            return [event async for event in provider.stream(req)]
+        finally:
+            await client.close()
+
+    return asyncio.run(scenario())
+
+
 class TestResponses:
     def test_text_streams_as_deltas_then_one_final_message_with_usage_and_request_id(self) -> None:
         server = sse.Server([sse.stream_response(sse.message(sse.text_block(0, "Hel", "lo")))])
 
         events = run(server, request())
 
-        assert events[:2] == [TextDelta(text="Hel"), TextDelta(text="lo")]
+        assert [e for e in events if isinstance(e, TextDelta)] == [
+            TextDelta(text="Hel"),
+            TextDelta(text="lo"),
+        ]
+        assert [type(e).__name__ for e in events] == [
+            "UsageUpdate",  # message_start: the input is known
+            "TextDelta",
+            "TextDelta",
+            "UsageUpdate",  # message_delta: the output so far
+            "LlmDone",
+        ]
         done = events[-1]
         assert isinstance(done, LlmDone)
         assert done.content == (TextBlock(text="Hello"),)
@@ -188,7 +219,58 @@ class TestResponses:
             run(sse.Server([sse.stream_response(body)]), request())
 
 
+class TestModelTextIsCleaned:
+    def test_empty_text_deltas_are_not_events(self) -> None:
+        body = sse.message(sse.text_block(0, "", "a", "", "", "b"))
+
+        events = run(sse.Server([sse.stream_response(body)]), request())
+
+        assert [e.text for e in events if isinstance(e, TextDelta)] == ["a", "b"]
+
+    def test_the_final_message_has_no_lone_surrogate_and_no_nul(self) -> None:
+        body = sse.message(
+            sse.text_block(0, "a\ud800b", "c\x00d"),
+            sse.tool_block(1, "toolu_01", "add", '{"k": "v\\u0000w\\u00e9"}'),
+            stop_reason="tool_use",
+        )
+
+        done = run(sse.Server([sse.stream_response(body)]), request())[-1]
+
+        assert isinstance(done, LlmDone)
+        text, call = done.content
+        assert isinstance(text, TextBlock)
+        assert text.text == "a\ufffdbc\ufffdd"
+        assert isinstance(call, ToolUseBlock)
+        assert call.input == {"k": "v\ufffdw\u00e9"}
+        for block in done.content:
+            block.model_dump_json().encode("utf-8")
+
+
 class TestRequests:
+    def test_a_tool_result_that_is_an_error_says_so_to_the_model(self) -> None:
+        server = sse.Server([sse.stream_response(sse.message(sse.text_block(0, "x")))])
+        messages = (
+            user("q"),
+            LlmMessage(
+                role="assistant",
+                content=(ToolUseBlock(id=ToolUseId("toolu_1"), name="add", input={}),),
+            ),
+            LlmMessage(
+                role="user",
+                content=(
+                    ToolResultBlock(tool_use_id=ToolUseId("toolu_1"), content="bad", is_error=True),
+                ),
+            ),
+        )
+
+        run(server, request(*messages))
+
+        sent = server.bodies[0]["messages"]
+        assert isinstance(sent, list)
+        assert sent[2]["content"] == [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "bad", "is_error": True}
+        ]
+
     def test_the_request_carries_model_system_messages_tools_and_the_key(self) -> None:
         server = sse.Server([sse.stream_response(sse.message(sse.text_block(0, "x")))])
         tool = ToolSpec(
@@ -229,14 +311,18 @@ class TestRequests:
 
 
 class TestClient:
-    def test_the_client_is_configured_with_bounded_timeouts_retries_and_the_base_url(self) -> None:
+    def test_the_client_is_configured_with_bounded_timeouts_no_retries_of_its_own_and_the_base_url(
+        self,
+    ) -> None:
         client = build_client(api_key=ApiKey(KEY), base_url="https://proxy.example.com/v1")
 
         assert str(client.base_url).startswith("https://proxy.example.com/v1")
-        assert client.max_retries == MAX_RETRIES == 2
+        assert client.max_retries == 0  # the provider retries, with a delay of its own
+        assert MAX_ATTEMPTS == 3
         timeout = client.timeout
         assert isinstance(timeout, httpx2.Timeout)
         assert (timeout.connect, timeout.read) == (CONNECT_TIMEOUT, READ_TIMEOUT)
+        assert (CONNECT_TIMEOUT, READ_TIMEOUT) == (10.0, 60.0)
         assert timeout.write is not None
         assert timeout.pool is not None
 
@@ -250,6 +336,15 @@ class TestClient:
 
         assert client.api_key == KEY
         assert str(client.base_url).startswith("https://configured.example.com")
+
+    def test_the_http_client_follows_no_redirects_and_ignores_the_environments_proxies(
+        self,
+    ) -> None:
+        client = build_client(api_key=ApiKey(KEY), base_url="https://configured.example.com")
+        http = client._client  # noqa: SLF001  (the point: what the SDK was given)
+
+        assert http.follow_redirects is False
+        assert http.trust_env is False
 
 
 class TestErrors:
@@ -339,24 +434,82 @@ class TestErrors:
         with pytest.raises(ProviderOverloadedError):
             asyncio.run(scenario())
 
-        assert events == [TextDelta(text="partial")]
+        assert [e for e in events if isinstance(e, TextDelta)] == [TextDelta(text="partial")]
+        assert not any(isinstance(e, LlmDone) for e in events)
 
-    def test_a_server_error_is_retried_by_the_sdk_before_it_is_reported(self) -> None:
+    def test_a_server_error_is_retried_by_the_provider_before_it_is_reported(self) -> None:
         server = sse.Server(
             [sse.error_response(529), sse.stream_response(sse.message(sse.text_block(0, "ok")))]
         )
+        delays: list[float] = []
 
-        async def scenario() -> list[LlmEvent]:
-            client = server.client(KEY, max_retries=1)
-            try:
-                return [e async for e in AnthropicProvider(client).stream(request())]
-            finally:
-                await client.close()
-
-        events = asyncio.run(scenario())
+        events = run_with(server, request(), delays=delays)
 
         assert isinstance(events[-1], LlmDone)
         assert len(server.requests) == 2
+        assert delays == [1.0]
+
+    def test_retries_stop_after_the_attempt_limit_and_the_last_error_is_reported(self) -> None:
+        server = sse.Server([sse.error_response(529)])
+        delays: list[float] = []
+
+        with pytest.raises(ProviderOverloadedError):
+            run_with(server, request(), delays=delays)
+
+        assert len(server.requests) == MAX_ATTEMPTS
+        assert delays == [1.0, 2.0]
+
+    @pytest.mark.parametrize(("asked", "waited"), [("99999", [1.0, 2.0]), ("3000", [10.0, 10.0])])
+    def test_a_retry_after_of_hours_or_days_never_makes_us_wait_that_long(
+        self, asked: str, waited: list[float]
+    ) -> None:
+        server = sse.Server([sse.error_response(429, headers={"retry-after": asked})])
+        delays: list[float] = []
+
+        with pytest.raises(ProviderRateLimitedError):
+            run_with(server, request(), delays=delays)
+
+        assert delays == waited
+        assert max(delays) <= 10.0
+        assert len(server.requests) == MAX_ATTEMPTS
+
+    def test_a_short_retry_after_is_honoured(self) -> None:
+        server = sse.Server(
+            [
+                sse.error_response(429, headers={"retry-after": "3"}),
+                sse.stream_response(sse.message(sse.text_block(0, "ok"))),
+            ]
+        )
+        delays: list[float] = []
+
+        run_with(server, request(), delays=delays)
+
+        assert delays == [3.0]
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404])
+    def test_an_error_that_waiting_cannot_fix_is_not_retried(self, status: int) -> None:
+        server = sse.Server([sse.error_response(status)])
+
+        with pytest.raises(ProviderError):
+            run_with(server, request(), delays=[])
+
+        assert len(server.requests) == 1
+
+    def test_a_failure_after_text_has_arrived_is_not_retried(self) -> None:
+        body = (
+            sse.message_start()
+            + sse.text_block(0, "partial")
+            + sse.event(
+                "error",
+                {"type": "error", "error": {"type": "overloaded_error", "message": "x"}},
+            )
+        )
+        server = sse.Server([sse.stream_response(body)])
+
+        with pytest.raises(ProviderOverloadedError):
+            run_with(server, request(), delays=[])
+
+        assert len(server.requests) == 1  # the user has seen the start of it: no second answer
 
     def test_a_failure_is_logged_by_type_and_status_only(
         self, caplog: pytest.LogCaptureFixture

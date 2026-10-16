@@ -11,6 +11,9 @@ dependencies = [
     # and their dependencies have wheels for every platform we lock). >=1.13 is the newest release
     # inside the 7-day cooldown today (1.15.0 is younger); it uses httpx2, not httpx (#43).
     "anthropic>=1.13",
+    # The SDK's HTTP library, imported directly by `agent.anthropic_provider` (a bounded transport,
+    # no redirects, no environment proxies, its exception types), so it is declared, not borrowed.
+    "httpx2>=2.13",
     "pydantic>=2.11",
     # Built from source against the system GTK (Homebrew on macOS, apt in the Linux image).
     # >=3.50 was chosen for `gi.events` (D2); the agent runs its own loop on a worker thread
@@ -272,7 +275,7 @@ forbidden_modules = [
 # stays in the one module that adapts it (DECISIONS D3), so a proxy or another vendor replaces one
 # file. Direct imports only: the shell reaches the SDK through the factory, which is the point.
 [[tool.importlinter.contracts]]
-name = "the Anthropic SDK is imported only by tumbleweed.agent.anthropic_provider (D3)"
+name = "the Anthropic SDK and its HTTP library are imported only by tumbleweed.agent.anthropic_provider (D3)"
 type = "forbidden"
 source_modules = [
     "tumbleweed.agent",
@@ -281,6 +284,9 @@ source_modules = [
     "tumbleweed.shell",
     "tumbleweed.ui",
 ]
-forbidden_modules = ["anthropic"]
+forbidden_modules = ["anthropic", "httpx2"]
 allow_indirect_imports = true
-ignore_imports = ["tumbleweed.agent.anthropic_provider -> anthropic"]
+ignore_imports = [
+    "tumbleweed.agent.anthropic_provider -> anthropic",
+    "tumbleweed.agent.anthropic_provider -> httpx2",
+]

@@ -142,26 +142,19 @@ class Server:
         respond = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
         return respond(request)
 
-    def client(self, key: str, *, max_retries: int = 0) -> anthropic.AsyncAnthropic:
-        return anthropic.AsyncAnthropic(
-            api_key=key,
-            base_url=BASE_URL,
-            max_retries=max_retries,
-            http_client=anthropic.DefaultAsyncHttpxClient(
-                transport=httpx2.MockTransport(self.handler)
-            ),
-        )
-
-    def client_with_build(self, key: ApiKey) -> anthropic.AsyncAnthropic:
+    def client(
+        self, key: str = "sk-ant-test-0123456789abcdefghijklmnop"
+    ) -> anthropic.AsyncAnthropic:
+        """The client `build_client` makes (no redirects, no retries of its own, bounded
+        responses), with this server under it instead of the network."""
         from tumbleweed.agent.anthropic_provider import build_client
 
         return build_client(
-            api_key=key,
-            base_url=BASE_URL,
-            http_client=anthropic.DefaultAsyncHttpxClient(
-                transport=httpx2.MockTransport(self.handler)
-            ),
+            api_key=ApiKey(key), base_url=BASE_URL, transport=httpx2.MockTransport(self.handler)
         )
+
+    def client_with_build(self, key: ApiKey) -> anthropic.AsyncAnthropic:
+        return self.client(key.reveal())
 
 
 def stream_response(
