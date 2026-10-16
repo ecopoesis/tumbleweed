@@ -30,8 +30,8 @@ from tumbleweed.broker.fdio import (
     MAX_PATH_BYTES,
     OpenedPath,
     OpenStrategy,
-    identity_chain,
     open_absolute,
+    walk,
 )
 from tumbleweed.broker.identity import FsIdentity
 from tumbleweed.broker.model import PolicyModel
@@ -96,7 +96,8 @@ class ResolvedPath(PolicyModel):
     of each directory below it on the way to the target, then of the target, for as far as they
     exist and can be opened; it ends early at the first component that does not exist, is not a
     directory (when more follows), is a socket, FIFO or device, or cannot be opened for lack of
-    permission. The target has an `identity` only when the chain reaches it.
+    permission. The target has an `identity` only when the chain reaches it. `shared_directory`
+    says that the target is a directory anyone can write to that is sticky (`/tmp`).
 
     The constructor takes these as given and does not look at the file system, so build one
     with `resolve`, never from parts.
@@ -104,6 +105,7 @@ class ResolvedPath(PolicyModel):
 
     canonical: CanonicalPath
     chain: tuple[FsIdentity, ...]
+    shared_directory: bool = False
 
     @classmethod
     def resolve(cls, text: str) -> Self:
@@ -122,7 +124,8 @@ class ResolvedPath(PolicyModel):
             components = components_of(str(canonical))
         except InvalidValueError:
             raise PathError(PathFault.INVALID) from None
-        return cls(canonical=canonical, chain=identity_chain(components))
+        found = walk(components)
+        return cls(canonical=canonical, chain=found.chain, shared_directory=found.shared_directory)
 
     @property
     def text(self) -> str:
@@ -153,11 +156,20 @@ class ResolvedPath(PolicyModel):
         Decided by identity, not by text: `root` covers a path that reaches the same directory
         by another name (a bind mount, a case variant on a case-insensitive volume), and does
         not cover a different directory that happens to have the same name, nor the same name
-        after the directory was replaced. An empty tuple means the target is `root` itself.
+        after the directory was replaced. Where the file system reports `f_fsid` 0 identity is
+        not enough and the canonical text of `root` must also be a prefix of the target's. An
+        empty tuple means the target is `root` itself.
         """
         if root.identity not in self.chain_set:
             return None
-        return self.components[self.chain.index(root.identity) :]
+        depth = self.chain.index(root.identity)
+        if root.identity.fsid == 0:
+            # A file system that reports no f_fsid (some FUSE ones) is told apart by inode number
+            # alone, which two such file systems share: there the name has to agree as well.
+            if self.components[: len(root.components)] != root.components:
+                return None
+            depth = len(root.components)
+        return self.components[depth:]
 
 
 @final

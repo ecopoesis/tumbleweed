@@ -1225,14 +1225,18 @@ class TestTheDecision:
         assert net.within_grant is None
         assert isinstance(refusal_of(files), TaintConflict)
 
-    def test_a_file_grant_covers_no_network_request(self, world: World, task: TaskState) -> None:
+    def test_a_file_grant_covers_no_network_request_and_taints_against_one(
+        self, world: World, task: TaskState
+    ) -> None:
+        """Found in a store beside a clean task state, the file grant still counts: the task
+        cannot be given the network on top of it."""
         grant = forged(world.home / "Photos", FsRead, task)
 
         decision = decide(
             task, [grant], request(task.task, None, capability=NETWORK), rules=world.rules, now=NOW
         )
 
-        assert isinstance(decision, NeedsPrompt)
+        assert refusal_of(decision) == TaintConflict(held=TaintKind.FS, wanted=TaintKind.NET)
 
     @pytest.mark.parametrize("path", ["missing", "fifo"])
     def test_what_cannot_be_recorded_is_not_asked_about(
@@ -1622,3 +1626,257 @@ def test_the_resolved_path_of_a_request_is_the_one_a_grant_records(
 
     assert isinstance(grant.capability, FsRead)
     assert grant.capability.path == StoredPath.record(resolved)
+
+
+def net_task_grant(task: TaskState, *, issued_at: dt.datetime = NOW) -> Grant:
+    return TaskGrant(
+        id=GrantId.new(),
+        capability=NetFull(),
+        origin=GrantOrigin.PROMPT,
+        issued_at=issued_at,
+        task=task.task,
+    )
+
+
+class TestAnInconsistentStore:
+    """A store can disagree with the task's state (a lost write, a forged row). I12 must hold
+    anyway: nothing here may ever make a task both fs- and net-tainted, and `decide` and
+    `issue_grant` must agree on what the task holds."""
+
+    def test_a_clean_task_with_a_file_task_grant_and_a_net_tool_grant_never_gets_both(
+        self, world: World, task: TaskState
+    ) -> None:
+        tool = ToolId.new()
+        run = tool_run(tool)
+        files = forged(world.home / "Photos", FsRead, task)
+        network = ToolGrant(
+            id=GrantId.new(),
+            capability=NetFull(),
+            origin=GrantOrigin.PROMPT,
+            issued_at=NOW - MINUTE,  # older: it would win if tool grants went first
+            tool=tool,
+            content_hash=run.tool.content_hash if run.tool else HASH_A,
+        )
+
+        selection = select_grants(task, run, [network, files], rules=world.rules, now=NOW)
+
+        assert selection.applicable == (files,)
+        assert [(s.grant, s.reason) for s in selection.skipped] == [
+            (network.id, SkipReason.TAINT_CONFLICT)
+        ]
+        assert selection.task_taint == FS
+        decision = decide(
+            task,
+            [network, files],
+            request(task.task, world.home / "Photos" / "a.jpg", run=run),
+            rules=world.rules,
+            now=NOW,
+        )
+        assert isinstance(decision, Allow)
+        assert decision.task_taint == FS  # healed: the task now holds what the store says
+
+    def test_two_task_grants_that_conflict_the_earlier_one_applies(
+        self, world: World, task: TaskState
+    ) -> None:
+        files = forged(world.home / "Photos", FsRead, task)
+        network = net_task_grant(task, issued_at=NOW + MINUTE)
+
+        selection = select_grants(
+            task, run_context(), [network, files], rules=world.rules, now=NOW + MINUTE
+        )
+
+        assert selection.applicable == (files,)
+        assert [(s.grant, s.reason) for s in selection.skipped] == [
+            (network.id, SkipReason.TAINT_CONFLICT)
+        ]
+        assert selection.task_taint == FS
+
+    def test_a_net_request_is_then_refused_not_covered(self, world: World, task: TaskState) -> None:
+        files = forged(world.home / "Photos", FsRead, task)
+        network = net_task_grant(task, issued_at=NOW + MINUTE)
+
+        decision = decide(
+            task,
+            [files, network],
+            request(task.task, None, capability=NETWORK),
+            rules=world.rules,
+            now=NOW + MINUTE,
+        )
+
+        assert refusal_of(decision) == TaintConflict(held=TaintKind.FS, wanted=TaintKind.NET)
+
+    def test_a_once_or_task_grant_that_conflicts_with_the_task_is_skipped(
+        self, world: World, task: TaskState
+    ) -> None:
+        net_held = TaskState(task=task.task, taint=NET)
+        files = forged(world.home / "Photos", FsRead, task)
+
+        selection = select_grants(net_held, run_context(), [files], rules=world.rules, now=NOW)
+
+        assert [s.reason for s in selection.skipped] == [SkipReason.TAINT_CONFLICT]
+        assert selection.task_taint == NET
+
+    def test_issuing_counts_the_grants_that_apply_to_the_run(
+        self, world: World, task: TaskState
+    ) -> None:
+        """The state is clean, the store holds a file grant: the network cannot be issued."""
+        files = forged(world.home / "Photos", FsRead, task)
+
+        result = issue_grant(
+            task,
+            request(task.task, None, capability=NETWORK),
+            scope=GrantScope.TASK,
+            origin=GrantOrigin.PROMPT,
+            grant_id=GrantId.new(),
+            rules=world.rules,
+            now=NOW,
+            grants=[files],
+        )
+
+        assert refusal_of(result) == TaintConflict(held=TaintKind.FS, wanted=TaintKind.NET)
+
+    def test_issuing_counts_the_tool_grants_that_apply_to_the_run(
+        self, world: World, task: TaskState
+    ) -> None:
+        tool = ToolId.new()
+        run = tool_run(tool)
+        assert run.tool is not None
+        tool_files = ToolGrant(
+            id=GrantId.new(),
+            capability=FsRead(path=StoredPath.record(resolve(world.home / "Photos"))),
+            origin=GrantOrigin.PROMPT,
+            issued_at=NOW - MINUTE,
+            tool=tool,
+            content_hash=run.tool.content_hash,
+        )
+
+        refused = issue_grant(
+            task,
+            request(task.task, None, capability=NETWORK, run=run),
+            scope=GrantScope.TASK,
+            origin=GrantOrigin.PROMPT,
+            grant_id=GrantId.new(),
+            rules=world.rules,
+            now=NOW,
+            grants=[tool_files],
+        )
+        elsewhere = issue_grant(  # the same grants, for a run the tool grant does not apply to
+            task,
+            request(task.task, None, capability=NETWORK),
+            scope=GrantScope.TASK,
+            origin=GrantOrigin.PROMPT,
+            grant_id=GrantId.new(),
+            rules=world.rules,
+            now=NOW,
+            grants=[tool_files],
+        )
+
+        assert refusal_of(refused) == TaintConflict(held=TaintKind.FS, wanted=TaintKind.NET)
+        assert isinstance(elsewhere, Issued)
+
+    def test_what_is_issued_carries_the_taint_of_what_applies(
+        self, world: World, task: TaskState
+    ) -> None:
+        files = forged(world.home / "Photos", FsRead, task)
+
+        result = issue_grant(
+            task,
+            request(task.task, world.home / "Documents"),
+            scope=GrantScope.TASK,
+            origin=GrantOrigin.PROMPT,
+            grant_id=GrantId.new(),
+            rules=world.rules,
+            now=NOW,
+            grants=[files],
+        )
+
+        assert isinstance(result, Issued)
+        assert result.task.taint == FS
+
+
+class TestAnEndedTask:
+    def test_its_once_and_task_grants_are_skipped_as_ended(
+        self, world: World, task: TaskState
+    ) -> None:
+        run = run_context()
+        once, _ = issued(world, task, world.home / "Photos", scope=GrantScope.ONCE, run=run)
+        wide, tainted = issued(world, task, world.home / "Documents")
+
+        selection = select_grants(tainted.end(), run, [once, wide], rules=world.rules, now=NOW)
+
+        assert selection.applicable == ()
+        assert {(s.grant, s.reason) for s in selection.skipped} == {
+            (once.id, SkipReason.TASK_ENDED),
+            (wide.id, SkipReason.TASK_ENDED),
+        }
+
+    def test_a_live_task_keeps_them(self, world: World, task: TaskState) -> None:
+        wide, tainted = issued(world, task, world.home / "Documents")
+
+        selection = select_grants(tainted, run_context(), [wide], rules=world.rules, now=NOW)
+
+        assert selection.applicable == (wide,)
+
+
+class TestAllowNamesTheTarget:
+    def test_the_identity_the_decision_saw(self, world: World, task: TaskState) -> None:
+        grant, task = issued(world, task, world.home / "Photos")
+
+        decision = decide(
+            task,
+            [grant],
+            request(task.task, world.home / "Photos" / "a.jpg"),
+            rules=world.rules,
+            now=NOW,
+        )
+
+        assert isinstance(decision, Allow)
+        assert decision.target == resolve(world.home / "Photos" / "a.jpg").identity
+
+    def test_none_for_a_file_that_did_not_exist_and_for_the_network(
+        self, world: World, task: TaskState
+    ) -> None:
+        grant, task = issued(world, task, world.home / "Photos")
+
+        missing = decide(
+            task,
+            [grant],
+            request(task.task, world.home / "Photos" / "later.jpg"),
+            rules=world.rules,
+            now=NOW,
+        )
+
+        assert isinstance(missing, Allow)
+        assert missing.target is None
+
+    def test_opening_below_the_grant_with_it_refuses_a_file_swapped_after_the_decision(
+        self, world: World, task: TaskState
+    ) -> None:
+        grant, task = issued(world, task, world.home / "Photos")
+        assert isinstance(grant.capability, FsRead)
+        decision = decide(
+            task,
+            [grant],
+            request(task.task, world.home / "Photos" / "a.jpg"),
+            rules=world.rules,
+            now=NOW,
+        )
+        assert isinstance(decision, Allow)
+        assert decision.within_grant is not None
+        # replaced by another file of the same name (the old one is renamed, not deleted: the
+        # inode number of a deleted file can be handed to the next one)
+        (world.home / "Photos" / "a.jpg").rename(world.home / "Photos" / "old.jpg")
+        (world.home / "Photos" / "a.jpg").write_text("swapped")
+
+        with open_granted(grant.capability.path, rules=world.rules) as root:
+            with pytest.raises(PathError) as raised:
+                read_workspace_file(
+                    root,
+                    decision.within_grant,
+                    max_bytes=ByteCount(100),
+                    expect=decision.target,
+                )
+            unchecked = read_workspace_file(root, decision.within_grant, max_bytes=ByteCount(100))
+
+        assert raised.value.fault is PathFault.IDENTITY_MISMATCH
+        assert unchecked == b"swapped"  # without `expect` nothing would have noticed

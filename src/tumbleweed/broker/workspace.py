@@ -25,6 +25,7 @@ from tumbleweed.broker.fdio import (
     open_below,
     read_capped,
 )
+from tumbleweed.broker.identity import FsIdentity
 from tumbleweed.core.types import ByteCount, WorkspaceRelPath
 
 
@@ -33,17 +34,19 @@ def open_in_workspace(
     rel: WorkspaceRelPath,
     *,
     want: FileKind | None = None,
+    expect: FsIdentity | None = None,
     strategy: OpenStrategy = OpenStrategy.AUTO,
 ) -> OpenedPath:
     """Open the file or directory `rel` below the directory `root`, following no symlink.
 
-    `want` is the kind it must be. Raises `PathError` (`SYMLINK`, `MISSING`, `WRONG_KIND`,
+    `want` is the kind it must be, `expect` the identity it must have (`Allow.target`: what the
+    decision saw). Raises `PathError` (`SYMLINK`, `MISSING`, `WRONG_KIND`,
     `SPECIAL_FILE`, ...); the caller closes the result.
     """
     raw: object = rel  # the annotation is for the checker; callers can pass anything
     if type(raw) is not WorkspaceRelPath:
         raise PathError(PathFault.INVALID)
-    return open_below(root, str(raw).split("/"), want=want, strategy=strategy)
+    return open_below(root, str(raw).split("/"), want=want, expect=expect, strategy=strategy)
 
 
 def read_workspace_file(
@@ -51,9 +54,12 @@ def read_workspace_file(
     rel: WorkspaceRelPath,
     *,
     max_bytes: ByteCount,
+    expect: FsIdentity | None = None,
     strategy: OpenStrategy = OpenStrategy.AUTO,
 ) -> bytes:
     """Read the regular file `rel` below `root` whole, or raise `PathError` (also `TOO_LARGE`
     when it is over `max_bytes`, which may not exceed `fdio.MAX_READ_BYTES`)."""
-    with open_in_workspace(root, rel, want=FileKind.REGULAR, strategy=strategy) as file:
+    with open_in_workspace(
+        root, rel, want=FileKind.REGULAR, expect=expect, strategy=strategy
+    ) as file:
         return read_capped(file, max_bytes)

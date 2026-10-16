@@ -54,6 +54,7 @@ from tumbleweed.broker.grants import (
     TaskGrant,
     ToolGrant,
 )
+from tumbleweed.broker.identity import FsIdentity
 from tumbleweed.broker.model import PolicyModel
 from tumbleweed.broker.paths import ResolvedPath, StoredPath
 from tumbleweed.broker.task import (
@@ -234,13 +235,16 @@ class Allow(PolicyModel):
 
     `within_grant`, for a file request, is the path from the object the grant was made for down
     to the target (None if the target is that object): open the grant's `StoredPath`, then open
-    this below it with `workspace.open_beneath`.
+    this below it with `workspace.open_in_workspace`, passing `target` as `expect` so that
+    what is opened is what the decision saw. `target` is the target's identity when it existed
+    at the decision, else None.
     """
 
     kind: Literal["allow"] = "allow"
     grant: GrantId
     consumes: bool
     within_grant: WorkspaceRelPath | None = None
+    target: FsIdentity | None = None
     task_taint: frozenset[TaintKind]
 
 
@@ -283,6 +287,7 @@ class SkipReason(StrEnum):
     """Why a grant does not apply to a run."""
 
     EXPIRED = "expired"
+    TASK_ENDED = "task_ended"  # a once or task grant of a task that has ended
     CONSUMED = "consumed"
     OTHER_TASK = "other_task"
     OTHER_RUN = "other_run"
@@ -347,6 +352,8 @@ def _skip_reason(
 ) -> SkipReason | None:
     if grant.is_expired(now):
         return SkipReason.EXPIRED
+    if task.ended and not isinstance(grant, ToolGrant):
+        return SkipReason.TASK_ENDED  # ending a task revokes its once and task grants
     binding = _binding_skip(grant, task, run)
     if binding is not None:
         return binding
@@ -388,9 +395,12 @@ def select_grants(
     **Applying a tool grant counts as issuing it** (I12): the tool grants that apply are taken
     in order of issue (`issued_at`, then ID) and each adds its taint to the running taint, so
     the first of two conflicting tool grants applies and the second is withheld
-    (`TAINT_CONFLICT`), as is any tool grant that conflicts with what the task already holds. A
-    once or task grant was issued, and its taint set then, so it only has to agree with the
-    task's taint. Everything is returned in order of issue.
+    (`TAINT_CONFLICT`), as is any tool grant that conflicts with what the task already holds.
+    A once or task grant was issued, and its taint set then, but a store can be inconsistent, so
+    those are applied first, in order of issue, the same way: each adds its taint to the running
+    one, and one that conflicts with the task's taint or with an earlier one is skipped
+    (`TAINT_CONFLICT`), which fails closed. Ending a task revokes its once and task grants
+    (`TASK_ENDED`). Everything is returned in order of issue.
     """
     _require_aware(now, "now")
     ordered = sorted(grants, key=lambda grant: (grant.issued_at, grant.id))
@@ -399,7 +409,11 @@ def select_grants(
     for index, grant in enumerate(ordered):
         if not isinstance(grant, ToolGrant):
             reason = _skip_reason(grant, task, run, rules, now)
-            reasons[index] = _taint_skip(task.taint, grant) if reason is None else reason
+            if reason is None:
+                reason = _taint_skip(taint, grant)
+                if reason is None:
+                    taint = taint | {taint_of(grant.capability.kind)}
+            reasons[index] = reason
     for index, grant in enumerate(ordered):
         if isinstance(grant, ToolGrant):
             reason = _skip_reason(grant, task, run, rules, now)
@@ -537,6 +551,7 @@ def decide(
             grant=best.grant.id,
             consumes=isinstance(best.grant, OnceGrant),
             within_grant=WorkspaceRelPath("/".join(best.below)) if best.below else None,
+            target=None if request.path is None else request.path.identity,
             task_taint=selection.task_taint,
         )
     wanted = taint_of(request.capability)
@@ -561,6 +576,7 @@ def issue_grant(
     rules: DenyRules,
     now: datetime,
     expires_at: datetime | None = None,
+    grants: Sequence[Grant] = (),
 ) -> Issuance:
     """Make the grant the user decided on, or refuse.
 
@@ -573,6 +589,10 @@ def issue_grant(
     user-triggered run of a saved tool) and, last, a taint that conflicts. On success the
     returned task has the new grant's taint, whether or not the grant is ever used (I12), and
     the grant is bound to `request.run` (once) or to its tool and content hash (tool).
+
+    `grants` are the grants the caller holds that could apply to the run, as for `decide`: the
+    taint check counts the ones that apply, so a task whose store disagrees with its state cannot
+    be made both fs- and net-tainted by issuing.
     """
     _require_aware(now, "now")
     if expires_at is not None:
@@ -589,10 +609,14 @@ def issue_grant(
     if grant is None:
         return Deny(reason=ScopeUnavailable(scope=scope))
     wanted = taint_of(request.capability)
-    tainted = task.with_taint(frozenset({wanted}))
-    if tainted is None:
+    # The taint to extend is the one `decide` would use for this run: the task's, with that of the
+    # grants that apply to the run (once and task grants, and the tool grants applying counts as
+    # issuing), so that the two never disagree about what the task holds.
+    held = select_grants(task, request.run, grants, rules=rules, now=now).task_taint
+    merged = merged_taint(held, frozenset({wanted}))
+    if merged is None:
         return Deny(reason=TaintConflict(held=other_taint(wanted), wanted=wanted))
-    return Issued(grant=grant, task=tainted)
+    return Issued(grant=grant, task=TaskState(task=task.task, taint=merged, ended=task.ended))
 
 
 def _new_grant(

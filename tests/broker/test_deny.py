@@ -249,7 +249,9 @@ class TestTheAncestorRule:
         for ancestor in (world.home, *world.home.parents):
             match = world.rules.check(resolve(ancestor))
             assert match is not None, ancestor
-            assert match.relation is ANCESTOR, ancestor
+            # (a shared directory such as /tmp, where the test world lives on Linux, is refused
+            # for being one, by itself)
+            assert match.relation is ANCESTOR or match.entry == SHARED_DIRECTORY, ancestor
 
     @pytest.mark.parametrize(
         "relative", [".config", ".local", ".local/share", ".cache", ".local/state", ".var"]

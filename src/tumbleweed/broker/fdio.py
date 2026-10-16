@@ -36,7 +36,7 @@ import warnings
 from collections.abc import Sequence
 from enum import StrEnum
 from types import TracebackType
-from typing import Final, Self, assert_never, final
+from typing import Final, NamedTuple, Self, assert_never, final
 
 from tumbleweed.broker.errors import PathError, PathFault
 from tumbleweed.broker.identity import FsIdentity
@@ -50,6 +50,16 @@ _CHUNK: Final = 1024 * 1024
 
 _COMMON: Final = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NOCTTY
 _DIRECTORY_FLAGS: Final = _COMMON | os.O_DIRECTORY
+# The directories on the way to a file are only searched, never read. O_PATH (Linux) says so, and
+# makes the walk need what `openat2` needs, search permission and nothing more, so that the two
+# strategies refuse the same things. Where there is no O_PATH (macOS) a directory on the way must
+# be readable too: a host difference, not one between the strategies.
+# openat2 refuses O_PATH with any flag but these three (open(2) would ignore them).
+_PARENT_FLAGS: Final = (
+    os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    if hasattr(os, "O_PATH")
+    else _DIRECTORY_FLAGS
+)
 # O_NONBLOCK so that opening a FIFO that slipped in after the check does not wait for a writer.
 _FILE_FLAGS: Final = _COMMON | os.O_NONBLOCK
 
@@ -301,7 +311,7 @@ def _open_directories(start_fd: int, names: list[bytes], how: OpenStrategy) -> i
         return os.dup(start_fd)
     if how is OpenStrategy.OPENAT2:
         try:
-            return _openat2(start_fd, b"/".join(names), _DIRECTORY_FLAGS, _RESOLVE_FLAGS)
+            return _openat2(start_fd, b"/".join(names), _PARENT_FLAGS, _RESOLVE_FLAGS)
         except OSError as exc:
             if exc.errno not in _NEEDS_DIAGNOSIS:
                 raise _fault_of(exc, None, names[-1]) from None
@@ -312,7 +322,7 @@ def _open_directories(start_fd: int, names: list[bytes], how: OpenStrategy) -> i
     try:
         for name in names:
             try:
-                following = os.open(name, _DIRECTORY_FLAGS, dir_fd=current)
+                following = os.open(name, _PARENT_FLAGS, dir_fd=current)
             except OSError as exc:
                 raise _fault_of(exc, current, name) from None
             os.close(current)
@@ -392,29 +402,61 @@ def open_below(
     names: Sequence[str],
     *,
     want: FileKind | None = None,
+    expect: FsIdentity | None = None,
     strategy: OpenStrategy = OpenStrategy.AUTO,
 ) -> OpenedPath:
     """Open the file or directory at `names` below the directory `root`, never through a symlink.
 
     Nothing can leave `root`: `names` cannot hold `..` (see `_encode`), and no symlink is
-    followed. At least one name is required. Raises `PathError`.
+    followed. At least one name is required. If `expect` is given, what was opened must have
+    that identity (`IDENTITY_MISMATCH` otherwise): the identity a decision saw. Raises
+    `PathError`.
     """
     if root.kind is not FileKind.DIRECTORY:
         raise PathError(PathFault.WRONG_KIND)
     if not names:
         raise PathError(PathFault.INVALID)
-    return _open_in(root.fd, _encode(names), want, _chosen(strategy))
+    opened = _open_in(root.fd, _encode(names), want, _chosen(strategy))
+    if expect is not None and opened.identity != expect:
+        opened.close()
+        raise PathError(PathFault.IDENTITY_MISMATCH)
+    return opened
+
+
+class Walk(NamedTuple):
+    """What `walk` found: the identity chain, and whether the target is a shared directory."""
+
+    chain: tuple[FsIdentity, ...]
+    shared_directory: bool
+
+
+def _identity_of(fd: int) -> FsIdentity:
+    try:
+        return FsIdentity.of_fd(fd)
+    except OSError as exc:
+        raise PathError(PathFault.IO, exc.errno) from None
 
 
 def identity_chain(names: Sequence[str]) -> tuple[FsIdentity, ...]:
-    """The identity of `/` and of each prefix of `names` that exists, from `/` downwards.
+    """The identities `walk` finds, without the rest."""
+    return walk(names).chain
+
+
+def walk(names: Sequence[str]) -> Walk:
+    """The identity of `/` and of each prefix of `names` that exists, from `/` downwards, and
+    whether the target is a directory that anyone can write to and that is sticky (`/tmp`).
 
     Walks without following symlinks, like `open_absolute`, and stops without error at the first
     component that does not exist, is not a directory (when more follows), is a socket, FIFO or
     device, or cannot be opened for lack of permission. Those are "not there for our purposes":
-    the result is then shorter than `len(names) + 1`, and the caller treats the target as one
+    the chain is then shorter than `len(names) + 1`, and the caller treats the target as one
     that has no identity. A symlink is an error (the caller canonicalised the path first, so
-    one now means it changed under us), as is anything the operating system reports otherwise.
+    one now means it changed under us), as is anything the operating system reports otherwise
+    (always a `PathError`, never a bare `OSError`).
+
+    Like every open here this can wait for as long as the file system takes to answer: on a hung
+    network or FUSE mount it blocks, and nothing in this module puts a deadline on it. The
+    broker daemon decides on a worker it can abandon (S17).
     """
     encoded = _encode(names)
     try:
@@ -422,22 +464,29 @@ def identity_chain(names: Sequence[str]) -> tuple[FsIdentity, ...]:
     except OSError as exc:
         raise _fault_of(exc, None, b"/") from None
     chain: list[FsIdentity] = []
+    shared = False
     try:
-        chain.append(FsIdentity.of_fd(current))
+        chain.append(_identity_of(current))
         for index, name in enumerate(encoded):
             following = _open_for_chain(current, name, last=index == len(encoded) - 1)
             if following is None:
                 break
             os.close(current)
             current = following
-            chain.append(FsIdentity.of_fd(current))
+            chain.append(_identity_of(current))
+        if len(chain) == len(encoded) + 1:
+            try:
+                mode = os.fstat(current).st_mode
+            except OSError as exc:
+                raise PathError(PathFault.IO, exc.errno) from None
+            shared = stat.S_ISDIR(mode) and bool(mode & stat.S_ISVTX) and bool(mode & stat.S_IWOTH)
     finally:
         os.close(current)
-    return tuple(chain)
+    return Walk(tuple(chain), shared)
 
 
 def _open_for_chain(parent_fd: int, name: bytes, *, last: bool) -> int | None:
-    """Open `name` for `identity_chain`, or return None where the walk should stop."""
+    """Open `name` for `walk`, or return None where the walk should stop."""
     try:
         if last:
             mode = os.stat(name, dir_fd=parent_fd, follow_symlinks=False).st_mode
@@ -455,7 +504,11 @@ def _open_for_chain(parent_fd: int, name: bytes, *, last: bool) -> int | None:
             return None
         raise error from None
     if last:
-        opened_mode = os.fstat(fd).st_mode
+        try:
+            opened_mode = os.fstat(fd).st_mode
+        except OSError as exc:
+            os.close(fd)
+            raise PathError(PathFault.IO, exc.errno) from None
         if not (stat.S_ISDIR(opened_mode) or stat.S_ISREG(opened_mode)):
             os.close(fd)  # swapped for a special file between the check and the open
             return None

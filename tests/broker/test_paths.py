@@ -614,3 +614,41 @@ class TestOpen:
         public = {name for name in dir(StoredPath) if not name.startswith("_")}
 
         assert not {name for name in public if "resolve" in name or "canonical" in name}
+
+
+class TestCoverageWhereTheFileSystemReportsNoId:
+    """FUSE file systems report `f_fsid` 0, so identity is an inode number that two of them can
+    share. There the name has to agree too."""
+
+    def path(self, text: str, chain: tuple[FsIdentity, ...]) -> ResolvedPath:
+        return ResolvedPath(canonical=CanonicalPath.resolve(text), chain=chain)
+
+    ROOT = FsIdentity(fsid=9, ino=1)
+    ZERO_A = FsIdentity(fsid=0, ino=5)
+    ZERO_B = FsIdentity(fsid=0, ino=6)
+
+    def test_the_same_inode_under_another_name_is_not_covered(self) -> None:
+        elsewhere = StoredPath(path="/other/mount", identity=self.ZERO_A)
+        target = self.path("/syn/a/b", (self.ROOT, self.ZERO_A, self.ZERO_B, self.ZERO_B))
+
+        assert target.below(elsewhere) is None
+
+    def test_the_same_name_is_covered(self) -> None:
+        mount = StoredPath(path="/syn", identity=self.ZERO_A)
+        target = self.path("/syn/a/b", (self.ROOT, self.ZERO_A, self.ZERO_B, self.ZERO_B))
+
+        assert target.below(mount) == ("a", "b")
+
+    def test_a_name_that_only_starts_alike_is_not_covered(self) -> None:
+        mount = StoredPath(path="/sy", identity=self.ZERO_A)
+        target = self.path("/syn/a", (self.ROOT, self.ZERO_A, self.ZERO_B))
+
+        assert target.below(mount) is None
+
+    def test_a_file_system_with_an_id_is_still_covered_by_identity_alone(self) -> None:
+        """A bind mount or a case variant: another name, the same object, and a real f_fsid."""
+        real = FsIdentity(fsid=7, ino=5)
+        mount = StoredPath(path="/other/mount", identity=real)
+        target = self.path("/syn/a", (self.ROOT, real, self.ZERO_B))
+
+        assert target.below(mount) == ("a",)

@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 import tracemalloc
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -751,3 +751,128 @@ def test_a_symlink_swapped_in_between_the_check_and_the_open_is_still_refused(
     assert swapped
     assert raised.value.fault is PathFault.SYMLINK
     assert stat.S_ISLNK(os.lstat(target).st_mode)
+
+
+class TestOperatingSystemErrorsDuringTheWalk:
+    def test_a_filesystem_query_that_fails_is_a_path_error_not_an_oserror(
+        self, tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def failing(fd: int) -> os.statvfs_result:
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(os, "fstatvfs", failing)
+        before = open_descriptors()
+
+        with pytest.raises(PathError) as raised:
+            identity_chain(names_of(tree / "dir"))
+
+        assert raised.value.fault is PathFault.IO
+        assert raised.value.errno_name == "EIO"
+        assert open_descriptors() == before
+
+    def test_the_same_through_resolve(self, tree: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tumbleweed.broker import ResolvedPath
+
+        def failing(fd: int) -> os.stat_result:
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr(os, "fstat", failing)
+
+        with pytest.raises(PathError) as raised:
+            ResolvedPath.resolve(str(tree / "dir"))
+
+        assert raised.value.fault is PathFault.IO
+
+    def test_the_descriptor_of_the_last_component_is_closed_if_it_cannot_be_examined(
+        self, tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The root's identity is the first `fstat`; the target's descriptor is the second."""
+        real_fstat = os.fstat
+        calls: list[int] = []
+
+        def second_fails(fd: int) -> os.stat_result:
+            calls.append(fd)
+            if len(calls) == 2:
+                raise OSError(errno.EIO, "Input/output error")
+            return real_fstat(fd)
+
+        monkeypatch.setattr(os, "fstat", second_fails)
+        before = open_descriptors()
+
+        with pytest.raises(PathError) as raised:
+            identity_chain(names_of(tree / "outside.txt"))
+
+        monkeypatch.undo()
+        assert raised.value.fault is PathFault.IO
+        assert len(calls) == 2
+        assert open_descriptors() == before
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(calls[1])  # the descriptor that failed to be examined is closed
+
+
+class TestADirectoryThatCanOnlyBeSearched:
+    """Mode 0311: the owner can search it but not read it. `openat2` needs search permission on
+    the directories on the way, and the component-wise walk needs the same (with `O_PATH`) on
+    Linux, so that the strategies refuse the same things. Where there is no `O_PATH` (macOS)
+    both need to read them."""
+
+    @pytest.fixture
+    def search_only(self, tree: Path) -> Iterator[Path]:
+        (tree / "locked").mkdir()
+        (tree / "locked" / "file.txt").write_text("inside")
+        (tree / "locked").chmod(0o311)
+        yield tree / "locked"
+        (tree / "locked").chmod(0o755)
+
+    @pytest.mark.skipif(not can_search_denied_directories(), reason="root ignores permission bits")
+    def test_a_file_in_it_is_opened_where_search_is_enough_and_refused_where_not(
+        self, search_only: Path, strategy: OpenStrategy
+    ) -> None:
+        names = names_of(search_only / "file.txt")
+
+        if sys.platform == "linux":
+            with open_absolute(names, strategy=strategy) as opened:
+                assert os.pread(opened.fd, 10, 0) == b"inside"
+        else:
+            with pytest.raises(PathError) as raised:
+                open_absolute(names, strategy=strategy)
+            assert raised.value.fault is PathFault.DENIED
+
+    @pytest.mark.skipif(not can_search_denied_directories(), reason="root ignores permission bits")
+    def test_below_a_workspace_root_too(self, search_only: Path, strategy: OpenStrategy) -> None:
+        with open_absolute(names_of(search_only.parent)) as root:
+            if sys.platform == "linux":
+                with open_below(root, ["locked", "file.txt"], strategy=strategy) as opened:
+                    assert opened.kind is FileKind.REGULAR
+            else:
+                with pytest.raises(PathError) as raised:
+                    open_below(root, ["locked", "file.txt"], strategy=strategy)
+                assert raised.value.fault is PathFault.DENIED
+
+    @pytest.mark.skipif(not can_search_denied_directories(), reason="root ignores permission bits")
+    def test_the_directory_itself_cannot_be_opened_to_be_read(
+        self, search_only: Path, strategy: OpenStrategy
+    ) -> None:
+        with pytest.raises(PathError) as raised:
+            open_absolute(names_of(search_only), strategy=strategy)
+
+        assert raised.value.fault is PathFault.DENIED
+
+
+class TestExpectedIdentity:
+    def test_opening_below_a_root_verifies_what_was_opened(
+        self, tree: Path, strategy: OpenStrategy
+    ) -> None:
+        wanted = identity_of_path(tree / "dir" / "file.txt")
+        with open_absolute(names_of(tree / "dir")) as root:
+            with open_below(root, ["file.txt"], expect=wanted, strategy=strategy) as opened:
+                assert opened.identity == wanted
+            # renamed, not deleted: a deleted file's inode number can be handed to the next one
+            (tree / "dir" / "file.txt").rename(tree / "dir" / "old.txt")
+            (tree / "dir" / "file.txt").write_text("another file")
+            before = open_descriptors()
+            with pytest.raises(PathError) as raised:
+                open_below(root, ["file.txt"], expect=wanted, strategy=strategy)
+            assert open_descriptors() == before
+
+        assert raised.value.fault is PathFault.IDENTITY_MISMATCH
