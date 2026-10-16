@@ -9,6 +9,7 @@ ancestors, chains and loops of symlinks, case variants, and Unicode variants.
 
 import datetime as dt
 import os
+import sys
 import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -21,6 +22,7 @@ from tests.broker.consts import NOW
 from tests.broker.requests import request, run_context
 from tests.broker.support import World, resolve
 from tumbleweed.broker import (
+    SYSTEM_DENY,
     AccessRequest,
     Allow,
     Capability,
@@ -126,11 +128,32 @@ def same_file(left: str, right: str) -> bool:
 
 
 def touches_protected(real: str, protected: list[str]) -> bool:
-    """Whether `real` is at, below or above any protected place, by `st_dev` and `st_ino`."""
+    """Whether `real` is at, below or above any protected place, by `st_dev` and `st_ino`.
+
+    On macOS the data volume is also `/`, for everything the user owns, under a name no symlink
+    leads to (firmlinks), which `samefile` cannot know: `real` is looked at under both names.
+    """
+    candidates = [real]
+    data_volume = "/System/Volumes/Data"
+    if sys.platform == "darwin" and (real == data_volume or real.startswith(f"{data_volume}/")):
+        candidates.append(real.removeprefix(data_volume) or "/")
+    for candidate in candidates:
+        for place in protected:
+            if any(same_file(prefix, place) for prefix in prefixes(candidate)):
+                return True
+            if any(same_file(candidate, prefix) for prefix in prefixes(place)):
+                return True
+    return False
+
+
+def folded_touches_protected(canonical: str, protected: list[str]) -> bool:
+    """Whether the canonical path, folded component by component, is at, below or above a
+    protected place, folded the same way. No file system is asked."""
+    path = [fold_name(part) for part in Path(canonical).parts[1:]]
     for place in protected:
-        if any(same_file(prefix, place) for prefix in prefixes(real)):
-            return True
-        if any(same_file(real, prefix) for prefix in prefixes(place)):
+        other = [fold_name(part) for part in Path(place).parts[1:]]
+        shared = min(len(path), len(other))
+        if path[:shared] == other[:shared]:
             return True
     return False
 
@@ -267,7 +290,14 @@ class TestEscapeAttemptsAgainstTheDenyRules:
             now=NOW,
         )
 
-        if touches:
+        # What does not need a file system to say: the canonical path and a protected place agree
+        # (equal, or one inside the other) once case and Unicode are folded away. On a
+        # case-sensitive host that is the only thing that refuses `.SSH`, which does not exist.
+        folds_to_protected = folded_touches_protected(
+            resolved.text, [*protected_places(attack), *SYSTEM_DENY]
+        )
+
+        if touches or folds_to_protected:
             assert isinstance(decision, Deny), (text, resolved.text)
             assert isinstance(decision.reason, StaticDeny)
             assert isinstance(issuance, Deny)
@@ -357,6 +387,25 @@ class TestEscapeAttemptsAgainstTheDenyRules:
         )
         assert below is not None
         assert below.relation is (DenyRelation.INSIDE if extra else DenyRelation.EQUAL)
+
+
+class TestTheFoldedCheckIsIndependent:
+    def test_it_sees_what_the_oracle_cannot_on_a_case_sensitive_host(self, attack: World) -> None:
+        protected = protected_places(attack)
+        spelled = resolve(f"{attack.home}/{fullwidth('.ssh')}/id_rsa")
+
+        assert folded_touches_protected(spelled.text, protected)
+        assert not folded_touches_protected(resolve(attack.home / "Documents").text, protected)
+
+    def test_and_the_rules_refuse_it(self, attack: World) -> None:
+        for spelling in (".SSH", fullwidth(".ssh"), ".s" + ZWJ + "sh"):
+            path = resolve(f"{attack.home}/{spelling}/new")
+            task = TaskState(task=TaskId.new())
+
+            decision = decide(task, [], request(task.task, path.text), rules=attack.rules, now=NOW)
+
+            assert isinstance(decision, Deny), ascii(spelling)
+            assert isinstance(decision.reason, StaticDeny)
 
 
 class TestFoldProperties:

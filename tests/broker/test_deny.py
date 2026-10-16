@@ -7,10 +7,12 @@ import pwd as accounts
 import sys
 import unicodedata
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from pydantic import ValidationError
 
+from tests.broker.expected_deny import EXPECTED_HOME_DENY, EXPECTED_SYSTEM_DENY
 from tests.broker.fsutil import can_search_denied_directories
 from tests.broker.support import World, resolve
 from tumbleweed.broker import (
@@ -28,7 +30,7 @@ from tumbleweed.broker import (
     StoredPath,
     deny_entries,
 )
-from tumbleweed.broker.deny import DenyEntry, DenyForm
+from tumbleweed.broker.deny import SHARED_DIRECTORY, DenyEntry, DenyForm
 from tumbleweed.core.types import CanonicalPath
 
 EQUAL, INSIDE, ANCESTOR = DenyRelation.EQUAL, DenyRelation.INSIDE, DenyRelation.ANCESTOR
@@ -205,13 +207,17 @@ class TestEveryEntry:
 
         equal = shared_world.rules.check(entry)
         above = shared_world.rules.check(resolve(posixpath.dirname(entry.text)))
+        above_text = shared_world.rules.check_text(
+            StoredPath(path=posixpath.dirname(entry.text), identity=FsIdentity(fsid=1, ino=2))
+        )
         stored = StoredPath(path=below, identity=FsIdentity(fsid=1, ino=2))
         inside_text = shared_world.rules.check_text(stored)
 
         assert equal is not None
         assert equal.relation is EQUAL
-        assert above is not None
-        assert above.relation is ANCESTOR
+        assert above is not None  # (for /tmp/.X11-unix it is /tmp: a shared directory, by itself)
+        assert above_text is not None
+        assert above_text.relation is ANCESTOR
         assert inside_text is not None
         assert inside_text.relation is INSIDE
         if Path(entry.text).is_dir() and not os.access(entry.text, os.X_OK):
@@ -459,7 +465,7 @@ class TestIdentity:
         assert protected is not None
         assert protected.relation is EQUAL
         assert world.rules.check(resolve(f"{data}{world.home}/Documents")) is None
-        assert world.rules.check(resolve(f"{data}/Users/Shared")) is None
+        assert world.rules.check(resolve(f"{data}/Applications")) is None
 
     def test_checking_does_no_file_system_access(
         self, world: World, monkeypatch: pytest.MonkeyPatch
@@ -681,3 +687,273 @@ class TestForTheCurrentUser:
         )
         rules = DenyRules.build(context)
         assert "~/.ssh" in rules.labels
+
+
+class TestTheListAsLiterals:
+    """The lists compared with a copy written out by hand (`expected_deny`), so that deleting or
+    misspelling an entry, or changing one, fails here."""
+
+    def test_the_home_entries(self) -> None:
+        assert HOME_DENY == EXPECTED_HOME_DENY
+
+    def test_the_system_entries(self) -> None:
+        assert SYSTEM_DENY == EXPECTED_SYSTEM_DENY
+
+    @pytest.mark.parametrize(
+        "required",
+        [
+            "/root",
+            "/run/user",
+            "/etc/shadow",
+            ".config/gh",
+            ".config/git/credentials",
+            ".local/share/fish/fish_history",
+            ".terraformrc",
+            ".config/hub",
+            ".cache/huggingface/token",
+            ".huggingface",
+            ".claude",
+            ".codex",
+            ".lima",
+            ".colima",
+            ".msmtprc",
+            ".config/msmtp",
+        ],
+    )
+    def test_names_these_places(self, required: str) -> None:
+        assert required in {*HOME_DENY, *SYSTEM_DENY}
+
+    def test_no_duplicates(self) -> None:
+        assert len(set(HOME_DENY)) == len(HOME_DENY)
+        assert len(set(SYSTEM_DENY)) == len(SYSTEM_DENY)
+
+
+def context_for(base: Path, **changes: object) -> DenyContext:
+    home = base / "home"
+    fields: dict[str, object] = {
+        "homes": (str(home),),
+        "config_home": str(home / ".config"),
+        "data_home": str(home / ".local" / "share"),
+        "state_home": str(home / ".local" / "state"),
+        "cache_home": str(home / ".cache"),
+    }
+    return DenyContext.model_validate({**fields, **changes})
+
+
+class TestSharedPlacesUnderTmp:
+    """A read-only bind of a directory still lets a sandbox connect() to the sockets in it, and
+    tmux, X11 and ssh-agent sockets live under /tmp (I3)."""
+
+    @pytest.mark.parametrize(
+        "path",
+        ["/tmp/.X11-unix", "/tmp/.ICE-unix", "/tmp/.XIM-unix", "/tmp/.font-unix"],  # noqa: S108
+    )
+    def test_the_desktop_socket_directories(self, world: World, path: str) -> None:
+        for spelled in (path, f"{path}/X0", f"{path}/a/b"):
+            assert world.rules.check_text(
+                StoredPath(path=spelled, identity=FsIdentity(fsid=1, ino=2))
+            ), spelled
+        assert world.rules.check(resolve(path)) is not None
+        assert world.rules.check(resolve(f"{path}/X0")) is not None
+
+    def test_tmux_sockets_of_this_uid(self, tmp_path: Path) -> None:
+        rules = DenyRules.build(context_for(tmp_path, uid=4242))
+        identity = FsIdentity(fsid=1, ino=2)
+
+        mine = rules.check_text(StoredPath(path="/tmp/tmux-4242/default", identity=identity))  # noqa: S108
+        other = rules.check_text(StoredPath(path="/tmp/tmux-4243", identity=identity))  # noqa: S108
+
+        assert mine is not None
+        assert (mine.entry, mine.relation) == ("/tmp/tmux-<uid>", INSIDE)  # noqa: S108
+        assert other is None
+
+    def test_tmux_tmpdir_when_set(self, tmp_path: Path) -> None:
+        (tmp_path / "sockets" / "tmux-1").mkdir(parents=True)
+        rules = DenyRules.build(context_for(tmp_path, tmux_tmpdir=str(tmp_path / "sockets")))
+
+        inside = rules.check(resolve(tmp_path / "sockets" / "tmux-1"))
+        above = rules.check(resolve(tmp_path / "sockets"))
+
+        assert inside is not None
+        assert inside.entry == "$TMUX_TMPDIR"
+        assert above is not None
+        assert above.entry == "$TMUX_TMPDIR"
+
+    def test_tmux_tmpdir_from_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        entry = accounts.struct_passwd(
+            ("alice", "x", 1000, 1000, "Alice", "/home/alice", "/bin/sh")
+        )
+        monkeypatch.setattr(accounts, "getpwuid", lambda uid: entry)
+
+        context = DenyContext.for_current_user({"TMUX_TMPDIR": "/var/run/tmux-here/"})
+
+        assert context.tmux_tmpdir == "/var/run/tmux-here"
+        assert context.uid == os.getuid()
+        assert DenyContext.for_current_user({}).tmux_tmpdir is None
+
+    def test_tmp_itself_is_never_grantable(self, world: World) -> None:
+        """By the ancestor rule (it holds protected entries) and as a shared directory."""
+        for path in ("/tmp", "/var/tmp"):  # noqa: S108
+            match = world.rules.check(resolve(path))
+            assert match is not None, path
+
+    def test_var_tmp_and_what_is_in_it(self, world: World) -> None:
+        stored = StoredPath(path="/var/tmp/anything/at/all", identity=FsIdentity(fsid=1, ino=2))  # noqa: S108
+
+        assert world.rules.check_text(stored) is not None
+        assert world.rules.check(resolve("/var/tmp")) is not None  # noqa: S108
+
+    def test_ancestor_rule_makes_tmp_ungrantable_without_the_sticky_rule(self) -> None:
+        """Which of the two refuses /tmp: the entries under it do, whatever its mode."""
+        rules = DenyRules.build(
+            DenyContext(
+                homes=("/nonexistent-home",),
+                config_home="/nonexistent-home/.config",
+                data_home="/nonexistent-home/.local/share",
+                state_home="/nonexistent-home/.local/state",
+                cache_home="/nonexistent-home/.cache",
+            )
+        )
+
+        match = rules.check_text(StoredPath(path="/tmp", identity=FsIdentity(fsid=1, ino=2)))  # noqa: S108
+
+        assert match is not None
+        assert match.relation is ANCESTOR
+
+
+class TestSharedDirectories:
+    def make(self, world: World, name: str, mode: int) -> Path:
+        directory = world.base / name
+        directory.mkdir()
+        directory.chmod(mode)
+        return directory
+
+    def test_a_world_writable_sticky_directory_is_refused_whatever_its_name(
+        self, world: World
+    ) -> None:
+        shared = self.make(world, "scratch-space", 0o1777)
+
+        match = world.rules.check(resolve(shared))
+
+        assert match is not None
+        assert (match.entry, match.relation) == (SHARED_DIRECTORY, EQUAL)
+
+    def test_what_is_inside_it_is_not_refused_for_that_reason(self, world: World) -> None:
+        shared = self.make(world, "scratch-space", 0o1777)
+        (shared / "mine").mkdir()
+
+        assert world.rules.check(resolve(shared / "mine")) is None
+
+    @pytest.mark.parametrize("mode", [0o1755, 0o777, 0o755, 0o1770])
+    def test_one_property_without_the_other_is_not_a_shared_directory(
+        self, world: World, mode: int
+    ) -> None:
+        directory = self.make(world, f"mode-{mode:o}", mode)
+
+        assert world.rules.check(resolve(directory)) is None
+
+    def test_a_file_with_those_bits_is_not_a_directory(self, world: World) -> None:
+        file = world.base / "file"
+        file.write_text("x")
+        file.chmod(0o1777)
+
+        assert world.rules.check(resolve(file)) is None
+
+    def test_a_symlink_to_one_is_judged_by_its_target(self, world: World) -> None:
+        shared = self.make(world, "scratch-space", 0o1777)
+        (world.base / "link").symlink_to(shared)
+
+        match = world.rules.check(resolve(world.base / "link"))
+
+        assert match is not None
+        assert match.entry == SHARED_DIRECTORY
+
+    def test_the_host_tmp_directories_are_shared_directories(self) -> None:
+        for path in ("/tmp", "/var/tmp"):  # noqa: S108
+            resolved = resolve(path)
+            if Path(path).stat().st_mode & 0o1002 != 0o1002:
+                continue  # a host where it is not (a container with a private /tmp)
+            assert resolved.shared_directory, path
+
+
+XDG_PREFIXES = (".config/", ".local/share/", ".local/state/", ".cache/")
+
+
+class TestEntriesMovedByTheXdgVariables:
+    """The credential stores under ~/.config, ~/.local/share, ~/.local/state and ~/.cache are
+    protected where XDG_* point instead, as well as at their defaults (B2)."""
+
+    PREFIXES: ClassVar[dict[str, str]] = {
+        ".config/": "config_home",
+        ".local/share/": "data_home",
+        ".local/state/": "state_home",
+        ".cache/": "cache_home",
+    }
+
+    @pytest.fixture
+    def moved(self, tmp_path: Path) -> tuple[Path, DenyRules]:
+        context = context_for(
+            tmp_path,
+            config_home=str(tmp_path / "elsewhere" / "cfg"),
+            data_home=str(tmp_path / "elsewhere" / "data"),
+            state_home=str(tmp_path / "elsewhere" / "state"),
+            cache_home=str(tmp_path / "elsewhere" / "cache"),
+        )
+        return tmp_path, DenyRules.build(context)
+
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            r
+            for r in HOME_DENY
+            if r.startswith((".config/", ".local/share/", ".local/state/", ".cache/"))
+        ],
+    )
+    def test_every_such_entry_at_its_new_place(
+        self, moved: tuple[Path, DenyRules], relative: str
+    ) -> None:
+        base, rules = moved
+        for prefix, field in self.PREFIXES.items():
+            if relative.startswith(prefix):
+                root = {
+                    "config_home": "cfg",
+                    "data_home": "data",
+                    "state_home": "state",
+                    "cache_home": "cache",
+                }[field]
+                path = base / "elsewhere" / root / relative.removeprefix(prefix)
+                stored = StoredPath(path=str(path), identity=FsIdentity(fsid=1, ino=2))
+                inside = StoredPath(path=f"{path}/x", identity=FsIdentity(fsid=1, ino=2))
+
+                assert rules.check_text(stored) is not None, path
+                assert rules.check_text(inside) is not None, path
+
+    def test_the_default_places_are_still_protected(self, moved: tuple[Path, DenyRules]) -> None:
+        base, rules = moved
+        stored = StoredPath(
+            path=str(base / "home" / ".config" / "gcloud"), identity=FsIdentity(fsid=1, ino=2)
+        )
+
+        assert rules.check_text(stored) is not None
+
+    def test_labels_name_the_variable(self, moved: tuple[Path, DenyRules]) -> None:
+        _, rules = moved
+
+        assert {
+            "$XDG_CONFIG_HOME/gcloud",
+            "$XDG_DATA_HOME/keyrings",
+            "$XDG_STATE_HOME/tumbleweed",
+            "$XDG_CACHE_HOME/huggingface/token",
+        } <= set(rules.labels)
+
+    def test_an_existing_moved_store_is_matched_by_identity_as_well(self, tmp_path: Path) -> None:
+        (tmp_path / "cfg" / "gcloud").mkdir(parents=True)
+        rules = DenyRules.build(context_for(tmp_path, config_home=str(tmp_path / "cfg")))
+
+        match = rules.check(resolve(tmp_path / "cfg" / "gcloud" / "credentials.db"))
+        parent = rules.check(resolve(tmp_path / "cfg"))
+
+        assert match is not None
+        assert match.relation is INSIDE
+        assert parent is not None
+        assert parent.relation is ANCESTOR

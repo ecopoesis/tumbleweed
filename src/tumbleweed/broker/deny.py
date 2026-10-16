@@ -5,8 +5,13 @@ Tumbleweed's own directories and sockets, `$XDG_RUNTIME_DIR` and the system's se
 refused. A path is refused when it **equals, is inside, or is an ancestor of** any entry
 (`DenyRelation`), so `~` is never grantable: it is an ancestor of `~/.ssh`. The lists are
 `HOME_DENY` (relative to the user's home), `SYSTEM_DENY` (absolute) and what `deny_entries`
-derives from a `DenyContext` (the XDG directories, the runtime directory and extra entries such
-as the broker's socket directory, which the daemon knows and this module does not).
+derives from a `DenyContext` (every `HOME_DENY` entry under `.config`, `.local/share`,
+`.local/state` or `.cache` again where the XDG variables put them, the runtime directory, the
+tmux socket directory of this uid and `$TMUX_TMPDIR`, and extra entries such as the broker's
+socket directory, which the daemon knows and this module does not). The sockets under `/tmp`
+are entries because a read-only bind of a directory still lets a sandbox `connect()` to them,
+and that makes `/tmp` itself ungrantable; a directory that is world-writable and sticky is
+refused as a target whatever its name (`SHARED_DIRECTORY`).
 
 Matching never trusts a name alone (the S01 review, #16). `DenyRules.build` resolves every entry
 once and keeps, besides the folded text, the identity of each directory on the way to it
@@ -78,6 +83,18 @@ HOME_DENY: Final = (
     ".authinfo",
     ".authinfo.gpg",
     ".vault-token",
+    ".config/git/credentials",
+    ".terraformrc",
+    ".huggingface",
+    ".cache/huggingface/token",
+    ".config/hub",
+    ".config/msmtp",
+    ".msmtprc",
+    # assistants' and VMs' state: credentials, history and sockets
+    ".claude",
+    ".codex",
+    ".lima",
+    ".colima",
     # cloud and infrastructure
     ".aws",
     ".azure",
@@ -163,6 +180,7 @@ HOME_DENY: Final = (
     # shell and tool histories
     ".bash_history",
     ".zsh_history",
+    ".local/share/fish/fish_history",
     ".zhistory",
     ".python_history",
     ".psql_history",
@@ -182,6 +200,14 @@ SYSTEM_DENY: Final = (
     "/sys",
     "/dev",
     "/run/user",  # every user's $XDG_RUNTIME_DIR: sockets, keyring and bus
+    # Sockets of the user's desktop and shell live under /tmp, and a read-only bind of a directory
+    # still lets a sandbox connect() to them (tmux runs commands as the user, X11 takes
+    # keystrokes). Protecting them makes /tmp itself ungrantable (the ancestor rule).
+    "/tmp/.X11-unix",  # noqa: S108  (a deny list names /tmp, it does not use it)
+    "/tmp/.ICE-unix",  # noqa: S108  (a deny list names /tmp, it does not use it)
+    "/tmp/.XIM-unix",  # noqa: S108  (a deny list names /tmp, it does not use it)
+    "/tmp/.font-unix",  # noqa: S108  (a deny list names /tmp, it does not use it)
+    "/var/tmp",  # noqa: S108  (a deny list names /tmp, it does not use it)
     "/run/dbus",
     "/run/docker.sock",
     "/var/run/docker.sock",
@@ -206,6 +232,7 @@ SYSTEM_DENY: Final = (
     "/System/Library/Keychains",
 )
 
+SHARED_DIRECTORY: Final = "world-writable sticky directory"  # the label of that refusal
 _XDG: Final = (
     ("XDG_CONFIG_HOME", ".config"),
     ("XDG_DATA_HOME", ".local/share"),
@@ -256,6 +283,8 @@ class DenyContext(PolicyModel):
     state_home: AbsoluteText
     cache_home: AbsoluteText
     runtime_dir: AbsoluteText | None = None
+    tmux_tmpdir: AbsoluteText | None = None
+    uid: Annotated[int, Field(ge=0, le=2**32 - 1)] = Field(default_factory=os.getuid)
     extra: Annotated[tuple[ExtraDeny, ...], Field(max_length=_MAX_EXTRA)] = ()
 
     @classmethod
@@ -293,6 +322,8 @@ class DenyContext(PolicyModel):
             state_home=xdg["XDG_STATE_HOME"],
             cache_home=xdg["XDG_CACHE_HOME"],
             runtime_dir=_absolute_or_none(env.get("XDG_RUNTIME_DIR", ""), "XDG_RUNTIME_DIR"),
+            tmux_tmpdir=_absolute_or_none(env.get("TMUX_TMPDIR", ""), "TMUX_TMPDIR"),
+            uid=os.getuid(),
             extra=tuple(extra),
         )
 
@@ -332,17 +363,25 @@ def deny_entries(context: DenyContext) -> Iterator[DenyDefinition]:
     for home in context.homes:
         for relative in HOME_DENY:
             yield DenyDefinition(f"~/{relative}", _under(home, relative))
-    for variable, root in (
-        ("XDG_CONFIG_HOME", context.config_home),
-        ("XDG_DATA_HOME", context.data_home),
-        ("XDG_STATE_HOME", context.state_home),
-        ("XDG_CACHE_HOME", context.cache_home),
+    # The XDG variables may move these places away from their defaults: every entry that lives
+    # under one of them is protected at its new place as well as at the default one above.
+    for variable, root, prefix in (
+        ("XDG_CONFIG_HOME", context.config_home, ".config/"),
+        ("XDG_DATA_HOME", context.data_home, ".local/share/"),
+        ("XDG_STATE_HOME", context.state_home, ".local/state/"),
+        ("XDG_CACHE_HOME", context.cache_home, ".cache/"),
     ):
-        yield DenyDefinition(f"${variable}/tumbleweed", _under(root, "tumbleweed"))
+        for relative in HOME_DENY:
+            if relative.startswith(prefix):
+                rest = relative.removeprefix(prefix)
+                yield DenyDefinition(f"${variable}/{rest}", _under(root, rest))
     if context.runtime_dir is not None:
         yield DenyDefinition("$XDG_RUNTIME_DIR", context.runtime_dir)
     for path in SYSTEM_DENY:
         yield DenyDefinition(path, path)
+    yield DenyDefinition("/tmp/tmux-<uid>", f"/tmp/tmux-{context.uid}")  # noqa: S108
+    if context.tmux_tmpdir is not None:
+        yield DenyDefinition("$TMUX_TMPDIR", context.tmux_tmpdir)
     for entry in context.extra:
         yield DenyDefinition(entry.label, entry.path)
 
@@ -439,8 +478,12 @@ class DenyRules:
         """The first entry that `path` equals, is inside or is an ancestor of, or None.
 
         By identity wherever both sides have one, and by folded text as well, so the path need
-        not exist and a different spelling does not escape.
+        not exist and a different spelling does not escape. A directory that anyone can write to
+        and that is sticky (`/tmp`, `/var/tmp`, whatever a host adds) is refused as a target
+        whatever its name: what other users and the desktop put there is theirs.
         """
+        if path.shared_directory:
+            return DenyMatch(entry=SHARED_DIRECTORY, relation=DenyRelation.EQUAL)
         for entry in self._entries:
             for form in entry.forms:
                 relation = _relation(form, path.folded, path.chain_set, path.identity)
