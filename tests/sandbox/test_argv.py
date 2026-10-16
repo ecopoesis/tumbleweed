@@ -135,7 +135,7 @@ class TestWorkspace:
     ) -> None:
         argv = build_bwrap_argv(policy(workspace, "true"))
 
-        assert operations(argv, "--bind-fd", 2) == [(str(workspace.fileno()), "/workspace")]
+        assert operations(argv, "--bind-fd", 2) == [(str(workspace.fd), "/workspace")]
 
     def test_the_workspace_is_the_working_directory(self, workspace: Opened) -> None:
         argv = build_bwrap_argv(policy(workspace, "true"))
@@ -222,7 +222,7 @@ class TestInputs:
             argv = build_bwrap_argv(made)
 
             assert operations(argv, "--ro-bind-fd", 2) == [
-                (str(handle.fileno()), f"/inputs/{connection}")
+                (str(handle.fd), f"/inputs/{connection}")
             ]
 
     def test_several_inputs_each_get_their_own_directory(
@@ -257,12 +257,10 @@ class TestGrants:
 
             argv = build_bwrap_argv(policy(workspace, "true", grants=mounts))
 
-            assert (str(read_handle.fileno()), "/data/ro") in operations(argv, "--ro-bind-fd", 2)
-            assert (str(write_handle.fileno()), "/data/rw") in operations(argv, "--bind-fd", 2)
-            assert (str(write_handle.fileno()), "/data/rw") not in operations(
-                argv, "--ro-bind-fd", 2
-            )
-            assert (str(read_handle.fileno()), "/data/ro") not in operations(argv, "--bind-fd", 2)
+            assert (str(read_handle.fd), "/data/ro") in operations(argv, "--ro-bind-fd", 2)
+            assert (str(write_handle.fd), "/data/rw") in operations(argv, "--bind-fd", 2)
+            assert (str(write_handle.fd), "/data/rw") not in operations(argv, "--ro-bind-fd", 2)
+            assert (str(read_handle.fd), "/data/ro") not in operations(argv, "--bind-fd", 2)
 
     def test_a_grant_is_bound_at_its_host_path_by_descriptor_not_by_path(
         self, workspace: Opened, tmp_path: Path
@@ -313,7 +311,7 @@ class TestGrants:
 
             numbers = descriptors_to_pass(made)
 
-            assert numbers == [workspace.fileno(), second.fileno(), first.fileno()]
+            assert numbers == [workspace.fd, second.fd, first.fd]
             for number in numbers:
                 assert str(number) in build_bwrap_argv(made)
 

@@ -505,7 +505,8 @@ class TestLeaks:
 
     def test_a_policy_that_is_refused_leaves_nothing_open(self, workspace: Opened) -> None:
         class NotOpen:
-            def fileno(self) -> int:
+            @property
+            def fd(self) -> int:
                 return 900
 
         before = open_descriptors()

@@ -55,14 +55,22 @@ class TestMountPath:
             "/a\0b",
             "/a\nb",
             "/a\x7fb",
-            "/a\ud800b",
-            "/" + "a" * 256,
-            "/" + "/".join(["abcdefgh"] * 600),
+            "/.",
+            "/a/../b",
         ],
     )
     def test_refuses_anything_else(self, text: str) -> None:
-        with pytest.raises((InvalidPolicyError, ValueError)):
+        with pytest.raises(ValueError, match="MountPath"):
             MountPath(text)
+
+    @pytest.mark.parametrize(
+        "text", ["/a\ud800b", "/" + "a" * 256, "/" + "/".join(["abcdefgh"] * 600)]
+    )
+    def test_text_the_kernel_cannot_hold_is_refused_where_a_policy_part_takes_it(
+        self, workspace: Opened, text: str
+    ) -> None:
+        with pytest.raises(InvalidPolicyError):
+            GrantMount(source=workspace, target=MountPath(text), access=GrantAccess.READ)
 
 
 class TestGrantMount:
@@ -120,19 +128,21 @@ class TestGrantMount:
     @pytest.mark.parametrize("number", [0, 1, 2])
     def test_a_standard_stream_is_not_a_descriptor_to_mount(self, number: int) -> None:
         class Stream:
-            def fileno(self) -> int:
+            @property
+            def fd(self) -> int:
                 return number
 
         with pytest.raises(InvalidPolicyError, match="a standard stream"):
             GrantMount(source=Stream(), target=MountPath("/a"), access=GrantAccess.READ)
 
     @pytest.mark.parametrize("number", [True, -1, "3", 3.0])
-    def test_fileno_must_return_a_descriptor_number(self, number: object) -> None:
+    def test_fd_must_be_a_descriptor_number(self, number: object) -> None:
         class Odd:
-            def fileno(self) -> int:
+            @property
+            def fd(self) -> int:
                 return number  # type: ignore[return-value]  # the wrong type is the point
 
-        with pytest.raises(InvalidPolicyError, match="did not return a descriptor number"):
+        with pytest.raises(InvalidPolicyError, match="is not a descriptor number"):
             GrantMount(source=Odd(), target=MountPath("/a"), access=GrantAccess.READ)
 
     def test_access_must_be_an_access(self, workspace: Opened) -> None:
@@ -526,7 +536,8 @@ class TestDescriptorKinds:
         try:
 
             class Pipe:
-                def fileno(self) -> int:
+                @property
+                def fd(self) -> int:
                     return read_end
 
             mount = GrantMount(source=Pipe(), target=MountPath("/p"), access=GrantAccess.READ)
@@ -541,7 +552,7 @@ class TestDescriptorKinds:
     ) -> None:
         ws = Opened(workspace_dir)
         made = policy(ws, "true")
-        os.close(ws.fileno())  # closed behind its owner's back: the number is still reported
+        os.close(ws.fd)  # closed behind its owner's back: the number is still reported
         try:
             with pytest.raises(InvalidPolicyError, match="is not open"):
                 made.check_descriptors()

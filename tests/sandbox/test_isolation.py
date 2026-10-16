@@ -33,6 +33,7 @@ from tests.sandbox.support import (
     run_sandbox,
     sandboxed_python,
 )
+from tumbleweed.broker.fdio import OpenedPath
 from tumbleweed.core.ids import ConnectionId
 from tumbleweed.sandbox.errors import InvalidPolicyError, SandboxLaunchError
 from tumbleweed.sandbox.policy import (
@@ -150,7 +151,8 @@ class TestRunning:
         self, workspace: Opened
     ) -> None:
         class NotOpen:
-            def fileno(self) -> int:
+            @property
+            def fd(self) -> int:
                 return 900  # no test opens as many descriptors as this
 
         made = policy(
@@ -604,7 +606,7 @@ class TestGrants:
                 grant(granted, GrantAccess.READ, handle),
                 grant(home_scratch / "ro2", GrantAccess.READ, second),
             )
-            assert handle.fileno() > 2
+            assert handle.fd > 2
             seen = report(workspace, payloads.SELF, grants=grants)
 
         assert seen["open_fds"] == []
@@ -755,20 +757,38 @@ class TestConfinement:
         assert PYTHON.startswith("/usr/")
 
 
-def test_a_grant_descriptor_can_be_a_file_object_with_fileno(
+def test_the_brokers_opened_paths_are_accepted_as_they_are(
     workspace: Opened, home_scratch: Path
 ) -> None:
-    # Anything with `fileno()` is an opened descriptor: a file object from `open`, for instance.
+    # S16's OpenedPath satisfies the sandbox's descriptor protocol structurally; the sandbox does
+    # not import the broker, only this test does.
+    directory = home_scratch / "dir"
+    directory.mkdir()
+    (directory / "f.txt").write_text("from a directory")
     file = home_scratch / "plain.txt"
     file.write_text("plain")
-    with file.open("rb") as handle:
-        mount = GrantMount(source=handle, target=MountPath(str(file)), access=GrantAccess.READ)
+    with (
+        OpenedPath(os.open(directory, os.O_RDONLY | os.O_DIRECTORY)) as dir_path,
+        OpenedPath(os.open(file, os.O_RDONLY)) as file_path,
+    ):
+        grants = (
+            GrantMount(source=dir_path, target=MountPath(str(directory)), access=GrantAccess.READ),
+            GrantMount(source=file_path, target=MountPath(str(file)), access=GrantAccess.READ),
+        )
 
         seen = report(
             workspace,
             payloads.ACCESS,
-            json.dumps({"read": [str(file)]}),
-            grants=(mount,),
+            json.dumps({"read": [f"{directory}/f.txt", str(file)]}),
+            grants=grants,
         )
 
-    assert seen["read"] == {str(file): "plain"}
+    assert seen["read"] == {f"{directory}/f.txt": "from a directory", str(file): "plain"}
+
+
+def test_a_closed_opened_path_is_an_invalid_policy(workspace: Opened, home_scratch: Path) -> None:
+    opened_path = OpenedPath(os.open(home_scratch, os.O_RDONLY | os.O_DIRECTORY))
+    opened_path.close()
+
+    with pytest.raises(InvalidPolicyError, match="closed"):
+        GrantMount(source=opened_path, target=MountPath("/x"), access=GrantAccess.READ)

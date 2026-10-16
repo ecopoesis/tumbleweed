@@ -37,7 +37,8 @@ class Opened:
     def __init__(self, path: Path, flags: int = os.O_RDONLY | os.O_DIRECTORY) -> None:
         self._fd: int | None = os.open(path, flags | os.O_CLOEXEC)
 
-    def fileno(self) -> int:
+    @property
+    def fd(self) -> int:
         if self._fd is None:
             raise ValueError("closed")
         return self._fd

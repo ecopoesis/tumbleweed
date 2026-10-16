@@ -56,42 +56,46 @@ _SECRET_NAME: Final = re.compile(r"key|token|secret|passw|credential|auth|anthro
 class OpenedDescriptor(Protocol):
     """An open file descriptor for a directory or file at a host path the broker has verified.
 
-    S16's `OpenedPath` is one (S17 adapts it); so is anything with a `fileno()`, such as the
-    object a test wraps around `os.open`. It may be an `O_PATH` descriptor.
+    Structurally what the broker's `OpenedPath` is (`tumbleweed.broker.fdio`, which this package
+    may not import): an object with an `fd` property, which raises `ValueError` once closed. It
+    may be an `O_PATH` descriptor. The launcher borrows it and never closes it.
     """
 
-    def fileno(self) -> int: ...
+    @property
+    def fd(self) -> int: ...
+
+
+_CHAR = r"[^/\x00-\x1f\x7f]"
+_FIRST = r"[^/.\x00-\x1f\x7f]"
+# One component: not empty, not `.`, not `..` (so no lookahead, which pydantic's regex lacks).
+_COMPONENT = rf"(?:{_FIRST}{_CHAR}*|\.{_FIRST}{_CHAR}*|\.\.{_CHAR}+)"
 
 
 @final
-class MountPath(
-    PatternStr, pattern=r"(?:/[^/\x00-\x1f\x7f]+)+", expects="a normalised absolute path"
-):
+class MountPath(PatternStr, pattern=rf"(?:/{_COMPONENT})+", expects="a normalised absolute path"):
     """An absolute path as text: no `.`, `..`, empty or control-character components, never `/`.
 
-    Lexical only. It names where something appears inside the sandbox, and for a grant the host
-    path that was granted; the thing that is mounted is always a descriptor or one of the fixed
-    runtime paths, never what this text resolves to.
+    Lexical only (`check_mount_path` adds the byte limits, and is what policy parts call). It
+    names where something appears inside the sandbox, and for a grant the host path that was
+    granted; the thing that is mounted is always a descriptor or one of the fixed runtime paths,
+    never what this text resolves to.
     """
 
     __slots__ = ()
 
-    def __new__(cls, value: str) -> Self:
-        text = super().__new__(cls, value)
-        try:
-            encoded = text.encode("utf-8")
-        except UnicodeEncodeError:
-            raise InvalidPolicyError(
-                "a mount path must be valid UTF-8 (it holds a surrogate)"
-            ) from None
-        if len(encoded) > MAX_PATH_BYTES:
-            raise InvalidPolicyError(f"a mount path is over {MAX_PATH_BYTES} bytes")
-        for part in text.split("/")[1:]:
-            if part in {".", ".."}:
-                raise InvalidPolicyError(f"a mount path has a '{part}' component")
-            if len(part.encode("utf-8")) > MAX_NAME_BYTES:
-                raise InvalidPolicyError(f"a mount path component is over {MAX_NAME_BYTES} bytes")
-        return text
+
+def check_mount_path(path: MountPath) -> None:
+    """Refuse a path that is not valid UTF-8 (a surrogate) or over the kernel's name limits."""
+    try:
+        encoded = path.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InvalidPolicyError(
+            "a mount path must be valid UTF-8 (it holds a surrogate)"
+        ) from None
+    if len(encoded) > MAX_PATH_BYTES:
+        raise InvalidPolicyError(f"a mount path is over {MAX_PATH_BYTES} bytes")
+    if any(len(part.encode("utf-8")) > MAX_NAME_BYTES for part in path.split("/")):
+        raise InvalidPolicyError(f"a mount path component is over {MAX_NAME_BYTES} bytes")
 
 
 def overlaps(first: str, second: str) -> bool:
@@ -99,17 +103,16 @@ def overlaps(first: str, second: str) -> bool:
     return first == second or first.startswith(f"{second}/") or second.startswith(f"{first}/")
 
 
-def descriptor_number(source: object, what: str) -> int:
+def descriptor_number(source: OpenedDescriptor, what: str) -> int:
     """The number of a policy descriptor, or `InvalidPolicyError`: closed, or not a descriptor."""
-    fileno = getattr(source, "fileno", None)
-    if not callable(fileno):
-        raise InvalidPolicyError(f"{what} has no fileno(): it is not an opened descriptor")
     try:
-        number: object = fileno()
-    except (OSError, ValueError) as exc:  # a closed file object raises ValueError
+        number: object = source.fd
+    except AttributeError:
+        raise InvalidPolicyError(f"{what} has no fd: it is not an opened descriptor") from None
+    except (OSError, ValueError) as exc:  # `OpenedPath.fd` raises ValueError once closed
         raise InvalidPolicyError(f"{what} is closed: {type(exc).__name__}") from None
     if type(number) is not int or number < 0:
-        raise InvalidPolicyError(f"{what}.fileno() did not return a descriptor number")
+        raise InvalidPolicyError(f"{what}.fd is not a descriptor number")
     if number < 3:
         raise InvalidPolicyError(f"{what} is descriptor {number}, a standard stream")
     return number
@@ -152,7 +155,7 @@ class GrantMount:
 
     def __post_init__(self) -> None:
         descriptor_number(self.source, "a grant's source")
-        _require_type(self.target, MountPath, "a grant's target")
+        check_mount_path(_require_type(self.target, MountPath, "a grant's target"))
         _require_type(self.access, GrantAccess, "a grant's access")
         for reserved in RESERVED_TARGETS:
             if overlaps(self.target, reserved):
@@ -283,7 +286,7 @@ class RuntimeSymlink:
     target: str
 
     def __post_init__(self) -> None:
-        _require_type(self.link, MountPath, "a runtime symlink's link")
+        check_mount_path(_require_type(self.link, MountPath, "a runtime symlink's link"))
         if self.link not in _LINK_NAMES:
             raise InvalidPolicyError(f"a runtime symlink may only be one of {sorted(_LINK_NAMES)}")
         target = _require_type(self.target, str, "a runtime symlink's target")
@@ -313,6 +316,7 @@ class RuntimeSpec:
         if len(set(targets)) != len(targets):
             raise InvalidPolicyError("the runtime lists a path twice")
         for mount in mounts:
+            check_mount_path(mount)
             if not _is_runtime_path(mount):
                 raise InvalidPolicyError(
                     f"{mount!r} is not an allowed runtime mount (system program directories and "

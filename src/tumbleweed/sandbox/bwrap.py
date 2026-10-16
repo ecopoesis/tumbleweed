@@ -13,6 +13,7 @@ and last the read-only remount of the root, which would otherwise be a writable 
 from tumbleweed.sandbox.policy import (
     WORKSPACE_TARGET,
     GrantAccess,
+    OpenedDescriptor,
     SandboxPolicy,
     descriptor_number,
 )
@@ -73,7 +74,7 @@ def descriptors_to_pass(policy: SandboxPolicy) -> list[int]:
     return list(dict.fromkeys(descriptor_number(source, what) for source, what in sources))
 
 
-def _fd(source: object, what: str) -> str:
+def _fd(source: OpenedDescriptor, what: str) -> str:
     return str(descriptor_number(source, what))
 
 
