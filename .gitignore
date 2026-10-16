@@ -16,6 +16,10 @@ htmlcov/
 result
 result-*
 
+# Secrets (never commit)
+.anthropic-key
+*.key
+
 # Local tooling / orchestration state
 .omc/
 .worktrees/
