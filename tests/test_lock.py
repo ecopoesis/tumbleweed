@@ -100,6 +100,23 @@ def overrides_of(uv_settings: Toml, written: dt.datetime) -> dict[str, dt.dateti
     }
 
 
+class NoLockHistory(Exception):  # noqa: N818  (not an error: the age check skips on it)
+    """uv.lock cannot be dated from git here; the message says why."""
+
+
+# So that a stray user or system config cannot change what git answers, and so that `git status`
+# never writes `.git/index` (an optional lock for refreshing stat data) in a checkout we only read.
+GIT_ISOLATION = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
+
+
+def git_env(home: Path) -> dict[str, str]:
+    return {"PATH": os.environ.get("PATH", ""), "HOME": str(home), **GIT_ISOLATION}
+
+
 def git_output(git: str, root: Path, *args: str) -> str | None:
     result = subprocess.run(  # noqa: S603  (argv list, no shell)
         [git, "-C", str(root), *args],
@@ -107,24 +124,37 @@ def git_output(git: str, root: Path, *args: str) -> str | None:
         text=True,
         check=False,
         timeout=60,
-        env={"PATH": os.environ.get("PATH", ""), "HOME": str(root), "GIT_CONFIG_NOSYSTEM": "1"},
+        env=git_env(root),
     )
     return result.stdout if result.returncode == 0 else None
 
 
-def lock_written_at(root: Path) -> dt.datetime | None:
-    """When uv.lock was last written: now if uncommitted, else its last commit; None if unknown."""
+def lock_written_at(root: Path) -> dt.datetime:
+    """When uv.lock was last written: now if uncommitted, else the time of its last commit.
+
+    Raises `NoLockHistory` when git cannot say: no git, no `.git` of its own in `root` (a copy, or
+    a checkout nested inside another repository, whose history git would otherwise use), a
+    shallow clone (its history is cut off, so HEAD would stand in for the lock's commit), or no
+    commit of the lock yet.
+    """
     git = shutil.which("git")
-    if git is None or not (root / ".git").exists():
-        return None
+    if git is None:
+        raise NoLockHistory("the git program is not installed")
+    if not (root / ".git").exists():
+        raise NoLockHistory("there is no .git here (a copy, or a checkout nested in a repository)")
+    shallow = git_output(git, root, "rev-parse", "--is-shallow-repository")
+    if shallow is None:
+        raise NoLockHistory("git cannot read this repository")
+    if shallow.strip() == "true":
+        raise NoLockHistory("this is a shallow clone: the lock's last commit may be cut off")
     status = git_output(git, root, "status", "--porcelain", "--", "uv.lock")
     if status is None:
-        return None
+        raise NoLockHistory("git status failed")
     if status.strip():
         return dt.datetime.now(dt.UTC)
     stamp = git_output(git, root, "log", "-1", "--format=%ct", "--", "uv.lock")
     if stamp is None or not stamp.strip():
-        return None
+        raise NoLockHistory("uv.lock has no commit")
     return dt.datetime.fromtimestamp(int(stamp), dt.UTC)
 
 
@@ -157,9 +187,10 @@ def test_the_lock_records_the_same_window(pyproject: Toml, lock: Toml) -> None:
 def test_no_locked_artifact_is_younger_than_its_cutoff_when_the_lock_was_written(
     pyproject: Toml, lock: Toml
 ) -> None:
-    written = lock_written_at(ROOT)
-    if written is None:
-        pytest.skip("no git history for uv.lock here: the age check runs on the macOS CI jobs")
+    try:
+        written = lock_written_at(ROOT)
+    except NoLockHistory as why:
+        pytest.skip(f"uv.lock cannot be dated from git here ({why}): the macOS CI jobs run this")
     uv_settings = table(pyproject["uv"])
     setting = uv_settings["exclude-newer"]
     assert isinstance(setting, str)
@@ -273,13 +304,7 @@ class TestLockWrittenAt:
     def commit(repo: Path, message: str, when: dt.datetime) -> None:
         git = shutil.which("git") or "git"
         stamp = when.isoformat()
-        env = {
-            "PATH": os.environ.get("PATH", ""),
-            "HOME": str(repo),
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_AUTHOR_DATE": stamp,
-            "GIT_COMMITTER_DATE": stamp,
-        }
+        env = {**git_env(repo), "GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
         config = [
             "-c",
             "user.name=t",
@@ -329,11 +354,96 @@ class TestLockWrittenAt:
     def test_without_git_history_it_is_unknown(self, tmp_path: Path) -> None:
         (tmp_path / "uv.lock").write_text("lock\n")
 
-        assert lock_written_at(tmp_path) is None
+        with pytest.raises(NoLockHistory, match=r"no \.git here"):
+            lock_written_at(tmp_path)
 
     def test_without_the_git_program_it_is_unknown(
         self, repo: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(shutil, "which", lambda name: None)
 
-        assert lock_written_at(repo) is None
+        with pytest.raises(NoLockHistory, match="not installed"):
+            lock_written_at(repo)
+
+    def test_a_repository_with_no_commit_of_the_lock_is_unknown(self, tmp_path: Path) -> None:
+        git = shutil.which("git") or "git"
+        subprocess.run([git, "init", "-q", str(tmp_path)], check=True, capture_output=True)  # noqa: S603
+        (tmp_path / "other.txt").write_text("1\n")
+        self.commit(tmp_path, "no lock yet", dt.datetime(2026, 1, 1, tzinfo=dt.UTC))
+
+        with pytest.raises(NoLockHistory, match="no commit"):
+            lock_written_at(tmp_path)
+
+    def test_an_untracked_lock_is_new_so_it_means_now(self, tmp_path: Path) -> None:
+        git = shutil.which("git") or "git"
+        subprocess.run([git, "init", "-q", str(tmp_path)], check=True, capture_output=True)  # noqa: S603
+        (tmp_path / "other.txt").write_text("1\n")
+        self.commit(tmp_path, "no lock yet", dt.datetime(2026, 1, 1, tzinfo=dt.UTC))
+        (tmp_path / "uv.lock").write_text("a new lock\n")
+
+        written = lock_written_at(tmp_path)
+
+        assert abs(dt.datetime.now(dt.UTC) - written) < dt.timedelta(minutes=1)
+
+    def test_a_shallow_clone_is_unknown_not_dated_by_head(
+        self, repo: Path, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        (repo / "other.txt").write_text("2\n")
+        self.commit(
+            repo,
+            "a newer commit that does not touch the lock",
+            dt.datetime(2026, 8, 1, tzinfo=dt.UTC),
+        )
+        clone = tmp_path_factory.mktemp("shallow") / "clone"
+        git = shutil.which("git") or "git"
+        subprocess.run(  # noqa: S603  (argv list, no shell)
+            [git, "clone", "-q", "--depth", "1", f"file://{repo}", str(clone)],
+            check=True,
+            capture_output=True,
+            env=git_env(clone.parent),
+        )
+
+        with pytest.raises(NoLockHistory, match="shallow"):
+            lock_written_at(clone)
+
+    def test_a_checkout_nested_in_another_repository_is_unknown(self, repo: Path) -> None:
+        """Without the `.git` check, git would walk up and date the lock by the outer history."""
+        nested = repo / "vendor" / "checkout"
+        nested.mkdir(parents=True)
+        (nested / "uv.lock").write_text("a copy of some other lock\n")
+        self.commit(repo, "vendor a copy", dt.datetime(2026, 7, 7, tzinfo=dt.UTC))
+
+        with pytest.raises(NoLockHistory, match=r"no \.git here"):
+            lock_written_at(nested)
+
+    def test_git_is_run_isolated_from_stray_config_and_optional_locks(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[dict[str, str]] = []
+        real_run = subprocess.run
+
+        def spying_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            env = kwargs.get("env")
+            assert isinstance(env, dict)
+            seen.append(env)
+            return real_run(*args, **kwargs)  # type: ignore[no-any-return,call-overload]
+
+        monkeypatch.setattr(subprocess, "run", spying_run)
+
+        lock_written_at(repo)
+
+        assert seen, "git was never run"
+        for env in seen:
+            assert env["GIT_CONFIG_GLOBAL"] == os.devnull
+            assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+            assert env["GIT_OPTIONAL_LOCKS"] == "0"
+
+    def test_reading_the_lock_date_does_not_write_the_index(self, repo: Path) -> None:
+        """`git status` normally refreshes stat data in .git/index after a touch."""
+        os.utime(repo / "uv.lock", (1, 1))  # makes the index's stat data stale
+        index = repo / ".git" / "index"
+        before = (index.read_bytes(), index.stat().st_mtime_ns)
+
+        lock_written_at(repo)
+
+        assert (index.read_bytes(), index.stat().st_mtime_ns) == before
