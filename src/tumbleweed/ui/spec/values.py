@@ -8,14 +8,19 @@ compares them, so none of this changes shape later.
 
 An `ImageRef` or `FileRef` names a file in a workspace, as a `WorkspaceRelPath` (relative; no
 `..`, no empty or `.` component, no control characters; see `tumbleweed.core.types`) and
-nothing else: no absolute path, no URL, no `data:` URI. On top of that lexical check, which
-cannot see symlinks, trusted code still opens the path component by component without following
-them (I11): a valid ref is not proof that the file is safe to read.
+nothing else: no absolute path, no URL, no `data:` URI, no backslash. On top of that lexical
+check, which cannot see symlinks, trusted code still opens the path component by component
+from a directory file descriptor without following them (I11), and never as a URI; a valid
+ref is not proof that the file is safe to read. A name can start with `-`, so a ref that is
+ever passed on a command line goes after `--` or with a `./` in front.
+
+Every value here is bounded in count (`MAX_JSON_NODES`, `MAX_TABLE_CELLS`, ...) and in text
+(`MAX_VALUE_TEXT_BYTES`), and a value that would be refused for its size is refused without
+being walked whole: the checks stop at the first limit crossed.
 """
 
 import math
-import unicodedata
-from typing import Annotated, Final, Literal, Self, assert_never, final, get_args
+from typing import Annotated, Final, Literal, Self, assert_never, cast, final, get_args
 
 from pydantic import (
     AfterValidator,
@@ -36,15 +41,17 @@ from tumbleweed.ui.spec.limits import (
     MAX_TABLE_CELLS,
     MAX_TABLE_COLUMNS,
     MAX_TABLE_ROWS,
+    MAX_VALUE_TEXT_BYTES,
 )
 from tumbleweed.ui.spec.model import SpecModel
 from tumbleweed.ui.spec.text import (
     Cell,
     ColumnName,
-    FiniteFloat,
-    SafeInt,
     as_tuple,
+    canonical_text,
     check_data_text,
+    exact_double,
+    text_bytes,
 )
 
 type PortType = Literal["text", "json", "table", "image", "file"]
@@ -55,15 +62,41 @@ PORT_TYPES: Final[tuple[PortType, ...]] = get_args(PortType.__value__)
 # there.
 IMAGE_EXTENSIONS: Final = (".png", ".jpg", ".jpeg", ".webp")
 
+_SCHEME_CHARACTERS: Final = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-"
+)
+
+
+def _starts_with_scheme(component: str) -> bool:
+    """Whether `component` begins with a URL scheme or a drive letter: `https:`, `data:`, `C:`.
+
+    A scheme is a letter, then letters, digits, `+`, `.` or `-`, then a colon. Blanks before it
+    are skipped, as URL parsers skip them. Without a regular expression: no parsing of anything
+    in this package goes through one.
+    """
+    text = component.lstrip()
+    if not text or not (text[0].isascii() and text[0].isalpha()):
+        return False
+    for character in text[1:]:
+        if character == ":":
+            return True
+        if character not in _SCHEME_CHARACTERS:
+            return False
+    return False
+
 
 def _check_file_path(path: WorkspaceRelPath) -> WorkspaceRelPath:
+    text = str(path)
     # `https:/host/x`, `file:/etc/passwd` and `data:image/png;base64,...` are valid relative
-    # paths to WorkspaceRelPath (a directory called `https:`), but nobody means a directory.
-    # A colon in the first component is where a URL scheme or a drive letter would be.
-    first = str(path).split("/", 1)[0]
-    if ":" in first:
+    # paths to WorkspaceRelPath (a directory called `https:`), but nobody means a directory. A
+    # colon after a first component that is no scheme is a file name (`report 12:30.png`).
+    if _starts_with_scheme(text.split("/", 1)[0]):
         raise InvalidValueError(
-            f"a workspace reference must not look like a URL or a drive, got {excerpt(str(path))}"
+            f"a workspace reference must not look like a URL or a drive, got {excerpt(text)}"
+        )
+    if "\\" in text:
+        raise InvalidValueError(
+            f"a workspace reference must not contain a backslash, got {excerpt(text)}"
         )
     return path
 
@@ -95,14 +128,27 @@ class ImageRef(SpecModel):
 # --- JSON ------------------------------------------------------------------------------------
 
 
-def check_json(value: JsonValue) -> JsonValue:
+def _json_text(text: str) -> int:
+    """Check a string or key of a JSON value and return its size in UTF-8 bytes."""
+    if len(text) > MAX_STRING_LENGTH:
+        raise InvalidValueError(f"JSON string is longer than {MAX_STRING_LENGTH} characters")
+    check_data_text(text)
+    return text_bytes(text)
+
+
+def check_json(value: object) -> JsonValue:
     """Walk a JSON value (iteratively: depth is attacker-chosen) and enforce the limits.
 
-    Also refuses what is not JSON at all (a tuple, a set, an object), exactly: a subclass of
-    `dict` or `list` is not one either.
+    At most `MAX_JSON_NODES` nodes, `MAX_JSON_DEPTH` levels, `MAX_VALUE_TEXT_BYTES` bytes of
+    text; integers must be exactly some double and floats finite (`tumbleweed.ui.spec.text`);
+    the keys of an object must be distinct once normalised as the tool store does (NFC, line
+    feeds). The walk stops at the first limit crossed, and a list is not unpacked if it
+    cannot fit. Also refuses what is not JSON at all (a tuple, a set, an object), exactly: a
+    subclass of `dict` or `list` is not one either.
     """
     nodes = 0
-    stack: list[tuple[JsonValue, int]] = [(value, 1)]
+    text = 0
+    stack: list[tuple[object, int]] = [(value, 1)]
     while stack:
         current, depth = stack.pop()
         nodes += 1
@@ -111,29 +157,39 @@ def check_json(value: JsonValue) -> JsonValue:
         if depth > MAX_JSON_DEPTH:
             raise InvalidValueError(f"JSON value is nested deeper than {MAX_JSON_DEPTH}")
         if type(current) is dict:
+            keys: set[str] = set()
             for key, child in current.items():
                 nodes += 1
-                _check_json_string(key)
+                if nodes + len(stack) > MAX_JSON_NODES:
+                    raise InvalidValueError(f"JSON value has more than {MAX_JSON_NODES} nodes")
+                text += _json_text(key)
+                canonical = key if key.isascii() and "\r" not in key else canonical_text(key)
+                if canonical in keys:
+                    raise InvalidValueError(
+                        "a JSON object has two keys that are the same once normalised "
+                        f"(NFC, line feeds): {excerpt(key)}"
+                    )
+                keys.add(canonical)
                 stack.append((child, depth + 1))
         elif type(current) is list:
+            if nodes + len(stack) + len(current) > MAX_JSON_NODES:
+                raise InvalidValueError(f"JSON value has more than {MAX_JSON_NODES} nodes")
             stack.extend((child, depth + 1) for child in current)
         elif type(current) is str:
-            _check_json_string(current)
+            text += _json_text(current)
         elif type(current) is int:
-            if abs(current) > MAX_SAFE_INT:
-                raise InvalidValueError(f"JSON integer is outside +-{MAX_SAFE_INT}")
+            exact_double(current)
         elif type(current) is float:
             if not math.isfinite(current):
                 raise InvalidValueError("JSON number must be finite")
         elif type(current) is not bool and current is not None:
-            raise InvalidValueError(f"{type(current).__name__} is not a JSON value")
-    return value
-
-
-def _check_json_string(text: str) -> None:
-    if len(text) > MAX_STRING_LENGTH:
-        raise InvalidValueError(f"JSON string is longer than {MAX_STRING_LENGTH} characters")
-    check_data_text(text)
+            raise InvalidValueError(f"{excerpt(current)} is not a JSON value")
+        if text > MAX_VALUE_TEXT_BYTES:
+            raise InvalidValueError(
+                f"JSON value has more than {MAX_VALUE_TEXT_BYTES} bytes of text"
+            )
+    # Sound: the walk accepted nothing but exact dicts, lists, strings, ints, floats, bools, None.
+    return cast("JsonValue", value)
 
 
 JsonData = Annotated[JsonValue, AfterValidator(check_json)]
@@ -141,7 +197,9 @@ JsonData = Annotated[JsonValue, AfterValidator(check_json)]
 # --- tables ----------------------------------------------------------------------------------
 
 type ColumnType = Literal["string", "int", "float", "bool"]
-type CellValue = bool | SafeInt | FiniteFloat | Cell
+type Row = Annotated[
+    tuple[Cell, ...], Field(max_length=MAX_TABLE_COLUMNS, fail_fast=True), BeforeValidator(as_tuple)
+]
 
 
 @final
@@ -152,18 +210,24 @@ class TableColumn(SpecModel):
     type: ColumnType
 
 
-def _cell_matches(value: CellValue, column: ColumnType) -> bool:
+def _cell_matches(value: object, column: ColumnType) -> bool:
     match column:
         case "string":
             return type(value) is str
         case "int":
-            return type(value) is int
+            return type(value) is int and abs(value) <= MAX_SAFE_INT
         case "float":
-            return type(value) in {int, float}  # `5` and `5.0` are the same JSON number
+            return type(value) in {int, float}  # an int that is exactly a double: see `Cell`
         case "bool":
             return type(value) is bool
         case _ as unreachable:
             assert_never(unreachable)
+
+
+def _describe_mismatch(cell: object, column: ColumnType) -> str:
+    if type(cell) is int and column == "int":
+        return f"an integer beyond +-{MAX_SAFE_INT}"
+    return type(cell).__name__
 
 
 @final
@@ -172,24 +236,26 @@ class Table(SpecModel):
 
     A state declaration of kind `table` bounds the value (`max_rows`) but does not fix its
     columns, because a CSV viewer cannot know the headers of a file it has not read. Every row
-    has one cell per column, of that column's type; an `int` is accepted in a `float` column.
-    Rows are bounded by `MAX_TABLE_ROWS` and, with the columns, by `MAX_TABLE_CELLS`.
+    has one cell per column, of that column's type; an `int` is accepted in a `float` column
+    and stored as a float. Rows are bounded by `MAX_TABLE_ROWS` and, with the columns, by
+    `MAX_TABLE_CELLS`; the text in it by `MAX_VALUE_TEXT_BYTES`. Column names are distinct once
+    normalised as the tool store does (NFC, line feeds).
     """
 
     columns: Annotated[
-        tuple[TableColumn, ...], Field(max_length=MAX_TABLE_COLUMNS), BeforeValidator(as_tuple)
+        tuple[TableColumn, ...],
+        Field(max_length=MAX_TABLE_COLUMNS, fail_fast=True),
+        BeforeValidator(as_tuple),
     ] = ()
     rows: Annotated[
-        tuple[Annotated[tuple[CellValue, ...], BeforeValidator(as_tuple)], ...],
-        Field(max_length=MAX_TABLE_ROWS),
-        BeforeValidator(as_tuple),
+        tuple[Row, ...], Field(max_length=MAX_TABLE_ROWS, fail_fast=True), BeforeValidator(as_tuple)
     ] = ()
 
     @field_validator("rows", mode="after")
     @classmethod
     def _floats_are_floats(
-        cls, rows: tuple[tuple[CellValue, ...], ...], info: ValidationInfo[None]
-    ) -> tuple[tuple[CellValue, ...], ...]:
+        cls, rows: tuple[tuple[Cell, ...], ...], info: ValidationInfo[None]
+    ) -> tuple[tuple[Cell, ...], ...]:
         # An `int` cell of a `float` column is stored as a float, so that `5` and `5.0` are one
         # spelling of one value, as they are in a float field.
         columns = info.data.get("columns")
@@ -206,9 +272,11 @@ class Table(SpecModel):
 
     @model_validator(mode="after")
     def _rows_fit_the_columns(self) -> Self:
-        names = [unicodedata.normalize("NFC", column.name) for column in self.columns]
+        names = [canonical_text(column.name) for column in self.columns]
         if len(set(names)) != len(names):
-            raise InvalidValueError("table column names must be distinct (compared as NFC text)")
+            raise InvalidValueError(
+                "table column names must be distinct (compared as NFC text with line feeds)"
+            )
         if not self.columns and self.rows:
             raise InvalidValueError("a table with no columns has no rows")
         if len(self.rows) * len(self.columns) > MAX_TABLE_CELLS:
@@ -216,6 +284,7 @@ class Table(SpecModel):
                 f"table has {len(self.rows)} rows of {len(self.columns)} columns, "
                 f"more than {MAX_TABLE_CELLS} cells"
             )
+        text = sum(text_bytes(column.name) for column in self.columns)
         for number, row in enumerate(self.rows):
             if len(row) != len(self.columns):
                 raise InvalidValueError(
@@ -225,6 +294,10 @@ class Table(SpecModel):
                 if not _cell_matches(cell, column.type):
                     raise InvalidValueError(
                         f"table row {number}, column {excerpt(column.name)} is of type "
-                        f"{column.type}, got {type(cell).__name__}"
+                        f"{column.type}, got {_describe_mismatch(cell, column.type)}"
                     )
+                if type(cell) is str:
+                    text += text_bytes(cell)
+            if text > MAX_VALUE_TEXT_BYTES:
+                raise InvalidValueError(f"table has more than {MAX_VALUE_TEXT_BYTES} bytes of text")
         return self

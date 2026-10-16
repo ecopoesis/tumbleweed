@@ -43,11 +43,31 @@ NOT_RELATIVE_WORKSPACE_PATHS = {
     "data URI": "data:image/png;base64,iVBORw0KGgo.png",
     "drive letter": "C:\\Users\\a.png",
     "scheme in first component": "x:y/a.png",
+    "upper-case scheme": "HTTP:/example.com/a.png",
+    "scheme with plus and dot": "git+ssh.v2:/host/a.png",
+    "javascript": "javascript:alert(1).png",
+    "mailto": "mailto:a@example.com.png",
+    "scheme after blanks": " https:/example.com/a.png",
+    "single-letter drive with a slash": "c:/Windows/a.png",
+    "backslash": "a\\b.png",
+    "backslash traversal": "..\\..\\secret.png",
+    "backslash at the start": "\\server\\share\\a.png",
+    "backslash after a colon": "report 12:30\\a.png",
     "component over NAME_MAX": "a" * 256 + ".png",
     "path over PATH_MAX": "/".join(["a" * 200] * 21) + ".png",
 }
-# A colon is fine after the first component: `a/b:c.png` is a file called `b:c.png`.
-COLON_BEYOND_THE_FIRST_COMPONENT = "photos/2026-10-16 12:30.png"
+# A colon is a file name character unless it ends what looks like a URL scheme or a drive letter
+# (a letter, then letters, digits, + . -, then the colon) at the start of the first component.
+COLONS_THAT_ARE_JUST_FILE_NAMES = [
+    "photos/2026-10-16 12:30.png",  # after the first component
+    "report 12:30.png",  # a space before the colon: no scheme starts like that
+    "2024-01-01T10:30:00.png",  # starts with a digit
+    "12:30.png",
+    "a b:c.png",
+    "my_photo:1.png",  # an underscore is not a scheme character
+    "caf\u00e9:1.png",  # nor is a letter outside ASCII
+    ".hidden:1.png",
+]
 
 
 class TestRefsAreWorkspaceRelativeAndNothingElse:
@@ -69,12 +89,43 @@ class TestRefsAreWorkspaceRelativeAndNothingElse:
     def test_accepts_relative_paths_to_raster_images(self, path: str) -> None:
         assert str(ImageRef.model_validate({"path": path}).path) == path
 
-    def test_a_colon_after_the_first_component_is_a_file_name(self) -> None:
+    @pytest.mark.parametrize("path", COLONS_THAT_ARE_JUST_FILE_NAMES)
+    def test_a_colon_that_ends_no_url_scheme_is_a_file_name(self, path: str) -> None:
+        assert str(ImageRef.model_validate({"path": path}).path) == path
+        assert str(FileRef.model_validate({"path": path}).path) == path
         assert str(FileRef.model_validate({"path": "a/b:c"}).path) == "a/b:c"
-        assert (
-            str(ImageRef.model_validate({"path": COLON_BEYOND_THE_FIRST_COMPONENT}).path)
-            == COLON_BEYOND_THE_FIRST_COMPONENT
-        )
+
+    def test_nothing_that_parses_as_a_url_gets_through(self) -> None:
+        # The other direction of the test above: a URL has a scheme before its first slash.
+        urls = [
+            "http://h/a.png",
+            "https:/h/a.png",
+            "HTTPS:h/a.png",
+            "ftp:a.png",
+            "file:/etc/passwd",
+            "data:image/png;base64,AAAA",
+            "javascript:alert(1)",
+            "x:a.png",
+            "s3+x.y-z:bucket/a.png",
+            "\t".join(["", "http:/h/a.png"]).replace("\t", " "),
+        ]
+        ours = 0
+        for url in urls:
+            with pytest.raises(ValidationError):
+                FileRef.model_validate({"path": url})
+            try:
+                WorkspaceRelPath(url)
+            except InvalidValueError:
+                continue  # `//` and the like: WorkspaceRelPath refuses it already
+            ours += 1
+            with pytest.raises(ValidationError, match="URL or a drive"):
+                FileRef.model_validate({"path": url})
+        assert ours >= 6  # the rule is what stops most of these
+
+    def test_a_refused_ref_is_refused_before_it_is_ever_a_path(self) -> None:
+        for path in ("a\\b.png", "a/b\\c.png"):
+            with pytest.raises(ValidationError, match="backslash"):
+                FileRef.model_validate({"path": path})
 
     @pytest.mark.parametrize("path", ["a.svg", "a.SVG", "a.gif", "a.bmp", "a.tiff", "a.ico", "a"])
     def test_an_image_is_png_jpeg_or_webp_by_extension_never_svg(self, path: str) -> None:
@@ -320,11 +371,20 @@ class TestJsonData:
         with pytest.raises(ValidationError, match="NUL"):
             JSON.validate_python({"a\0": 1})
 
-    def test_integers_are_safe_and_floats_finite(self) -> None:
-        assert JSON.validate_python([MAX_SAFE_INT, -MAX_SAFE_INT])
-        for bad in (MAX_SAFE_INT + 1, -MAX_SAFE_INT - 1, 10**30):
-            with pytest.raises(ValidationError, match="outside"):
-                JSON.validate_python([bad])
+    @pytest.mark.parametrize("value", [2**53 - 1, 2**53, 10**16, 10**20, 10**22, -(2**53), 2**100])
+    def test_an_integer_is_valid_when_some_double_equals_it(self, value: int) -> None:
+        assert JSON.validate_python([value, {"k": value}]) == [value, {"k": value}]
+
+    @pytest.mark.parametrize("value", [2**53 + 1, -(2**53) - 1, 10**16 + 1, 10**23 + 1])
+    def test_an_integer_no_double_equals_is_refused_not_rounded(self, value: int) -> None:
+        with pytest.raises(ValidationError, match="no double is equal"):
+            JSON.validate_python([value])
+
+    def test_an_integer_too_large_for_any_double_is_refused(self) -> None:
+        with pytest.raises(ValidationError, match="too large for a double"):
+            JSON.validate_python([10**400])
+
+    def test_floats_are_finite(self) -> None:
         for bad_float in (float("nan"), float("inf"), float("-inf")):
             with pytest.raises(ValidationError, match="finite"):
                 JSON.validate_python({"x": bad_float})
@@ -340,10 +400,120 @@ class TestJsonData:
 
         for bad in ((1, 2), {1, 2}, object(), Sub(a=1), [(1, 2)]):
             with pytest.raises(InvalidValueError, match="is not a JSON value"):
-                values.check_json(bad)  # type: ignore[arg-type]  # the point of the test
+                values.check_json(bad)
         assert values.check_json({"a": [1, None, True, 1.5, "x"]}) == {
             "a": [1, None, True, 1.5, "x"]
         }
+
+
+class TestNormalisationCollisions:
+    """Names that are distinct as written but one after the tool store normalises text (S23)."""
+
+    COMPOSED = unicodedata.normalize("NFC", "e\u0301")
+    DECOMPOSED = unicodedata.normalize("NFD", COMPOSED)
+
+    def test_the_two_spellings_really_differ(self) -> None:
+        assert self.COMPOSED != self.DECOMPOSED
+        assert unicodedata.normalize("NFC", self.DECOMPOSED) == self.COMPOSED
+
+    def test_json_object_keys_must_be_distinct_after_nfc(self) -> None:
+        with pytest.raises(ValidationError, match="two keys that are the same once normalised"):
+            JSON.validate_python({self.COMPOSED: 1, self.DECOMPOSED: 2})
+        with pytest.raises(ValidationError, match="two keys that are the same once normalised"):
+            JSON.validate_python([{"outer": {self.COMPOSED: 1, self.DECOMPOSED: 2}}])
+
+    def test_json_object_keys_must_be_distinct_after_line_feeds_too(self) -> None:
+        with pytest.raises(ValidationError, match="two keys that are the same once normalised"):
+            JSON.validate_python({"a\nb": 1, "a\r\nb": 2})
+        with pytest.raises(ValidationError, match="two keys that are the same once normalised"):
+            JSON.validate_python({"a\nb": 1, "a\rb": 2})
+
+    def test_keys_that_stay_distinct_are_fine(self) -> None:
+        assert JSON.validate_python({"a": 1, "A": 2, self.COMPOSED: 3, "e": 4})
+        assert JSON.validate_python({"x": {"k": 1}, "y": {"k": 2}})  # one object's keys at a time
+
+    def test_the_message_quotes_a_short_excerpt_of_the_key(self) -> None:
+        key = "k" * 5000
+        with pytest.raises(ValidationError) as raised:
+            JSON.validate_python({key + "e\u0301": 1, key + "\u00e9": 2})
+
+        assert len(str(raised.value)) < 800
+
+    def test_table_column_names_must_be_distinct_after_nfc_and_line_feeds(self) -> None:
+        for first, second in [
+            (self.COMPOSED, self.DECOMPOSED),
+            ("a\nb", "a\r\nb"),
+            ("a\nb", "a\rb"),
+            ("x" + self.DECOMPOSED + "\r\ny", "x" + self.COMPOSED + "\ny"),
+        ]:
+            with pytest.raises(ValidationError, match="column names must be distinct"):
+                table([(first, "int"), (second, "int")], [])
+
+    def test_columns_that_stay_distinct_are_fine(self) -> None:
+        assert table([("a", "int"), ("A", "int"), ("a b", "int"), ("a\nb", "int")], []).columns
+
+
+class TestACellIsOneCheck:
+    """A cell is a string, a number or a bool: one error and one message, however it fails."""
+
+    @pytest.mark.parametrize("cell", [None, [], {}, "a\0b", "x" * 1001, float("nan"), 2**53 + 1])
+    def test_a_bad_cell_is_one_error_at_its_place(self, cell: object) -> None:
+        rows: list[list[object]] = [[0], [1], [cell]]
+
+        with pytest.raises(ValidationError) as raised:
+            table([("a", "int")], rows)
+
+        assert raised.value.error_count() == 1
+        assert raised.value.errors()[0]["loc"] == ("rows", 2, 0)
+
+    def test_the_message_says_what_a_cell_is(self) -> None:
+        with pytest.raises(ValidationError, match="expected a string, a number or a bool"):
+            table([("a", "int")], [[None]])
+
+    def test_many_bad_cells_make_one_error_not_one_each(self) -> None:
+        bad: list[list[object]] = [[None]] * 500
+
+        with pytest.raises(ValidationError) as raised:
+            table([("a", "int")], bad)
+
+        assert raised.value.error_count() == 1
+
+    def test_a_cell_has_no_union_noise(self) -> None:
+        with pytest.raises(ValidationError) as raised:
+            table([("a", "int")], [[[]]])
+
+        text = str(raised.value)
+        assert "valid boolean" not in text
+        assert "valid integer" not in text
+        assert "valid number" not in text
+
+
+class TestCellNumbers:
+    """Numbers in a table follow the one rule: ints within 2**53 - 1, floats any exact double."""
+
+    def test_an_int_column_takes_safe_integers_only(self) -> None:
+        assert table([("a", "int")], [[2**53 - 1], [-(2**53 - 1)]]).rows
+        for bad in (2**53, 10**16, 10**20):
+            with pytest.raises(ValidationError, match="beyond"):
+                table([("a", "int")], [[bad]])
+        with pytest.raises(ValidationError, match="no double is equal"):
+            table([("a", "int")], [[2**53 + 1]])
+
+    @pytest.mark.parametrize("value", [2**53, 10**16, 10**20, 2**100])
+    def test_a_float_column_takes_an_integer_that_is_exactly_a_double(self, value: int) -> None:
+        parsed = table([("a", "float")], [[value]])
+
+        assert parsed.rows == ((float(value),),)
+        assert type(parsed.rows[0][0]) is float
+
+    @pytest.mark.parametrize("value", [2**53 + 1, 10**16 + 1, 10**400])
+    def test_a_float_column_refuses_an_integer_it_would_round(self, value: int) -> None:
+        with pytest.raises(ValidationError):
+            table([("a", "float")], [[value]])
+
+    def test_a_string_column_takes_no_number_however_exact(self) -> None:
+        with pytest.raises(ValidationError, match="is of type string"):
+            table([("a", "string")], [[10**16]])
 
 
 class TestPortTypes:

@@ -1,6 +1,8 @@
 """Authored text, data text, safe integers and finite floats."""
 
 import math
+import time
+import unicodedata
 
 import pytest
 from pydantic import ConfigDict, TypeAdapter, ValidationError
@@ -33,7 +35,7 @@ POSITIVE_FINITE_FLOAT = TypeAdapter(text.PositiveFiniteFloat, config=STRICT)
 
 LINE_TYPES = {"Title": TITLE, "Line": LINE, "Option": OPTION}
 AUTHORED_TYPES = {**LINE_TYPES, "Block": BLOCK}
-DATA_TYPES = {"Cell": CELL, "DataString": DATA_STRING, "ColumnName": COLUMN_NAME}
+DATA_TYPES = {"DataString": DATA_STRING, "ColumnName": COLUMN_NAME}
 
 # What no authored text may hold, and why. A lone surrogate is here too: it is refused by
 # pydantic itself before our validator sees it, so it is tested separately below.
@@ -131,11 +133,10 @@ def test_the_validators_themselves_refuse_a_lone_surrogate() -> None:
         (LINE, MAX_LINE_LENGTH, 0),
         (BLOCK, MAX_TEXT_LENGTH, 0),
         (OPTION, MAX_OPTION_LENGTH, 1),
-        (CELL, MAX_CELL_LENGTH, 0),
         (COLUMN_NAME, MAX_CELL_LENGTH, 1),
         (DATA_STRING, MAX_STRING_LENGTH, 0),
     ],
-    ids=["Title", "Line", "Block", "Option", "Cell", "ColumnName", "DataString"],
+    ids=["Title", "Line", "Block", "Option", "ColumnName", "DataString"],
 )
 def test_lengths_are_counted_in_characters_and_bounded(
     check: TypeAdapter[str], limit: int, minimum: int
@@ -245,3 +246,241 @@ class TestAsTuple:
         subclass = Sub([1])
         for value in ({1}, "ab", None, subclass):
             assert text.as_tuple(value) is value
+
+
+# --- one rule for every number (RFC 8785) --------------------------------------------------
+
+# Integers that a double holds exactly, and some that it does not (above 2**53 the doubles are
+# the multiples of 2, then 4, ...).
+EXACT_INTS = [0, 1, -1, 2**53 - 1, 2**53, -(2**53), 2**53 + 2, 10**16, 10**20, 2**100, 10**22]
+INEXACT_INTS = [2**53 + 1, -(2**53) - 1, 2**53 + 3, 10**16 + 1, 10**23 + 1, 3 * 2**100 + 1]
+
+
+class TestExactDouble:
+    @pytest.mark.parametrize("value", EXACT_INTS, ids=lambda v: str(v)[:12])
+    def test_an_int_a_double_holds_comes_back_as_that_float(self, value: int) -> None:
+        number = text.exact_double(value)
+
+        assert type(number) is float
+        assert int(number) == value
+
+    @pytest.mark.parametrize("value", INEXACT_INTS, ids=lambda v: str(v)[:12])
+    def test_an_int_no_double_equals_is_refused_not_rounded(self, value: int) -> None:
+        with pytest.raises(InvalidValueError, match="no double is equal"):
+            text.exact_double(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [pytest.param(10**400, id="10**400"), pytest.param(-(10**5000), id="-10**5000")],
+    )
+    def test_an_int_too_large_for_any_double_is_refused_with_a_short_message(
+        self, value: int
+    ) -> None:
+        with pytest.raises(InvalidValueError, match="too large for a double") as raised:
+            text.exact_double(value)
+
+        assert len(str(raised.value)) < 100
+
+
+class TestFloatPositionsTakeExactIntegers:
+    """`FiniteFloat`: an integer is a float if some double equals it, in any size."""
+
+    @pytest.mark.parametrize("value", EXACT_INTS, ids=lambda v: str(v)[:12])
+    def test_accepts_and_stores_a_float(self, value: int) -> None:
+        number = FINITE_FLOAT.validate_python(value)
+
+        assert type(number) is float
+        assert int(number) == value
+        assert FINITE_FLOAT.validate_json(str(value)) == number
+
+    @pytest.mark.parametrize("value", INEXACT_INTS, ids=lambda v: str(v)[:12])
+    def test_refuses_what_it_would_have_to_round(self, value: int) -> None:
+        with pytest.raises(ValidationError, match="no double is equal"):
+            FINITE_FLOAT.validate_python(value)
+        with pytest.raises(ValidationError, match="no double is equal"):
+            FINITE_FLOAT.validate_json(str(value))
+
+    def test_a_bool_is_not_a_number(self) -> None:
+        for bad in (True, False):
+            with pytest.raises(ValidationError):
+                FINITE_FLOAT.validate_python(bad)
+
+    def test_the_positive_variant_applies_the_same_rule(self) -> None:
+        assert POSITIVE_FINITE_FLOAT.validate_python(10**20) == 1e20
+        with pytest.raises(ValidationError, match="no double is equal"):
+            POSITIVE_FINITE_FLOAT.validate_python(2**53 + 1)
+        with pytest.raises(ValidationError, match="greater than 0"):
+            POSITIVE_FINITE_FLOAT.validate_python(0)
+
+
+class TestIntPositionsStayWithinSafeIntegers:
+    @pytest.mark.parametrize("value", [2**53, 10**16, 2**60])
+    def test_an_int_slot_refuses_what_a_float_slot_takes(self, value: int) -> None:
+        assert FINITE_FLOAT.validate_python(value) == float(value)
+        with pytest.raises(ValidationError):
+            SAFE_INT.validate_python(value)
+
+
+class TestScalarCell:
+    """A table cell or list item: one validator, one message."""
+
+    @pytest.mark.parametrize("value", [True, False, 0, -5, 2**53, 10**20, 1.5, -0.0, "", "text"])
+    def test_accepts_a_bool_a_number_or_a_string(self, value: object) -> None:
+        assert CELL.validate_python(value) == value
+        assert type(CELL.validate_python(value)) is type(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            [],
+            {},
+            (1,),
+            b"x",
+            object(),
+            float("nan"),
+            float("inf"),
+            2**53 + 1,
+            "a\0b",
+            "\ud800",
+        ],
+        ids=lambda v: type(v).__name__ + ":" + repr(v)[:10],
+    )
+    def test_refuses_everything_else_with_one_error(self, value: object) -> None:
+        with pytest.raises(ValidationError) as raised:
+            CELL.validate_python(value)
+
+        assert raised.value.error_count() == 1
+
+    def test_the_message_says_what_is_accepted(self) -> None:
+        with pytest.raises(ValidationError, match="expected a string, a number or a bool"):
+            CELL.validate_python([])
+
+    def test_a_string_is_at_most_a_thousand_characters(self) -> None:
+        assert CELL.validate_python("x" * MAX_CELL_LENGTH)
+        with pytest.raises(ValidationError, match="longer than 1000 characters"):
+            CELL.validate_python("x" * (MAX_CELL_LENGTH + 1))
+
+    def test_a_subclass_of_a_scalar_is_not_one(self) -> None:
+        class Str(str):
+            __slots__ = ()
+
+        class Int(int):
+            __slots__ = ()
+
+        class Float(float):
+            __slots__ = ()
+
+        for impostor in (Str("x"), Int(1), Float(1.5)):
+            with pytest.raises(ValidationError):
+                CELL.validate_python(impostor)
+
+    def test_the_json_schema_names_the_three_types(self) -> None:
+        schema = CELL.json_schema()
+
+        assert schema["anyOf"] == [
+            {"type": "boolean"},
+            {"type": "number"},
+            {"type": "string", "maxLength": MAX_CELL_LENGTH},
+        ]
+
+
+# --- every format and control character, exhaustively -----------------------------------
+
+
+def code_points(*categories: str) -> list[str]:
+    return [
+        char
+        for number in range(0x110000)
+        if unicodedata.category(char := chr(number)) in categories
+    ]
+
+
+FORMAT_CHARACTERS = code_points("Cf")
+CONTROLS = code_points("Cc")
+SEPARATORS = code_points("Zl", "Zp")
+SURROGATES = code_points("Cs")
+
+
+class TestEveryForbiddenCharacter:
+    """Not a list of examples: every code point of each category, from the Unicode database."""
+
+    def test_the_categories_are_what_they_were_taken_to_be(self) -> None:
+        assert len(FORMAT_CHARACTERS) > 100
+        assert len(CONTROLS) == 65
+        assert SEPARATORS == ["\u2028", "\u2029"]
+        assert len(SURROGATES) == 2048
+
+    def test_only_the_two_joiners_of_the_format_characters_are_allowed_in_authored_text(
+        self,
+    ) -> None:
+        accepted = [char for char in FORMAT_CHARACTERS if _accepts(LINE, char)]
+
+        assert accepted == ["\u200c", "\u200d"]
+        assert accepted == [char for char in FORMAT_CHARACTERS if _accepts(BLOCK, char)]
+
+    def test_no_control_is_allowed_in_a_line_and_only_newline_and_tab_in_a_block(self) -> None:
+        assert not [char for char in CONTROLS if _accepts(LINE, char)]
+        assert [char for char in CONTROLS if _accepts(BLOCK, char)] == ["\t", "\n"]
+
+    def test_no_separator_or_surrogate_is_allowed_in_authored_text(self) -> None:
+        for adapter in (LINE, BLOCK, TITLE, OPTION):
+            assert not [char for char in SEPARATORS + SURROGATES if _accepts(adapter, char)]
+
+    def test_the_same_holds_in_the_middle_of_a_word(self) -> None:
+        for char in FORMAT_CHARACTERS:
+            assert _accepts(LINE, f"a{char}b") == (char in {"\u200c", "\u200d"})
+
+    def test_data_text_refuses_exactly_nul_and_the_surrogates(self) -> None:
+        refused = [
+            char
+            for category in (FORMAT_CHARACTERS, CONTROLS, SEPARATORS, SURROGATES)
+            for char in category
+            if not _accepts(DATA_STRING, char)
+        ]
+
+        assert refused == ["\x00", *SURROGATES]
+
+
+def _accepts(adapter: TypeAdapter[str], text: str) -> bool:
+    try:
+        adapter.validate_python(text)
+    except ValidationError:
+        return False
+    return True
+
+
+# --- text helpers --------------------------------------------------------------------------
+
+
+class TestTextBytes:
+    @pytest.mark.parametrize(
+        ("value", "size"),
+        [("", 0), ("abc", 3), ("\u00e9", 2), ("\u20ac", 3), ("\U0001f600", 4), ("\ud800", 3)],
+    )
+    def test_is_the_length_in_utf8(self, value: str, size: int) -> None:
+        assert text.text_bytes(value) == size
+
+
+class TestCanonicalText:
+    def test_is_nfc_with_line_feeds(self) -> None:
+        assert text.canonical_text("e\u0301") == "\u00e9"
+        assert text.canonical_text("a\r\nb\rc\nd") == "a\nb\nc\nd"
+
+    def test_is_idempotent_and_leaves_plain_text_alone(self) -> None:
+        for value in ("plain", "", "e\u0301\r\n", "\u00e9\n"):
+            once = text.canonical_text(value)
+            assert text.canonical_text(once) == once
+        assert text.canonical_text("plain") == "plain"
+
+
+class TestDataTextIsFast:
+    def test_a_long_string_is_checked_in_c(self) -> None:
+        started = time.perf_counter()
+        for _ in range(200):
+            text.check_data_text("x" * 65_536)
+            text.check_data_text("\u00e9" * 65_536)
+        elapsed = time.perf_counter() - started
+
+        # 26 million characters. A Python loop over them takes tens of seconds.
+        assert elapsed < 2.0

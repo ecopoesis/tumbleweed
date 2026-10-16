@@ -1,5 +1,6 @@
 """State declarations and the one function that decides whether a value fits one."""
 
+import time
 import unicodedata
 
 import pytest
@@ -9,6 +10,7 @@ from tests.ui.spec.support import MINIMAL_STATE as MINIMAL
 from tests.ui.spec.support import STATE_KINDS, Json, lit_int
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.types import JsonValue
+from tumbleweed.ui.spec import state
 from tumbleweed.ui.spec.limits import (
     DEFAULT_LIST_MAX_ITEMS,
     DEFAULT_STRING_MAX_LENGTH,
@@ -33,6 +35,7 @@ from tumbleweed.ui.spec.state import (
     TableState,
     check_value,
     port_type_of,
+    value_text_bytes,
 )
 from tumbleweed.ui.spec.values import FileRef, ImageRef, Table
 
@@ -402,7 +405,8 @@ class TestJson:
         for _ in range(20):
             deep = [deep]
         refuse("json", "nested deeper than 16", default=deep)
-        refuse("json", "outside", default=[2**60])
+        refuse("json", "no double is equal", default=[2**53 + 1])
+        accepts("json", default=[2**53, 10**16, 10**20])
 
 
 class TestPortTypes:
@@ -476,8 +480,10 @@ class TestCheckValue:
         result = value_of("float", 2)
         assert result == 2.0
         assert type(result) is float
-        for bad in ("1.5", True, None, float("nan"), float("inf"), float("-inf"), MAX_SAFE_INT + 1):
+        for bad in ("1.5", True, None, float("nan"), float("inf"), float("-inf"), 2**53 + 1):
             refused("float", bad, "k is a finite number")
+        for exact in (2**53, 10**16, 10**20):
+            assert value_of("float", exact) == float(exact)
 
     def test_float_bounds_are_inclusive(self) -> None:
         for good in (0.0, 0.5, 1.0):
@@ -580,7 +586,7 @@ class TestCheckValue:
     def test_json(self) -> None:
         assert value_of("json", {"a": [1, None]}) == {"a": [1, None]}
         assert value_of("json", None) is None
-        refused("json", [2**60], "^k: ")
+        refused("json", [2**53 + 1], "^k: ")
         refused("json", (1, 2), "^k: ")
         refused("json", object(), "^k: ")
 
@@ -598,3 +604,222 @@ class TestCheckValue:
 
         assert result == (1, 2)
         assert not isinstance(result, list)
+
+
+# --- numbers follow the one rule (RFC 8785): see tumbleweed.ui.spec.text -----------------------
+
+
+class TestNumbersInDeclarations:
+    @pytest.mark.parametrize("field", ["default", "minimum", "maximum", "step"])
+    @pytest.mark.parametrize("value", [2**53, 10**16, 10**20])
+    def test_a_float_field_takes_an_integer_that_is_exactly_a_double(
+        self, field: str, value: int
+    ) -> None:
+        fields: dict[str, JsonValue] = {"default": 1, "minimum": 0, "maximum": 10**21, "step": 1}
+        fields[field] = value
+        if field == "minimum":
+            fields["default"] = value  # a default below the minimum would be refused for that
+        parsed = decl("float", **fields)
+
+        assert isinstance(parsed, FloatState)
+        assert type(getattr(parsed, field)) is float
+        assert getattr(parsed, field) == float(value)
+
+    @pytest.mark.parametrize("field", ["default", "minimum", "maximum", "step"])
+    @pytest.mark.parametrize("value", [2**53 + 1, 10**16 + 1])
+    def test_a_float_field_refuses_an_integer_it_would_round(self, field: str, value: int) -> None:
+        fields: dict[str, JsonValue] = {"default": 1, "minimum": 0, "maximum": 10**21, "step": 1}
+        fields[field] = value
+        with pytest.raises(ValidationError, match="no double is equal"):
+            decl("float", **fields)
+
+    @pytest.mark.parametrize("value", [2**53, 10**16, 2**60])
+    def test_an_int_field_refuses_what_a_float_field_takes(self, value: int) -> None:
+        for field in ("default", "minimum", "maximum", "step"):
+            fields: dict[str, JsonValue] = {"default": 1}
+            fields[field] = value
+            with pytest.raises(ValidationError):
+                decl("int", **fields)
+
+    def test_check_value_agrees_with_the_declaration(self) -> None:
+        assert value_of("float", 2**53) == float(2**53)
+        assert value_of("float", 10**20) == 1e20
+        refused("float", 2**53 + 1, "k is a finite number")
+        refused("float", 10**400, "k is a finite number")
+        refused("int", 2**53, "within")
+        assert value_of("list", [2**53, 10**20], item_type="float") == (float(2**53), 1e20)
+        refused("list", [2**53 + 1], r"k\[0\] must be a float", item_type="float")
+        refused("list", [2**53], r"k\[0\] must be a int", item_type="int")
+
+
+# --- every error names the key ----------------------------------------------------------------
+
+KEYED_FAILURES: list[tuple[str, object, dict[str, JsonValue]]] = [
+    ("bool", 1, {}),
+    ("int", "1", {}),
+    ("int", 2**53, {}),
+    ("int", 99, {"minimum": 0, "maximum": 10}),
+    ("float", "1", {}),
+    ("float", 99.0, {"minimum": 0, "maximum": 10, "default": 5}),
+    ("string", 1, {}),
+    ("string", "a\0b", {}),
+    ("string", "abcdef", {"max_length": 3}),
+    ("enum", "zzz", {}),
+    ("image", "a.png", {}),
+    ("image", {"path": "../a.png"}, {}),
+    ("file", {"path": "/etc/passwd"}, {}),
+    ("table", [], {}),
+    ("table", {"columns": [], "rows": [[1]]}, {}),
+    ("list", "ab", {}),
+    ("list", [1, "a"], {}),
+    ("list", [0, 1, 2.5], {}),
+    ("json", [2**53 + 1], {}),
+    ("json", object(), {}),
+]
+
+
+class TestEveryErrorNamesTheKey:
+    @pytest.mark.parametrize(
+        ("kind", "raw", "fields"),
+        KEYED_FAILURES,
+        ids=[f"{k}:{type(r).__name__}:{str(r)[:12]!r}" for k, r, _ in KEYED_FAILURES],
+    )
+    def test_the_message_starts_with_the_key(
+        self, kind: str, raw: object, fields: dict[str, JsonValue]
+    ) -> None:
+        with pytest.raises(InvalidValueError) as raised:
+            value_of(kind, raw, **fields)
+
+        message = str(raised.value)
+        assert message.startswith(("k is ", "k: ", "k must", "k has", "k[")), message
+
+    def test_an_item_of_a_list_is_named_by_its_position(self) -> None:
+        with pytest.raises(InvalidValueError, match=r"^k\[2\] must be a int, got <float>"):
+            value_of("list", [0, 1, 2.5])
+        with pytest.raises(InvalidValueError, match=r"^k\[1\]: text must not contain NUL"):
+            value_of("list", ["ok", "a\0b"], item_type="string")
+
+    def test_a_text_error_names_the_key_not_only_the_text(self) -> None:
+        with pytest.raises(InvalidValueError, match=r"^k: text must not contain NUL"):
+            value_of("string", "a\0b")
+
+
+class TestValueTextBytes:
+    def test_counts_the_utf8_bytes_of_every_string_and_key_and_nothing_else(self) -> None:
+        assert value_text_bytes("abc") == 3
+        assert value_text_bytes("é") == 2
+        assert value_text_bytes(5) == 0
+        assert value_text_bytes(True) == 0
+        assert value_text_bytes(None) == 0
+        assert value_text_bytes(1.5) == 0
+        assert value_text_bytes(("ab", "€", 7)) == 5
+        assert value_text_bytes({"key": ["ab", {"kéy": "x"}]}) == 3 + 2 + 4 + 1
+
+    def test_counts_a_table_by_its_column_names_and_text_cells(self) -> None:
+        value = check_value(
+            decl("table"),
+            {
+                "columns": [{"name": "naïve", "type": "string"}, {"name": "n", "type": "int"}],
+                "rows": [["abc", 5], ["é", 6]],
+            },
+        )
+
+        assert value_text_bytes(value) == 6 + 1 + 3 + 2
+
+    def test_counts_a_reference_by_its_path(self) -> None:
+        assert value_text_bytes(check_value(decl("image"), {"path": "out/a.png"})) == 9
+        assert value_text_bytes(check_value(decl("file"), {"path": "dé.csv"})) == 7
+
+    def test_does_not_recurse(self) -> None:
+        nested: JsonValue = "x"
+        for _ in range(10_000):
+            nested = [nested]
+
+        assert value_text_bytes(nested) == 1
+
+
+class TestHugeValuesAreRefusedBeforeTheyAreCopied:
+    """A value over a limit is refused by a check that stops at the limit, not walked whole.
+
+    pydantic would validate every node of a hostile value, and copy it, before our limits saw it.
+    """
+
+    @staticmethod
+    def forbidden(name: str) -> object:
+        class Forbidden:
+            def validate_python(self, *args: object, **kwargs: object) -> object:
+                raise AssertionError(f"{name} validated a value that is over a limit")
+
+        return Forbidden()
+
+    def test_a_json_value_with_too_many_nodes_never_reaches_pydantic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(state, "_JSON", self.forbidden("the JSON adapter"))
+        started = time.perf_counter()
+
+        with pytest.raises(InvalidValueError, match=r"^k: JSON value has more than 10000 nodes"):
+            value_of("json", [0] * 5_000_000)
+
+        assert time.perf_counter() - started < 1.0
+
+    def test_a_json_value_with_too_much_text_never_reaches_pydantic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(state, "_JSON", self.forbidden("the JSON adapter"))
+
+        with pytest.raises(InvalidValueError, match="bytes of text"):
+            value_of("json", ["x" * 65_536] * 17)
+
+    def test_a_json_value_that_is_too_deep_never_reaches_pydantic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(state, "_JSON", self.forbidden("the JSON adapter"))
+        deep: JsonValue = 1
+        for _ in range(100_000):
+            deep = [deep]
+
+        with pytest.raises(InvalidValueError, match="nested deeper than 16"):
+            value_of("json", deep)
+
+    def test_a_table_with_too_many_rows_never_reaches_pydantic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        declaration = decl("table", max_rows=5)
+        monkeypatch.setattr(state, "_TABLE", self.forbidden("the table adapter"))
+        rows: list[JsonValue] = [[0]] * 2_000_000
+
+        with pytest.raises(InvalidValueError, match=r"^k has 2000000 rows, the limit is 5"):
+            check_value(declaration, {"columns": COLUMN_A, "rows": rows})
+
+    def test_a_table_with_too_many_columns_never_reaches_pydantic(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        declaration = decl("table")
+        monkeypatch.setattr(state, "_TABLE", self.forbidden("the table adapter"))
+        columns: list[JsonValue] = [{"name": f"c{i}", "type": "int"} for i in range(1_000_000)]
+
+        with pytest.raises(InvalidValueError, match=r"^k has 1000000 columns, the limit is 32"):
+            check_value(declaration, {"columns": columns, "rows": []})
+
+    def test_the_same_values_within_their_limits_do_reach_it(self) -> None:
+        assert value_of("json", [0] * 9_999) == [0] * 9_999
+        rows: list[JsonValue] = [[0]] * 5
+        table = value_of("table", {"columns": COLUMN_A, "rows": rows}, max_rows=5)
+
+        assert isinstance(table, Table)
+        assert len(table.rows) == 5
+
+    def test_a_hostile_json_value_is_refused_quickly_whatever_it_is_made_of(self) -> None:
+        shapes: list[JsonValue] = [
+            ["x" * 65_536] * 200,
+            [{"k": 1}] * 50_000,
+            {f"k{i}": 0 for i in range(100_000)},
+            [[0] * 1000] * 1000,
+        ]
+        started = time.perf_counter()
+        for value in shapes:
+            with pytest.raises(InvalidValueError, match=r"^k: JSON value"):
+                value_of("json", value)
+
+        assert time.perf_counter() - started < 2.0

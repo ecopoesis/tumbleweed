@@ -50,9 +50,22 @@ MAX_TABLE_ROWS: Final = 10_000  # `max_rows` a table state may declare
 MAX_TABLE_CELLS: Final = 20_000  # rows times columns, of one table value
 MAX_JSON_DEPTH: Final = 16  # of a `json` state value
 MAX_JSON_NODES: Final = 10_000  # of a `json` state value (every container, scalar and key)
-# Integers stay exact in RFC 8785 (JCS) canonical JSON, which the tool store hashes (S23), only
-# up to 2**53 - 1: a larger one would not survive a round trip through a double.
+# Bytes of text, not of the encoded value: the UTF-8 bytes of every string and key in it. The
+# number of values is bounded by the limits above, so this bounds the size of a value. A
+# `string` value is bounded by `MAX_STRING_LENGTH` characters (at most four bytes each).
+MAX_VALUE_TEXT_BYTES: Final = 1_048_576  # in one `json`, `table` or `list` value
+MAX_PATCH_TEXT_BYTES: Final = 2_097_152  # in all the values of one patch (`validate_patch`)
+MAX_STATE_TEXT_BYTES: Final = 4_194_304  # in all the values of the state of one tool instance
+# Spec numbers are IEEE-754 doubles, as in I-JSON and RFC 8785 (JCS), the canonical JSON the tool
+# store hashes (S23). A whole number is exact up to 2**53 - 1, so that is the magnitude of every
+# value of an `int` entry, `int` literal, table `int` cell and list `int` item. A number in a
+# `float` or `json` position may be written as an integer of any size that is exactly a double.
 MAX_SAFE_INT: Final = 2**53 - 1
+# A slider, spin button or progress bar needs a range that is finite and a step that divides it
+# into a sane number of positions: the bounds are within +-MAX_SAFE_INT, `minimum` is below
+# `maximum`, the range is at most MAX_SAFE_INT wide, and a `float` entry's `step` is at least
+# the smallest normal float and at most MAX_WIDGET_STEPS steps fit in the range.
+MAX_WIDGET_STEPS: Final = 10_000_000
 
 # Defaults for the optional bounds of a state declaration.
 DEFAULT_STRING_MAX_LENGTH: Final = 1_000
