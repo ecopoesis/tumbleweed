@@ -11,6 +11,9 @@ dependencies = [
     "PyGObject>=3.50",
 ]
 
+[project.scripts]
+tumbleweed-shell = "tumbleweed.shell.launch:main"
+
 [dependency-groups]
 dev = [
     "import-linter>=2.3",
