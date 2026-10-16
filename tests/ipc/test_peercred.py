@@ -3,6 +3,7 @@
 import asyncio
 import errno
 import os
+import shutil
 import socket
 import struct
 import sys
@@ -125,8 +126,8 @@ class TestRequireSameUser:
                 accepted[0].close()
                 server.close()
                 await server.wait_closed()
-                os.unlink(path)  # noqa: PTH108  (the file is ours, and this is cleanup)
-                os.rmdir(directory)  # noqa: PTH106
+                # Python 3.13 removes the socket file when the server closes; older ones do not.
+                shutil.rmtree(directory, ignore_errors=True)
 
         run(scenario)
 
