@@ -198,11 +198,14 @@ class TestWithLandlock:
         """Two granted writable directories, `named` and `other`, and a second launcher in the
         sandbox (its source is in `named`) that restricts further with the given rules.
         """
-        named, other = tmp_path / "named", tmp_path / "other"
-        for directory in (named, other):
+        # Host directories under tmp_path, granted at /named and /other: nothing may be granted
+        # inside /tmp, where tmp_path lives.
+        named_host, other_host = tmp_path / "named", tmp_path / "other"
+        for directory in (named_host, other_host):
             directory.mkdir(parents=True)
             (directory / "file").write_text(f"secret of {directory.name}")
-        (named / "sandbox_exec.py").write_bytes(helper_source())
+        (named_host / "sandbox_exec.py").write_bytes(helper_source())
+        named, other = Path("/named"), Path("/other")
         payload = [PYTHON, "-c", code, str(named), str(other)]
         inner = [
             PYTHON,
@@ -215,13 +218,13 @@ class TestWithLandlock:
             "--",
             *payload,
         ]
-        with opened(named) as named_handle, opened(other) as other_handle:
+        with opened(named_host) as named_handle, opened(other_host) as other_handle:
             made = policy(
                 workspace,
                 *(inner if layered else payload),
                 grants=(
-                    grant(named, GrantAccess.WRITE, named_handle),
-                    grant(other, GrantAccess.WRITE, other_handle),
+                    grant(named_host, GrantAccess.WRITE, named_handle, target=str(named)),
+                    grant(other_host, GrantAccess.WRITE, other_handle, target=str(other)),
                 ),
                 require_landlock=True,
             )
