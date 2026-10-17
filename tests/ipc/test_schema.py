@@ -9,6 +9,13 @@ from typing import get_args
 import pytest
 from pydantic import JsonValue
 
+from tumbleweed.ipc.broker_messages import (
+    DirEntry,
+    EnvPair,
+    NetworkAccess,
+    ReadAccess,
+    WriteAccess,
+)
 from tumbleweed.ipc.messages import IpcMessage, Request, RequestBody, Response, ResponseBody
 from tumbleweed.ipc.schema import SCHEMA_FILE_NAME, SCHEMA_TITLE, build_schema, render_schema
 from tumbleweed.ipc.wire import PROTOCOL_VERSION, ErrorFrame, Hello, RequestFrame, ResponseFrame
@@ -42,6 +49,10 @@ ALL_MESSAGES: tuple[type[IpcMessage], ...] = (
     *members(RequestBody),
     *members(ResponseBody),
 )
+
+
+# Models that are parts of a message, not messages themselves (nested under one).
+PARTS: tuple[type[IpcMessage], ...] = (ReadAccess, WriteAccess, NetworkAccess, DirEntry, EnvPair)
 
 
 def definition(name: str) -> dict[str, JsonValue]:
@@ -82,9 +93,21 @@ def test_the_schema_is_versioned_in_its_file_name_and_its_title() -> None:
 
 
 def test_the_schema_has_every_frame_and_every_registered_message_and_nothing_stale() -> None:
-    expected = {cls.__name__ for cls in ALL_MESSAGES}
+    expected = {cls.__name__ for cls in (*ALL_MESSAGES, *PARTS)}
 
     assert set(obj(build_schema()["$defs"])) == {*expected, "ErrorCode"}
+
+
+@pytest.mark.parametrize("cls", PARTS, ids=[cls.__name__ for cls in PARTS])
+def test_every_part_of_a_message_is_strict_and_closed_too(cls: type[IpcMessage]) -> None:
+    assert definition(cls.__name__)["additionalProperties"] is False
+    assert getattr(cls, "__final__", False), f"{cls.__name__} must be @final"
+    assert cls.model_config == {
+        "strict": True,
+        "extra": "forbid",
+        "frozen": True,
+        "allow_inf_nan": False,
+    }
 
 
 def test_the_top_level_is_a_union_of_the_frames_discriminated_on_kind() -> None:

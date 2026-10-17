@@ -199,7 +199,10 @@ class IpcServer:
         last = _wall_clock()
         while True:
             await asyncio.sleep(min(self._refresh_interval, _WAKE_INTERVAL).total_seconds())
-            if _wall_clock() - last < self._refresh_interval.total_seconds():
+            elapsed = _wall_clock() - last
+            # A wall clock set back (negative `elapsed`) must not delay the touch by the size of
+            # the jump (#69): it counts as an interval passed, and the next one starts from now.
+            if 0 <= elapsed < self._refresh_interval.total_seconds():
                 continue
             last = _wall_clock()
             if not claim.touch():

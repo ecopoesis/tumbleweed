@@ -60,8 +60,8 @@ class TestWallClock:
 
         assert result.termination is Termination.TIMED_OUT
         assert result.exit_code is None
-        assert 1.0 <= time.monotonic() - started < 3.0  # on time: the wall clock and 2 s of slack
-        assert 1.0 <= result.wall_time.total_seconds() < 3.0
+        assert 1.0 <= time.monotonic() - started < 2.0  # on time: the wall clock, not twice it
+        assert 1.0 <= result.wall_time.total_seconds() < 2.0
         assert wait_until_none(mark, 3.0) == []
 
     def test_the_control_the_same_program_finishes_inside_the_wall_clock(
