@@ -30,6 +30,7 @@ dependencies = [
 [project.scripts]
 tumbleweed-shell = "tumbleweed.shell.launch:main"
 tumbleweed-sandbox-exec = "tumbleweed.sandbox.sandbox_exec:main"
+tumbleweed-render = "tumbleweed.shell.render:main"
 
 [dependency-groups]
 dev = [

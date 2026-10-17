@@ -10,7 +10,8 @@ together, and [`docs/handoff.md`](docs/handoff.md) for the original vision. What
 far is the typed foundation in `src/tumbleweed/core`, the build and test setup around it, and the
 GTK4 shell skeleton (`tumbleweed-shell`: a window with a canvas, a chat panel that talks to Claude,
 and a status strip; see [Running the shell](#running-the-shell) and
-[Talking to Claude](#talking-to-claude)).
+[Talking to Claude](#talking-to-claude)), and the renderer core that turns a UI spec into live
+widgets (`tumbleweed-render`; see [UI spec](#ui-spec)).
 
 ## Development setup (macOS)
 
@@ -60,7 +61,8 @@ uv run tumbleweed-shell --version  # answered at once, with no window and no GTK
 
 One window opens, with no desktop around it:
 
-- the **canvas** (left), where generated tools will render (S10); it shows a placeholder for now;
+- the **canvas** (left), where generated tools render (`CanvasView.show_spec`); it shows a placeholder
+  until a tool is shown, and nothing in the shell shows one yet (S12 connects the agent);
 - the **side panel** (right): the chat transcript, a multi-line input and a Send button. Messages are
   answered by Claude, streamed in as they are written (with no key configured the chat says how to
   set one; `responder = "echo"` brings back the S02 placeholder that echoes). While a reply streams
@@ -317,3 +319,19 @@ reference; the tests fail until you do:
 uv run python -m tumbleweed.ui.spec.schema --write
 uv run python -m tests.ui.spec.docgen --write
 ```
+
+#### Previewing a spec
+
+```sh
+uv run tumbleweed-render tests/ui/spec/golden/tip_calculator.json
+```
+
+opens a window with the spec rendered on a canvas, by the renderer the shell uses and with nothing
+behind it: computed state and `set` handlers work (the tip calculator needs no agent), `sandbox` and
+`agent` handlers do nothing yet (S20, S12). A file that is not a valid spec is printed as the model
+would be told, one problem per line, with exit status 1 and no window. The renderer is
+`tumbleweed.ui.runtime` (state, expressions, handlers; no GTK, unit-tested without a display) and
+`tumbleweed.ui.gtk` (the thin adapter; `pytest -m gtk` in the container). It creates no popover,
+dialog, tooltip or drag icon from a spec, so that the canvas can never cover the trusted chrome
+(a `dropdown` is a list in place; DECISIONS D11), and images, tables, text views, tabs and expanders
+show as a placeholder until S11.
