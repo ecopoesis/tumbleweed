@@ -33,7 +33,7 @@ from tumbleweed.agent.responder import (
     Responder,
 )
 from tumbleweed.core.errors import InvalidValueError, TumbleweedError
-from tumbleweed.core.ids import MessageId
+from tumbleweed.core.ids import MessageId, SessionId
 from tumbleweed.shell.viewmodel.transcript import (
     MessageState,
     Role,
@@ -65,9 +65,9 @@ def context_turns(messages: Sequence[TranscriptMessage]) -> tuple[ContextTurn, .
     conversation so far (ARCHITECTURE section 2: text turns of replies that finished).
 
     A turn is a user message directly followed by an assistant message that completed. A reply that
-    failed or was cancelled, a user message nothing answered (the shell ended first), and a reply
-    with no text leave no turn, so what is sent always alternates and starts with the user. Only
-    the newest `MAX_CONTEXT_TURNS` are built.
+    failed or was cancelled, a user message nothing answered (the shell ended first), and a message
+    or reply with no text leave no turn, so what is sent always alternates and starts with the
+    user. Only the newest `MAX_CONTEXT_TURNS` are built.
     """
     pairs: list[tuple[TranscriptMessage, TranscriptMessage]] = []
     pending: TranscriptMessage | None = None
@@ -75,7 +75,10 @@ def context_turns(messages: Sequence[TranscriptMessage]) -> tuple[ContextTurn, .
         if message.role is Role.USER:
             pending = message
         elif (
-            pending is not None and message.state is MessageState.COMPLETE and message.text.strip()
+            pending is not None
+            and pending.text.strip()
+            and message.state is MessageState.COMPLETE
+            and message.text.strip()
         ):
             pairs.append((pending, message))
             pending = None
@@ -178,6 +181,12 @@ class ChatController:
         self._transcript = transcript
         self._responder = responder
         self._reply: _Reply | None = None
+        self._session_id: SessionId | None = None
+
+    def set_session(self, session_id: SessionId | None) -> None:
+        """The chat session the next messages belong to; the responder records it with each model
+        call, so that an invocation can be traced to the conversation it was part of."""
+        self._session_id = session_id
 
     @property
     def busy(self) -> bool:
@@ -195,7 +204,9 @@ class ChatController:
         history = context_turns(self._transcript.messages[:-1])  # everything before this message
         reply = _Reply(self._transcript, self._transcript.begin_assistant().id)
         self._reply = reply
-        request = ReplyRequest(message_id=user.id, text=user.text, history=history)
+        request = ReplyRequest(
+            message_id=user.id, text=user.text, history=history, session_id=self._session_id
+        )
         try:
             handle = self._responder.start(request, reply)
         except TumbleweedError as exc:

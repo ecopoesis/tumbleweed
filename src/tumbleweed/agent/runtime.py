@@ -33,7 +33,7 @@ import threading
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Final, Protocol, final
 
-from tumbleweed.agent.context import fit_history
+from tumbleweed.agent.context import fit_history, history_budget
 from tumbleweed.agent.errors import AgentBusyError, AgentError, LimitError, describe_unexpected
 from tumbleweed.agent.limits import MAX_USER_TEXT_BYTES, AgentLimits
 from tumbleweed.agent.llm import LlmMessage, LlmProvider
@@ -168,14 +168,13 @@ class AgentResponder:
         self._dispatcher = dispatcher
         self._limits = limits
         self._system_prompt = system_prompt
+        # The invocation log names the chat session of the request; a responder used without one
+        # (a test, a shell with no history) has a session of its own.
         self._session_id = SessionId.new()
-        self._loop = AgentLoop(
-            provider=recorder.record(provider, session_id=self._session_id),
-            registry=registry,
-            model=model,
-            system_prompt=system_prompt,
-            limits=limits,
-        )
+        self._provider = provider
+        self._recorder = recorder
+        self._registry = registry
+        self._model = model
         self._cleanup = cleanup
         self._worker = _Worker()
         self._active: _Run | None = None
@@ -198,8 +197,22 @@ class AgentResponder:
         run = _Run(sink)
         self._active = run
         try:
-            history = fit_history(self._system_prompt, request.history, request.text)
-            run.future = self._worker.submit(self._drive(run, history, request.text))
+            history = fit_history(
+                self._system_prompt,
+                request.history,
+                request.text,
+                budget=history_budget(self._limits.max_turn_output_tokens),
+            )
+            loop = AgentLoop(
+                provider=self._recorder.record(
+                    self._provider, session_id=request.session_id or self._session_id
+                ),
+                registry=self._registry,
+                model=self._model,
+                system_prompt=self._system_prompt,
+                limits=self._limits,
+            )
+            run.future = self._worker.submit(self._drive(run, loop, history, request.text))
         except BaseException:
             self._active = None
             raise
@@ -227,11 +240,11 @@ class AgentResponder:
 
     # On the worker thread.
 
-    async def _drive(self, run: _Run, history: tuple[LlmMessage, ...], text: str) -> None:
+    async def _drive(
+        self, run: _Run, loop: AgentLoop, history: tuple[LlmMessage, ...], text: str
+    ) -> None:
         try:
-            await self._loop.run(
-                history, text, lambda piece: self._post(run, ReplyDelta(text=piece))
-            )
+            await loop.run(history, text, lambda piece: self._post(run, ReplyDelta(text=piece)))
         except AgentError as exc:
             self._post(run, ReplyFailed(reason=str(exc)))
         except Exception as exc:  # noqa: BLE001  (the worker is a boundary)

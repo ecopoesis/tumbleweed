@@ -32,7 +32,7 @@ from typing import Annotated, Literal, Protocol, final
 from pydantic import BaseModel, ConfigDict, Field
 
 from tumbleweed.agent.limits import MAX_REPLY_BYTES, MAX_USER_TEXT_BYTES
-from tumbleweed.core.ids import MessageId
+from tumbleweed.core.ids import MessageId, SessionId
 
 MAX_CONTEXT_TURNS = 500  # half of the transcript's 1000 messages
 
@@ -61,6 +61,8 @@ class ReplyRequest(BaseModel):
     message_id: MessageId
     text: str
     history: tuple[ContextTurn, ...] = Field(default=(), max_length=MAX_CONTEXT_TURNS)
+    session_id: SessionId | None = None
+    """The chat session this belongs to, if the shell keeps one; recorded with every model call."""
 
 
 @final

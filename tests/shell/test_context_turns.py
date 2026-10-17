@@ -55,6 +55,10 @@ class TestWhichMessagesAreTurns:
     def test_a_reply_that_never_ended_is_not_a_turn(self) -> None:
         assert context_turns([user("q"), reply("so far", MessageState.STREAMING)]) == ()
 
+    def test_a_blank_question_is_not_a_turn_the_provider_would_refuse_it(self) -> None:
+        assert context_turns([user("   "), reply("a")]) == ()
+        assert context_turns([user("\n"), reply("a"), user("q"), reply("b")]) == turns(("q", "b"))
+
     def test_an_answer_without_a_question_is_not_a_turn(self) -> None:
         assert context_turns([reply("orphan"), user("q"), reply("a")]) == turns(("q", "a"))
 

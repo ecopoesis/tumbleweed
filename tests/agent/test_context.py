@@ -11,17 +11,26 @@ from pydantic import ValidationError
 from tests.agent.support import make_rig
 from tumbleweed.agent.context import (
     CONTEXT_BUDGET_TOKENS,
+    CONTEXT_WINDOW_TOKENS,
     MESSAGE_OVERHEAD_TOKENS,
+    RESERVED_TOKENS,
     estimate_tokens,
     fit_history,
+    history_budget,
     message_cost,
 )
 from tumbleweed.agent.fake import FakeTurn
-from tumbleweed.agent.limits import MAX_REPLY_BYTES, MAX_USER_TEXT_BYTES
+from tumbleweed.agent.limits import (
+    MAX_REPLY_BYTES,
+    MAX_TURN_OUTPUT_TOKENS,
+    MAX_USER_TEXT_BYTES,
+    AgentLimits,
+)
 from tumbleweed.agent.llm import LlmMessage, TextBlock
 from tumbleweed.agent.prompts import MAX_PROMPT_BYTES
 from tumbleweed.agent.responder import MAX_CONTEXT_TURNS, ContextTurn, ReplyRequest
-from tumbleweed.core.ids import MessageId
+from tumbleweed.core.ids import MessageId, SessionId
+from tumbleweed.core.types import TokenCount
 from tumbleweed.shell.viewmodel import transcript as shell_transcript
 from tumbleweed.shell.viewmodel.transcript import (
     MessageState,
@@ -275,3 +284,56 @@ class TestInTheRuntime:
             rig.send_and_wait("second")
 
             assert texts(rig.provider.requests[1].messages) == ["second"]
+
+
+class TestTheBudgetLeavesRoomForTheReply:
+    def test_the_default_output_limit_gets_the_whole_budget(self) -> None:
+        assert history_budget(AgentLimits().max_turn_output_tokens) == CONTEXT_BUDGET_TOKENS
+
+    def test_the_largest_output_limit_gets_what_the_window_has_left(self) -> None:
+        assert history_budget(MAX_TURN_OUTPUT_TOKENS) == 64_000
+
+    @pytest.mark.parametrize("output", [1, 16_000, 60_000, 100_000, 128_000])
+    def test_input_and_the_longest_reply_always_fit_the_window(self, output: int) -> None:
+        assert history_budget(output) + output + RESERVED_TOKENS <= CONTEXT_WINDOW_TOKENS
+
+    def test_the_budget_is_never_negative(self) -> None:
+        assert history_budget(10**9) == 0
+
+    def test_the_responder_sends_less_history_when_the_reply_may_be_longer(self) -> None:
+        old = [
+            message(role, text)
+            for _ in range(10)
+            for role, text in ((Role.USER, "u" * 10_000), (Role.ASSISTANT, "a" * 10_000))
+        ]  # 200 KB
+        sent: dict[int, int] = {}
+        for output in (TokenCount(16_000), MAX_TURN_OUTPUT_TOKENS):
+            with make_rig(
+                [FakeTurn(chunks=("ok",))], limits=AgentLimits(max_turn_output_tokens=output)
+            ) as rig:
+                rig.transcript.replace(old)
+                rig.send_and_wait("now")
+                sent[output] = len(rig.provider.requests[0].messages)
+
+        assert sent[MAX_TURN_OUTPUT_TOKENS] < sent[TokenCount(16_000)]
+
+
+class TestTheInvocationLogNamesTheChatSession:
+    def test_the_session_of_the_request_is_what_the_call_is_recorded_under(self) -> None:
+        chat_session = SessionId.new()
+        with make_rig([FakeTurn(chunks=("a",)), FakeTurn(chunks=("b",))]) as rig:
+            rig.controller.set_session(chat_session)
+            rig.send_and_wait("first")
+            other = SessionId.new()
+            rig.controller.set_session(other)  # a new session
+            rig.send_and_wait("second")
+
+            assert [r.session_id for r in rig.log.records] == [chat_session, other]
+
+    def test_without_one_the_responder_uses_a_session_of_its_own_for_every_call(self) -> None:
+        with make_rig([FakeTurn(chunks=("a",)), FakeTurn(chunks=("b",))]) as rig:
+            rig.send_and_wait("first")
+            rig.send_and_wait("second")
+
+            first, second = (r.session_id for r in rig.log.records)
+            assert first == second

@@ -23,13 +23,21 @@ text, English, code or any script, whatever the model's vocabulary. The price is
 ordinary English prose by about three to four times (the budget then holds about 30,000 real tokens
 of it): the guarantee that the estimate is never below the real count matters more than using every
 token of the model's window, and a budget that is too small costs the model some old turns, while
-one that is too big fails the reply (`context_window_exceeded`). The budget leaves room under a
-200,000-token window for the reply (up to `AgentLimits.max_turn_output_tokens`) and for the tool
-definitions; both are outside this module's estimate.
+one that is too big fails the reply (`context_window_exceeded`).
+
+**The budget** (`history_budget`) is what is left of a 200,000-token window
+(`CONTEXT_WINDOW_TOKENS`) after the reply the configuration allows
+(`AgentLimits.max_turn_output_tokens`, whose largest value is 128,000) and `RESERVED_TOKENS` for
+tool definitions, and never more than `CONTEXT_BUDGET_TOKENS` (120,000). At the default of 16,000
+output tokens that is the 120,000; a configuration that allows a larger reply gets a smaller
+history, down to 64,000 at the ceiling, so the estimated input and the longest reply together stay
+inside the window. (The window is the current models'; a model with a smaller one needs a smaller
+constant, not a different strategy.)
 
 The caps of the shell bound every input: the system prompt is at most 16 KiB, the new message 16
-KiB, a turn 80 KiB, so the system prompt and the new message use at most about 33,000 of the
-120,000, and the previous exchange always fits (a test pins that).
+KiB, a turn 80 KiB, so the system prompt and the new message use at most about 33,000 tokens; with
+the default output limit the previous exchange always fits (a test pins that), with the largest
+the budget still holds the system prompt, the new message and some history.
 """
 
 from collections.abc import Sequence
@@ -39,8 +47,18 @@ from tumbleweed.agent.llm import LlmMessage, TextBlock
 from tumbleweed.agent.responder import ContextTurn
 from tumbleweed.core.types import TokenCount
 
+CONTEXT_WINDOW_TOKENS: Final = TokenCount(200_000)
 CONTEXT_BUDGET_TOKENS: Final = TokenCount(120_000)
+RESERVED_TOKENS: Final = TokenCount(8_000)
 MESSAGE_OVERHEAD_TOKENS: Final = 16
+
+
+def history_budget(max_output_tokens: int) -> int:
+    """The estimated tokens of input to send: the window less the longest reply and the reserve,
+    at most `CONTEXT_BUDGET_TOKENS`."""
+    return max(
+        0, min(CONTEXT_BUDGET_TOKENS, CONTEXT_WINDOW_TOKENS - max_output_tokens - RESERVED_TOKENS)
+    )
 
 
 def estimate_tokens(text: str) -> int:

@@ -2,6 +2,7 @@
 happens when the history misbehaves. No GTK; the history is the real store or a fake that breaks."""
 
 import logging
+import sqlite3
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Literal
@@ -174,6 +175,67 @@ class TestSaving:
         rig.transcript.add_user("after")
 
         assert [row[1] for row in stored(tmp_path)] == ["q", "a"]
+
+
+class TestTheResponderKnowsTheSession:
+    def session_ids(self, tmp_path: Path) -> list[str]:
+        with raw(history_directory(tmp_path)) as connection:
+            return [row[0] for row in connection.execute("SELECT id FROM sessions")]
+
+    def test_every_request_names_the_chat_session_it_belongs_to(self, tmp_path: Path) -> None:
+        rig = Rig(tmp_path)
+        (current,) = self.session_ids(tmp_path)
+        rig.answer("a", "first")
+
+        rig.session.new_session()
+        rig.answer("b", "second")
+
+        first, second = (r.session_id for r in rig.responder.requests)
+        assert str(first) == current
+        assert second is not None
+        assert second != first
+        assert str(second) in self.session_ids(tmp_path)
+
+    def test_a_restored_session_keeps_its_id(self, tmp_path: Path) -> None:
+        first = Rig(tmp_path)
+        first.answer("a", "q")
+        first.session.close()
+
+        second = Rig(tmp_path)
+        second.controller.send("again")
+
+        assert str(second.responder.requests[0].session_id) in self.session_ids(tmp_path)
+        assert len(self.session_ids(tmp_path)) == 1
+
+    def test_without_a_history_there_is_no_session_to_name(self, tmp_path: Path) -> None:
+        rig = Rig(tmp_path, opener=None)
+
+        rig.answer("a", "q")
+
+        assert rig.responder.requests[0].session_id is None
+
+    def test_a_history_that_was_given_up_names_none(self, tmp_path: Path) -> None:
+        history = FakeHistory(begin=HistoryRefusedError("The chat history is closed."))
+        rig = Rig(tmp_path, opener(history))
+
+        rig.answer("a", "q")
+
+        assert rig.responder.requests[0].session_id is None
+
+
+class TestSqliteThatIsTooOld:
+    def test_the_chat_says_so_and_goes_on_unsaved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 36, 0))
+
+        rig = Rig(tmp_path)
+
+        assert "too old" in rig.session.notice
+        assert rig.session.notice.endswith("This chat will not be saved.")
+        assert not rig.session.saving
+        rig.answer("still here", "q")
+        assert rig.texts()[-1] == ("assistant", "still here", "complete")
 
 
 class TestOnlyTheTranscriptIsStored:

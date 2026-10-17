@@ -12,6 +12,7 @@ the window there; `tests/shell/test_launch.py` covers the macOS start-up.
 import os
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -89,6 +90,12 @@ def test_the_shell_starts_headless_and_quits_cleanly_on_a_stop_signal(
                 chunk = os.read(process.stderr.fileno(), 65536)
                 assert chunk, f"the shell closed its log:\n{log.decode()}"
                 log += chunk
+
+        # The history was opened in the scratch data home, with the modes the design says.
+        database = tmp_path / "tumbleweed" / "shell" / "chat.sqlite3"
+        assert database.is_file()
+        assert stat.S_IMODE(database.stat().st_mode) == 0o600
+        assert stat.S_IMODE(database.parent.stat().st_mode) == 0o700
 
         process.send_signal(stop_signal)
 

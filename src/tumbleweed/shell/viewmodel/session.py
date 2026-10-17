@@ -147,10 +147,12 @@ class ChatSession:
             logger.warning("a restored session was refused: %s", type(exc).__name__)
             notice = _NOT_RESTORABLE
             try:
-                history.new_session()
+                self._controller.set_session(history.new_session().id)
             except HistoryError as error:
                 self._give_up(error)
                 return
+        else:
+            self._controller.set_session(restored.session.id)
         self._saving = True
         self._set_notice(notice)
         self._transcript.subscribe(self)
@@ -160,9 +162,10 @@ class ChatSession:
         self._controller.cancel()  # the failed message is saved to the session it belongs to
         if self._history is not None:
             try:
-                self._history.new_session()
+                self._controller.set_session(self._history.new_session().id)
             except HistoryError as exc:
                 self._saving = False
+                self._controller.set_session(None)
                 self._set_notice(_STOPPED_SAVING.format(reason=exc))
             else:
                 self._saving = True
@@ -211,6 +214,7 @@ class ChatSession:
     def _give_up(self, exc: HistoryError) -> None:
         """No history for this run: close it and say why."""
         history, self._history = self._history, None
+        self._controller.set_session(None)
         self._set_notice(_NOT_SAVED.format(reason=exc))
         if history is not None:
             try:
