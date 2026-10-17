@@ -90,6 +90,24 @@ class TestNumericRange:
         assert numeric.integer is True
         assert 5.0 <= numeric.page <= 100.0
 
+    @pytest.mark.parametrize(
+        ("minimum", "maximum", "step", "page"),
+        [
+            (0, 100, 1, 10.0),  # a tenth of the range
+            (0, 100, 25, 25.0),  # the step, when it is wider than a tenth
+            (0, 100, 100, 100.0),  # never wider than the range
+            (0, 7, 1, 1.0),  # a tenth is narrower than the step
+            (-50, 50, 3, 10.0),
+        ],
+    )
+    def test_the_page_is_a_tenth_of_the_range_but_never_below_the_step_or_above_the_range(
+        self, minimum: int, maximum: int, step: int, page: float
+    ) -> None:
+        numeric = range_of(number("n", minimum, minimum=minimum, maximum=maximum, step=step))
+
+        assert numeric.page == page
+        assert numeric.step == float(step)
+
     def test_a_float_range_shows_the_decimals_of_its_step(self) -> None:
         assert range_of(real("f", 0.5, minimum=0.0, maximum=10.0, step=0.01)).digits == 2
         assert range_of(real("f", 0.5, minimum=0.0, maximum=10.0, step=0.25)).digits == 2

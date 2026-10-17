@@ -18,7 +18,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Protocol, final
 
-from tumbleweed.shell._gi import Gtk
+from tumbleweed.shell._gi import GLib, Gtk
+from tumbleweed.ui.gtk.budget import TextBudget
+from tumbleweed.ui.gtk.text import TextBlock
 from tumbleweed.ui.runtime import Change, Dispatch, UiEvent, UiRuntime, Value
 from tumbleweed.ui.spec.components import Component
 from tumbleweed.ui.spec.names import StateKey
@@ -27,6 +29,14 @@ from tumbleweed.ui.spec.state import StateValue
 logger = logging.getLogger(__name__)
 
 ERROR_CLASS = "error"
+
+
+type _Handler = Callable[[object], object] | Callable[[object, object], object]
+
+
+class _Connectable(Protocol):
+    def connect(self, detailed_signal: str, handler: _Handler, /) -> int: ...
+    def disconnect(self, handler_id: int, /) -> None: ...
 
 
 class UpdateWidget(Protocol):
@@ -57,6 +67,74 @@ class BuildContext:
         self._bindings: list[_Binding] = []
         self._by_key: dict[StateKey, list[_Binding]] = {}
         self._programmatic = 0
+        self.budget = TextBudget()
+        self._on_close: list[Callable[[], None]] = []
+        self._pending_text: dict[TextBlock, tuple[str, bool]] = {}
+        self._idle = 0
+        self.closed = False
+
+    # --- lifetime ------------------------------------------------------------------------
+
+    def connect(self, widget: _Connectable, signal: str, handler: _Handler) -> None:
+        """`widget.connect`, remembered so that `close` can undo it.
+
+        A handler refers to its widget and to this context, and a signal connection is a
+        reference GC cannot see: without `close` every tool shown would stay alive.
+        """
+        handler_id = widget.connect(signal, handler)
+        self._on_close.append(lambda: widget.disconnect(handler_id))
+
+    def on_close(self, undo: Callable[[], None]) -> None:
+        """Run `undo` when the tool is closed."""
+        self._on_close.append(undo)
+
+    def close(self) -> None:
+        """Disconnect every handler, drop the bindings and cancel what was waiting for idle."""
+        if self.closed:
+            return
+        self.closed = True
+        for undo in self._on_close:
+            try:
+                undo()
+            except Exception:
+                logger.exception("could not undo a connection")
+        self._on_close.clear()
+        self._bindings.clear()
+        self._by_key.clear()
+        self._pending_text.clear()
+        if self._idle:
+            GLib.source_remove(self._idle)
+            self._idle = 0
+        self.budget.clear()
+
+    # --- text shown ----------------------------------------------------------------------
+
+    def show_text(self, block: TextBlock, text: str, *, stale: bool) -> None:
+        """Show `text` in `block`: at once the first time, and after that on the next idle turn,
+        with only the latest value kept, so that a slider drag that changes a text a hundred times
+        a second lays it out once per frame, not a hundred times."""
+        if not block.has_text:
+            block.set_text(text, stale=stale)
+            return
+        self._pending_text[block] = (text, stale)
+        if not self._idle:
+            self._idle = GLib.idle_add(self._apply_text)
+
+    def flush(self) -> None:
+        """Show the texts that are waiting for an idle turn now."""
+        if self._idle:
+            GLib.source_remove(self._idle)
+        self._apply_text()
+
+    def _apply_text(self) -> bool:
+        self._idle = 0
+        pending, self._pending_text = self._pending_text, {}
+        for block, (text, stale) in pending.items():
+            try:
+                block.set_text(text, stale=stale)
+            except Exception:
+                logger.exception("a text could not be shown")
+        return GLib.SOURCE_REMOVE
 
     @property
     def updating(self) -> bool:
@@ -109,17 +187,9 @@ class BuildContext:
     # --- events --------------------------------------------------------------------------
 
     def user_input(self, key: StateKey, value: Value, event: UiEvent | None) -> Dispatch | None:
-        """The user edited a widget. Ignored while the runtime is the one changing it.
-
-        An edit that leaves the state as it was fires no handler (the widget is still written
-        back to the state's value). That is for GTK, which does not always announce a change at
-        once: a slider or a switch that the runtime has just set can report it after
-        `programmatic()` has ended, and that report is no edit. A real edit changes the value.
-        """
+        """The user edited a widget. Ignored while the runtime is the one changing it."""
         if self.updating:
             return None
-        if self._holds(key, value):
-            event = None
         return self._guarded(lambda: self.runtime.user_input(key, value, event=event))
 
     def user_event(self, event: UiEvent) -> Dispatch | None:
@@ -127,10 +197,6 @@ class BuildContext:
         if self.updating:
             return None
         return self._guarded(lambda: self.runtime.user_event(event))
-
-    def _holds(self, key: StateKey, value: Value) -> bool:
-        held = self.runtime.store.value(key)
-        return type(held) is type(value) and held == value
 
     @staticmethod
     def _guarded(action: Callable[[], Dispatch]) -> Dispatch:

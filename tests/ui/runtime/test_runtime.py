@@ -233,6 +233,35 @@ class TestUserInput:
         assert runtime.store.value(key("n")) == 7
         assert runtime.store.value(key("seen")) == 7  # the handler saw the edit
 
+    def test_an_edit_that_leaves_the_value_as_it_was_fires_nothing_but_is_still_announced(
+        self,
+    ) -> None:
+        runtime, sandbox, _agent = with_sinks()
+        changes = recorded(runtime)
+
+        # `n` holds 1: a widget that reports 1 again (or 0.6 that rounds to 1) changed nothing.
+        same = runtime.user_input(key("n"), 1, event=event("run"))
+        rounded = runtime.user_input(key("n"), 0.6, event=event("run"))
+
+        assert (same, rounded) == (Dispatch.IGNORED, Dispatch.IGNORED)
+        assert sandbox.calls == []
+        assert [(c.key, c.value, c.applied) for c in changes] == [
+            ("n", 1, True)
+        ] * 2  # widget resync
+        runtime.user_input(key("n"), 2, event=event("run"))
+        assert len(sandbox.calls) == 1  # a real change does fire
+
+    def test_a_value_that_clamps_back_to_the_old_one_fires_nothing(self) -> None:
+        runtime = runtime_with(
+            [number("n", 10, minimum=0, maximum=10), number("hits", 0)],
+            [set_handler("count", hits=binary("add", ref("hits"), lit_int(1)))],
+        )
+
+        result = runtime.user_input(key("n"), 99, event=event("count"))
+
+        assert result is Dispatch.IGNORED
+        assert runtime.store.value(key("hits")) == 0
+
     def test_an_edit_with_no_handler_is_just_written(self) -> None:
         runtime = runtime_with([number("n", 1)])
         changes = recorded(runtime)

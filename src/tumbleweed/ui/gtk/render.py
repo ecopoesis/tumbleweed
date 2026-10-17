@@ -62,10 +62,22 @@ class RenderedTool:
         return self._widgets.get(path)
 
     def close(self) -> None:
-        """Stop updating the widgets. The widgets stay; the store is no longer listened to."""
+        """Stop updating the widgets. The widgets stay, but nothing refers back to the tool.
+
+        Every signal handler of the widgets is disconnected and the bindings are dropped: the
+        handlers refer to the tool's context and the context to the widgets, a cycle that the
+        garbage collector cannot see through GTK, so that every tool shown would stay alive.
+        """
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
+        self._context.close()
+        self._widgets.clear()
+        self._factories.clear()
+
+    def flush(self) -> None:
+        """Show the texts that are waiting for an idle turn (they are shown once per frame)."""
+        self._context.flush()
 
     def _build(self, component: Component, path: str) -> Gtk.Widget:
         mark = self._context.mark()

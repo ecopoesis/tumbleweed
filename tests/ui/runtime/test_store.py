@@ -703,3 +703,94 @@ class TestThreads:
 
         assert isinstance(error, WrongThreadError)
         assert store.value(key("n")) == 1  # and nothing was changed
+
+
+class TestStaleEntriesAreRetriedWhenRoomIsMade:
+    def make_stale(self) -> StateStore:
+        store = over_budget_store()
+        store.write(key("pad"), "p" * 65535, origin=USER)
+        store.write(key("t"), "t" * 60000, origin=USER)
+        assert store.is_stale(key("c"))
+        return store
+
+    def test_a_write_elsewhere_that_shrinks_the_state_lets_the_stale_entry_catch_up(self) -> None:
+        store = self.make_stale()
+        changes = recorded_by(store)
+
+        store.write(key("pad"), "", origin=USER)  # frees 64 KiB, and reads nothing c reads
+
+        assert store.value(key("c")) == "t" * 60000 + "!"
+        assert store.is_stale(key("c")) is False
+        # c2 reads c and is 60,002 bytes more: it still does not fit, and says so
+        assert store.is_stale(key("c2")) is True
+        assert {c.key: c.stale for c in changes if c.origin is Origin.COMPUTED} == {key("c"): False}
+
+        store.write(key("t"), "t", origin=USER)  # now there is room for both
+
+        assert store.is_stale(key("c2")) is False
+        assert store.value(key("c2")) == "t!?"
+
+    def test_a_patch_that_shrinks_the_state_does_the_same(self) -> None:
+        store = self.make_stale()
+
+        store.patch({"b0": ""})
+
+        assert store.is_stale(key("c")) is False
+        assert store.value(key("c")) == "t" * 60000 + "!"
+
+    def test_a_write_that_makes_no_room_leaves_the_entry_stale_and_quiet(self) -> None:
+        store = self.make_stale()
+        changes = recorded_by(store)
+
+        store.write(key("pad"), "q" * 65535, origin=USER)  # same size: no room made
+
+        assert store.is_stale(key("c")) is True
+        assert [c.key for c in changes] == ["pad"]
+
+
+class TestTextAccounting:
+    def test_a_patch_updates_the_text_the_budget_counts(self) -> None:
+        store = store_of(text("a", "abc"), text("b", ""), number("n", 1))
+
+        store.patch({"a": "éé", "b": "xyz"})
+        assert store.text_bytes == 4 + 3
+
+        store.patch({"a": ""})
+        assert store.text_bytes == 3
+
+    def test_a_write_updates_it_too_and_the_two_agree(self) -> None:
+        store = store_of(text("a", "abc"), text("b", ""))
+
+        store.write(key("b"), "€", origin=USER)  # three bytes
+        store.patch({"a": "z"})
+
+        assert store.text_bytes == 1 + 3
+
+    def test_a_patch_that_ends_exactly_at_the_budget_is_applied(self) -> None:
+        store = budget_store()
+
+        store.patch({"t": "y" * 65536})
+
+        assert store.text_bytes == MAX_STATE_TEXT_BYTES
+
+    def test_a_computed_write_that_ends_exactly_at_the_budget_is_applied_and_not_stale(
+        self,
+    ) -> None:
+        state = [text(f"b{i}", max_length=65536) for i in range(63)]
+        state += [
+            text("t", max_length=65536),
+            {**computed("c", "string", ref("t"), ""), "max_length": 65536},
+        ]
+        store = StateStore(spec_with(state))
+        store.patch({f"b{i}": "x" * 65536 for i in range(32)})
+        store.patch({f"b{i}": "x" * 65536 for i in range(32, 63)})
+        # 63 strings = 4,128,768; t and c (a copy of t) may share the remaining 65,536 bytes
+        store.write(key("t"), "y" * 32768, origin=USER)
+
+        assert store.value(key("c")) == "y" * 32768
+        assert store.is_stale(key("c")) is False
+        assert store.text_bytes == MAX_STATE_TEXT_BYTES
+        store.write(key("t"), "y" * 32767, origin=USER)
+        assert store.text_bytes == MAX_STATE_TEXT_BYTES - 2 * 1
+        store.write(key("t"), "y" * 32769, origin=USER)  # t fits (to the byte); c would not
+        assert store.is_stale(key("c")) is True

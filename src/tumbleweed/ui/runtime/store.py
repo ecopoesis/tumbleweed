@@ -178,6 +178,7 @@ class StateStore:
         The computed entries that read what changed are re-evaluated once, after all the writes.
         """
         self.check_thread()
+        before = self._total
         dirty: set[StateKey] = set()
         changes: list[Change] = []
         applied: list[bool] = []
@@ -194,7 +195,7 @@ class StateStore:
             if ok and self._values[key] != old:
                 dirty.add(key)
             changes.append(Change(key, self._values[key], origin, applied=ok))
-        changes.extend(self._recompute(dirty))
+        changes.extend(self._recompute(dirty, retry_stale=self._total < before))
         self._deliver(changes)
         return tuple(applied)
 
@@ -217,6 +218,7 @@ class StateStore:
         """
         self.check_thread()
         checked = self._spec.validate_patch(patch, current=self._values, only=only)
+        before = self._total
         dirty: set[StateKey] = set()
         changes: list[Change] = []
         for key, value in checked.items():
@@ -227,7 +229,7 @@ class StateStore:
             self._total += size - self._sizes[key]
             self._sizes[key] = size
             changes.append(Change(key, value, origin))
-        changes.extend(self._recompute(dirty))
+        changes.extend(self._recompute(dirty, retry_stale=self._total < before))
         self._deliver(changes)
 
     # --- internals -----------------------------------------------------------------------
@@ -263,12 +265,34 @@ class StateStore:
         self._total = after
         return True
 
-    def _recompute(self, dirty: set[StateKey], *, everything: bool = False) -> list[Change]:
-        """Re-evaluate the computed entries that read something in `dirty`, in order."""
+    def _recompute(
+        self, dirty: set[StateKey], *, everything: bool = False, retry_stale: bool = False
+    ) -> list[Change]:
+        """Re-evaluate the computed entries that read something in `dirty`, in order.
+
+        With `retry_stale` (a write just made room in the budget) the entries that are stale are
+        evaluated too, and again after a pass that freed more room, since an entry earlier in the
+        order may fit only once a later one has shrunk.
+        """
+        before = self._total
+        changes = self._recompute_pass(dirty, everything=everything, retry_stale=retry_stale)
+        freed = self._total < before
+        for _ in range(2):
+            if not (freed and any(self._stale.values())):
+                break
+            before = self._total
+            changes.extend(self._recompute_pass(dirty, everything=False, retry_stale=True))
+            freed = self._total < before
+        return changes
+
+    def _recompute_pass(
+        self, dirty: set[StateKey], *, everything: bool, retry_stale: bool
+    ) -> list[Change]:
         changes: list[Change] = []
         for key in self._order:
             reads = self._reads[key]
-            if not everything and dirty.isdisjoint(reads):
+            retry = retry_stale and self._stale[key]
+            if not (everything or retry) and dirty.isdisjoint(reads):
                 continue
             decl = self._decls[key]
             raw = evaluate(self._programs[key], self.read)

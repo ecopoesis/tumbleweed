@@ -81,23 +81,41 @@ class TestPlainText:
 
 
 class TestLongText:
-    def test_a_bound_label_with_the_longest_value_is_a_column_of_small_labels(self) -> None:
+    def test_a_bound_label_with_the_longest_value_shows_its_start_and_says_it_is_cut(self) -> None:
         from tumbleweed.shell._gi import Gtk
         from tumbleweed.ui.gtk import RenderedTool
+        from tumbleweed.ui.gtk.budget import CUT_MARK, MAX_SHOWN_PER_TEXT
         from tumbleweed.ui.gtk.text import TextBlock
 
         state: list[Json] = [text("s", "", max_length=65536)]
         tool = RenderedTool(spec_of({"kind": "label", "bind": "s"}, state))
         started = time.monotonic()
 
-        tool.runtime.patch_state({"s": "각" * 21845})  # one unbreakable cluster
+        tool.runtime.patch_state({"s": "\u1100\u1161\u11a8" * 21845})  # one unbreakable cluster
+        tool.flush()
 
         assert time.monotonic() - started < 5
         assert isinstance(tool.widget, TextBlock)
         labels = of_type(tool, Gtk.Label)
-        assert len(labels) >= 16
+        assert len(labels) == 3  # 8,192 characters and the mark, in chunks of at most 4,096
         assert all(len(label.get_text()) <= MAX_CHUNK for label in labels)
-        assert ZERO_WIDTH_SPACE in tool.widget.shown_text  # the cluster was cut into pieces
+        shown = tool.widget.shown_text
+        assert shown.endswith(CUT_MARK)
+        assert ZERO_WIDTH_SPACE in shown  # the cluster was cut into pieces
+        assert len(shown.replace(ZERO_WIDTH_SPACE, "")) == MAX_SHOWN_PER_TEXT + len(CUT_MARK)
+        assert tool.runtime.store.value(key("s")) == "\u1100\u1161\u11a8" * 21845  # state: whole
+
+    def test_a_value_that_fits_is_shown_whole_without_a_mark(self) -> None:
+        from tumbleweed.ui.gtk import RenderedTool
+        from tumbleweed.ui.gtk.budget import MAX_SHOWN_PER_TEXT
+
+        state: list[Json] = [text("s", "", max_length=65536)]
+        tool = RenderedTool(spec_of({"kind": "label", "bind": "s"}, state))
+
+        tool.runtime.patch_state({"s": "y" * MAX_SHOWN_PER_TEXT})
+
+        assert "(cut)" not in labels_text(tool)[0]
+        assert labels_text(tool)[0].replace(ZERO_WIDTH_SPACE, "") == "y" * MAX_SHOWN_PER_TEXT
 
     def test_sixty_four_kib_with_no_break_opportunity_is_cut_and_fast(self) -> None:
         from tumbleweed.shell._gi import Gtk
@@ -108,28 +126,14 @@ class TestLongText:
         started = time.monotonic()
 
         tool.runtime.patch_state({"s": "y" * 65536})
+        tool.flush()
 
         assert time.monotonic() - started < 5
-        assert all(len(label.get_text()) <= MAX_CHUNK for label in of_type(tool, Gtk.Label))
-        assert (
-            "".join(label.get_text() for label in of_type(tool, Gtk.Label)).count(ZERO_WIDTH_SPACE)
-            >= 65536 // 256 - 1
-        )
-
-    def test_a_shorter_value_leaves_no_label_of_the_longer_one_behind(self) -> None:
-        from tumbleweed.shell._gi import Gtk
-        from tumbleweed.ui.gtk import RenderedTool
-
-        state: list[Json] = [text("s", "", max_length=65536)]
-        tool = RenderedTool(spec_of({"kind": "label", "bind": "s"}, state))
-        tool.runtime.patch_state({"s": "y" * 20000})
-        assert len(of_type(tool, Gtk.Label)) > 5
-
-        tool.runtime.patch_state({"s": "short"})
-
         labels = of_type(tool, Gtk.Label)
-        assert [label.get_text() for label in labels] == ["short"]
-        assert len(list(descendants(tool.widget))) == 2  # the block and its one label
+        assert all(len(label.get_text()) <= MAX_CHUNK for label in labels)
+        assert (
+            "".join(label.get_text() for label in labels).count(ZERO_WIDTH_SPACE) >= 8192 // 256 - 1
+        )
 
     def test_a_static_block_and_a_long_line_go_through_the_same_transform(self) -> None:
         from tumbleweed.ui.gtk import RenderedTool
@@ -154,6 +158,39 @@ class TestLongText:
         assert ZERO_WIDTH_SPACE in shown[1]
         assert shown[0].replace(ZERO_WIDTH_SPACE, "") == LONG_BLOCK  # only breaks were added
         assert shown[1].replace(ZERO_WIDTH_SPACE, "") == NO_SPACES
+
+    def test_rewriting_a_long_value_again_and_again_costs_one_layout_per_frame(self) -> None:
+        from tumbleweed.ui.gtk import RenderedTool
+
+        state: list[Json] = [text("s", "", max_length=65536)]
+        tool = RenderedTool(spec_of({"kind": "label", "bind": "s"}, state))
+        block_texts: list[str] = []
+        started = time.monotonic()
+
+        for round_ in range(200):
+            tool.runtime.patch_state({"s": ("z" if round_ % 2 else "q") * 65536})
+            block_texts.append("")  # (the labels have not been touched since the last frame)
+
+        assert time.monotonic() - started < 10
+        assert labels_text(tool)[0].startswith("z" * 100)  # only the latest was laid out
+        assert len(block_texts) == 200
+
+    def test_a_shorter_value_leaves_no_label_of_the_longer_one_behind(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk import RenderedTool
+
+        state: list[Json] = [text("s", "", max_length=65536)]
+        tool = RenderedTool(spec_of({"kind": "label", "bind": "s"}, state))
+        tool.runtime.patch_state({"s": "y" * 20000})
+        tool.flush()
+        assert len(of_type(tool, Gtk.Label)) == 3
+
+        tool.runtime.patch_state({"s": "short"})
+        tool.flush()
+
+        labels = of_type(tool, Gtk.Label)
+        assert [label.get_text() for label in labels] == ["short"]
+        assert len(list(descendants(tool.widget))) == 2  # the block and its one label
 
     def test_rewriting_a_long_value_again_and_again_costs_time_in_proportion_to_its_size(
         self,
@@ -247,7 +284,9 @@ class TestEntries:
         tool.runtime.patch_state({"s": "\u1100\u1161\u11a8" * 20000})
         cluster = tool.widget.measure(*measure)[:2]
 
-        assert long_value == empty == cluster
+        assert long_value == empty
+        # a text GTK cannot hold gets a warning icon (22 px) and nothing else
+        assert cluster[1] - empty[1] <= 30
 
 
 def present(shell: Shell) -> None:

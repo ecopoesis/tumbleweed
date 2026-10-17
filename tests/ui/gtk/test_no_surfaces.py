@@ -206,7 +206,7 @@ def test_the_search_for_surfaces_is_not_blind(echo_shell: Shell) -> None:
     delegate.activate_action("menu.popup", None)  # (it is closed by the window's teardown)
 
 
-def test_a_text_widget_has_no_long_press_and_a_capture_click_that_denies_the_menu(
+def test_a_text_widget_has_no_long_press_and_capture_clicks_that_deny_the_menu_and_touch(
     echo_shell: Shell,
 ) -> None:
     from tumbleweed.shell._gi import Gtk
@@ -225,8 +225,11 @@ def test_a_text_widget_has_no_long_press_and_a_capture_click_that_denies_the_men
             if isinstance(c, Gtk.GestureClick)
             and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
         ]
-        assert len(capture) == 1
-        assert capture[0].get_button() == 0  # every button
+        pointer = [c for c in capture if not c.get_touch_only()]
+        touch = [c for c in capture if c.get_touch_only()]
+        assert len(pointer) == 1
+        assert pointer[0].get_button() == 0  # every button
+        assert len(touch) == 1  # touchscreen sequences are claimed: no selection bubble, handles
 
 
 def test_a_secondary_press_is_claimed_and_any_other_press_drops_the_selection() -> None:
@@ -270,3 +273,30 @@ def test_a_dropdown_is_a_list_in_place_not_a_popup(echo_shell: Shell) -> None:
     (choices,) = [w for w in widgets if isinstance(w, ChoiceList)]
     assert choices.get_mapped()
     assert not [w for w in descendants(choices) if isinstance(w, Gtk.Popover)]
+
+
+def test_a_touch_is_claimed_and_focuses_the_text() -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk.guard import on_touch
+
+    class Gesture:
+        def __init__(self) -> None:
+            self.states: list[Gtk.EventSequenceState] = []
+
+        def set_state(self, state: Gtk.EventSequenceState) -> bool:
+            self.states.append(state)
+            return True
+
+    class Text:
+        focused = 0
+
+        def grab_focus(self) -> bool:
+            self.focused += 1
+            return True
+
+    gesture, text = Gesture(), Text()
+
+    on_touch(gesture, text)
+
+    assert gesture.states == [Gtk.EventSequenceState.CLAIMED]  # the text's own gestures: denied
+    assert text.focused == 1

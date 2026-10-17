@@ -54,6 +54,7 @@ def labels_text(tool: "RenderedTool") -> list[str]:
     from tumbleweed.shell._gi import Gtk
     from tumbleweed.ui.gtk.text import TextBlock
 
+    tool.flush()  # texts are shown once per frame: let the ones waiting be shown
     found: list[str] = []
     for widget in descendants(tool.widget):
         parent = widget.get_parent()

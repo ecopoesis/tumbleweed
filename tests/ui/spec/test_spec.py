@@ -614,6 +614,29 @@ class TestWidgetRanges:
         assert mentions(refused(build(template, [entry])), "not subnormal")
 
     @pytest.mark.parametrize("component", STEPPED)
+    @pytest.mark.parametrize("maximum", [5e-324, 1e-320, 2.2e-308])
+    def test_a_float_range_narrower_than_any_step_with_no_step_is_refused(
+        self, component: str, maximum: float
+    ) -> None:
+        # The renderer chooses the step of a float entry that has none; a range narrower than the
+        # smallest normal float (2.2250738585072014e-308) leaves it none that is not subnormal.
+        template = BOUND[component][0]
+        entry = number_entry("float", minimum=0, maximum=maximum)
+
+        assert mentions(refused(build(template, [entry])), "or a range at least as wide")
+
+    @pytest.mark.parametrize("component", STEPPED)
+    def test_the_narrowest_float_range_that_needs_no_step_is_accepted(self, component: str) -> None:
+        import sys
+
+        template = BOUND[component][0]
+
+        accepted(build(template, [number_entry("float", minimum=0, maximum=sys.float_info.min)]))
+
+    def test_a_progress_bar_over_a_float_range_with_no_step_needs_none(self) -> None:
+        accepted(build(BOUND["progress"][0], [number_entry("float", minimum=0, maximum=5e-324)]))
+
+    @pytest.mark.parametrize("component", STEPPED)
     @pytest.mark.parametrize("kind", ["int", "float"])
     def test_a_step_wider_than_the_range_is_refused(self, component: str, kind: str) -> None:
         template = BOUND[component][0]

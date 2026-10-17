@@ -497,7 +497,8 @@ Each invariant names where it is enforced. Reviews check every change against th
   popovers, dialogs, tooltips and drag icons are separate windows, so the renderer creates none
   from a spec (#53): a `dropdown` is a list in place and not a `Gtk.DropDown` (D14), a text entry or
   spin button cannot open its context menu or emoji chooser or start a drag
-  (`tumbleweed.ui.gtk.guard`), no tooltip is ever set, and `tests/ui/gtk/test_no_surfaces.py`
+  (`tumbleweed.ui.gtk.guard`; touchscreen sequences are claimed too, so no selection bubble or
+  handles), no tooltip is ever set, and `tests/ui/gtk/test_no_surfaces.py`
   looks for any toplevel, native surface, popover-bearing widget, tooltip or drag source besides
   the shell's own window after every golden spec and a hostile one has been rendered and used.
   Whatever later adds a widget to the renderer (S11) or a tooltip (S12's disabled `sandbox`
@@ -532,6 +533,12 @@ Each invariant names where it is enforced. Reviews check every change against th
   `regex`, D10), which breaks the grapheme clusters and the unbroken runs that would make a label
   wider than the window or quadratic to measure, and a long message is shown as a column of small
   labels.
+  The renderer bounds the total as well (`tumbleweed.ui.gtk.budget`): a label shows at most 8,192
+  characters then ` (cut)`, a tool at most 65,536 characters in all (`MAX_SHOWN_PER_TOOL`, a renderer
+  constant, not a spec limit; labels, buttons, options and entries all count), what does not fit is
+  replaced by a mark or left out until room appears, and text updates are applied once per frame
+  with the latest value (an 80 KB spec of 441 labels bound to one 64K string used to take minutes
+  to lay out, with the chrome frozen; a test holds it to seconds).
   The agent's limits are enforced in three places: `agent.limits` holds the values and refuses
   out-of-range settings; `agent.loop` enforces iterations per reply, output tokens per reply, the
   bytes of reply text (`MAX_REPLY_BYTES`, the hard guarantee that a reply fits a transcript message;

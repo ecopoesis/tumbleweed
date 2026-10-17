@@ -69,7 +69,6 @@ def hostile_json() -> Json:
         {"kind": "slider", "bind": "tiny"},
         {"kind": "slider", "bind": "fine"},
         {"kind": "slider", "bind": "whole"},
-        {"kind": "slider", "bind": "narrow"},  # no step to default to: a placeholder
         {"kind": "spin", "bind": "wide"},
         {"kind": "spin", "bind": "big"},
         {"kind": "spin", "bind": "tiny"},

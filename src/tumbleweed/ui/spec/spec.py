@@ -454,8 +454,10 @@ def _range_problem(decl: IntState | FloatState, *, stepped: bool) -> str | None:
     and a progress bar divides by it) and a range at most `MAX_SAFE_INT` wide, so that nothing
     the widget computes overflows or loses its integers. A slider or spin button (`stepped`)
     also needs a `step` that is a normal float (not subnormal, whose arithmetic underflows) and
-    no wider than the range. How many positions that makes is the author's business: a step of
-    0.01 over a range of a million is a fine slider. A progress bar has no step.
+    no wider than the range, or, with no `step`, a range at least as wide as the smallest normal
+    float (the renderer chooses the step then). How many positions that makes is the author's
+    business: a step of 0.01 over a range of a million is a fine slider. A progress bar has no
+    step.
     """
     minimum, maximum = decl.minimum, decl.maximum
     if minimum is None or maximum is None:
@@ -466,6 +468,10 @@ def _range_problem(decl: IntState | FloatState, *, stepped: bool) -> str | None:
         return "needs a minimum below its maximum"
     if maximum - minimum > MAX_SAFE_INT:
         return f"needs a range at most {MAX_SAFE_INT} wide"
+    if stepped and decl.step is None and maximum - minimum < sys.float_info.min:
+        # The renderer picks the step of a float entry that has none, and no step that is not
+        # subnormal fits a range narrower than the smallest normal float.
+        return "needs a step, or a range at least as wide as the smallest normal float"
     if stepped and decl.step is not None:
         if decl.step < sys.float_info.min:
             return "needs a step that is not subnormal"

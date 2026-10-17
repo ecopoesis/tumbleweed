@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.gtk
 
 HALF = MAX_SAFE_INT // 2
-NO_STEP = "float, narrower than any step"  # the one range with no step a widget can use
 SMALLEST = sys.float_info.min
 
 RANGES: dict[str, Json] = {
@@ -42,13 +41,9 @@ RANGES: dict[str, Json] = {
     "float, step is the range": real("x", 0.0, minimum=0.0, maximum=3.0, step=3.0),
     "float, no step, wide": real("x", 0.0, minimum=-4e15, maximum=4e15),
     "float, no step, narrow": real("x", 0.0, minimum=0.0, maximum=1e-300),
-    "float, narrower than any step": real("x", 0.0, minimum=0.0, maximum=5e-324),
     "float, narrowest with a default step": real("x", 0.0, minimum=0.0, maximum=SMALLEST),
     "float, huge bounds": real("x", 0.0, minimum=-4.5e15, maximum=4.5e15, step=0.5),
 }
-
-
-DRIVEN = [name for name in RANGES if name != NO_STEP]
 
 
 def widget_spec(kind: str, decl: Json) -> "UiSpec":
@@ -79,10 +74,6 @@ class TestRendering:
         if kind == "progress":
             assert isinstance(widget, Gtk.ProgressBar)
             assert 0.0 <= widget.get_fraction() <= 1.0
-        elif name == NO_STEP and kind != "progress":
-            # a range this narrow leaves no step a widget can use: a placeholder, not a crash
-            assert isinstance(widget, Gtk.Label)
-            assert "could not be shown" in widget.get_text()
         else:
             assert isinstance(widget, Gtk.Scale if kind == "slider" else Gtk.SpinButton)
             assert caplog.records == []
@@ -91,25 +82,23 @@ class TestRendering:
             assert math.isfinite(value)
             assert low <= value <= high
 
-    def test_a_range_too_narrow_for_a_step_is_a_placeholder_for_a_slider_and_a_spin_only(
-        self,
-    ) -> None:
+    def test_a_range_too_narrow_for_a_step_never_reaches_the_renderer(self) -> None:
+        # The spec refuses a slider or spin button over a float range narrower than the smallest
+        # normal float that gives no step; a progress bar needs none and is built.
         from tumbleweed.shell._gi import Gtk
         from tumbleweed.ui.gtk import RenderedTool
+        from tumbleweed.ui.spec import SpecError
 
         decl = real("x", 0.0, minimum=0.0, maximum=5e-324)
 
-        slider = RenderedTool(widget_spec("slider", decl)).widget
-        spin = RenderedTool(widget_spec("spin", decl)).widget
-        progress = RenderedTool(widget_spec("progress", decl)).widget
-
-        assert isinstance(slider, Gtk.Label)
-        assert isinstance(spin, Gtk.Label)
-        assert isinstance(progress, Gtk.ProgressBar)
+        for kind in ("slider", "spin"):
+            with pytest.raises(SpecError, match="smallest normal float"):
+                widget_spec(kind, decl)
+        assert isinstance(RenderedTool(widget_spec("progress", decl)).widget, Gtk.ProgressBar)
 
 
 class TestDrivenToTheEnds:
-    @pytest.mark.parametrize("name", DRIVEN)
+    @pytest.mark.parametrize("name", list(RANGES))
     @pytest.mark.parametrize("kind", ["slider", "spin"])
     def test_the_widget_driven_to_both_ends_writes_values_inside_the_bounds(
         self, kind: str, name: str, caplog: pytest.LogCaptureFixture
@@ -137,19 +126,6 @@ class TestDrivenToTheEnds:
 
         assert caplog.records == []
         assert seen  # the widget did write
-
-    def test_the_ranges_driven_above_are_all_the_ones_that_make_a_widget(self) -> None:
-        from tumbleweed.shell._gi import Gtk
-        from tumbleweed.ui.gtk import RenderedTool
-
-        placeholders = [
-            name
-            for name, decl in RANGES.items()
-            if isinstance(RenderedTool(widget_spec("slider", decl)).widget, Gtk.Label)
-        ]
-
-        assert placeholders == [NO_STEP]
-        assert [name for name in RANGES if name not in placeholders] == DRIVEN
 
     @pytest.mark.parametrize("name", list(RANGES))
     def test_a_patch_to_both_ends_moves_every_widget_and_the_bar_stays_in_0_to_1(

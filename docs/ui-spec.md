@@ -606,7 +606,8 @@ rule in `tests/ui/runtime/`, so that a spec means the same everywhere:
 - A computed entry whose write is held back keeps a value that no longer matches its expression:
   it is **stale**, and so is every computed entry that reads a stale one, until a recomputation
   applies. The renderer shows "Out of date" in place of a stale value, never the old value as if it
-  were current.
+  were current. Whenever a write makes the text of the state smaller, the stale entries are
+  evaluated again (and once more if that freed more room), so they catch up when room appears.
 - Computed entries are evaluated in `computed_order()` and re-evaluated, in that order,
   whenever an entry they read changes. A `set` handler's assignments are applied together, so the
   computed entries are re-evaluated once, after all of them.
@@ -648,6 +649,18 @@ component; `expander` shows or hides its `child`. A container has at most <!-- l
 the two. A heading's `level` is 1 to 3. `image` has `alt` text for accessibility. `text_view`
 is read-only unless `editable`. All text a component shows is plain text.
 
+**Text on the screen is bounded (I9).** A renderer lays text out on the thread that also serves the
+trusted chrome, and laying out text takes time that grows faster than its length, so what is shown is
+bounded, though the state holds the whole value. The reference renderer shows at most 8,192
+characters of one `label`, `heading` or bound text, followed by ` (cut)`, and at most sixty-four thousand characters
+in all (text blocks, button and check box labels and the options of a `dropdown`) in a tool: a text
+that does not fit is replaced by a line saying so, an option that does not fit is left out of its
+list (which ends in a line saying that more are not shown), and a text shown is laid out at most once
+per frame, the latest value only. A `dropdown` is a list in place, never a popup. An `entry` bound to a
+`string` that is longer than 65,534 bytes (what GTK's entry can hold) shows the start of it, read-only
+and with a warning icon: the state still holds it all, and an edit would otherwise write the cut text
+over it.
+
 What a widget shows or edits is an entry named by `bind`. The entry's declaration supplies range,
 options and limits, so they are written once. Which kinds of entry a component accepts:
 
@@ -676,9 +689,9 @@ the range at most 2**53 - 1 wide, and, for a `slider` or `spin` bound to an entr
 range. These are rules of numeric safety, not of taste: how many positions the step makes is up
 to the author (a range of a million in steps of 0.01 is a fine slider). A `progress` has no step,
 so the step of its entry is not checked for it. A `float` entry without a `step` leaves the step
-to the renderer, which uses a power of ten about a hundredth of the range; a range narrower than the
-smallest normal float (5e-324 wide, say) leaves a `slider` or `spin` no step that is not subnormal, so
-that one is shown as a placeholder, and a `progress` over it is unaffected.
+to the renderer, which uses a power of ten about a hundredth of the range, so a `slider` or `spin` bound to a float entry
+without a `step` needs a range at least as wide as the smallest normal float (a narrower one leaves no step
+that is not subnormal, and is refused).
 
 A component's events name a handler, or none:
 

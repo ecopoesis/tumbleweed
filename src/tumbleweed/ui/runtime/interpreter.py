@@ -17,7 +17,7 @@ It implements `docs/ui-spec.md` section 7, Evaluation, over the closed node set 
 - **Bounded.** An expression has at most `MAX_EXPR_NODES` nodes. A string is cut to
   `MAX_STRING_LENGTH` characters at each `concat`, the largest a `string` entry can hold, so a
   tree that repeats a long string cannot build a string of hundreds of megabytes; `format_number`
-  writes at most about 320 characters.
+  writes at most about 420 characters (309 digits, 10 decimals, 103 separators).
 """
 
 import operator

@@ -173,3 +173,97 @@ def test_an_edit_that_leaves_the_value_as_it_was_fires_no_handler_and_is_put_rig
 
     assert tool.runtime.store.value(key("edits")) == 0
     assert slider.get_value() == 18.0  # and the slider snaps to it
+
+
+def test_typing_into_an_entry_whose_handler_rewrites_it_keeps_the_order_and_the_cursor() -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    spec = spec_of(
+        {"kind": "entry", "bind": "s", "on_change": "shout"},
+        [text("s", max_length=100)],
+        [set_handler("shout", s=variadic("concat", ref("s"), lit_str("!")))],
+    )
+    tool = RenderedTool(spec)
+    (entry,) = of_type(tool, Gtk.Entry)
+
+    for letter in "abc":  # typed one after the other, each at the cursor
+        entry.get_buffer().insert_text(entry.get_position(), letter, -1)
+        entry.set_position(entry.get_position() + 1)  # (GTK does this when a key is typed)
+        assert pump_until(lambda: entry.get_text().endswith("!"))
+        pump(0.05)
+
+    assert entry.get_text() == "abc!!!"  # not reversed ("cba!!!"): the cursor was kept
+    assert tool.runtime.store.value(key("s")) == "abc!!!"
+    assert entry.get_position() == 3
+
+
+def test_the_cursor_is_kept_in_range_when_the_answer_is_shorter() -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    tool = RenderedTool(
+        spec_of({"kind": "entry", "bind": "s"}, [text("s", "hello", max_length=10)])
+    )
+    (entry,) = of_type(tool, Gtk.Entry)
+    entry.set_position(5)
+
+    tool.runtime.patch_state({"s": "ab"})
+
+    assert entry.get_text() == "ab"
+    assert entry.get_position() <= 2
+
+
+def test_a_dropdown_cannot_be_deselected_while_the_state_keeps_the_option() -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+    from tumbleweed.ui.gtk.choice import ChoiceList
+
+    state: list[Json] = [{"kind": "enum", "key": "e", "options": ["a", "b"], "default": "b"}]
+    tool = RenderedTool(spec_of({"kind": "dropdown", "bind": "e"}, state))
+    (choices,) = of_type(tool, ChoiceList)
+    (listbox,) = of_type(tool, Gtk.ListBox)
+    assert listbox.get_selection_mode() == Gtk.SelectionMode.BROWSE
+
+    listbox.unselect_all()
+    listbox.unselect_row(choices.rows[1])
+    listbox.activate_action("selection.unselect-all", None)
+
+    assert choices.selected == "b"
+    assert tool.runtime.store.value(key("e")) == "b"
+
+
+def test_selecting_what_is_not_an_option_changes_nothing() -> None:
+    from tumbleweed.ui.gtk import RenderedTool
+    from tumbleweed.ui.gtk.choice import ChoiceList
+
+    state: list[Json] = [{"kind": "enum", "key": "e", "options": ["a", "b"], "default": "a"}]
+    tool = RenderedTool(spec_of({"kind": "dropdown", "bind": "e"}, state))
+    (choices,) = of_type(tool, ChoiceList)
+    chosen: list[str] = []
+    tool.runtime.store.subscribe(lambda change: chosen.append(str(change.value)))
+
+    for not_an_option in ("zzz", "", "A", "a "):
+        choices.select(not_an_option)
+
+    assert choices.selected == "a"
+    assert chosen == []
+
+
+def test_a_text_too_long_for_gtks_entry_has_a_warning_icon_while_it_is_cut() -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    tool = RenderedTool(
+        spec_of({"kind": "entry", "bind": "s"}, [text("s", "ok", max_length=65536)])
+    )
+    (entry,) = of_type(tool, Gtk.Entry)
+    position = Gtk.EntryIconPosition.SECONDARY
+    assert entry.get_icon_name(position) is None
+
+    tool.runtime.patch_state({"s": "€" * 40000})
+    assert entry.get_icon_name(position) == "dialog-warning-symbolic"
+    assert entry.get_icon_activatable(position) is False
+
+    tool.runtime.patch_state({"s": "ok"})
+    assert entry.get_icon_name(position) is None

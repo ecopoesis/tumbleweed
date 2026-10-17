@@ -19,7 +19,7 @@ placeholder saying so.
 
 from typing import Literal, assert_never
 
-from tumbleweed.shell._gi import GLib, Gtk
+from tumbleweed.shell._gi import Gtk
 from tumbleweed.shell.viewmodel.display import display_text
 from tumbleweed.ui.gtk.choice import ChoiceList
 from tumbleweed.ui.gtk.context import BuildContext
@@ -63,6 +63,7 @@ from tumbleweed.ui.spec.state import (
 # `string` entry that is longer cannot be edited in one, and is shown cut and read-only instead.
 ENTRY_CAPACITY_BYTES = 65_534
 WARNING_CLASS = "warning"
+WARNING_ICON = "dialog-warning-symbolic"
 
 
 def _orientation(orientation: Orientation) -> Gtk.Orientation:
@@ -129,7 +130,7 @@ def _grid(component: Grid, path: str, ctx: BuildContext) -> Gtk.Widget:
 
 def _text(component: Label | Heading, ctx: BuildContext) -> Gtk.Widget:
     classes = [f"title-{component.level}"] if isinstance(component, Heading) else []
-    block = TextBlock(css_classes=classes)
+    block = TextBlock(css_classes=classes, budget=ctx.budget)
     if component.text is not None:
         block.set_text(component.text)
         return block
@@ -138,7 +139,7 @@ def _text(component: Label | Heading, ctx: BuildContext) -> Gtk.Widget:
         raise TypeError(f"a {component.kind} has neither text nor a binding")
 
     def update(value: StateValue, stale: bool) -> None:
-        block.set_text(_text_value(value), stale=stale)
+        ctx.show_text(block, _text_value(value), stale=stale)
 
     ctx.bind(binding.key, block, update)
     return block
@@ -175,12 +176,12 @@ def _separator(component: Separator) -> Gtk.Widget:
 
 def _button(component: Button, ctx: BuildContext) -> Gtk.Widget:
     button = Gtk.Button()
-    label = line_label(component.label)
+    label = line_label(component.label, budget=ctx.budget)
     label.set_xalign(0.5)
     button.set_child(label)
     event = _event(component.on_click, component.kind, "click")
     if event is not None:
-        button.connect("clicked", lambda _button: ctx.user_event(event))
+        ctx.connect(button, "clicked", lambda _button: ctx.user_event(event))
     return button
 
 
@@ -190,54 +191,37 @@ def _entry(component: Entry, ctx: BuildContext) -> Gtk.Widget:
     entry.set_hexpand(True)
     entry.set_max_length(min(decl.max_length, 65_535))
     entry.set_placeholder_text(display_text(component.placeholder) or None)
-    harden_text(entry)
+    ctx.on_close(harden_text(entry))
     change = _event(component.on_change, component.kind, "change", key)
     activate = _event(component.on_activate, component.kind, "activate", key)
-    editing = False  # inside this entry's own `changed`: its text must not be replaced there
-    sync_pending = False
 
     def show(value: StateValue) -> None:
         text = _text_value(value)
         fits = len(text) * 4 <= ENTRY_CAPACITY_BYTES or len(text.encode()) <= ENTRY_CAPACITY_BYTES
         entry.set_editable(fits)
+        # A text GTK cannot hold is shown cut, read-only, and with a warning icon and style.
+        entry.set_icon_from_icon_name(
+            Gtk.EntryIconPosition.SECONDARY, None if fits else WARNING_ICON
+        )
+        entry.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY, False)
         if fits:
             entry.remove_css_class(WARNING_CLASS)
         else:
             entry.add_css_class(WARNING_CLASS)
         if entry.get_text() != text:
-            entry.set_text(text)
-
-    def sync() -> bool:
-        nonlocal sync_pending
-        sync_pending = False
-        with ctx.programmatic():
-            show(ctx.runtime.store.value(key))  # whatever the state holds by now
-        return GLib.SOURCE_REMOVE
+            position = entry.get_position()
+            entry.set_text(text)  # which puts the cursor at the start
+            entry.set_position(min(position, len(entry.get_text())))
 
     def update(value: StateValue, stale: bool) -> None:
-        nonlocal sync_pending
-        if not editing:
-            show(value)
-        elif not sync_pending and entry.get_text() != _text_value(value):
-            # The state answered an edit with another text (a handler rewrote it, the budget
-            # refused it): replacing the text inside its own `changed` signal makes GTK run
-            # away (every replacement is announced again), so it is done once that signal is over.
-            sync_pending = True
-            GLib.idle_add(sync)
+        show(value)
 
-    def on_changed(_entry: Gtk.Entry) -> None:
-        nonlocal editing
-        if ctx.updating:
-            return
-        editing = True
-        try:
-            ctx.user_input(key, entry.get_text(), change)
-        finally:
-            editing = False
+    def on_changed(_entry: object) -> None:
+        ctx.user_input(key, entry.get_text(), change)
 
-    entry.connect("changed", on_changed)
+    ctx.connect(entry, "changed", on_changed)
     if activate is not None:
-        entry.connect("activate", lambda _entry: ctx.user_event(activate))
+        ctx.connect(entry, "activate", lambda _entry: ctx.user_event(activate))
     ctx.bind(key, entry, update)
     return entry
 
@@ -253,8 +237,10 @@ def _switch(component: Switch, ctx: BuildContext) -> Gtk.Widget:
         if switch.get_active() != (value is True):
             switch.set_active(value is True)
 
-    switch.connect(
-        "notify::active", lambda _switch, _param: ctx.user_input(key, switch.get_active(), change)
+    ctx.connect(
+        switch,
+        "notify::active",
+        lambda _switch, _param: ctx.user_input(key, switch.get_active(), change),
     )
     ctx.bind(key, switch, update)
     return switch
@@ -263,14 +249,14 @@ def _switch(component: Switch, ctx: BuildContext) -> Gtk.Widget:
 def _check(component: Check, ctx: BuildContext) -> Gtk.Widget:
     key, _decl = _bound(component, ctx, BoolState)
     check = Gtk.CheckButton()
-    check.set_child(line_label(component.label))
+    check.set_child(line_label(component.label, budget=ctx.budget))
     change = _event(component.on_change, component.kind, "change", key)
 
     def update(value: StateValue, stale: bool) -> None:
         if check.get_active() != (value is True):
             check.set_active(value is True)
 
-    check.connect("toggled", lambda _check: ctx.user_input(key, check.get_active(), change))
+    ctx.connect(check, "toggled", lambda _check: ctx.user_input(key, check.get_active(), change))
     ctx.bind(key, check, update)
     return check
 
@@ -289,7 +275,8 @@ def _slider(component: Slider, ctx: BuildContext) -> Gtk.Widget:
         if number is not None and scale.get_value() != float(number):
             scale.set_value(float(number))
 
-    scale.connect(
+    ctx.connect(
+        scale,
         "value-changed",
         lambda _scale: ctx.user_input(key, numeric.to_state(scale.get_value()), change),
     )
@@ -300,16 +287,34 @@ def _slider(component: Slider, ctx: BuildContext) -> Gtk.Widget:
 def _spin(component: Spin, ctx: BuildContext) -> Gtk.Widget:
     key, numeric, adjustment = _numeric(component, ctx)
     spin = Gtk.SpinButton.new(adjustment, 1.0, numeric.digits)  # climb rate: GTK's usual
-    spin.set_numeric(True)
-    harden_text(spin)
+    # Not numeric-only: GTK then refuses to take the text of a value with more decimals than
+    # `digits`, or with an exponent (1e-300), which is how a float is shown whole. What is typed
+    # is checked when the field is left: text that is no number leaves the value as it was.
+    spin.set_numeric(False)
+    ctx.on_close(harden_text(spin))
     change = _event(component.on_change, component.kind, "change", key)
+
+    def show_whole() -> None:
+        # The text shows the value whole (every digit that reads back as the same number). GTK's
+        # own output rounds to `digits` places, and when the user leaves the field or presses
+        # Enter it parses the text back: a value that is not on that grid (a default, a patch, a
+        # clamped result) would be rewritten rounded, and reported as an edit by the user.
+        value = adjustment.get_value()
+        spin.set_text(str(round(value)) if numeric.integer else repr(value))
+
+    def output(_spin: object) -> bool:
+        show_whole()
+        return True
 
     def update(value: StateValue, stale: bool) -> None:
         number = number_of(value)
-        if number is not None and spin.get_value() != float(number):
-            spin.set_value(float(number))
+        # Through the adjustment: the spin button's own `set_value` ignores a change under 1e-10.
+        if number is not None and adjustment.get_value() != float(number):
+            adjustment.set_value(float(number))
 
-    spin.connect(
+    ctx.connect(spin, "output", output)
+    ctx.connect(
+        spin,
         "value-changed",
         lambda _spin: ctx.user_input(key, numeric.to_state(spin.get_value()), change),
     )
@@ -324,7 +329,8 @@ def _dropdown(component: Dropdown, ctx: BuildContext) -> Gtk.Widget:
     def choose(option: str) -> None:
         ctx.user_input(key, option, change)
 
-    choices = ChoiceList(decl.options, choose)
+    choices = ChoiceList(decl.options, choose, ctx.budget)
+    ctx.on_close(choices.release)
 
     def update(value: StateValue, stale: bool) -> None:
         choices.select(_text_value(value))

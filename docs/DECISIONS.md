@@ -242,12 +242,14 @@ of the enum's options in a scrolled window of bounded height (`ChoiceList`); sel
 the option. Text entries and spin buttons are hardened (`tumbleweed.ui.gtk.guard`): the actions that
 open a popover are disabled, the long-press gesture is removed, a capture-phase click denies the
 secondary button to the text's own gestures, and any other press first drops the selection, since a
-drag starts only from a press inside one. No tooltip is set anywhere. Containment was considered
+drag starts only from a press inside one, and a touch-only click claims every touchscreen
+sequence (the selection bubble, handles and magnifier are popups too). No tooltip is set anywhere. Containment was considered
 instead (a popover constrained to the canvas) and rejected: GTK offers no way to bound a popover to
 a region, so nothing could be proved about it.
 **Consequences.** A dropdown takes room in the layout (up to about 180 px, then it scrolls) where a
 `Gtk.DropDown` takes one line, which is acceptable for at most 64 options. Selecting text in an
-entry and dragging it out is not possible, and Shift-click does not extend a selection. The pointer
+entry and dragging it out is not possible, Shift-click does not extend a selection, and a touch
+can focus an entry but not place its cursor or select. The pointer
 path (a right click) is covered by the structure of the controllers and by the keyboard and touch
 paths' tests, not by a synthesised click, because the headless compositor has no way to inject one.
 `tests/ui/gtk/test_no_surfaces.py` enumerates the toplevels and native widgets under the window

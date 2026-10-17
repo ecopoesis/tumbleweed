@@ -62,11 +62,19 @@ class UiRuntime:
     def user_input(self, key: StateKey, value: Value, *, event: UiEvent | None = None) -> Dispatch:
         """The user edited the widget bound to `key`: write `value`, then fire `event`'s handler.
 
-        A write that is held back (it would grow a state that is over budget) fires nothing.
+        The handler fires only if the write was applied **and changed the entry**: a write that is
+        held back (it would grow a state that is over budget) fires nothing, and neither does an
+        edit that leaves the value as it was (a slider moved between two positions that round to
+        one number, or a widget reporting late a value the runtime had just given it). The value
+        is still written, so that the store tells the widget what the entry really holds.
         """
+        before = self.store.value(key)
         if not self.store.write(key, value, origin=Origin.USER):
             return Dispatch.HELD_BACK
-        return Dispatch.IGNORED if event is None else self._fire(event)
+        after = self.store.value(key)
+        if event is None or (type(after) is type(before) and after == before):
+            return Dispatch.IGNORED
+        return self._fire(event)
 
     def user_event(self, event: UiEvent) -> Dispatch:
         """The user clicked or pressed Enter: fire the handler the event names."""

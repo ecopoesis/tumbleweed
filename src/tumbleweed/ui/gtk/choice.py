@@ -11,16 +11,26 @@ from collections.abc import Callable, Sequence
 from typing import Final, final
 
 from tumbleweed.shell._gi import Gtk
+from tumbleweed.ui.gtk.budget import MORE_OPTIONS, TextBudget
 from tumbleweed.ui.gtk.text import line_label
 
 MAX_HEIGHT: Final = 180  # pixels the list shows before it scrolls
+
+
+def _ignore(option: str) -> None:
+    """What a released list tells: nothing."""
 
 
 @final
 class ChoiceList(Gtk.ScrolledWindow):
     """Single selection from `options`, shown as a list."""
 
-    def __init__(self, options: Sequence[str], on_choose: Callable[[str], None]) -> None:
+    def __init__(
+        self,
+        options: Sequence[str],
+        on_choose: Callable[[str], None],
+        budget: TextBudget | None = None,
+    ) -> None:
         super().__init__(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
@@ -28,29 +38,57 @@ class ChoiceList(Gtk.ScrolledWindow):
             max_content_height=MAX_HEIGHT,
         )
         self.add_css_class("frame")
-        self.options = tuple(options)
         self._on_choose = on_choose
-        self._list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self._current: int | None = None  # the row last chosen, which stays chosen
+        # BROWSE: a row, once selected, cannot be deselected (Ctrl+click and Ctrl+Space would
+        # leave the list showing nothing while the entry still holds an option).
+        self._list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.BROWSE)
         self.rows: list[Gtk.ListBoxRow] = []
-        for option in self.options:
+        built: list[str] = []
+        for option in options:
             row = Gtk.ListBoxRow()
+            if budget is not None and not budget.fits(row, option):
+                break  # the rest would not be shown: a mark says so below
             row.set_child(line_label(option))
             self._list.append(row)
             self.rows.append(row)
-        self._list.connect("row-selected", self._on_row_selected)
+            built.append(option)
+        if len(built) < len(options):
+            more = Gtk.ListBoxRow(selectable=False, activatable=False)
+            more.set_child(line_label(MORE_OPTIONS))
+            self._list.append(more)
+        self.options = tuple(built)
+        self._handler = self._list.connect("row-selected", self._on_row_selected)
         self.set_child(self._list)
+
+    def release(self) -> None:
+        """Let go of the signal handler, which refers back to this widget, and of the callback."""
+        if self._handler:
+            self._list.disconnect(self._handler)
+            self._handler = 0
+        self._on_choose = _ignore
 
     @property
     def selected(self) -> str | None:
         """The option whose row is selected."""
         row = self._list.get_selected_row()
-        return None if row is None else self.options[row.get_index()]
+        if row is None or row.get_index() >= len(self.options):
+            return None
+        return self.options[row.get_index()]
 
     def select(self, option: str) -> None:
-        """Select the row of `option` (nothing happens for a text that is not an option)."""
+        """Select the row of `option` (nothing happens for a text that is not an option, or an
+        option that was not shown)."""
         if option in self.options and option != self.selected:
             self._list.select_row(self.rows[self.options.index(option)])
 
     def _on_row_selected(self, _list: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
-        if row is not None:
+        if row is None:
+            # BROWSE keeps a row selected, but not every route to "none" is closed (a select-all
+            # action, a keyboard shortcut): the entry still holds its option, so put the row back.
+            if self._current is not None:
+                self._list.select_row(self.rows[self._current])
+            return
+        if row.get_index() < len(self.options):
+            self._current = row.get_index()
             self._on_choose(self.options[row.get_index()])

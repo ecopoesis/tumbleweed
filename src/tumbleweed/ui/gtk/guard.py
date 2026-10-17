@@ -9,11 +9,15 @@ selected text. `harden_text` turns each off:
 - the long-press gesture is removed (the touch route);
 - a click gesture in the capture phase claims a secondary button press, which denies the text's own
   gestures the sequence, so no context menu opens (the pointer route), and on any other press it
-  drops the selection first, since a drag starts only from a press inside one.
+  drops the selection first, since a drag starts only from a press inside one;
+- a second, touch-only click gesture claims every touch sequence, so the selection bubble, the
+  selection handles and the magnifier (popups of their own) never start; a tap still focuses the
+  text, but a touch cannot place the cursor or select (a keyboard can).
 
 Selecting and typing, and copy and paste with the shortcuts, work as before.
 """
 
+from collections.abc import Callable
 from typing import Protocol
 
 from tumbleweed.shell._gi import Gdk, Gtk
@@ -35,8 +39,22 @@ def on_press(button: int, gesture: _Claimable, text: _Selectable) -> None:
         text.select_region(0, 0)
 
 
-def harden_text(widget: Gtk.Editable) -> None:
-    """Apply the measures above to the `Gtk.Text` inside an entry or spin button."""
+class _Focusable(Protocol):
+    def grab_focus(self) -> bool: ...
+
+
+def on_touch(gesture: _Claimable, text: _Focusable) -> None:
+    """A touch on the text: claimed (so its selection bubble and handles never start), and the
+    text takes the focus, as a tap would give it."""
+    gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+    text.grab_focus()
+
+
+def harden_text(widget: Gtk.Editable) -> Callable[[], None]:
+    """Apply the measures above to the `Gtk.Text` inside an entry or spin button.
+
+    Returns the function that disconnects the handlers, which refer back to the widget.
+    """
     delegate = widget.get_delegate()  # the Gtk.Text inside an entry or a spin button
     if not isinstance(delegate, Gtk.Text):
         raise TypeError("the widget has no Gtk.Text to harden")
@@ -49,8 +67,20 @@ def harden_text(widget: Gtk.Editable) -> None:
             delegate.remove_controller(controller)
     click = Gtk.GestureClick(button=0)  # every button
     click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-    click.connect(
+    pressed = click.connect(
         "pressed",
         lambda gesture, _presses, _x, _y: on_press(gesture.get_current_button(), gesture, widget),
     )
+    touch = Gtk.GestureClick(touch_only=True)
+    touch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    touched = touch.connect(
+        "pressed", lambda gesture, _presses, _x, _y: on_touch(gesture, delegate)
+    )
     delegate.add_controller(click)
+    delegate.add_controller(touch)
+
+    def disconnect() -> None:
+        click.disconnect(pressed)
+        touch.disconnect(touched)
+
+    return disconnect
