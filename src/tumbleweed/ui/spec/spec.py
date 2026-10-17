@@ -257,6 +257,19 @@ class UiSpec(SpecModel):
         if anything is wrong, `SpecError` lists the problems and no value is returned, so a
         caller never applies half a patch.
         """
+        try:
+            return self._validated_patch(patch, current=current, only=only)
+        except RecursionError:
+            # A caller within a few frames of the stack limit (#62): a refusal, not a crash.
+            raise SpecError(["the patch could not be checked: too little stack is left"]) from None
+
+    def _validated_patch(
+        self,
+        patch: Mapping[str, object],
+        *,
+        current: Mapping[StateKey, StateValue],
+        only: Collection[StateKey] | None,
+    ) -> dict[StateKey, StateValue]:
         declarations = self.declarations()
         allowed = None if only is None else set(only)
         problems: list[str] = []

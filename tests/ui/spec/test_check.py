@@ -121,6 +121,11 @@ OK: list[tuple[str, Json, ExprType]] = [
     ("eq enum with a nested if of its options", binary("eq", E, NESTED_IF_OPTIONS), "bool"),
     ("eq enum with an if that has a reference branch", binary("eq", E, IF_UNKNOWN), "bool"),
     ("ne an option with the enum", binary("ne", lit_str("red"), E), "bool"),
+    (
+        "eq enum with an if that has an enum branch sharing an option",
+        binary("eq", E, choose(ref("e3"), lit_str("red"))),
+        "bool",
+    ),
     ("lt", binary("lt", N, F), "bool"),
     ("le", binary("le", N, I1), "bool"),
     ("gt", binary("gt", F, F1), "bool"),
@@ -183,6 +188,21 @@ BAD: list[tuple[str, Json, str]] = [
         "'zzz' is not an option of e",
     ),
     ("enums with no option in common", binary("eq", E, ref("e2")), "e and e2 are enums with no"),
+    (
+        "an enum compared with an if that can give an enum with no option in common",
+        binary("eq", E, choose(ref("e2"), lit_str("red"))),
+        "e and e2 are enums with no",
+    ),
+    (
+        "the same, the if on the left",
+        binary("ne", choose(ref("e2"), lit_str("red")), E),
+        "e2 and e are enums with no",
+    ),
+    (
+        "two ifs, one branch of each from enums with no option in common",
+        binary("eq", choose(E, lit_str("x")), choose(lit_str("y"), ref("e2"))),
+        "e and e2 are enums with no",
+    ),
     (
         "enums with no option in common, ne",
         binary("ne", ref("e2"), E),
