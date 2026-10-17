@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Sequence
+from contextlib import closing
 from pathlib import Path
 from typing import Literal
 
@@ -207,7 +208,7 @@ class TestADirectorySwappedUnderSqlitePinned:
 
         assert list(evil.iterdir()) == []
         moved = shell.parent / "shell.moved"
-        with sqlite3.connect(moved / DATABASE_NAME) as connection:
+        with closing(sqlite3.connect(moved / DATABASE_NAME)) as connection:
             assert connection.execute("SELECT text FROM messages").fetchall() == [
                 ("my private chat",)
             ]
@@ -254,7 +255,7 @@ class TestADirectorySwappedUnderSqlitePortable:
         for path in evil.iterdir():  # SQLite may have made an empty file there: nothing of ours
             assert path.stat().st_size == 0 or path.name.endswith(("-shm", "-wal"))
         if (evil / DATABASE_NAME).exists():
-            with sqlite3.connect(evil / DATABASE_NAME) as connection:
+            with closing(sqlite3.connect(evil / DATABASE_NAME)) as connection:
                 tables = connection.execute("SELECT name FROM sqlite_master").fetchall()
             assert tables == []
 
