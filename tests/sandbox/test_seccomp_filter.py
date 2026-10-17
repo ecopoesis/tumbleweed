@@ -64,6 +64,9 @@ FAMILY_DENIED = [
     "clock_adjtime",
     "adjtimex",
     "open_by_handle_at",
+    "kcmp",
+    "memfd_secret",
+    "process_madvise",
 ]
 # Syscalls a program uses every day: none may be touched.
 EVERYDAY = [
@@ -182,11 +185,15 @@ def test_every_name_of_the_modules_list_that_exists_here_is_denied_in_the_progra
             )
 
 
-if ARCH == bpf.AUDIT_X86_64:
+X86_ONLY = pytest.mark.skipif(
+    platform.machine() != "x86_64", reason="these syscalls and the x32 ABI exist only on x86_64"
+)
 
-    @pytest.mark.parametrize("name", ["iopl", "ioperm", "modify_ldt"])
-    def test_the_x86_only_calls_are_denied_on_x86(program: bytes, native: int, name: str) -> None:
-        assert bpf.decide(program, nr=number(name), arch=native) == bpf.errno_action(errno.EPERM)
+
+@X86_ONLY
+@pytest.mark.parametrize("name", ["iopl", "ioperm", "modify_ldt"])
+def test_the_x86_only_calls_are_denied_on_x86(program: bytes, native: int, name: str) -> None:
+    assert bpf.decide(program, nr=number(name), arch=native) == bpf.errno_action(errno.EPERM)
 
 
 def test_a_name_libseccomp_does_not_know_is_an_error_not_a_silent_gap() -> None:
@@ -248,32 +255,100 @@ class TestClone:
         )
 
 
-class TestUnixSockets:
-    def test_a_unix_socket_cannot_be_made(self, program: bytes, native: int) -> None:
-        for kind in (SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET, SOCK_STREAM | SOCK_CLOEXEC):
-            assert bpf.decide(
-                program, nr=number("socket"), arch=native, args=[AF_UNIX, kind, 0]
-            ) == bpf.errno_action(errno.EPERM), kind
+HIGH_BITS = [0, 1 << 32, 0xFFFFFFFF << 32, 1 << 63]
+"""What the kernel drops from an `int` argument but a filter sees in the register."""
+EAFNOSUPPORT = bpf.errno_action(errno.EAFNOSUPPORT)
+# AF_MAX of the kernel the filter was written against is 46; the numbers are net/socket families.
+AF_VSOCK, AF_ALG, AF_PACKET, AF_BLUETOOTH, AF_KEY = 40, 38, 17, 31, 15
+ALLOWED_FAMILIES = {AF_INET, AF_INET6}
 
-    @pytest.mark.parametrize("family", [AF_INET, AF_INET6, AF_NETLINK, 0, 3, 17])
-    def test_other_socket_families_are_not_this_filters_business(
+
+class TestSocketFamilies:
+    @pytest.mark.parametrize("family", sorted(set(range(46)) - ALLOWED_FAMILIES))
+    @pytest.mark.parametrize("high", HIGH_BITS)
+    def test_every_family_but_inet_and_inet6_is_refused_with_or_without_high_bits(
+        self, program: bytes, native: int, family: int, high: int
+    ) -> None:
+        # The kernel keeps 32 bits of the family: (1 << 32) | AF_UNIX is AF_UNIX, and was an
+        # escape while the compare was against the whole register.
+        for kind in (SOCK_STREAM, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET | SOCK_CLOEXEC):
+            assert (
+                bpf.decide(program, nr=number("socket"), arch=native, args=[high | family, kind, 0])
+                == EAFNOSUPPORT
+            ), (family, hex(high), kind)
+
+    @pytest.mark.parametrize("family", [AF_INET, AF_INET6])
+    def test_inet_and_inet6_are_allowed_because_the_network_namespace_confines_them(
+        self, program: bytes, native: int, family: int
+    ) -> None:
+        for kind in (SOCK_STREAM, SOCK_DGRAM, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC):
+            assert (
+                bpf.decide(program, nr=number("socket"), arch=native, args=[family, kind, 0])
+                == bpf.ALLOW
+            )
+
+    @pytest.mark.parametrize("family", [AF_INET, AF_INET6])
+    @pytest.mark.parametrize("high", [1 << 32, 0xFFFFFFFF << 32, 1 << 63])
+    def test_a_high_bit_on_an_allowed_family_is_refused_not_looked_through(
+        self, program: bytes, native: int, family: int, high: int
+    ) -> None:
+        assert (
+            bpf.decide(
+                program, nr=number("socket"), arch=native, args=[high | family, SOCK_STREAM, 0]
+            )
+            == EAFNOSUPPORT
+        )
+
+    @pytest.mark.parametrize("family", [46, 47, 100, 0xFFFF, 0x7FFFFFFF, 0xFFFFFFFF])
+    def test_a_family_the_kernel_does_not_have_yet_is_refused(
         self, program: bytes, native: int, family: int
     ) -> None:
         assert (
             bpf.decide(program, nr=number("socket"), arch=native, args=[family, SOCK_STREAM, 0])
-            == bpf.ALLOW
+            == EAFNOSUPPORT
         )
 
+    @pytest.mark.parametrize("family", [AF_VSOCK, AF_ALG, AF_PACKET, AF_BLUETOOTH, AF_KEY, 16])
+    def test_the_families_that_reach_past_the_network_namespace_are_refused_by_name(
+        self, program: bytes, native: int, family: int
+    ) -> None:
+        # vsock reaches the host and other guests; the rest are kernel attack surface.
+        assert (
+            bpf.decide(program, nr=number("socket"), arch=native, args=[family, SOCK_STREAM, 0])
+            == EAFNOSUPPORT
+        )
+
+
+class TestUnixSockets:
+    @pytest.mark.parametrize("high", HIGH_BITS)
+    def test_a_unix_socket_cannot_be_made_whatever_the_high_bits(
+        self, program: bytes, native: int, high: int
+    ) -> None:
+        for kind in (SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET, SOCK_STREAM | SOCK_CLOEXEC):
+            assert (
+                bpf.decide(
+                    program, nr=number("socket"), arch=native, args=[high | AF_UNIX, kind, 0]
+                )
+                == EAFNOSUPPORT
+            ), (hex(high), kind)
+
+    @pytest.mark.parametrize("high", HIGH_BITS)
     @pytest.mark.parametrize("kind", [SOCK_DGRAM, SOCK_RAW, SOCK_RDM])
     @pytest.mark.parametrize(
         "flags", [0, SOCK_NONBLOCK, SOCK_CLOEXEC, SOCK_NONBLOCK | SOCK_CLOEXEC]
     )
     def test_a_datagram_pair_could_be_connected_elsewhere_so_it_is_refused(
-        self, program: bytes, native: int, kind: int, flags: int
+        self, program: bytes, native: int, high: int, kind: int, flags: int
     ) -> None:
-        assert bpf.decide(
-            program, nr=number("socketpair"), arch=native, args=[AF_UNIX, kind | flags, 0]
-        ) == bpf.errno_action(errno.EPERM)
+        assert (
+            bpf.decide(
+                program,
+                nr=number("socketpair"),
+                arch=native,
+                args=[high | AF_UNIX, kind | flags, 0],
+            )
+            == EAFNOSUPPORT
+        )
 
     @pytest.mark.parametrize("kind", [SOCK_STREAM, SOCK_SEQPACKET])
     @pytest.mark.parametrize(
@@ -289,12 +364,28 @@ class TestUnixSockets:
             == bpf.ALLOW
         )
 
-    def test_a_datagram_pair_of_another_family_is_not_this_filters_business(
-        self, program: bytes, native: int
+    @pytest.mark.parametrize("high", [1 << 32, 0xFFFFFFFF << 32])
+    def test_a_high_bit_on_the_pair_family_is_refused_too(
+        self, program: bytes, native: int, high: int
     ) -> None:
         assert (
-            bpf.decide(program, nr=number("socketpair"), arch=native, args=[AF_INET, SOCK_DGRAM, 0])
-            == bpf.ALLOW
+            bpf.decide(
+                program,
+                nr=number("socketpair"),
+                arch=native,
+                args=[high | AF_UNIX, SOCK_STREAM, 0],
+            )
+            == EAFNOSUPPORT
+        )
+
+    @pytest.mark.parametrize("family", [AF_INET, AF_INET6, AF_VSOCK, AF_ALG, AF_PACKET, 16, 0])
+    def test_a_pair_of_any_other_family_is_refused(
+        self, program: bytes, native: int, family: int
+    ) -> None:
+        # The kernel makes a socketpair of AF_UNIX only; the rest would answer EOPNOTSUPP.
+        assert (
+            bpf.decide(program, nr=number("socketpair"), arch=native, args=[family, SOCK_STREAM, 0])
+            == EAFNOSUPPORT
         )
 
     def test_connect_itself_cannot_be_told_by_family_so_it_is_not_filtered(
@@ -304,6 +395,22 @@ class TestUnixSockets:
         assert bpf.decide(program, nr=number("connect"), arch=native, args=[3, 0x1000, 110]) == (
             bpf.ALLOW
         )
+
+
+class TestPersonality:
+    @pytest.mark.parametrize(
+        "persona",
+        [1, 0x0040000, 0x0400000, 0x0020000, 0xFFFFFFFF, 0xFFFFFFFE, 1 << 32, (1 << 32) | 8],
+    )
+    def test_any_persona_but_linux_is_refused_the_query_included(
+        self, program: bytes, native: int, persona: int
+    ) -> None:
+        assert bpf.decide(
+            program, nr=number("personality"), arch=native, args=[persona]
+        ) == bpf.errno_action(errno.EPERM)
+
+    def test_per_linux_is_allowed(self, program: bytes, native: int) -> None:
+        assert bpf.decide(program, nr=number("personality"), arch=native, args=[0]) == bpf.ALLOW
 
 
 class TestArchitecture:
@@ -346,16 +453,15 @@ class TestArchitecture:
         # SIGSYS to one thread would leave the rest of a hostile process running.
         assert bpf.KILL_PROCESS == 0x80000000
 
-    if ARCH == bpf.AUDIT_X86_64:  # x32 exists only there: no test on other machines
-
-        def test_an_x32_syscall_number_is_killed_not_looked_up(
-            self, program: bytes, native: int
-        ) -> None:
-            # x32 calls arrive with the x86_64 arch and bit 30 set in the number, so a filter that
-            # only compares numbers would send ptrace-as-x32 through to the kernel.
-            for name in ("getpid", "ptrace", "keyctl", "mount", "io_uring_setup"):
-                assert (
-                    bpf.decide(program, nr=number(name) | bpf.X32_SYSCALL_BIT, arch=native)
-                    == bpf.KILL_PROCESS
-                ), name
-            assert bpf.decide(program, nr=bpf.X32_SYSCALL_BIT, arch=native) == bpf.KILL_PROCESS
+    @X86_ONLY
+    def test_an_x32_syscall_number_is_killed_not_looked_up(
+        self, program: bytes, native: int
+    ) -> None:
+        # x32 calls arrive with the x86_64 arch and bit 30 set in the number, so a filter that
+        # only compares numbers would send ptrace-as-x32 through to the kernel.
+        for name in ("getpid", "ptrace", "keyctl", "mount", "io_uring_setup"):
+            assert (
+                bpf.decide(program, nr=number(name) | bpf.X32_SYSCALL_BIT, arch=native)
+                == bpf.KILL_PROCESS
+            ), name
+        assert bpf.decide(program, nr=bpf.X32_SYSCALL_BIT, arch=native) == bpf.KILL_PROCESS

@@ -8,6 +8,7 @@ the standard library only (it runs in a sandbox that has no `tumbleweed`), and i
 
 import ast
 import ctypes
+import errno
 import json
 import os
 import subprocess
@@ -116,6 +117,44 @@ class TestRights:
         assert [launcher.scope(abi) for abi in range(1, 8)] == [0, 0, 0, 0, 0, 1, 1]
 
 
+class TestLandlockAnswers:
+    @staticmethod
+    def kernel_says(monkeypatch: pytest.MonkeyPatch, code: int) -> None:
+        def syscall(number: int, *args: object) -> int:
+            ctypes.set_errno(code)
+            return -1
+
+        monkeypatch.setattr(launcher, "_syscall", syscall)
+
+    @pytest.mark.parametrize("code", [errno.ENOSYS, errno.EOPNOTSUPP, errno.EPERM])
+    def test_these_answers_mean_there_is_no_landlock(
+        self, monkeypatch: pytest.MonkeyPatch, code: int
+    ) -> None:
+        self.kernel_says(monkeypatch, code)
+
+        abi, why = launcher.landlock_abi()
+
+        assert abi is None
+        assert why is not None
+        assert errno.errorcode[code] in why
+
+    @pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOMEM, errno.EFAULT, errno.EBUSY])
+    def test_any_other_answer_is_not_unavailable_it_is_a_refusal(
+        self, monkeypatch: pytest.MonkeyPatch, code: int
+    ) -> None:
+        self.kernel_says(monkeypatch, code)
+
+        with pytest.raises(launcher.Refused, match=errno.errorcode[code]):
+            launcher.landlock_abi()
+
+    def test_the_set_of_answers_that_mean_unavailable_is_these_three(self) -> None:
+        assert set(launcher._UNAVAILABLE_ERRNOS) == {  # noqa: SLF001
+            errno.ENOSYS,
+            errno.EOPNOTSUPP,
+            errno.EPERM,
+        }
+
+
 class TestCommandLine:
     def test_the_report_descriptor_rules_and_command_are_read(self) -> None:
         options = launcher.parse_args(
@@ -140,6 +179,18 @@ class TestCommandLine:
         assert options.require_landlock is True
         assert options.rules == [("read", "/usr"), ("write", "/workspace"), ("devices", "/dev")]
         assert options.command == ["/bin/sh", "-c", "--read /x"]
+
+    def test_environment_variables_are_pairs_given_as_arguments(self) -> None:
+        options = launcher.parse_args(
+            ["--report-fd", "3", "--env", "LANG", "C", "--env", "A", "--read=", "--", "true"]
+        )
+
+        assert options.env == [("LANG", "C"), ("A", "--read=")]
+
+    @pytest.mark.parametrize("name", ["", "A=B", "A\0B"])
+    def test_a_bad_variable_name_is_refused(self, name: str) -> None:
+        with pytest.raises(launcher.Refused, match="bad environment variable name"):
+            launcher.parse_args(["--report-fd", "3", "--env", name, "x", "--", "true"])
 
     def test_landlock_is_not_required_unless_asked(self) -> None:
         options = launcher.parse_args(["--report-fd", "3", "--", "true"])
@@ -176,19 +227,44 @@ def _own_status(field: str) -> str:
     raise AssertionError(field)
 
 
-def _load_filter_that_denies_nothing() -> None:
-    """Load a seccomp filter of another maker's: `Seccomp: 2`, and no rule of ours in it."""
+class _ArgCmp(ctypes.Structure):
+    _fields_ = (
+        ("arg", ctypes.c_uint),
+        ("op", ctypes.c_int),
+        ("datum_a", ctypes.c_uint64),
+        ("datum_b", ctypes.c_uint64),
+    )
+
+
+def _load_foreign_filter(*, deny_unmasked_unix: bool) -> None:
+    """Load a seccomp filter of another maker's: `Seccomp: 2`, and none of ours in it.
+
+    With `deny_unmasked_unix` it refuses `socket(AF_UNIX)` the way the first round's filter did:
+    by comparing the whole 64-bit argument, which a family with a high bit slips past.
+    """
     lib = ctypes.CDLL("libseccomp.so.2", use_errno=True)
     lib.seccomp_init.restype = ctypes.c_void_p
     lib.seccomp_init.argtypes = [ctypes.c_uint32]
     lib.seccomp_load.argtypes = [ctypes.c_void_p]
+    lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    lib.seccomp_rule_add_array.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.POINTER(_ArgCmp),
+    ]
     context = lib.seccomp_init(0x7FFF0000)  # SCMP_ACT_ALLOW
     assert context
+    if deny_unmasked_unix:
+        compare = (_ArgCmp * 1)(_ArgCmp(0, 4, 1, 0))  # arg0 == AF_UNIX, as a 64-bit compare
+        number = lib.seccomp_syscall_resolve_name(b"socket")
+        assert lib.seccomp_rule_add_array(context, 0x50001, number, 1, compare) == 0  # EPERM
     assert lib.seccomp_load(context) == 0
 
 
 def _launch(
-    argv: list[str], *, no_new_privs: bool, foreign_filter: bool = False
+    argv: list[str], *, no_new_privs: bool, foreign_filter: str | None = None
 ) -> tuple[subprocess.CompletedProcess[bytes], bytes]:
     """Run the launcher on this host (not in a sandbox), and return it with its report."""
     read_fd, write_fd = os.pipe()
@@ -196,8 +272,8 @@ def _launch(
     def prepare() -> None:
         if no_new_privs:
             assert ctypes.CDLL(None).prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
-        if foreign_filter:
-            _load_filter_that_denies_nothing()
+        if foreign_filter is not None:
+            _load_foreign_filter(deny_unmasked_unix=foreign_filter == "unmasked")
 
     try:
         done = subprocess.run(  # noqa: S603  (our own interpreter and file)
@@ -262,7 +338,7 @@ class TestRefusals:
         done, report = _launch(
             ["--", sys.executable, "-c", f"open({str(marker)!r}, 'w')"],
             no_new_privs=True,
-            foreign_filter=True,
+            foreign_filter="allow",
         )
 
         assert done.returncode == launcher.EXIT_REFUSED
@@ -271,6 +347,24 @@ class TestRefusals:
             "code": "setup",
             "reason": "the seccomp filter loaded is not the sandbox's: a unix socket can be made",
         }
+        assert not marker.exists()
+
+    def test_a_filter_that_misses_a_family_with_a_high_bit_does_not_pass_for_the_sandboxs(
+        self, tmp_path: Path
+    ) -> None:
+        assert _own_status("Seccomp") == "0", "the test runner is under seccomp: cannot check"
+        marker = tmp_path / "ran"
+
+        done, report = _launch(
+            ["--", sys.executable, "-c", f"open({str(marker)!r}, 'w')"],
+            no_new_privs=True,
+            foreign_filter="unmasked",
+        )
+
+        assert done.returncode == launcher.EXIT_REFUSED
+        assert json.loads(report)["reason"] == (
+            "the seccomp filter loaded is not the sandbox's: a unix socket can be made"
+        )
         assert not marker.exists()
 
     def test_a_command_line_it_does_not_understand_refuses_before_anything(self) -> None:

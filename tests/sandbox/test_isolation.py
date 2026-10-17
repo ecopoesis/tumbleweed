@@ -573,13 +573,13 @@ class TestGrants:
                 seen = report(
                     workspace,
                     payloads.ACCESS,
-                    json.dumps({"read": [f"{tmp_path}/f.txt"]}),
-                    grants=(grant(tmp_path, GrantAccess.READ, At(high)),),
+                    json.dumps({"read": ["/granted/f.txt"]}),
+                    grants=(grant(tmp_path, GrantAccess.READ, At(high), target="/granted"),),
                 )
             finally:
                 os.close(high)
 
-        assert seen["read"] == {f"{tmp_path}/f.txt": "high"}
+        assert seen["read"] == {"/granted/f.txt": "high"}
 
     def test_a_path_descriptor_opened_with_o_path_is_mounted_too(
         self, workspace: Opened, home_scratch: Path
@@ -638,22 +638,22 @@ class TestGrants:
         assert helper.returncode == 0, helper.stderr
         assert helper.stdout == "/dev/null ''\n"
 
-    def test_a_grant_inside_tmp_is_visible_and_the_rest_of_tmp_is_not(
+    def test_a_grant_inside_tmp_is_refused_and_the_hosts_tmp_is_not_visible(
         self, workspace: Opened, tmp_path: Path
     ) -> None:
+        # The sandbox's /tmp is its own tmpfs, which Landlock lets a program write to, so a grant
+        # inside it would be writable by Landlock's rules whatever its mount says: none may be.
         granted = tmp_path / "granted"
         granted.mkdir()
-        (granted / "f.txt").write_text("in tmp")
         (tmp_path / "sibling.txt").write_text("also in tmp")
         with opened(granted) as handle:
+            with pytest.raises(InvalidPolicyError, match="builds itself"):
+                grant(granted, GrantAccess.READ, handle)
             seen = report(
-                workspace,
-                payloads.ACCESS,
-                json.dumps({"read": [f"{granted}/f.txt", f"{tmp_path}/sibling.txt"]}),
-                grants=(grant(granted, GrantAccess.READ, handle),),
+                workspace, payloads.ACCESS, json.dumps({"read": [f"{tmp_path}/sibling.txt"]})
             )
 
-        assert seen["read"] == {f"{granted}/f.txt": "in tmp", f"{tmp_path}/sibling.txt": "ENOENT"}
+        assert seen["read"] == {f"{tmp_path}/sibling.txt": "ENOENT"}
 
     def test_the_grants_descriptors_are_not_open_in_the_program(
         self, workspace: Opened, home_scratch: Path
@@ -808,15 +808,18 @@ class TestConfinement:
 
         seen = report(workspace, payloads.ACCESS, json.dumps(spec))
 
-        assert seen["write"] == {
+        written = dict(seen.mapping("write"))
+        proc = written.pop("/proc/new")
+        assert written == {
             "/new": "EROFS",
             "/usr/new": "EROFS",
             "/etc/new": "EROFS",
             "/dev/new": "EROFS",
-            "/proc/new": seen.mapping("write")["/proc/new"],  # ENOENT, EACCES under Landlock
             "/workspace/ok": "ok",
         }
-        assert seen.mapping("write")["/proc/new"] in {"ENOENT", "EACCES"}
+        # procfs has no such entry (ENOENT); under Landlock, which gives /proc no right to create
+        # files, creating it is refused first (EACCES). Either way it was not made.
+        assert proc in {"ENOENT", "EACCES"}
         assert set(seen.mapping("mkdir").values()) == {"EROFS"}
 
     def test_only_the_python_runtime_is_there_to_run(self, workspace: Opened) -> None:

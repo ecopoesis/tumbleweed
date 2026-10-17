@@ -5,7 +5,10 @@ NETWORK = """
 import errno, fcntl, json, socket, struct, sys
 out = {"ifaces": {}, "connect": {}}
 probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-for _, name in socket.if_nameindex():
+# /proc/net/dev, not socket.if_nameindex(): glibc's reads interfaces over a netlink socket, which
+# the sandbox's filter does not allow.
+names = [line.split(":")[0].strip() for line in open("/proc/net/dev").read().splitlines()[2:]]
+for name in names:
     request = struct.pack("16sH14x", name.encode(), 0)
     out["ifaces"][name] = struct.unpack("16sH14x", fcntl.ioctl(probe, 0x8913, request))[1]
 for host, port in json.loads(sys.argv[1]):
@@ -113,14 +116,18 @@ out = {
     "etc": listing("/etc"),
     "mount_options": {fields[4]: fields[5].split(",") for fields in mounts},
 }
-open_fds = []
-for number in range(3, 256):
+# Every descriptor /proc/self/fd lists, not a guess at a range. Listing opens descriptors of its
+# own, so each number is checked again once the listing is closed.
+directory = os.open("/proc/self/fd", os.O_RDONLY | os.O_DIRECTORY)
+numbers = [int(name) for name in os.listdir(directory)]
+os.close(directory)
+def is_open(number):
     try:
         os.fstat(number)
-        open_fds.append(number)
+        return True
     except OSError:
-        pass
-out["open_fds"] = open_fds
+        return False
+out["open_fds"] = [n for n in sorted(numbers) if n > 2 and is_open(n)]
 print(json.dumps(out))
 """
 
@@ -418,4 +425,56 @@ inside.bind("\\0" + sys.argv[1] + "-inside")
 inside.listen(1)
 outside = connect(sys.argv[1])
 print(json.dumps({"abi": abi, "outside": outside, "inside": connect(sys.argv[1] + "-inside")}))
+"""
+
+# The unix-socket denial against family numbers with high bits, which the kernel drops from the
+# `int` it reads: socket and socketpair as raw syscalls with (1 << 32) | AF_UNIX and more, then a
+# connect to the listeners (argv[1] stream, argv[2] datagram) by whatever socket that gave.
+# argv[3] and argv[4] are the numbers of socket and socketpair.
+HIGH_BIT_UNIX = """
+import ctypes, errno, json, os, struct, sys
+stream_path, dgram_path = sys.argv[1:3]
+socket_nr, socketpair_nr = int(sys.argv[3]), int(sys.argv[4])
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+libc.connect.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+libc.send.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int]
+FAMILIES = {"plain": 1, "bit32": (1 << 32) | 1, "top32": (0xFFFFFFFF << 32) | 1}
+out = {}
+def name():
+    return errno.errorcode.get(ctypes.get_errno(), "?")
+def reach(descriptor, path, kind):
+    address = struct.pack("H", 1) + path.encode() + b"\\0"
+    if libc.connect(descriptor, address, len(address)) != 0:
+        return "connect " + name()
+    if kind == 2:
+        libc.send(descriptor, b"high-bit", 8, 0)
+    return "connected"
+for label, family in FAMILIES.items():
+    for kind, path in ((1, stream_path), (2, dgram_path)):
+        descriptor = libc.syscall(ctypes.c_long(socket_nr), ctypes.c_long(family),
+                                  ctypes.c_long(kind), ctypes.c_long(0))
+        key = f"socket_{label}_{kind}"
+        out[key] = reach(descriptor, path, kind) if descriptor >= 0 else name()
+    pair = (ctypes.c_int * 2)()
+    result = libc.syscall(ctypes.c_long(socketpair_nr), ctypes.c_long(family),
+                          ctypes.c_long(2), ctypes.c_long(0), pair)
+    key = f"socketpair_{label}_dgram"
+    out[key] = reach(pair[0], dgram_path, 2) if result == 0 else name()
+print(json.dumps(out))
+"""
+
+# Raw `socket` calls with the families argv[2:] (numbers), the syscall's number being argv[1].
+FAMILY_PROBE = """
+import ctypes, errno, json, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+out = {}
+for text in sys.argv[2:]:
+    family = int(text)
+    # SOCK_DGRAM: netlink and the inet families make one, and the filter looks at the family only.
+    result = libc.syscall(ctypes.c_long(int(sys.argv[1])), ctypes.c_long(family),
+                          ctypes.c_long(2), ctypes.c_long(0))
+    out[text] = "ok" if result >= 0 else errno.errorcode.get(ctypes.get_errno(), "?")
+print(json.dumps(out))
 """

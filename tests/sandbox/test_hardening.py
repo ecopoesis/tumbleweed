@@ -11,14 +11,15 @@ from pathlib import Path
 
 import pytest
 
-from tests.sandbox.support import Opened, grant, input_mount, opened, policy
+from tests.sandbox.support import Opened, env, grant, input_mount, opened, policy
 from tumbleweed.core.ids import ConnectionId
 from tumbleweed.sandbox.bwrap import build_bwrap_argv
-from tumbleweed.sandbox.errors import InvalidPolicyError
+from tumbleweed.sandbox.errors import InvalidPolicyError, SandboxLaunchError, SandboxUnavailable
 from tumbleweed.sandbox.hardening import (
     MAX_REPORT_BYTES,
     HardeningFds,
     LandlockRule,
+    LauncherReport,
     RuleKind,
     exec_command,
     helper_source,
@@ -33,7 +34,8 @@ from tumbleweed.sandbox.policy import (
     RuntimeSpec,
     SandboxPolicy,
 )
-from tumbleweed.sandbox.result import HardeningReport, LandlockState
+from tumbleweed.sandbox.result import HardeningReport, LandlockState, Termination
+from tumbleweed.sandbox.runner import SandboxRunner
 
 FDS = HardeningFds(seccomp=11, helper=12, report=13)
 
@@ -92,8 +94,8 @@ class TestLandlockRules:
                 workspace,
                 "true",
                 grants=(
-                    grant(read_dir, GrantAccess.READ, read_handle),
-                    grant(write_dir, GrantAccess.WRITE, write_handle),
+                    grant(read_dir, GrantAccess.READ, read_handle, target="/granted/r"),
+                    grant(write_dir, GrantAccess.WRITE, write_handle, target="/granted/w"),
                 ),
                 inputs=inputs,
             )
@@ -104,10 +106,10 @@ class TestLandlockRules:
         assert by_kind[RuleKind.READ] == {
             *made.runtime.mounts,
             "/proc",
-            str(read_dir),
+            "/granted/r",
             inputs[0].target,
         }
-        assert by_kind[RuleKind.WRITE] == {"/workspace", "/tmp", "/dev/shm", str(write_dir)}
+        assert by_kind[RuleKind.WRITE] == {"/workspace", "/tmp", "/dev/shm", "/granted/w"}
         assert by_kind[RuleKind.DEVICES] == {"/dev"}
         assert len(rules) == sum(len(paths) for paths in by_kind.values())
 
@@ -119,12 +121,83 @@ class TestLandlockRules:
 
     def test_a_read_grant_is_never_a_write_rule(self, workspace: Opened, tmp_path: Path) -> None:
         with opened(tmp_path) as handle:
-            made = policy(workspace, "true", grants=(grant(tmp_path, GrantAccess.READ, handle),))
+            made = policy(
+                workspace,
+                "true",
+                grants=(grant(tmp_path, GrantAccess.READ, handle, target="/granted"),),
+            )
 
             rules = landlock_rules(made)
 
-        assert LandlockRule(RuleKind.READ, str(tmp_path)) in rules
-        assert LandlockRule(RuleKind.WRITE, str(tmp_path)) not in rules
+        assert LandlockRule(RuleKind.READ, "/granted") in rules
+        assert LandlockRule(RuleKind.WRITE, "/granted") not in rules
+
+    @pytest.mark.parametrize("target", ["/tmp/x", "/tmp"])
+    def test_no_grant_can_inherit_the_tmp_rule(
+        self, workspace: Opened, tmp_path: Path, target: str
+    ) -> None:
+        # Landlock rights add up down a path, so a read grant inside /tmp would be writable by the
+        # /tmp rule (the ro mount would still stop it). The policy refuses the layout.
+        with opened(tmp_path) as handle, pytest.raises(InvalidPolicyError, match="builds itself"):
+            grant(tmp_path, GrantAccess.READ, handle, target=target)
+
+
+LOADER = [
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "GCONV_PATH",
+    "LOCPATH",
+    "NLSPATH",
+    "MALLOC_CHECK_",
+    "MALLOC_PERTURB_",
+    "GLIBC_TUNABLES",
+    "HOSTALIASES",
+    "RES_OPTIONS",
+]
+
+
+class TestEnvironment:
+    @pytest.mark.parametrize("name", LOADER)
+    def test_a_loader_variable_is_refused_in_the_environment_and_on_the_allowlist(
+        self, workspace: Opened, name: str
+    ) -> None:
+        variables, allowlist = env(**{name: "/granted/evil.so"})
+
+        with pytest.raises(InvalidPolicyError, match="changes how programs are loaded"):
+            policy(workspace, "true", variables=variables, allowlist=allowlist)
+        with pytest.raises(InvalidPolicyError, match="cannot be on the allowlist"):
+            policy(workspace, "true", allowlist=allowlist)
+
+    def test_python_variables_are_the_programs_own_business(self, workspace: Opened) -> None:
+        variables, allowlist = env(PYTHONPATH="/workspace", PYTHONHASHSEED="0")
+
+        policy(workspace, "true", variables=variables, allowlist=allowlist)
+
+    def test_the_launcher_gets_no_environment_of_the_policys_and_the_program_gets_it_as_data(
+        self, workspace: Opened
+    ) -> None:
+        variables, allowlist = env(LANG="C.UTF-8", PATH="/usr/bin")
+        made = policy(workspace, "true", variables=variables, allowlist=allowlist)
+
+        argv = build_bwrap_argv(made, hardening=FDS)
+
+        assert "--clearenv" in argv
+        assert "--setenv" not in argv
+        head = argv[: argv.index("--")]
+        assert "C.UTF-8" not in head  # not in bwrap's own part of the command line
+        inner = argv[argv.index("--") + 1 :]
+        pairs = [tuple(inner[i + 1 : i + 3]) for i, word in enumerate(inner) if word == "--env"]
+        assert pairs == [("LANG", "C.UTF-8"), ("PATH", "/usr/bin")]
+        assert inner.index("--env") < inner.index("--")
+
+    def test_without_hardening_the_variables_are_bwraps_own(self, workspace: Opened) -> None:
+        variables, allowlist = env(LANG="C.UTF-8")
+        made = policy(workspace, "true", variables=variables, allowlist=allowlist)
+
+        argv = build_bwrap_argv(made)
+
+        assert operations(argv, "--setenv", 2) == [("LANG", "C.UTF-8")]
 
 
 class TestCommandAndArgv:
@@ -284,3 +357,35 @@ def test_a_connection_id_input_target_is_a_read_rule(workspace: Opened, tmp_path
         rules = landlock_rules(made)
 
     assert LandlockRule(RuleKind.READ, f"/inputs/{connection}") in rules
+
+
+class TestRunnerChecksTheReport:
+    """The runner does not take the launcher's word for Landlock when the policy requires it."""
+
+    @staticmethod
+    def check(report: LauncherReport, *, require: bool) -> HardeningReport:
+        runner = SandboxRunner(use_systemd_scope=False)
+        return runner._hardening(report, Termination.EXITED, 0, bytearray(), require)  # noqa: SLF001
+
+    def test_a_report_without_landlock_is_refused_when_landlock_is_required(self) -> None:
+        said = LauncherReport(
+            hardening=HardeningReport(landlock=LandlockState.UNAVAILABLE, detail="ENOSYS")
+        )
+
+        with pytest.raises(SandboxUnavailable, match="did not apply it"):
+            self.check(said, require=True)
+
+    def test_the_same_report_is_the_result_when_it_is_not_required(self) -> None:
+        said = HardeningReport(landlock=LandlockState.UNAVAILABLE, detail="ENOSYS")
+
+        assert self.check(LauncherReport(hardening=said), require=False) == said
+
+    def test_an_applied_report_passes_either_way(self) -> None:
+        said = HardeningReport(landlock=LandlockState.APPLIED, landlock_abi=7)
+
+        for require in (True, False):
+            assert self.check(LauncherReport(hardening=said), require=require) == said
+
+    def test_a_launcher_that_reported_nothing_is_an_error_not_a_pass(self) -> None:
+        with pytest.raises(SandboxLaunchError):
+            self.check(LauncherReport(), require=True)

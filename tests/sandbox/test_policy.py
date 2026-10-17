@@ -101,12 +101,13 @@ class TestGrantMount:
         with pytest.raises(InvalidPolicyError, match="builds itself"):
             GrantMount(source=workspace, target=MountPath(target), access=GrantAccess.READ)
 
-    def test_a_grant_cannot_replace_the_sandboxs_tmpfs_but_may_sit_inside_it(
-        self, workspace: Opened
+    @pytest.mark.parametrize("target", ["/tmp", "/tmp/x", "/tmp/x/y"])
+    def test_a_grant_cannot_be_or_sit_inside_the_sandboxs_tmpfs(
+        self, workspace: Opened, target: str
     ) -> None:
-        with pytest.raises(InvalidPolicyError, match="own tmpfs"):
-            GrantMount(source=workspace, target=MountPath("/tmp"), access=GrantAccess.READ)
-        GrantMount(source=workspace, target=MountPath("/tmp/x"), access=GrantAccess.READ)
+        # Landlock lets a program write to /tmp, so a grant there would inherit that.
+        with pytest.raises(InvalidPolicyError, match="builds itself"):
+            GrantMount(source=workspace, target=MountPath(target), access=GrantAccess.READ)
 
     @pytest.mark.parametrize("target", ["/tmpfoo", "/procs", "/workspaces", "/devices", "/inputs2"])
     def test_a_sibling_with_a_longer_name_is_not_reserved(
@@ -532,7 +533,11 @@ class TestDescriptorKinds:
         file = tmp_path / "f"
         file.write_text("x")
         with opened(file, os.O_RDONLY) as handle:
-            made = policy(workspace, "true", grants=(grant(file, GrantAccess.READ, handle),))
+            made = policy(
+                workspace,
+                "true",
+                grants=(grant(file, GrantAccess.READ, handle, target="/granted/f"),),
+            )
 
             made.check_descriptors()
 
