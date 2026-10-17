@@ -114,6 +114,40 @@ class TestEscape:
         assert escape_shortcuts(shell.window.chat_panel) == []
         assert escape_shortcuts(shell.window.canvas) == []
 
+    def test_the_shortcut_is_the_bare_escape_key_in_the_bubble_phase(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        """GTK4 has no public way to make a key event, so the key path is checked piece by piece:
+        a key press goes from the focus widget up through its ancestors (the canvas, the chat
+        panel and the input are all inside the window), and the window's controller sees it last
+        (a popover or an entry that wants Esc takes it first), for Esc with no modifier."""
+        from tumbleweed.shell._gi import Gdk, Gtk
+
+        shell = build_shell(ManualResponder())
+        (controller,) = (
+            c
+            for c in shell.window.observe_controllers()
+            if isinstance(c, Gtk.ShortcutController)
+            and any(
+                isinstance(sc.get_trigger(), Gtk.KeyvalTrigger)
+                and sc.get_trigger().get_keyval() == Gdk.KEY_Escape
+                for sc in c
+            )
+        )
+        (shortcut,) = escape_shortcuts(shell.window)
+        trigger = shortcut.get_trigger()
+
+        assert isinstance(trigger, Gtk.KeyvalTrigger)
+        assert trigger.get_keyval() == Gdk.KEY_Escape
+        assert int(trigger.get_modifiers()) == 0
+        assert controller.get_propagation_phase() == Gtk.PropagationPhase.BUBBLE
+        for widget in (
+            shell.window.canvas,
+            shell.window.chat_panel,
+            shell.window.chat_panel.input_view,
+        ):
+            assert widget.get_root() is shell.window
+
     def test_esc_works_with_the_focus_on_the_canvas_too(self, build_shell: ShellBuilder) -> None:
         responder = ManualResponder()
         shell = build_shell(responder)

@@ -20,7 +20,6 @@ from tests.shell.gtk_support import (
     input_text,
     labels_in,
     press,
-    primary_text,
     pump,
     pump_until,
     rows,
@@ -1081,71 +1080,24 @@ class TestCopying:
 
         assert clipboard_text(label) == label.get_text()[:300].replace("\u200b", "")
 
-    def test_selecting_puts_the_source_text_on_the_primary_selection_not_the_display_text(
-        self, build_shell: ShellBuilder
-    ) -> None:
+    @pytest.mark.parametrize("how", ["select_region", "select_all"])
+    def test_a_selection_stays_selected(self, build_shell: ShellBuilder, how: str) -> None:
+        """Nothing of ours may take the selection away. (An earlier attempt to put the source text
+        on the primary selection made the label drop it: (True, 250, 270) became (False, 270, 270).)
+        """
         _shell, row = self.long_reply(build_shell, "ab" * 600)
         label = row.paragraphs[0]
-        shown = label.get_text()
-        assert "\u200b" in shown[250:270]
-
         label.grab_focus()  # selecting with the pointer or the keyboard focuses the label
-        label.select_region(250, 270)
-        pump(0.1)
 
-        assert primary_text(label) == shown[250:270].replace("\u200b", "")
+        if how == "select_region":
+            label.select_region(250, 270)
+            expected = (True, 250, 270)
+        else:
+            label.activate_action("selection.select-all", None)
+            expected = (True, 0, len(label.get_text()))
+        pump(0.2)
 
-    def test_the_primary_selection_follows_the_selection(self, build_shell: ShellBuilder) -> None:
-        _shell, row = self.long_reply(build_shell, "ab" * 600)
-        label = row.paragraphs[0]
-        label.grab_focus()
-
-        label.select_region(0, 10)
-        pump(0.1)
-        assert primary_text(label) == "ab" * 5
-        label.select_region(20, 24)
-        pump(0.1)
-
-        assert primary_text(label) == "abab"
-
-    def test_a_click_that_clears_the_selection_drops_what_we_put_on_the_primary_selection(
-        self, build_shell: ShellBuilder
-    ) -> None:
-        from tumbleweed.shell._gi import Gtk
-
-        _shell, row = self.long_reply(build_shell, "ab" * 600)
-        label = row.paragraphs[0]
-        label.grab_focus()
-        label.select_region(0, 10)
-        pump(0.1)
-        assert primary_text(label) == "ab" * 5
-
-        label.select_region(3, 3)  # what a click inside the selection does
-        (click,) = (
-            c
-            for c in label.observe_controllers()
-            if isinstance(c, Gtk.GestureClick)
-            and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
-        )
-        click.emit("released", 1, 0.0, 0.0)
-        pump(0.1)
-
-        assert row.primary is None
-        assert primary_text(label) in {None, ""}
-
-    def test_a_selection_of_a_label_without_the_focus_is_left_to_gtk(
-        self, build_shell: ShellBuilder
-    ) -> None:
-        # Not reachable by a user (every way of selecting focuses the label), and harmless: GTK's
-        # own text goes on the primary selection, as it did before.
-        shell, row = self.long_reply(build_shell, "ab" * 600)
-        label = row.paragraphs[0]
-        shell.window.chat_panel.input_view.grab_focus()
-
-        label.select_region(0, 10)
-        pump(0.1)
-
-        assert row.primary is None
+        assert tuple(label.get_selection_bounds()) == expected
 
     def _drag_prepare(self, label: "Gtk.Label", x: float, y: float) -> str | None:
         from tumbleweed.shell._gi import Gdk, Gtk
@@ -1186,6 +1138,18 @@ class TestCopying:
         offset_x, offset_y = label.get_layout_offsets()
 
         assert self._drag_prepare(label, offset_x + 1, offset_y + 1) is None  # the first character
+
+    def test_a_press_below_the_text_is_not_on_the_selection_though_the_nearest_index_is(
+        self, build_shell: ShellBuilder
+    ) -> None:
+        _shell, row = self.long_reply(build_shell, "ab" * 600)
+        label = row.paragraphs[0]
+        label.select_region(0, -1)  # everything: any nearest index is inside the selection
+        offset_x, offset_y = label.get_layout_offsets()
+        _width, height = label.get_layout().get_pixel_size()
+
+        assert self._drag_prepare(label, offset_x + 1, offset_y + height + 500) is None
+        assert self._drag_prepare(label, offset_x + 1, offset_y + 1) is not None
 
     def test_with_nothing_selected_there_is_nothing_to_drag(
         self, build_shell: ShellBuilder
