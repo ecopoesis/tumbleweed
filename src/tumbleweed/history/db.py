@@ -49,6 +49,7 @@ from tumbleweed.history.files import (
     open_private_file,
     same_directory,
     same_file,
+    same_resolved,
 )
 from tumbleweed.history.schema import MIGRATIONS, Migration, migrate, verify
 
@@ -150,6 +151,14 @@ class Database:
         migrations: tuple[Migration, ...],
     ) -> None:
         directory_path, directory_fd = directory
+        # The path SQLite resolved and kept, which is what it opens, checks and derives the side
+        # files from: it must be our file in our directory, before anything is read or written.
+        rows = connection.execute("PRAGMA database_list").fetchall()
+        resolved = next((row[2] for row in rows if row[1] == b"main"), None)
+        if type(resolved) is not bytes or not same_resolved(
+            os.fsdecode(resolved), file_fd, directory_fd
+        ):
+            raise HistoryRefusedError("The chat history file was replaced while opening.")
         # Reads only: a file that is not ours is refused before it is switched to WAL or written.
         verify(connection, migrations)
         # SQLite has opened the file by now, by the path string it was given (on Linux a

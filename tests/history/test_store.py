@@ -695,6 +695,58 @@ class TestNewSessionByTheUser:
 
         assert [row[0] for row in self.sessions(tmp_path)] == [str(last.id)]
 
+    def test_two_shells_that_each_press_new_session_and_quit_leave_one_empty_session(
+        self, tmp_path: Path
+    ) -> None:
+        clock = Ticks()
+        first = open_store(tmp_path, clock)
+        first.begin(limit=10)
+        first.new_session()
+        second = open_store(tmp_path, clock)
+        second.begin(limit=10)
+        newest = second.new_session()  # reaps the first shell's, which is held: not yet
+        first.close()
+        second.close()
+        third = open_store(tmp_path, clock)  # starting one more of the user's reaps what is left
+        third.begin(limit=10)
+        last = third.new_session()
+        third.close()
+
+        assert [row[0] for row in self.sessions(tmp_path)] == [str(last.id)]
+        assert last.id != newest.id
+
+    def test_the_ordinary_prune_leaves_an_empty_session_the_user_started(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_store(tmp_path)
+        store.begin(limit=10)
+        repository = store._sessions  # noqa: SLF001  (what pruning asks)
+        auto, user_made = SessionId.new(), SessionId.new()
+        repository.create(auto, EpochMillis(1_000))
+        repository.create(user_made, EpochMillis(2_000), user_started=True)
+
+        ordinary = repository.empty(PRUNE_BATCH)  # (the shell's own empty session is there too)
+        assert auto in ordinary
+        assert user_made not in ordinary
+        assert repository.empty(PRUNE_BATCH, user_started=True) == (user_made,)
+        store._prune()  # noqa: SLF001
+        remaining = {row[0] for row in self.sessions(tmp_path)}
+        assert str(user_made) in remaining
+        assert str(auto) not in remaining
+        store.close()
+
+    def test_an_empty_session_another_shell_holds_is_not_reaped(self, tmp_path: Path) -> None:
+        first = open_store(tmp_path)
+        first.begin(limit=10)
+        held = first.new_session()
+        second = open_store(tmp_path)
+        second.begin(limit=10)
+        second.new_session()
+
+        assert str(held.id) in {row[0] for row in self.sessions(tmp_path)}
+        first.close()
+        second.close()
+
     def test_a_user_started_session_that_got_messages_is_an_ordinary_one(
         self, tmp_path: Path
     ) -> None:

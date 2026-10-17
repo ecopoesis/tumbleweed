@@ -220,6 +220,54 @@ class TestADirectorySwappedInsideTheOpen:
             or (evil / f"{DATABASE_NAME}-wal").stat().st_size == 0
         )  # nothing of ours was written there
 
+    def test_a_swap_in_for_the_connect_and_back_before_our_checks_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SQLite resolves the symlink when it opens and keeps the attacker's path, so a swap that
+        is undone before our checks look at the directory still has it writing there. Only the
+        path SQLite really uses (`PRAGMA database_list`) shows it."""
+        shell = history_directory(tmp_path)
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        attackers = Database.open(evil)  # (a database of the attacker's own, with something in it)
+        attackers.close()
+        before = (evil / DATABASE_NAME).read_bytes()
+        real_connect = sqlite3.connect
+
+        def swapping_back(path: str, *, timeout: float, autocommit: bool) -> sqlite3.Connection:
+            moved = shell.parent / "shell.moved"
+            shell.rename(moved)
+            shell.symlink_to(evil)
+            connection = real_connect(path, timeout=timeout, autocommit=autocommit)
+            connection.execute("PRAGMA schema_version").fetchone()  # SQLite has opened it, there
+            shell.unlink()  # the attacker is gone again before our checks
+            moved.rename(shell)
+            return connection
+
+        monkeypatch.setattr(sqlite3, "connect", swapping_back)
+
+        with pytest.raises(HistoryRefusedError, match="replaced"):
+            HistoryStore.open(shell)
+
+        assert (evil / DATABASE_NAME).read_bytes() == before  # nothing of ours went there
+        assert not (evil / "chat.locks").exists()
+
+    def test_the_path_sqlite_uses_is_what_is_checked(self, tmp_path: Path) -> None:
+        directory = history_directory(tmp_path)
+        directory.mkdir(parents=True, mode=0o700)
+        other = tmp_path / "other"
+        other.mkdir(mode=0o700)
+        ours = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        descriptor = os.open(directory / "f", os.O_RDWR | os.O_CREAT, 0o600)
+        (other / "f").write_bytes(b"")
+        try:
+            assert files.same_resolved(str(directory / "f"), descriptor, ours)
+            assert not files.same_resolved(str(other / "f"), descriptor, ours)  # another file
+            assert not files.same_resolved(str(directory / "gone"), descriptor, ours)
+        finally:
+            os.close(descriptor)
+            os.close(ours)
+
 
 def swap_setup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, hard_link: bool = False

@@ -16,18 +16,29 @@ descriptor, never through a second look at a path (CLAUDE.md, TOCTOU):
 - Files are opened relative to a directory descriptor with `O_NOFOLLOW`, created with mode 0600, and
   must be a regular file, owned by this user, with one link. A mode other than 0600 on a file of
   ours is set to exactly 0600 the same way.
-- SQLite opens the database by path itself, and a `/proc/self/fd/<n>` path would not pin
-  anything: SQLite resolves it to the plain path (`PRAGMA database_list` shows it) and opens
-  that, and derives the `-wal`, `-shm` and `-journal` names from it. So after SQLite has opened
-  the file, `same_directory` compares the directory path with the descriptor we hold (device
-  and inode), `same_file` the file in it, and `check_sidecar` looks at the side files, all
-  relative to our directory descriptor; a redirected ancestor is refused before anything is
-  written. What remains is the instant
-  between our check and SQLite's own opens: someone able to write inside our 0700 directory, or
-  to rename it or an ancestor (this user, or root), could have SQLite open, read and create its
-  empty files in another directory then. Nothing of ours is written there, because the checks
-  that follow fail first; but the attacker's file could have been read. An ACL on a directory
-  is not examined (#80).
+- SQLite opens the database by path itself, resolves any symlink in it at that moment and keeps
+  the *resolved* path for the life of the connection (`PRAGMA database_list` shows it; a
+  `/proc/self/fd/<n>` path would only be resolved to the plain one, so it pins nothing). It derives
+  the `-wal`, `-shm` and `-journal` names from that path and, before each write, checks that the
+  file at it is still the one it opened. So after connecting, and before anything is read or
+  written, `same_resolved` takes the path SQLite is really using and requires the file there,
+  and its directory, to be the file and directory we hold descriptors for (device and inode,
+  no symlink followed for the file). A directory swapped for a symlink just for the connect and
+  swapped back before our checks is caught by this, since SQLite kept the attacker's path. The
+  older checks stay: `same_directory` compares the directory path as it is now with our
+  descriptor, `same_file` the file in it, `check_sidecar` the side files. Because the resolved
+  path is ours, SQLite's own "file has moved" check, which compares that same path with the open
+  file before it writes, guards every later write to the database.
+
+  What is guaranteed: nothing of ours is written to a file that is not the one we examined, if
+  the swap happens before the check. What is not: (1) in the instant before SQLite opens, someone
+  able to write inside our 0700 directory, or to rename it or an ancestor (this user, or root),
+  could make SQLite open the attacker's file (and create it, empty, if it is missing); it is
+  refused straight after, before anything is read from it or written. (2) A swap *after* the
+  check is caught for the database file by SQLite's own moved-check, but the `-wal` and `-shm`
+  files are opened by their path when SQLite first needs them, so they could be created in the
+  attacker's directory; whoever can rename our directory can do far more than that. An ACL on a
+  directory is not examined (#80).
 """
 
 import contextlib
@@ -176,6 +187,24 @@ def check_sidecar(directory: int, name: str) -> None:
     except OSError:
         raise HistoryIoError("A chat history file cannot be examined.") from None
     _check_regular(info, "side file")
+
+
+def same_resolved(resolved: str, file_descriptor: int, directory_descriptor: int) -> bool:
+    """Whether the path SQLite says it opened (`resolved`) is our file in our directory."""
+    try:
+        file_on_disk = os.stat(resolved, follow_symlinks=False)  # noqa: PTH116
+        directory_on_disk = Path(resolved).parent.stat()
+    except OSError:
+        return False
+    file_opened = os.fstat(file_descriptor)
+    directory_opened = os.fstat(directory_descriptor)
+    return (file_on_disk.st_dev, file_on_disk.st_ino) == (
+        file_opened.st_dev,
+        file_opened.st_ino,
+    ) and (
+        directory_on_disk.st_dev,
+        directory_on_disk.st_ino,
+    ) == (directory_opened.st_dev, directory_opened.st_ino)
 
 
 def same_directory(path: Path, descriptor: int) -> bool:

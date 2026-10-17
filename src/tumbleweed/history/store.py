@@ -60,7 +60,7 @@ RESTORE_BYTES: Final = ByteCount(4 * 1024 * 1024)
 PRUNE_BATCH: Final = 20
 NOT_RESTORED: Final = (
     "The last chat could not be read (its stored data is damaged), so a new session was "
-    "started. The old data was left untouched."
+    "started. The damaged rows were not changed."
 )
 
 
@@ -227,19 +227,27 @@ class HistoryStore:
             claim.forget()
             raise
         self._session, self._claim = session, claim
-        self._prune()
+        self._prune(reap_user_started=user_started)
         return session
 
-    def _prune(self) -> None:
+    def _prune(self, *, reap_user_started: bool = False) -> None:
         """Delete up to `PRUNE_BATCH` of the oldest sessions with messages beyond the newest
         `MAX_SESSIONS` of them, and up to as many empty ones, in one write; nothing another shell
-        holds, and no write at all if there is nothing to delete. Empty sessions do not count
-        towards `MAX_SESSIONS`, so they cannot push a real chat out."""
+        holds, and no write at all if there is nothing to delete. With `reap_user_started`, the
+        empty sessions the user started (in other shells, now closed) go too. Empty sessions do
+        not count towards `MAX_SESSIONS`, so they cannot push a real chat out."""
         claims: list[Claim] = []
         try:
             candidates = (
                 *self._sessions.beyond(MAX_SESSIONS, PRUNE_BATCH),
                 *self._sessions.empty(PRUNE_BATCH),
+                # Starting a session of the user's own replaces the empty ones that other shells
+                # left (not one a shell holds): only the newest is kept, across shells.
+                *(
+                    self._sessions.empty(PRUNE_BATCH, user_started=True)
+                    if reap_user_started
+                    else ()
+                ),
             )
             for session_id in candidates:
                 if (claim := self._claims.try_claim(session_id)) is not None:

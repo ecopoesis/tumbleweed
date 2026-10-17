@@ -172,18 +172,19 @@ class SessionRepository:
         )
         return tuple(reversed(_ids(rows)))
 
-    def empty(self, batch: int) -> tuple[SessionId, ...]:
-        """Up to `batch` of the oldest sessions without messages that the user did not start
-        (among the newest `SCAN_WINDOW`), for deleting if nobody holds them."""
+    def empty(self, batch: int, *, user_started: bool = False) -> tuple[SessionId, ...]:
+        """Up to `batch` of the oldest sessions without messages (among the newest `SCAN_WINDOW`),
+        those the user started with "New session" or, by default, those a shell made by itself,
+        for deleting if nobody holds them."""
         if not 1 <= batch <= MAX_SEQUENCE:
             raise ValueError("batch must be positive")
         rows = self._database.query(
             "SELECT id FROM (SELECT id, updated_at, user_started FROM sessions "
             "ORDER BY updated_at DESC, id DESC LIMIT ?) AS s "
-            "WHERE user_started = 0 AND NOT EXISTS "
+            "WHERE user_started = ? AND NOT EXISTS "
             "(SELECT 1 FROM messages WHERE session_id = s.id) "
             "ORDER BY updated_at ASC, id ASC LIMIT ?",
-            (SCAN_WINDOW, batch),
+            (SCAN_WINDOW, int(user_started), batch),
         )
         return _ids(rows)
 

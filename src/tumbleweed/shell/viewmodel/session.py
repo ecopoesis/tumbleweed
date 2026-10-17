@@ -52,8 +52,8 @@ RESTORE_MESSAGES: Final = MAX_MESSAGES - 2
 _NOT_SAVED = "{reason} This chat will not be saved."
 _STOPPED_SAVING = "{reason} The rest of this chat will not be saved."
 _NOT_RESTORABLE = (
-    "The last chat could not be restored, so a new session was started. The old data was left "
-    "untouched."
+    "The last chat could not be restored, so a new session was started. The old rows were not "
+    "changed."
 )
 type HistoryOpener = Callable[[], ChatHistory]
 type NoticeObserver = Callable[[str], None]
