@@ -127,6 +127,8 @@ class TestWithLandlock:
         assert result.hardening.detail is None
         # Abstract unix sockets are scoped from ABI 6 (Linux 6.12) and not before.
         assert result.hardening.unix_socket_scope is (abi >= 6)
+        # Shown by `pytest -rP` in the CI log: which kernel the Landlock tests ran against.
+        sys.stdout.write(f"Landlock ABI {abi}, abstract unix socket scope: {abi >= 6}\n")
 
     def test_everything_a_program_does_every_day_still_works(self, workspace: Opened) -> None:
         landlock_or_skip()
