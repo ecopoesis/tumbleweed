@@ -164,6 +164,7 @@ class HistoryStore:
             self._session, self._claim = candidate, claim
             return RestoredSession(candidate, messages, None)
         session = self._start()
+        self._prune()
         return RestoredSession(session, (), notice)
 
     def new_session(self) -> StoredSession:
@@ -171,6 +172,7 @@ class HistoryStore:
         previous, claim = self._session, self._claim
         session = self._start(user_started=True)  # the previous claim is held until this works
         self._let_go(previous, claim, keep_user_started=False)
+        self._prune(reap_user_started=True)  # after: the old empty one is not in the way
         return session
 
     def append(self, message: NewMessage) -> None:
@@ -186,6 +188,10 @@ class HistoryStore:
             return
         self._closed = True
         try:
+            if self._session is not None and self._session.user_started:
+                # This one may be kept (if it is still empty): the empty ones the user started in
+                # shells that have closed meanwhile go, so that one is left across shells.
+                self._prune(reap_user_started=True)
             self._let_go(self._session, self._claim, keep_user_started=True)
         finally:
             try:
@@ -212,7 +218,7 @@ class HistoryStore:
             claim.release()
 
     def _start(self, *, user_started: bool = False) -> StoredSession:
-        """Create a session, claim it, make it the current one, and prune the oldest.
+        """Create a session, claim it and make it the current one.
 
         The claim comes first: nobody else knows the new ID yet, so it cannot fail for want of
         luck, and no other shell can see the session (and take it) before it is ours.
@@ -227,7 +233,6 @@ class HistoryStore:
             claim.forget()
             raise
         self._session, self._claim = session, claim
-        self._prune(reap_user_started=user_started)
         return session
 
     def _prune(self, *, reap_user_started: bool = False) -> None:

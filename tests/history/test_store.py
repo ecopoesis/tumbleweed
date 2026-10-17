@@ -201,8 +201,9 @@ class TestBounds:
             orphans = connection.execute(
                 "SELECT count(*) FROM messages WHERE session_id NOT IN (SELECT id FROM sessions)"
             ).fetchone()
-        assert len(kept) == MAX_SESSIONS
-        assert str(ids[-2]) in kept  # (the last one is empty: closing deleted it)
+        assert len(kept) == MAX_SESSIONS + 1  # the chats, and the empty one the user started last
+        assert str(ids[-2]) in kept
+        assert str(ids[-1]) in kept
         assert str(ids[0]) not in kept
         assert orphans == (0,)  # the messages went with their sessions
         locks = list((history_directory(tmp_path) / "chat.locks").iterdir())
@@ -537,7 +538,7 @@ class TestAnAccidentalSecondShell:
         store.close()
         with raw(history_directory(tmp_path)) as connection:
             (count,) = connection.execute("SELECT count(*) FROM sessions").fetchone()
-        assert count == MAX_SESSIONS
+        assert count == MAX_SESSIONS + 1
 
 
 class TestTheClaimsAndTheClockAndTheOrder:
@@ -769,7 +770,55 @@ class TestNewSessionByTheUser:
             store.append(user(f"chat {index}"))
         store.close()
 
-        assert len(self.sessions(tmp_path)) == MAX_SESSIONS
+        # The newest chat got its message after the prune that started its session: at most one
+        # over until the next one.
+        assert MAX_SESSIONS <= len(self.sessions(tmp_path)) <= MAX_SESSIONS + 1
+
+    def real_chats(self, tmp_path: Path) -> int:
+        with raw(history_directory(tmp_path)) as connection:
+            return int(
+                connection.execute(
+                    "SELECT count(*) FROM sessions WHERE EXISTS "
+                    "(SELECT 1 FROM messages WHERE session_id = sessions.id)"
+                ).fetchone()[0]
+            )
+
+    def test_new_session_over_and_over_never_pushes_a_real_chat_out(self, tmp_path: Path) -> None:
+        store = open_store(tmp_path)
+        store.begin(limit=10)
+        for index in range(MAX_SESSIONS):
+            store.append(user(f"real chat {index}"))
+            store.new_session()
+        assert self.real_chats(tmp_path) == MAX_SESSIONS
+
+        for _ in range(5):  # the user clears the chat again and again
+            store.new_session()
+
+        assert self.real_chats(tmp_path) == MAX_SESSIONS
+        store.close()
+        assert self.real_chats(tmp_path) == MAX_SESSIONS
+
+    def test_two_shells_taking_turns_keep_the_cap_of_real_chats_and_one_empty_session(
+        self, tmp_path: Path
+    ) -> None:
+        clock = Ticks()
+        shells = [open_store(tmp_path, clock), open_store(tmp_path, clock)]
+        for shell in shells:
+            shell.begin(limit=10)
+        for round_ in range(60):
+            shell = shells[round_ % 2]
+            shell.append(user(f"round {round_}"))
+            shell.new_session()
+        for shell in shells:
+            shell.close()
+
+        assert self.real_chats(tmp_path) == MAX_SESSIONS
+        with raw(history_directory(tmp_path)) as connection:
+            (empty_user_started,) = connection.execute(
+                "SELECT count(*) FROM sessions WHERE user_started = 1 AND NOT EXISTS "
+                "(SELECT 1 FROM messages WHERE session_id = sessions.id)"
+            ).fetchone()
+        assert empty_user_started <= 1
 
     def test_a_shell_that_crashed_leaves_an_empty_session_that_is_reaped_not_restored(
         self, tmp_path: Path

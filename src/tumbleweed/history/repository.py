@@ -95,12 +95,16 @@ def message_from_row(row: Row) -> StoredMessage:
 
 SCAN_WINDOW: Final = 1000
 _SESSION_COLUMNS: Final = "id, created_at, updated_at, user_started"
-# The sessions worth keeping: they have messages, or the user made them with "New session".
-_KEPT: Final = (
+_WINDOW: Final = (
     f"SELECT {_SESSION_COLUMNS} FROM (SELECT {_SESSION_COLUMNS} FROM sessions "  # noqa: S608
     "ORDER BY updated_at DESC, id DESC LIMIT ?) AS s "
-    "WHERE user_started = 1 OR EXISTS (SELECT 1 FROM messages WHERE session_id = s.id) "
 )
+_HAS_MESSAGES: Final = "EXISTS (SELECT 1 FROM messages WHERE session_id = s.id)"
+# The sessions one can restore: they have messages, or the user made them with "New session".
+_KEPT: Final = _WINDOW + f"WHERE user_started = 1 OR {_HAS_MESSAGES} "
+# The sessions that count towards the cap: only those with messages (the one empty session the
+# user started is kept besides them, never counted, and never pushes a chat out).
+_CHATS: Final = _WINDOW + f"WHERE {_HAS_MESSAGES} "
 
 
 def _ids(rows: list[Row]) -> tuple[SessionId, ...]:
@@ -161,13 +165,13 @@ class SessionRepository:
         return tuple(sessions)
 
     def beyond(self, keep: int, batch: int) -> tuple[SessionId, ...]:
-        """Up to `batch` kept sessions (with messages, or started by the user) older than the
-        newest `keep` of them, oldest first, for deleting. Sessions a shell made by itself and
-        that are still empty do not count towards `keep`."""
+        """Up to `batch` sessions with messages older than the newest `keep` of them, oldest
+        first, for deleting. Empty sessions, those the user started included, do not count
+        towards `keep`."""
         if not (1 <= batch <= MAX_SEQUENCE and 0 <= keep <= MAX_SEQUENCE):
             raise ValueError("batch must be positive and keep not negative")
         rows = self._database.query(
-            _KEPT + "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            _CHATS + "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
             (SCAN_WINDOW, batch, keep),
         )
         return tuple(reversed(_ids(rows)))
