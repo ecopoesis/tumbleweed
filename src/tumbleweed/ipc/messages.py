@@ -7,9 +7,9 @@ that the exported JSON Schema (`schemas/ipc.v1.json`) lists all of them.
 
 To add a message (S17 and later steps do this; nothing else in `ipc` changes):
 
-1. Subclass `Request` (or `Response`, from `tumbleweed.ipc.base`), mark the class `@final`, and give it
-   `kind: Literal["<unique_name>"]` without a default, so that `kind` is required on the wire
-   and in the schema. Fields use strict types, typed IDs from `tumbleweed.core.ids` and bounded
+1. Subclass `Request` (or `Response`, from `tumbleweed.ipc.base`), mark the class `@final`, and
+   give it `kind: Literal["<unique_name>"]` without a default, so that `kind` is required on the
+   wire and in the schema. Fields use strict types, typed IDs from `tumbleweed.core.ids` and bounded
    strings and collections; never `dict[str, Any]`.
 2. Add the class to `RequestBody` or `ResponseBody`.
 3. Regenerate the schema: `uv run python -m tumbleweed.ipc.schema > schemas/ipc.v1.json`. A

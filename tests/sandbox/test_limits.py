@@ -1,8 +1,8 @@
 """How limits are applied and reported, on every OS: command lines, probe, platform check."""
 
 import asyncio
-import time
 import dataclasses
+import time
 from datetime import timedelta
 from pathlib import Path
 
