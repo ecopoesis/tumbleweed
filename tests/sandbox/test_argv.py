@@ -277,16 +277,16 @@ class TestGrants:
         assert "/home/u/Photos" in argv
         assert str(tmp_path) not in argv  # what the descriptor really is does not matter to bwrap
 
-    def test_a_grant_inside_another_is_mounted_after_it_whatever_the_order_given(
+    def test_grants_are_mounted_in_the_same_order_whatever_order_they_were_given(
         self, workspace: Opened, tmp_path: Path
     ) -> None:
         with opened(tmp_path) as handle:
-            inner = grant(Path("/data/a/b"), GrantAccess.WRITE, handle)
-            outer = grant(Path("/data/a"), GrantAccess.READ, handle)
-            sibling = grant(Path("/data/c"), GrantAccess.READ, handle)
+            one = grant(Path("/data/b"), GrantAccess.WRITE, handle)
+            two = grant(Path("/data/a"), GrantAccess.READ, handle)
+            three = grant(Path("/data/c/d"), GrantAccess.READ, handle)
 
-            first = build_bwrap_argv(policy(workspace, "true", grants=(inner, outer, sibling)))
-            second = build_bwrap_argv(policy(workspace, "true", grants=(sibling, outer, inner)))
+            first = build_bwrap_argv(policy(workspace, "true", grants=(one, two, three)))
+            second = build_bwrap_argv(policy(workspace, "true", grants=(three, two, one)))
 
         assert first == second
         targets = [
@@ -294,9 +294,7 @@ class TestGrants:
             for flag in ("--bind-fd", "--ro-bind-fd")
             for _, target in operations(first, flag, 2)
         ]
-        ordered = [word for word in first if word in {"/data/a", "/data/a/b", "/data/c"}]
-        assert ordered.index("/data/a") < ordered.index("/data/a/b")
-        assert set(targets) >= {"/data/a", "/data/a/b", "/data/c"}
+        assert set(targets) >= {"/data/a", "/data/b", "/data/c/d"}
 
     def test_the_descriptors_to_pass_are_the_ones_named_without_repeats(
         self, workspace: Opened, tmp_path: Path

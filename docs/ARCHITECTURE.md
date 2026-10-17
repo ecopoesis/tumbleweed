@@ -154,11 +154,14 @@ shell, voice or `gi` (section 10).
   `/workspace` (the working directory); retained workspaces read-only at `/inputs/<ConnectionId>`;
   and each grant at its host path. Workspace, inputs and grants are bound by the descriptor the
   broker opened and verified (`--bind-fd`, `--ro-bind-fd`), never by a path bwrap would resolve
-  again, so a path swapped for a symlink after the check changes nothing. bwrap closes the
-  descriptors before the program runs. A grant may sit inside another (the shallower is mounted
-  first; inside a read-only one the mount point must already exist), may not be, contain or be
-  inside `/proc`, `/dev`, `/sys`, `/workspace` or `/inputs`, may not replace `/tmp`, and may not
-  overlap a runtime path.
+  again, so a path swapped for a symlink after the check cannot change what is mounted (the
+  mount *sources*; a mount point's parents are another matter, below). bwrap closes the
+  descriptors before the program runs. A grant may be, contain or be inside none of `/proc`,
+  `/dev`, `/sys`, `/workspace`, `/inputs`, another grant or a runtime path, and may not replace
+  `/tmp`. No nesting, because bwrap makes the mount point of an inner grant by walking the live
+  directory of the outer one, which the program can write to: a symlink planted there
+  (`/oldroot`, which bwrap itself uses to reach the host while it builds the sandbox) would send
+  that `mkdir` to the host, outside every grant. The broker keeps its grants apart (S17).
 - **Flags.** `--unshare-all --unshare-user --disable-userns --die-with-parent --new-session
   --clearenv --cap-drop ALL`, plus a hostname of its own. There is no network option until S22:
   the sandbox's `lo` is its own, and no host interface, host loopback or host abstract socket is
@@ -166,19 +169,25 @@ shell, voice or `gi` (section 10).
 - **Environment.** Empty, plus the variables the policy lists, each of which must be on the
   policy's allowlist (otherwise the policy is refused, not trimmed). A name that looks like a
   secret (`key`, `token`, `secret`, `passw`, `credential`, `auth`, `anthropic`) is refused even on
-  the allowlist (I6). bwrap adds `PWD`.
+  the allowlist (I6). bwrap adds `PWD`. The fixed allowlist of a real run is S17's (the launcher
+  only enforces the one it is given).
 - **Limits (I9).** Wall time and output are the launcher's: stdout and stderr are read
   concurrently, each cut at `max_output_bytes`, and exceeding the cap or the wall clock `SIGKILL`s
   bwrap, which takes the sandbox's PID namespace down with it (`--die-with-parent`). CPU time, file
-  size and core dumps are `prlimit` rlimits (soft equal to hard, so an overrun is an uncatchable
-  `SIGKILL`). Memory, `pids.max` and a CPU quota come from `systemd-run --user --scope` when the
+  size, core dumps and open files (256) are `prlimit` rlimits (soft equal to hard, so a CPU
+  overrun is an uncatchable `SIGKILL`). Without a scope, processes are bounded by `RLIMIT_NPROC`
+  (limit plus 16 for bwrap's own) where the kernel counts them per user namespace (5.14 and
+  later; before that it would count the user's other processes, so it is not set); that is an
+  approximation and `pids` is still reported as unenforced. Memory, `pids.max` and a CPU quota come from `systemd-run --user --scope` when the
   host has a systemd user manager whose controllers are delegated. The launcher proves that
   once, by starting a scope and reading the limits the kernel reports for it; a limit it did not
   see applied is not counted. Otherwise memory is `RLIMIT_AS` per process, there is no `pids`
   limit and no CPU quota, and **every result says so** (`LimitsReport.unenforced`, with the reason
   in `detail`). The container and CI have no user manager, so they run the rlimit path; the scope
   path is tested against a stand-in for `systemd-run` there (it cannot show a kernel enforcing the
-  limits), and on the target (S26) the scope is expected.
+  limits), and on the target (S27) the scope is expected; its real verification is #73. The probe is repeated
+  every 60 s while the plan has no scope, and the scope is run by the absolute path of the
+  `systemd-run` the probe ran.
 - **Failure.** A program that fails is a result. A sandbox that could not be set up (a mount
   source gone, a program that does not exist, user namespaces refused, a scope that cannot be
   started) raises `SandboxLaunchError` with bwrap's own message and runs nothing: there is no
@@ -188,8 +197,14 @@ shell, voice or `gi` (section 10).
   read-only bind of a directory that holds a Unix socket still allows `connect()` to it from the
   sandbox (#15); the policy core's deny rules (S16) keep the broker, runtime and display sockets'
   directories from being granted, and S15 adds the seccomp and Landlock denials. Memory is per
-  process without a scope, so a program that starts many processes multiplies it, and nothing
-  bounds the disk a program writes to its workspace beyond the per-file limit.
+  process without a scope, so a program that starts many processes multiplies it; `memfd` and
+  SysV shared memory are not address space of the process and escape `RLIMIT_AS` (the scope's
+  memory limit covers them; without one, the open-file limit and the wall clock are what bound
+  them); a fork bomb is bounded only by `RLIMIT_NPROC` and the wall clock without a scope;
+  nothing bounds the disk a program writes to its workspace beyond the per-file limit; and the
+  program inherits the launcher's session keyring until S15 (#15). S17 must refuse, on the
+  target, runs on a host that lacks the pids or memory-total limit; these and the other gaps are
+  tracked in #74.
 
 ## 3. Request flow
 

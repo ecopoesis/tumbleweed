@@ -41,6 +41,9 @@ TMPFS_TARGET: Final = "/tmp"  # noqa: S108
 MAX_PATH_BYTES: Final = 4096
 MAX_NAME_BYTES: Final = 255
 MAX_GRANTS: Final = 64
+# A NixOS runtime is a store closure: Python with Pillow and numpy is 80 to 150 store paths, each
+# one a mount. 512 leaves room for a larger one and is still a bound.
+MAX_RUNTIME_MOUNTS: Final = 512
 MAX_INPUTS: Final = 64
 MAX_ARGS: Final = 256
 MAX_ARG_BYTES: Final = 32 * 1024
@@ -309,7 +312,7 @@ class RuntimeSpec:
     symlinks: tuple[RuntimeSymlink, ...] = ()
 
     def __post_init__(self) -> None:
-        mounts = _require_tuple(self.mounts, MountPath, "runtime mounts", 64)
+        mounts = _require_tuple(self.mounts, MountPath, "runtime mounts", MAX_RUNTIME_MOUNTS)
         symlinks = _require_tuple(self.symlinks, RuntimeSymlink, "runtime symlinks", 16)
         homes = _home_directories()
         targets = [*mounts, *(link.link for link in symlinks)]
@@ -430,9 +433,17 @@ class SandboxPolicy:
         grants = _require_tuple(self.grants, GrantMount, "grants", MAX_GRANTS)
         if len({mount.connection for mount in inputs}) != len(inputs):
             raise InvalidPolicyError("two inputs name the same connection")
-        targets = [grant.target for grant in grants]
-        if len(set(targets)) != len(targets):
-            raise InvalidPolicyError("two grants have the same target")
+        # No grant may be inside another (or the same). bwrap makes the mount point of an inner
+        # one by walking the outer's live directory, which the program can write to: a symlink
+        # it plants there (`/oldroot/...` is how bwrap itself reaches the host) would make bwrap
+        # create a directory outside every grant. The broker keeps its grants apart (S17).
+        for index, grant in enumerate(grants):
+            for other in grants[index + 1 :]:
+                if overlaps(grant.target, other.target):
+                    raise InvalidPolicyError(
+                        f"grants {grant.target!r} and {other.target!r} overlap: a grant may not "
+                        "be the same as, or inside, another"
+                    )
         for grant in grants:
             for runtime_target in self.runtime.targets:
                 if overlaps(grant.target, runtime_target):

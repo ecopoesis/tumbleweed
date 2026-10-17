@@ -6,6 +6,7 @@ it, so that a program failing for another reason cannot pass for a limit that wo
 
 import asyncio
 import contextlib
+import os
 import resource
 import shutil
 import signal
@@ -27,6 +28,7 @@ from tests.sandbox.procs import (
 from tests.sandbox.support import PYTHON, Opened, grant, opened, policy, run_sandbox
 from tumbleweed.core.types import ByteCount
 from tumbleweed.sandbox.errors import InvalidPolicyError, SandboxLaunchError
+from tumbleweed.sandbox.limits import kernel_counts_processes_per_namespace
 from tumbleweed.sandbox.policy import GrantAccess, SandboxLimits
 from tumbleweed.sandbox.result import LimitKind, LimitsBackend, LimitsReport, Termination
 from tumbleweed.sandbox.runner import SandboxRunner
@@ -59,8 +61,8 @@ class TestWallClock:
 
         assert result.termination is Termination.TIMED_OUT
         assert result.exit_code is None
-        assert 1.0 <= time.monotonic() - started < 6.0
-        assert 1.0 <= result.wall_time.total_seconds() < 6.0
+        assert 1.0 <= time.monotonic() - started < 3.0  # on time: the wall clock and 2 s of slack
+        assert 1.0 <= result.wall_time.total_seconds() < 3.0
         assert wait_until_none(mark, 3.0) == []
 
     def test_the_control_the_same_program_finishes_inside_the_wall_clock(
@@ -108,9 +110,12 @@ class TestWallClock:
         )
         limits = SandboxLimits(wall_time=timedelta(seconds=1))
 
+        started = time.monotonic()
+
         result = run_sandbox(policy(workspace, PYTHON, "-c", code, limits=limits))
 
         assert result.termination is Termination.TIMED_OUT
+        assert time.monotonic() - started < 3.0
         assert wait_until_none(mark, 3.0) == []
 
 
@@ -319,6 +324,75 @@ class TestCpuAndFiles:
         assert result.stdout == b"/tmp ENOSPC True\n/dev/shm ENOSPC True\n"
 
 
+class TestProcessesAndFiles:
+    FORK = (
+        "import os, time\n"
+        "kids = []\n"
+        "try:\n"
+        "    for _ in range(300):\n"
+        "        pid = os.fork()\n"
+        "        if pid == 0:\n"
+        "            time.sleep(10)\n"
+        "            os._exit(0)\n"
+        "        kids.append(pid)\n"
+        "    print('forked', len(kids))\n"
+        "except OSError as exc:\n"
+        "    print('stopped', len(kids), exc.errno)\n"
+        "for kid in kids:\n"
+        "    os.kill(kid, 9)\n"
+    )
+
+    @pytest.fixture(autouse=True)
+    def need_a_kernel_with_per_namespace_process_counts(self) -> None:
+        if not kernel_counts_processes_per_namespace(os.uname().release):
+            pytest.skip("RLIMIT_NPROC counts the user's other processes before Linux 5.14")
+
+    def test_without_a_scope_a_fork_bomb_stops_near_the_pids_limit(self, workspace: Opened) -> None:
+        limits = SandboxLimits(pids=20, wall_time=timedelta(seconds=30))
+
+        result = run_sandbox(policy(workspace, PYTHON, "-c", self.FORK, limits=limits))
+
+        word, count, errno_ = result.stdout.decode().split()
+        assert (word, errno_) == ("stopped", "11")  # EAGAIN
+        assert 20 <= int(count) < 60
+
+    def test_the_control_a_larger_limit_lets_the_same_program_fork_them_all(
+        self, workspace: Opened
+    ) -> None:
+        limits = SandboxLimits(pids=1000, wall_time=timedelta(seconds=30))
+
+        result = run_sandbox(policy(workspace, PYTHON, "-c", self.FORK, limits=limits))
+
+        assert result.stdout == b"forked 300\n"
+
+    def test_the_hosts_own_processes_are_not_counted_against_the_sandbox(
+        self, workspace: Opened
+    ) -> None:
+        # The limit is per user namespace, so a busy desktop does not stop a small sandbox.
+        limits = SandboxLimits(pids=8)
+
+        result = run_sandbox(policy(workspace, "/bin/sh", "-c", "echo a | cat", limits=limits))
+
+        assert result.stdout == b"a\n"
+
+    def test_open_files_are_limited_per_process(self, workspace: Opened) -> None:
+        code = (
+            "import os\n"
+            "fds = []\n"
+            "try:\n"
+            "    for _ in range(1000):\n"
+            "        fds.append(os.open('/dev/null', os.O_RDONLY))\n"
+            "    print('opened', len(fds))\n"
+            "except OSError as exc:\n"
+            "    print('stopped', len(fds), exc.errno)\n"
+        )
+
+        result = run_sandbox(policy(workspace, PYTHON, "-c", code))
+
+        assert result.stdout.startswith(b"stopped 25")  # 256 less the three standard streams
+        assert result.stdout.endswith(b" 24\n")  # EMFILE
+
+
 class TestReport:
     def test_without_a_scope_the_result_says_which_limits_are_missing(
         self, workspace: Opened
@@ -388,6 +462,25 @@ class TestScopeWrapper:
         assert not any(arg.startswith("--as") for arg in rest), "the scope limits memory"
         assert rest[rest.index("--") + 1].endswith("bwrap")
         assert "--unshare-all" in rest
+
+    def test_a_default_runner_runs_the_systemd_run_it_found_on_its_path_by_that_path(
+        self, workspace: Opened, fake: FakeSystemd, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The scoped child has no PATH: it must be given the absolute path the probe used, not a
+        # bare name it would look up in the default one (where there may be no systemd-run).
+        monkeypatch.setenv("PATH", f"{fake.directory}:{os.environ['PATH']}")
+        fake.canned(ALL_LIMITS)
+
+        result = asyncio.run(SandboxRunner().run(policy(workspace, "/bin/echo", "scoped")))
+
+        assert result.stdout == b"scoped\n"
+        assert result.limits.backend is LimitsBackend.SYSTEMD_SCOPE
+        probe, run = fake.calls()
+        assert any(arg.startswith("--property=MemoryMax=") for arg in probe)
+        assert "--scope" in run
+        assert "/bin/echo" in run
+        log = (fake.directory / "calls.log").read_text()
+        assert log.count("--call--") == 2, "the probe and the run both reached the stand-in"
 
     def test_a_scope_without_memory_still_limits_address_space(
         self, workspace: Opened, fake: FakeSystemd

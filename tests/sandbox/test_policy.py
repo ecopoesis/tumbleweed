@@ -384,19 +384,42 @@ class TestSandboxPolicy:
         with pytest.raises(InvalidPolicyError, match="an entry of grants"):
             policy_with(workspace, grants=("/etc",))
 
-    def test_two_grants_may_not_share_a_target(self, workspace: Opened) -> None:
-        mounts = tuple(grant(Path("/data"), GrantAccess.READ, workspace) for _ in range(2))
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ("/data", "/data"),
+            ("/data", "/data/sub"),
+            ("/data/sub", "/data"),
+            ("/data/a/b/c", "/data/a"),
+        ],
+    )
+    def test_no_grant_may_be_the_same_as_or_inside_another(
+        self, workspace: Opened, first: str, second: str
+    ) -> None:
+        mounts = (
+            grant(Path(first), GrantAccess.READ, workspace),
+            grant(Path(second), GrantAccess.WRITE, workspace),
+        )
 
-        with pytest.raises(InvalidPolicyError, match="same target"):
+        with pytest.raises(InvalidPolicyError, match="overlap"):
             policy_with(workspace, grants=mounts)
 
-    def test_a_grant_may_be_inside_another_grant(self, workspace: Opened) -> None:
+    def test_siblings_with_a_common_prefix_are_not_nested(self, workspace: Opened) -> None:
         mounts = (
-            grant(Path("/data"), GrantAccess.READ, workspace),
-            grant(Path("/data/sub"), GrantAccess.WRITE, workspace),
+            grant(Path("/data/a"), GrantAccess.READ, workspace),
+            grant(Path("/data/ab"), GrantAccess.READ, workspace),
         )
 
         assert len(policy_with(workspace, grants=mounts).grants) == 2
+
+    def test_the_runtime_may_name_as_many_mounts_as_a_store_closure_needs(
+        self, workspace: Opened
+    ) -> None:
+        mounts = tuple(MountPath(f"/nix/store/pkg-{n}") for n in range(512))
+
+        assert len(RuntimeSpec(mounts=mounts).mounts) == 512
+        with pytest.raises(InvalidPolicyError, match="at most 512"):
+            RuntimeSpec(mounts=(*mounts, MountPath("/nix/store/one-more")))
 
     @pytest.mark.parametrize("target", ["/usr", "/usr/share/x", "/etc/ld.so.cache", "/etc"])
     def test_a_grant_may_not_overlap_the_runtime(self, workspace: Opened, target: str) -> None:

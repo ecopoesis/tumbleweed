@@ -21,6 +21,7 @@ the ones the policy names; bwrap closes those before it executes the program.
 """
 
 import asyncio
+import dataclasses
 import io
 import json
 import logging
@@ -31,6 +32,7 @@ import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from datetime import timedelta
+from pathlib import Path
 from typing import Final, final
 
 from tumbleweed.core.errors import excerpt
@@ -42,13 +44,20 @@ from tumbleweed.sandbox.errors import (
     SandboxUnavailable,
     SandboxUnsupported,
 )
-from tumbleweed.sandbox.limits import LimitsPlan, prlimit_argv, probe_scope, scope_argv
+from tumbleweed.sandbox.limits import (
+    LimitsPlan,
+    kernel_counts_processes_per_namespace,
+    prlimit_argv,
+    probe_scope,
+    scope_argv,
+)
 from tumbleweed.sandbox.policy import SandboxPolicy
 from tumbleweed.sandbox.process import kill_and_reap
 from tumbleweed.sandbox.result import SandboxResult, Termination
 
 log = logging.getLogger(__name__)
 
+REPROBE_SECONDS: Final = 60.0
 _CHUNK: Final = 64 * 1024
 _STATUS_LIMIT: Final = 64 * 1024
 _DRAIN_SECONDS: Final = 2.0
@@ -56,6 +65,18 @@ _ERROR_EXCERPT_BYTES: Final = 512
 # What systemd-run needs to find the user's manager. It is the launcher's environment, not the
 # sandbox's: bwrap clears the latter.
 _USER_MANAGER_VARIABLES: Final = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+
+
+def _absolute(path: str) -> str:
+    return str(Path(path).absolute())
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+def _kernel_release() -> str:
+    return os.uname().release
 
 
 def _platform() -> str:
@@ -133,14 +154,28 @@ class SandboxRunner:
         self._systemd_run = systemd_run
         self._use_scope = use_systemd_scope
         self._plan: LimitsPlan | None = None
+        self._plan_at = 0.0
         self._plan_lock = asyncio.Lock()
 
     async def limits_plan(self) -> LimitsPlan:
-        """How limits are applied on this host. Probed on first use, then remembered."""
+        """How limits are applied on this host.
+
+        Probed on first use and remembered. A plan with a scope is kept; one without is probed
+        again after `REPROBE_SECONDS`, so that a user manager that was not up yet, or one probe
+        that failed, does not switch cgroup limits off for the life of the runner.
+        """
         async with self._plan_lock:
-            if self._plan is None:
+            stale = (
+                self._plan is not None
+                and not self._plan.scope
+                and self._use_scope
+                and _now() - self._plan_at >= REPROBE_SECONDS
+            )
+            if self._plan is None or stale:
+                previous = self._plan
                 self._plan = await self._probe()
-                if self._plan.unenforced:
+                self._plan_at = _now()
+                if self._plan.unenforced and (previous is None or previous.scope):
                     log.warning(
                         "sandbox limits not enforced on this host: %s (%s)",
                         ", ".join(self._plan.unenforced),
@@ -149,15 +184,22 @@ class SandboxRunner:
             return self._plan
 
     async def _probe(self) -> LimitsPlan:
+        plan = await self._probe_scope()
+        return dataclasses.replace(
+            plan, pids_rlimit=kernel_counts_processes_per_namespace(_kernel_release())
+        )
+
+    async def _probe_scope(self) -> LimitsPlan:
         if not self._use_scope:
             return LimitsPlan(detail="the systemd scope is switched off")
-        systemd_run = self._systemd_run or shutil.which("systemd-run")
-        if systemd_run is None:
+        found = self._systemd_run or shutil.which("systemd-run")
+        if found is None:
             return LimitsPlan(detail="systemd-run is not installed")
         env = _user_manager_env()
         if "XDG_RUNTIME_DIR" not in env:
             return LimitsPlan(detail="no user session (XDG_RUNTIME_DIR is not set)")
-        return await probe_scope(systemd_run, env)
+        # Absolute, and the one every scoped run uses: the child has no PATH of its own.
+        return await probe_scope(_absolute(found), env)
 
     async def run(self, policy: SandboxPolicy) -> SandboxResult:
         """Run the policy's command to its end, its limits, or the wall-clock limit.
@@ -184,9 +226,7 @@ class SandboxRunner:
         with os.fdopen(read_fd, "rb", buffering=0) as status_file:
             try:
                 argv = [
-                    *scope_argv(
-                        plan, policy.limits, systemd_run=self._systemd_run or "systemd-run"
-                    ),
+                    *scope_argv(plan, policy.limits),
                     *prlimit_argv(plan, policy.limits, prlimit=prlimit),
                     bwrap,
                     *build_bwrap_argv(policy, status_fd=write_fd),

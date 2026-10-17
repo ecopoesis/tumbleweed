@@ -15,7 +15,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 LINT = "from importlinter.cli import lint_imports_command; lint_imports_command()"
 
-SANDBOX = "sandbox never imports broker, agent, shell, voice, ui.gtk or gi"
+SANDBOX = "sandbox never imports broker, agent, shell, voice, ui.gtk, gi or an LLM SDK"
 
 # (file to append to, the import to plant, the contract that must report BROKEN, and modules that
 # the copy needs for the import to mean something: ones that do not exist yet in this step's tree)
@@ -81,6 +81,9 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         SANDBOX,
         ("ui/gtk/__init__.py",),
     ),
+    "the sandbox imports the Anthropic SDK": ("sandbox/runner.py", "import anthropic", SANDBOX, ()),
+    "the sandbox imports the OpenAI SDK": ("sandbox/policy.py", "import openai", SANDBOX, ()),
+    "the sandbox imports LiteLLM": ("sandbox/limits.py", "import litellm", SANDBOX, ()),
     "the sandbox imports the shell's GTK window": (
         "sandbox/process.py",
         "import tumbleweed.shell.window",

@@ -549,29 +549,44 @@ class TestGrants:
 
         assert seen["read"] == {f"{directory}/f.txt": "via O_PATH"}
 
-    def test_a_nested_grant_overrides_its_parent_whatever_the_order(
+    def test_a_grant_inside_a_writable_grant_is_refused_so_a_planted_symlink_reaches_nothing(
         self, workspace: Opened, home_scratch: Path
     ) -> None:
-        parent = home_scratch / "parent"
-        (parent / "child").mkdir(parents=True)
-        (parent / "child" / "f.txt").write_text("child")
-        (parent / "p.txt").write_text("parent")
-        with opened(parent) as outer, opened(parent / "child") as inner:
+        # bwrap makes the mount point of an inner grant by walking the outer one's live
+        # directory, which the program can write to. A symlink planted there (`/oldroot` is how
+        # bwrap itself reaches the host while it builds the sandbox) would send that `mkdir`
+        # to the host, outside every grant. So no grant may sit inside another.
+        victim = home_scratch / "victim"
+        victim.mkdir()
+        outer = home_scratch / "outer"
+        outer.mkdir()
+        (outer / "oldroot").symlink_to(victim)  # what a sandbox that ran earlier left behind
+        with opened(outer) as outer_handle, opened(victim) as inner_handle:
             grants = (
-                grant(parent / "child", GrantAccess.WRITE, inner),
-                grant(parent, GrantAccess.READ, outer),
-            )
-            seen = report(
-                workspace,
-                payloads.ACCESS,
-                json.dumps({"write": [str(parent / "p.txt"), str(parent / "child" / "f.txt")]}),
-                grants=grants,
+                grant(outer, GrantAccess.WRITE, outer_handle),
+                grant(outer / "oldroot" / "planted", GrantAccess.READ, inner_handle),
             )
 
-        assert seen["write"] == {
-            str(parent / "p.txt"): "EROFS",
-            str(parent / "child" / "f.txt"): "ok",
-        }
+            with pytest.raises(InvalidPolicyError, match="overlap"):
+                policy(workspace, "/bin/true", grants=grants)
+
+        assert list(victim.iterdir()) == []
+
+    def test_the_launcher_has_a_pipe_on_stdin_and_the_program_has_dev_null(
+        self, workspace_dir: Path
+    ) -> None:
+        # The program must not be able to read what the launcher's own stdin carries.
+        helper = subprocess.run(  # noqa: S603  (our own interpreter and module)
+            [sys.executable, "-m", "tests.sandbox.helper_stdin", str(workspace_dir)],
+            input="the launcher's own input",
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+        assert helper.returncode == 0, helper.stderr
+        assert helper.stdout == "/dev/null ''\n"
 
     def test_a_grant_inside_tmp_is_visible_and_the_rest_of_tmp_is_not(
         self, workspace: Opened, tmp_path: Path

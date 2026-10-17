@@ -155,7 +155,7 @@ versions as soon as `regex` is. Break opportunities stay our own small set (the 
 U+200B), because `regex` has no line breaker and an over-inserted U+200B is harmless.
 
 
-## D11 — The sandbox's limits: `prlimit` between systemd-run and bwrap, and a proof that the scope works (2026-10-16, accepted)
+## D13 — The sandbox's limits: `prlimit` between systemd-run and bwrap, and a proof that the scope works (2026-10-16, accepted)
 
 **Context.** S14 needs CPU, memory, pids, file-size and time limits, with cgroup limits where the
 host has them and a reported fallback where it does not. Two choices were not obvious: how to set
@@ -173,8 +173,9 @@ user manager has no delegated controllers therefore says so instead of pretendin
 `child-pid` as soon as its namespaces exist (before any mount, so it proves nothing) and
 `exit-code` only once the program it started has ended, by exit or by signal. A run that ends
 without an `exit-code` is a `SandboxLaunchError` carrying bwrap's message.
-**Consequences.** The probe costs one scope per runner. The rlimit fallback has no total memory
-limit, no pids limit and no CPU quota (reported). Unlike the rest, the scope path cannot be run in
+**Consequences.** The probe costs one scope per runner, and one a minute while the host has none.
+The rlimit fallback has no total memory limit, no exact pids limit (an `RLIMIT_NPROC` approximation
+on kernels that count it per user namespace) and no CPU quota (reported). Unlike the rest, the scope path cannot be run in
 the container or in CI, where there is no user manager: its command lines and the probe's decision
-are unit-tested, the wrapper is exercised with a stand-in `systemd-run`, and S26's VM test is where
-the real thing runs.
+are unit-tested, the wrapper is exercised with a stand-in `systemd-run`, and S27's VM test is where
+the real thing runs (#73).

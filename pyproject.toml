@@ -246,7 +246,7 @@ forbidden_modules = ["gi"]
 # The launcher is confined code's jailer: it may not depend on whoever calls it (the broker builds
 # a SandboxPolicy and hands it over) nor on anything that holds model output or a display.
 [[tool.importlinter.contracts]]
-name = "sandbox never imports broker, agent, shell, voice, ui.gtk or gi (ARCHITECTURE section 10)"
+name = "sandbox never imports broker, agent, shell, voice, ui.gtk, gi or an LLM SDK (ARCHITECTURE section 10)"
 type = "forbidden"
 source_modules = ["tumbleweed.sandbox"]
 forbidden_modules = [
@@ -256,4 +256,7 @@ forbidden_modules = [
     "tumbleweed.voice",
     "tumbleweed.ui.gtk",
     "gi",
+    "anthropic",
+    "openai",
+    "litellm",
 ]

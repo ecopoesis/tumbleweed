@@ -13,6 +13,7 @@ have them. The wrapper command lines are pure functions, unit-tested on every OS
 """
 
 import asyncio
+import dataclasses
 import logging
 import sys
 from dataclasses import dataclass
@@ -24,6 +25,11 @@ from tumbleweed.sandbox.process import kill_and_reap
 from tumbleweed.sandbox.result import LimitKind, LimitsBackend, LimitsReport
 
 log = logging.getLogger(__name__)
+
+MAX_OPEN_FILES: Final = 256
+"""Descriptors per process: bounds sockets, pipes and memfds, which `RLIMIT_AS` does not count."""
+NPROC_SLACK: Final = 16
+"""Processes of the sandbox's own (bwrap's init and helpers) on top of the program's `pids`."""
 
 _PROBE_MEMORY: Final = 256 * 1024 * 1024
 _PROBE_TASKS: Final = 64
@@ -54,6 +60,10 @@ class LimitsPlan:
     scope_memory: bool = False
     scope_pids: bool = False
     scope_cpu: bool = False
+    systemd_run: str | None = None
+    """The absolute path the probe ran, and the only one a scoped run may use."""
+    pids_rlimit: bool = False
+    """Also bound processes with `RLIMIT_NPROC` (counted per user namespace since Linux 5.14)."""
     detail: str | None = None
 
     @property
@@ -77,11 +87,16 @@ class LimitsPlan:
         return LimitsReport(backend=backend, unenforced=self.unenforced, detail=self.detail)
 
 
-def scope_argv(plan: LimitsPlan, limits: SandboxLimits, *, systemd_run: str) -> list[str]:
-    """`systemd-run` and its properties, ending in `--`; empty when the plan has no scope."""
+def scope_argv(plan: LimitsPlan, limits: SandboxLimits) -> list[str]:
+    """`systemd-run` and its properties, ending in `--`; empty when the plan has no scope.
+
+    The program is the one the probe ran, by absolute path: the child has no `PATH` to find
+    another by, and a different one is not the one that was shown to work.
+    """
     if not plan.scope:
         return []
-    argv = [systemd_run, "--user", "--scope", "--quiet"]
+    assert plan.systemd_run is not None  # noqa: S101  (a plan with a scope always names it)
+    argv = [plan.systemd_run, "--user", "--scope", "--quiet"]
     if plan.scope_memory:
         argv += [f"--property=MemoryMax={int(limits.memory)}", "--property=MemorySwapMax=0"]
     if plan.scope_pids:
@@ -100,11 +115,34 @@ def prlimit_argv(plan: LimitsPlan, limits: SandboxLimits, *, prlimit: str) -> li
     """
     cpu = limits.cpu_seconds
     size = int(limits.file_size)
-    argv = [prlimit, f"--cpu={cpu}:{cpu}", f"--fsize={size}:{size}", "--core=0:0"]
+    argv = [
+        prlimit,
+        f"--cpu={cpu}:{cpu}",
+        f"--fsize={size}:{size}",
+        "--core=0:0",
+        f"--nofile={MAX_OPEN_FILES}:{MAX_OPEN_FILES}",
+    ]
+    if plan.pids_rlimit and not (plan.scope and plan.scope_pids):
+        processes = limits.pids + NPROC_SLACK
+        argv.append(f"--nproc={processes}:{processes}")
     if plan.address_space:
         memory = int(limits.memory)
         argv.append(f"--as={memory}:{memory}")
     return [*argv, "--"]
+
+
+def kernel_counts_processes_per_namespace(release: str) -> bool:
+    """Whether `RLIMIT_NPROC` is counted per user namespace here (Linux 5.14 and later).
+
+    Before that it counts every process of the uid, so a limit low enough to matter would stop
+    the user's own processes (and bwrap's first fork) on a busy desktop.
+    """
+    parts = release.split(".")[:2]
+    try:
+        major, minor = (int("".join(c for c in part if c.isdigit()) or "x") for part in parts)
+    except ValueError:
+        return False
+    return (major, minor) >= (5, 14)
 
 
 def parse_probe(output: str) -> LimitsPlan:
@@ -171,7 +209,10 @@ async def probe_scope(systemd_run: str, env: dict[str, str]) -> LimitsPlan:
     if proc.returncode != 0:
         reason = excerpt(err[:_PROBE_OUTPUT_BYTES].decode("utf-8", errors="replace").strip())
         return LimitsPlan(detail=f"systemd-run --user --scope failed ({proc.returncode}): {reason}")
-    plan = parse_probe(out[:_PROBE_OUTPUT_BYTES].decode("utf-8", errors="replace"))
+    plan = dataclasses.replace(
+        parse_probe(out[:_PROBE_OUTPUT_BYTES].decode("utf-8", errors="replace")),
+        systemd_run=systemd_run,
+    )
     if not (plan.scope_memory or plan.scope_pids or plan.scope_cpu):
         return LimitsPlan(detail="a systemd scope starts here but applies none of the limits")
     log.info("systemd scope limits seen applied: %s", plan)
