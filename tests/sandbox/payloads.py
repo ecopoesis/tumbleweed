@@ -198,11 +198,11 @@ out["request"] = outcome(
 print(json.dumps(out))
 """
 
-# What a unix socket can do: connect to the stream and datagram listeners whose paths are argv[1]
-# and argv[2], by every way there is to get a socket, and what still works.
+# What a unix socket can do: connect to the stream, datagram and seqpacket listeners whose paths
+# are argv[1], argv[2] and argv[3], by every way there is to get a socket, and what still works.
 UNIX_SOCKETS = """
 import asyncio, errno, json, socket, sys
-stream_path, dgram_path = sys.argv[1:3]
+stream_path, dgram_path, seqpacket_path = sys.argv[1:4]
 out = {}
 def attempt(label, action):
     try:
@@ -230,6 +230,11 @@ def stream_pair_reconnect():
     with first, second:
         first.connect(stream_path)
     return "connected"
+def seqpacket_pair_reconnect():
+    first, second = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    with first, second:
+        first.connect(seqpacket_path)
+    return "connected"
 def stream_pair_works():
     first, second = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     with first, second:
@@ -251,6 +256,7 @@ for label, action in [
     ("connect_dgram", connect_dgram),
     ("pair_then_connect", pair_then_connect),
     ("stream_pair_reconnect", stream_pair_reconnect),
+    ("seqpacket_pair_reconnect", seqpacket_pair_reconnect),
     ("stream_pair_works", stream_pair_works),
     ("seqpacket_pair_works", seqpacket_pair_works),
     ("event_loop", event_loop),

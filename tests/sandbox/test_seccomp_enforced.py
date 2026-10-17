@@ -245,20 +245,33 @@ class TestKeyring:
 
 
 @contextmanager
-def listeners() -> Iterator[tuple[Path, Path, socket.socket, socket.socket]]:
-    """A stream and a datagram unix socket in a directory the sandbox will be granted."""
+def listeners() -> Iterator[tuple[Path, Path, Path, socket.socket, socket.socket]]:
+    """A stream, a datagram and a seqpacket unix socket in a directory the sandbox is granted."""
     directory = Path(tempfile.mkdtemp(prefix="tw-s15-"))
     stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     dgram = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    seqpacket = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
-        for sock, name in ((stream, "stream.sock"), (dgram, "dgram.sock")):
+        for sock, name in (
+            (stream, "stream.sock"),
+            (dgram, "dgram.sock"),
+            (seqpacket, "seqpacket.sock"),
+        ):
             sock.bind(str(directory / name))
             sock.setblocking(False)
         stream.listen(4)
-        yield directory / "stream.sock", directory / "dgram.sock", stream, dgram
+        seqpacket.listen(4)
+        yield (
+            directory / "stream.sock",
+            directory / "dgram.sock",
+            directory / "seqpacket.sock",
+            stream,
+            dgram,
+        )
     finally:
         stream.close()
         dgram.close()
+        seqpacket.close()
         shutil.rmtree(directory, ignore_errors=True)
 
 
@@ -278,7 +291,7 @@ def received(stream: socket.socket, dgram: socket.socket) -> dict[str, bool]:
 
 class TestUnixSockets:
     def run(self, workspace: Opened, *, hardened: bool) -> tuple[Report, dict[str, bool]]:
-        with listeners() as (stream_path, dgram_path, stream, dgram):
+        with listeners() as (stream_path, dgram_path, seqpacket_path, stream, dgram):
             # Read-only, as in the issue: a read-only bind of the directory still lets a
             # program connect to a socket in it.
             with closing(Opened(stream_path.parent)) as handle:
@@ -289,6 +302,7 @@ class TestUnixSockets:
                     payloads.UNIX_SOCKETS,
                     str(stream_path),
                     str(dgram_path),
+                    str(seqpacket_path),
                     grants=grants,
                 )
             return seen, received(stream, dgram)
@@ -320,8 +334,13 @@ class TestUnixSockets:
         assert seen["seqpacket_pair_works"] == "ok"
         assert seen["event_loop"] == "ok"  # asyncio wakes itself through a stream socketpair
         assert seen["tcp_socket"] == "ok"  # other families are not this filter's business
-        # A connected pair cannot be pointed at another address.
+        # A connected pair cannot be pointed at another address, in the namespaces alone either:
+        # that is why the filter leaves them.
         assert seen["stream_pair_reconnect"] == "EISCONN"
+        assert seen["seqpacket_pair_reconnect"] == "EISCONN"
+        control, _ = self.run(workspace, hardened=False)
+        assert control["stream_pair_reconnect"] == "EISCONN"
+        assert control["seqpacket_pair_reconnect"] == "EISCONN"
 
 
 class TestOtherAbis:
