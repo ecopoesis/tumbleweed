@@ -257,7 +257,7 @@ is covered with a fake credentials provider.
 
 `tumbleweed.sandbox` ([ARCHITECTURE: Sandbox launcher](docs/ARCHITECTURE.md)) runs one argv list in
 bubblewrap: no network, only its workspace and what it was granted, hard limits. It is a library
-for the broker (S17) and has no command of its own yet. Its policy and bubblewrap argument builder
+for the broker (below) and has no command of its own. Its policy and bubblewrap argument builder
 are tested on every OS; running a sandbox needs Linux, so on a Mac use the container:
 
 ```sh
@@ -298,13 +298,34 @@ The first lines of a pytest run say whether the `TUMBLEWEED_CI` guard is active.
 ### Broker policy core
 
 `src/tumbleweed/broker` is the decision logic behind every grant (ARCHITECTURE section 7), as
-pure code with no daemon, IPC or storage yet (S17 builds those on it): capabilities, grant
+pure code with no daemon, IPC or storage (the daemon, below, is built on it): capabilities, grant
 scopes, the static deny rules with the ancestor rule, sticky taint, the write gate, and the
 path handling (`ResolvedPath` when deciding, `StoredPath` and a component-by-component open
 that follows no symlink when running). Its tests include property tests (hypothesis) that
 generate escape attempts. A few tests need a case-insensitive volume, which a Mac has and the
 Linux container does not (they skip there, with the reason), and the `openat2` ones need Linux
 (marked `linux`, run by `scripts/test-linux`); between them both ways of opening are covered.
+
+### Broker daemon
+
+`tumbleweed-broker` (`src/tumbleweed/broker`, [ARCHITECTURE: Broker daemon](docs/ARCHITECTURE.md),
+D17) serves tasks, grants, file access and sandbox runs over the IPC above. Nothing in the shell
+starts it yet (S19 wires it in); to try it by hand, in one terminal:
+
+```sh
+uv run tumbleweed-broker --no-landlock --allow-unenforced-limits   # a development host
+```
+
+and from Python, `BrokerConnector(socket_path, spawn=spawn_broker_process).connect()` returns a
+`BrokerClient` (starting the daemon if nobody is there). Until S18 there is nobody to ask, so every
+`request_grant` is denied and nothing can be granted: the tests give the daemon a scripted user.
+`--no-landlock` and `--allow-unenforced-limits` are for a development host only (Docker Desktop's
+kernel has no Landlock; the container and CI have no systemd user manager). Without them the daemon
+refuses runs on a host that cannot apply Landlock, the process limit and the total-memory limit,
+which is what the target needs, and it writes the setting to its audit log
+(`$XDG_DATA_HOME/tumbleweed/broker/audit.jsonl`, one JSON entry per decision, run and revocation).
+The tests that run a real sandbox through the daemon are marked `linux` (`scripts/test-linux`);
+the rest use a fake sandbox and run everywhere.
 
 ### UI spec
 

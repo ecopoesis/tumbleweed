@@ -354,6 +354,28 @@ class TestTheHostMustBeAbleToEnforceTheLimits:
 
         run(scenario)
 
+    def test_a_check_of_the_host_that_never_finishes_is_a_timeout_and_nothing_runs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("tumbleweed.broker.service._PROBE_WAIT", timedelta(milliseconds=200))
+
+        async def scenario() -> None:
+            sandbox = FakeSandbox()
+            sandbox.hang_plan = True
+            async with running(sandbox=sandbox, require_scope_limits=True) as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.run_in_sandbox(task, RunId.new(), COMMAND)
+
+                assert caught.value.reason == "timeout"
+                assert sandbox.policies == []
+                (refused,) = rig.audit_of(SandboxRun)
+                assert refused.reason == "limits_probe_timeout"
+
+        run(scenario)
+
     def test_a_host_that_enforces_both_runs_even_without_a_cpu_quota(self) -> None:
         async def scenario() -> None:
             sandbox = FakeSandbox()

@@ -18,7 +18,7 @@ What the file guarantees, and what it does not:
   before it starts, and `sandbox_run_result`, how it ended.
 - Not fsynced: an entry survives a crash of the broker, not a loss of power. Not tamper
   evident either: anything running as the user can edit the file (ARCHITECTURE section 8 puts
-  same-uid processes out of scope), and nothing rotates it (#TODO-FILED-IN-PR).
+  same-uid processes out of scope), and nothing rotates it (#82).
 - Bounded: an entry is at most `MAX_ENTRY_BYTES`, because every field is bounded. Text that
   came from outside (a model's reason, a path) is cut to its field's limit; the file is JSONL, so
   a newline in it is written as an escape and cannot start a second entry.

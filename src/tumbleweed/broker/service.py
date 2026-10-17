@@ -1109,8 +1109,12 @@ class BrokerService:
         """Refuse a run on a host that cannot enforce the limits the target requires (#74)."""
         if not self._config.require_scope_limits:
             return
-        async with asyncio.timeout(_PROBE_WAIT.total_seconds()):
-            plan = await self._sandbox.limits_plan()
+        try:
+            async with asyncio.timeout(_PROBE_WAIT.total_seconds()):
+                plan = await self._sandbox.limits_plan()
+        except TimeoutError:
+            self._audit_refused_run(request, "limits_probe_timeout")
+            raise _Refuse("timeout", "the host's limits could not be checked in time") from None
         missing = [
             kind for kind in plan.unenforced if kind in (LimitKind.PIDS, LimitKind.MEMORY_TOTAL)
         ]

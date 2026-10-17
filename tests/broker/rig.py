@@ -141,6 +141,7 @@ class FakeSandbox:
             scope=True, scope_memory=True, scope_pids=True, scope_cpu=True, systemd_run="/x"
         )
         self.hang = False
+        self.hang_plan = False
         self.started = asyncio.Event()
         self.cancelled = False
         self.plans_asked = 0
@@ -169,6 +170,8 @@ class FakeSandbox:
 
     async def limits_plan(self) -> LimitsPlan:
         self.plans_asked += 1
+        if self.hang_plan:
+            await asyncio.Event().wait()
         return self.plan
 
     async def aclose(self) -> None:
