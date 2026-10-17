@@ -607,7 +607,8 @@ alone and refused. A second server on a live path is refused and the first is no
   when that shell closes or starts another session, and one a killed shell left is deleted by the next
   shell's pruning; so an accidental second shell leaves nothing that could hide the real chat. An
   empty session the user made *is* kept (it restores as an empty chat: "New session", quit, start
-  gives an empty chat), but only the newest one: starting another session replaces it. Starting a
+  gives an empty chat), but only the newest one: starting another session (in any shell) deletes the empty user-started
+  ones that nobody holds. Starting a
   session deletes (in one write) up to 20 kept sessions beyond the newest 20, and up to 20
   auto-created empty ones, never one a shell holds. Only the newest 1000 sessions are looked at
   (`SCAN_WINDOW`).
@@ -620,11 +621,15 @@ alone and refused. A second server on a live path is refused and the first is no
   chain `tumbleweed/`, `shell/`, `chat.locks/` is opened component by component with
   `O_NOFOLLOW` and examined through each descriptor, and the files relative to them: a symlink,
   another owner, a non-regular file or a second hard link is **refused**; a mode other than
-  0700/0600 on something of ours is **repaired** and logged. SQLite opens the file by path itself
-  (a `/proc/self/fd/<n>` path would only be resolved to the plain one), so once it has, that path
-  is compared (device and inode) with the descriptor, as are the directory and the `-wal`, `-shm`
-  and `-journal` files, and a redirected ancestor is refused before anything is written; the
-  residual window is described in `history.files`. A file that is not ours is
+  0700/0600 on something of ours is **repaired** and logged. SQLite opens the file by path itself, resolves any symlink in it then and keeps the resolved
+  path (a `/proc/self/fd/<n>` path would only be resolved to the plain one). Straight after it
+  connects, and before anything is read or written, the shell reads that path (`PRAGMA
+  database_list`) and requires the file and directory there to be the ones it holds descriptors
+  for; the directory path, the file in it and the `-wal`, `-shm` and `-journal` files are
+  compared too, and SQLite's own moved-check then guards later writes to the database. A swap
+  before that check is refused with nothing written; the windows that remain (SQLite opening an
+  attacker's file in the instant before the check, side files created by path after it) are
+  described in `history.files`. A file that is not ours is
   checked, read-only, before it is switched to WAL or written to. SQLite runs in defensive mode
   with `ATTACH` off and limits on a value, a statement and an expression's depth; text is read as
   bytes and decoded strictly; every row is validated into a typed record, and a read refuses

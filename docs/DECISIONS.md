@@ -281,7 +281,7 @@ by activity among the kept ones that nobody holds, a kept session being one with
 made empty with "New session" (`user_started`, schema v2): "New session", quit, start gives an empty chat; the
 empty session a shell makes by itself is deleted when it closes or moves on (or reaped if its shell was
 killed), so an accidental second shell cannot hide the real chat; only the newest user-started empty session is
-kept. Only the newest 1000 sessions are looked at (`SCAN_WINDOW`), so a file of millions of rows costs what a
+kept (starting one deletes the others nobody holds, in any shell). Only the newest 1000 sessions are looked at (`SCAN_WINDOW`), so a file of millions of rows costs what a
 small one does. (3) *Bad files.* Refuse what is not ours (a symlink, another owner,
 not a regular file, a foreign or newer database) and run without history; repair the mode of what is ours;
 if the newest session's rows are invalid, do not restore it and start a fresh one, leaving the data in place. Never

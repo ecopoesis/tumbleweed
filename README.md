@@ -196,8 +196,8 @@ holds the window for longer than that.
 
 **New session and quitting.** An empty session you made with the **New session** button is kept: it is the
 last session, so after you quit and start again the chat is empty (your old chat is still in the file, but is
-not shown: there is no session browser yet, #80). Only the one newest such session is kept, and one that got
-messages is an ordinary session. The empty session a shell makes by itself when it starts is not kept: it is
+not shown: there is no session browser yet, #80). Only the one newest such session is kept (starting another, in any shell, deletes the
+empty ones nobody is using), and one that got messages is an ordinary session. The empty session a shell makes by itself when it starts is not kept: it is
 deleted when that shell closes or starts another session, and one left by a shell that was killed is deleted
 by the next shell that starts a session.
 
