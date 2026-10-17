@@ -47,6 +47,17 @@ class Termination(StrEnum):
     """stdout or stderr went over its cap and the sandbox was killed."""
 
 
+class LandlockState(StrEnum):
+    """Whether the program ran under a Landlock ruleset."""
+
+    APPLIED = "applied"
+    UNAVAILABLE = "unavailable"
+    """The kernel has no usable Landlock. The program ran without it, which the policy allowed
+    (`require_landlock=False`: a dev kernel); with it required the run is refused instead."""
+    UNKNOWN = "unknown"
+    """The run was killed at a limit before the in-sandbox launcher reported."""
+
+
 _CONFIG = ConfigDict(strict=True, extra="forbid", frozen=True)
 
 
@@ -69,6 +80,25 @@ class LimitsReport(BaseModel):
 
 
 @final
+class HardeningReport(BaseModel):
+    """What the in-sandbox launcher applied beyond the mounts and the seccomp filter (S15, I3).
+
+    The seccomp filter is not reported: a run without it never starts. Landlock may be absent on a
+    dev host, and then the result says so, never leaving it to be inferred.
+    """
+
+    model_config = _CONFIG
+
+    landlock: LandlockState
+    landlock_abi: int | None = None
+    """The kernel's Landlock ABI version when it is applied."""
+    unix_socket_scope: bool = False
+    """Whether the ruleset also scopes abstract unix sockets (ABI 6, Linux 6.12)."""
+    detail: str | None = None
+    """Why there is no Landlock, when there is not."""
+
+
+@final
 class SandboxResult(BaseModel):
     """The outcome of a run that started. A sandbox that could not start raises instead."""
 
@@ -84,4 +114,5 @@ class SandboxResult(BaseModel):
     stderr_truncated: bool
     wall_time: timedelta
     limits: LimitsReport
+    hardening: HardeningReport
     max_output_bytes: ByteCount

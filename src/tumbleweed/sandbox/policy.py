@@ -31,12 +31,22 @@ from tumbleweed.sandbox.errors import InvalidPolicyError
 
 WORKSPACE_TARGET: Final = "/workspace"
 INPUTS_TARGET: Final = "/inputs"
+HELPER_TARGET: Final = "/tumbleweed-sandbox-exec"
+"""Where `tumbleweed-sandbox-exec` is put inside the sandbox (S15): bwrap makes this file."""
 # Paths of the sandbox that are not the policy's to hand out, nor anything inside them: bwrap makes
 # them itself, or (the workspace and inputs) a mount point inside would be created in the host's
-# directory. /tmp is the sandbox's own tmpfs: a grant may sit inside it (the mount point is made
-# in the tmpfs), but not replace it.
-RESERVED_TARGETS: Final = ("/proc", "/dev", "/sys", WORKSPACE_TARGET, INPUTS_TARGET)
+# directory. /tmp is the sandbox's own tmpfs and Landlock gives it write rights (S15), which a
+# grant inside it would inherit whatever its mount says, so none may be there.
 TMPFS_TARGET: Final = "/tmp"  # noqa: S108
+RESERVED_TARGETS: Final = (
+    "/proc",
+    "/dev",
+    "/sys",
+    WORKSPACE_TARGET,
+    INPUTS_TARGET,
+    HELPER_TARGET,
+    TMPFS_TARGET,
+)
 
 MAX_PATH_BYTES: Final = 4096
 MAX_NAME_BYTES: Final = 255
@@ -54,6 +64,14 @@ MAX_ENV_VALUE_BYTES: Final = 4096
 # Names that look like they carry a secret are refused whatever the allowlist says: the API key
 # must never reach a sandbox (I6), and a caller that put it on the allowlist by mistake is a bug.
 _SECRET_NAME: Final = re.compile(r"key|token|secret|passw|credential|auth|anthropic", re.IGNORECASE)
+# Names the dynamic loader and libc read to load code or change how it is loaded. The program
+# itself is confined, and the launcher runs without the policy's environment, so these cannot
+# reach the launcher; they are refused all the same, as defence in depth and because no program
+# of a sandbox needs them (a Nix runtime uses RPATH). `PYTHON*` is allowed: it is the program's
+# own business, and the launcher runs `python3 -I`, which ignores it.
+_LOADER_NAME: Final = re.compile(
+    r"LD_.*|MALLOC_.*|GCONV_PATH|LOCPATH|NLSPATH|GLIBC_TUNABLES|HOSTALIASES|RES_OPTIONS"
+)
 
 
 class OpenedDescriptor(Protocol):
@@ -85,6 +103,9 @@ class MountPath(PatternStr, pattern=rf"(?:/{_COMPONENT})+", expects="a normalise
     """
 
     __slots__ = ()
+
+
+DEFAULT_INTERPRETER: Final = MountPath("/usr/bin/python3")
 
 
 def check_mount_path(path: MountPath) -> None:
@@ -166,10 +187,6 @@ class GrantMount:
                     f"a grant's target {self.target!r} is, contains or is inside {reserved}, "
                     "which the sandbox builds itself"
                 )
-        if self.target == TMPFS_TARGET:
-            raise InvalidPolicyError(
-                f"a grant cannot replace {TMPFS_TARGET}, the sandbox's own tmpfs"
-            )
 
 
 @final
@@ -310,8 +327,17 @@ class RuntimeSpec:
 
     mounts: tuple[MountPath, ...]
     symlinks: tuple[RuntimeSymlink, ...] = ()
+    interpreter: MountPath = DEFAULT_INTERPRETER
+    """The Python that runs `tumbleweed-sandbox-exec` (stdlib only) inside the sandbox, as a path
+    in it. The program itself need not be Python. That the mounts provide it is not checked here:
+    when they do not, bwrap cannot start it and the run raises `SandboxLaunchError`."""
 
     def __post_init__(self) -> None:
+        check_mount_path(_require_type(self.interpreter, MountPath, "the runtime's interpreter"))
+        if not _is_runtime_path(self.interpreter):
+            raise InvalidPolicyError(
+                f"the interpreter {self.interpreter!r} is not under a system program directory"
+            )
         mounts = _require_tuple(self.mounts, MountPath, "runtime mounts", MAX_RUNTIME_MOUNTS)
         symlinks = _require_tuple(self.symlinks, RuntimeSymlink, "runtime symlinks", 16)
         homes = _home_directories()
@@ -410,6 +436,10 @@ class SandboxPolicy:
       empty one; a variable whose name is not on the allowlist, or that looks like a secret, is
       refused rather than dropped.
     - `limits`: see `SandboxLimits`.
+    - `require_landlock`: refuse to run (`SandboxUnavailable`) when the kernel has no Landlock,
+      which is what the target needs: a sandbox there that silently lost a layer would be a
+      weaker one nobody chose. A dev kernel without it (Docker Desktop's, #44) sets this false,
+      and each result then records that no Landlock was applied (`SandboxResult.hardening`).
 
     There is no network option: a sandbox never has one in S14, and S22 adds it as its own
     field.
@@ -423,9 +453,11 @@ class SandboxPolicy:
     grants: tuple[GrantMount, ...] = ()
     env: tuple[EnvVar, ...] = ()
     env_allowlist: frozenset[EnvName] = frozenset()
+    require_landlock: bool = True
 
     def __post_init__(self) -> None:
         self._check_command()
+        _require_type(self.require_landlock, bool, "require_landlock")
         descriptor_number(self.workspace, "the workspace")
         _require_type(self.runtime, RuntimeSpec, "runtime")
         _require_type(self.limits, SandboxLimits, "limits")
@@ -481,7 +513,14 @@ class SandboxPolicy:
                 raise InvalidPolicyError(
                     f"{name} looks like a secret and cannot be on the allowlist"
                 )
+            if _LOADER_NAME.fullmatch(name):
+                raise InvalidPolicyError(
+                    f"{name} changes how programs are loaded and cannot be on the allowlist"
+                )
         names = [var.name for var in env]
+        for name in names:
+            if _LOADER_NAME.fullmatch(name):
+                raise InvalidPolicyError(f"{name} changes how programs are loaded: refused")
         if len(set(names)) != len(names):
             raise InvalidPolicyError("the environment sets a variable twice")
         for name in names:

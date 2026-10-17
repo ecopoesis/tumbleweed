@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import platform
+import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -12,6 +14,7 @@ from typing import final
 from pydantic import JsonValue
 
 from tumbleweed.core.ids import ConnectionId
+from tumbleweed.sandbox.bwrap import build_bwrap_argv, descriptors_to_pass
 from tumbleweed.sandbox.policy import (
     EnvName,
     EnvVar,
@@ -26,9 +29,16 @@ from tumbleweed.sandbox.policy import (
 )
 from tumbleweed.sandbox.result import SandboxResult
 from tumbleweed.sandbox.runner import SandboxRunner
+from tumbleweed.sandbox.sandbox_exec import landlock_abi
 
 O_PATH = getattr(os, "O_PATH", 0o10000000)  # Linux only, and the same on every architecture
 PYTHON = "/usr/bin/python3"  # the system Python the runtime mounts; the venv's is under $HOME
+
+
+def landlock_available() -> bool:
+    """Whether the kernel running these tests has Landlock (`False` anywhere but Linux)."""
+    # platform, not sys.platform: mypy would take the latter for a fact and flag the rest.
+    return platform.system() == "Linux" and landlock_abi()[0] is not None
 
 
 class Opened:
@@ -88,8 +98,14 @@ def policy(
     inputs: tuple[InputMount, ...] = (),
     variables: tuple[EnvVar, ...] = (),
     allowlist: frozenset[EnvName] = frozenset(),
+    require_landlock: bool | None = None,
 ) -> SandboxPolicy:
-    """A policy over the system runtime (`merged_usr`), with the defaults of everything else."""
+    """A policy over the system runtime (`merged_usr`), with the defaults of everything else.
+
+    `require_landlock` defaults to whether this kernel has Landlock: Docker Desktop's does not
+    (#44), so the tests that are not about Landlock run there without it, and wherever the kernel
+    has it (CI) they run with it required, so none can pass by quietly running without.
+    """
     return SandboxPolicy(
         command=command,
         workspace=workspace,
@@ -99,6 +115,7 @@ def policy(
         inputs=inputs,
         env=variables,
         env_allowlist=allowlist,
+        require_landlock=landlock_available() if require_landlock is None else require_landlock,
     )
 
 
@@ -120,6 +137,43 @@ def sandboxed_python(
     """Run `python3 -c code args...` in a sandbox over the system runtime and wait for it."""
     made = policy(workspace, PYTHON, "-c", code, *args, limits=limits, grants=grants, inputs=inputs)
     return run_sandbox(made)
+
+
+def namespaces_only(
+    sandbox_policy: SandboxPolicy, *, timeout: float = 60.0
+) -> subprocess.CompletedProcess[bytes]:
+    """Run the policy in bubblewrap's namespaces and mounts alone: no seccomp, no Landlock.
+
+    What S14 proved about the mounts and namespaces is a property of those layers, and S15 adds
+    more on top: a test of a lower layer would pass vacuously if a higher one refused first (a
+    socket that cannot be created cannot be connected). So those tests look at the layer by itself.
+    """
+    argv = ["bwrap", *build_bwrap_argv(sandbox_policy)]
+    return subprocess.run(  # noqa: S603  (argv list, no shell)
+        argv,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        env={},
+        pass_fds=descriptors_to_pass(sandbox_policy),
+        timeout=timeout,
+        check=False,
+    )
+
+
+def report_namespaces_only(
+    workspace: "Opened",
+    code: str,
+    *args: str,
+    grants: tuple[GrantMount, ...] = (),
+    inputs: tuple[InputMount, ...] = (),
+) -> "Report":
+    """`report`, in the namespaces alone (see `namespaces_only`)."""
+    made = policy(workspace, PYTHON, "-c", code, *args, grants=grants, inputs=inputs)
+    done = namespaces_only(made)
+    assert done.returncode == 0, done.stderr.decode(errors="replace")
+    loaded: object = json.loads(done.stdout)
+    assert isinstance(loaded, dict)
+    return Report(loaded)
 
 
 @final

@@ -36,6 +36,7 @@ COVERED_FIELDS = {
     "grants": "TestGrants",
     "env": "TestEnvironment",
     "env_allowlist": "TestEnvironment",
+    "require_landlock": "tests/sandbox/test_hardening.py::TestPolicyFields",
 }
 
 
@@ -170,13 +171,18 @@ class TestRuntime:
         self, workspace: Opened, tmp_path: Path
     ) -> None:
         with opened(tmp_path) as handle:
-            made = policy(workspace, "true", grants=(grant(tmp_path, GrantAccess.WRITE, handle),))
+            made = policy(
+                workspace,
+                "true",
+                grants=(grant(tmp_path, GrantAccess.WRITE, handle, target="/granted"),),
+            )
 
             argv = build_bwrap_argv(made)
 
         sources = [source for source, _ in operations(argv, "--ro-bind", 2)]
         assert sources == list(made.runtime.mounts)
         assert not any(word.startswith(str(Path.home())) for word in argv)
+        assert str(tmp_path) not in argv  # a grant is a descriptor and a target, never a path
 
     def test_a_policy_without_runtime_mounts_mounts_nothing_from_the_host(
         self, workspace: Opened

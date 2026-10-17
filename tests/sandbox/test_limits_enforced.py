@@ -454,8 +454,8 @@ class TestScopeWrapper:
             made = policy(
                 workspace,
                 "/bin/cat",
-                f"{granted}/f.txt",
-                grants=(grant(granted, GrantAccess.READ, handle),),
+                "/granted/f.txt",
+                grants=(grant(granted, GrantAccess.READ, handle, target="/granted"),),
             )
 
             result = asyncio.run(SandboxRunner(systemd_run=str(fake.path)).run(made))

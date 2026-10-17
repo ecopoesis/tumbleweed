@@ -5,6 +5,7 @@ listener on loopback), shows that the host can reach it, and then shows that the
 A test that only looked for something that is not there would pass vacuously.
 """
 
+import fcntl
 import json
 import os
 import shutil
@@ -30,6 +31,7 @@ from tests.sandbox.support import (
     opened,
     policy,
     report,
+    report_namespaces_only,
     run_sandbox,
     sandboxed_python,
 )
@@ -121,7 +123,9 @@ class TestRunning:
     def test_a_program_that_does_not_exist_is_a_launch_error_with_bwrap_saying_why(
         self, workspace: Opened
     ) -> None:
-        with pytest.raises(SandboxLaunchError, match=r"did not start.*execvp /no/such/program"):
+        with pytest.raises(
+            SandboxLaunchError, match=r"did not start.*/no/such/program: No such file"
+        ):
             run_sandbox(policy(workspace, "/no/such/program"))
 
     def test_a_runtime_mount_that_vanished_is_a_launch_error(self, workspace: Opened) -> None:
@@ -262,7 +266,10 @@ class TestNetwork:
         with listening(name.replace("@", "\0", 1), family=socket.AF_UNIX):
             assert host_can_connect(name.replace("@", "\0", 1), socket.AF_UNIX)
 
-            seen = report(workspace, payloads.VISIBILITY, "[]", json.dumps([name]), "[]")
+            # In the namespaces alone: with seccomp on, the socket cannot even be made (EPERM).
+            seen = report_namespaces_only(
+                workspace, payloads.VISIBILITY, "[]", json.dumps([name]), "[]"
+            )
 
         assert seen["connect"] == {name: "ECONNREFUSED"}
         assert name[1:] not in str(seen["proc_net_unix"])
@@ -301,7 +308,7 @@ class TestHostSockets:
             for address in [*map(str, paths), *abstract]:
                 assert host_can_connect(address.replace("@", "\0", 1), socket.AF_UNIX), address
 
-            seen = report(
+            seen = report_namespaces_only(
                 workspace,
                 payloads.VISIBILITY,
                 json.dumps([str(path) for path in paths] + [str(runtime), str(x11), "/run"]),
@@ -363,7 +370,9 @@ class TestHome:
             "/media",
         ]
 
-        seen = report(
+        # The namespaces alone: Landlock leaves `/` and `/etc` unlistable, which would hide
+        # whether the mounts do.
+        seen = report_namespaces_only(
             workspace,
             payloads.ACCESS,
             json.dumps({"read": probes, "list": [str(home), "/", "/etc", str(home.parent)]}),
@@ -382,7 +391,7 @@ class TestHome:
     def test_the_root_holds_only_the_runtime_and_the_sandboxs_own_directories(
         self, workspace: Opened
     ) -> None:
-        seen = report(workspace, payloads.SELF)
+        seen = report_namespaces_only(workspace, payloads.SELF)
 
         assert set(map(str, seen.items("root"))) <= {
             "bin",
@@ -459,10 +468,18 @@ class TestGrants:
                 ],
                 "mkdir": [str(tree["ro_dir"] / "d"), str(tree["rw_dir"] / "d")],
                 "unlink": [str(tree["ro_dir"] / "a.txt"), str(tree["rw_dir"] / "c.txt")],
-                "list": [str(home_scratch), str(tree["ro_dir"]), str(tree["other"])],
+                "list": [str(tree["ro_dir"]), str(tree["other"])],
             }
 
             seen = report(workspace, payloads.ACCESS, json.dumps(spec), grants=grants)
+            # The directories between `/` and the grants are made by bwrap and are in no
+            # Landlock rule, so only the namespaces alone can show what they hold.
+            parents = report_namespaces_only(
+                workspace,
+                payloads.ACCESS,
+                json.dumps({"list": [str(home_scratch)]}),
+                grants=grants,
+            )
 
         read = seen.mapping("read")
         assert read[str(tree["ro_dir"] / "a.txt")] == "photo"
@@ -494,7 +511,12 @@ class TestGrants:
         }
         listing = seen.mapping("listing")
         # The parent of the grants shows the granted names and nothing else of the host's.
-        assert listing[str(home_scratch)] == ["journal.txt", "notes.txt", "photos", "scratch"]
+        assert parents.mapping("listing")[str(home_scratch)] == [
+            "journal.txt",
+            "notes.txt",
+            "photos",
+            "scratch",
+        ]
         assert listing[str(tree["ro_dir"])] == ["a.txt", "sub"]
         assert listing[str(tree["other"])] == "ENOENT"
         # And the host agrees on what changed: the writes through the writable grants landed,
@@ -533,6 +555,32 @@ class TestGrants:
 
         assert seen["read"] == {f"{granted}/mine.txt": "the directory that was granted"}
 
+    def test_a_grant_descriptor_above_the_open_file_limit_is_still_mounted(
+        self, workspace: Opened, tmp_path: Path
+    ) -> None:
+        # The sandbox runs under `--nofile=256`; a descriptor numbered above it is inherited all
+        # the same, since the limit stops new descriptors and does not close old ones.
+        (tmp_path / "f.txt").write_text("high")
+
+        class At:
+            def __init__(self, number: int) -> None:
+                self.fd = number
+
+        with opened(tmp_path) as handle:
+            high = fcntl.fcntl(handle.fd, fcntl.F_DUPFD_CLOEXEC, 300)
+            try:
+                assert high >= 300
+                seen = report(
+                    workspace,
+                    payloads.ACCESS,
+                    json.dumps({"read": ["/granted/f.txt"]}),
+                    grants=(grant(tmp_path, GrantAccess.READ, At(high), target="/granted"),),
+                )
+            finally:
+                os.close(high)
+
+        assert seen["read"] == {"/granted/f.txt": "high"}
+
     def test_a_path_descriptor_opened_with_o_path_is_mounted_too(
         self, workspace: Opened, home_scratch: Path
     ) -> None:
@@ -549,13 +597,15 @@ class TestGrants:
 
         assert seen["read"] == {f"{directory}/f.txt": "via O_PATH"}
 
-    def test_a_grant_inside_a_writable_grant_is_refused_so_a_planted_symlink_reaches_nothing(
+    def test_a_grant_inside_a_writable_grant_is_a_policy_refusal_and_bwrap_never_runs(
         self, workspace: Opened, home_scratch: Path
     ) -> None:
-        # bwrap makes the mount point of an inner grant by walking the outer one's live
-        # directory, which the program can write to. A symlink planted there (`/oldroot` is how
-        # bwrap itself reaches the host while it builds the sandbox) would send that `mkdir`
-        # to the host, outside every grant. So no grant may sit inside another.
+        # This tests the policy, not bubblewrap: the refusal comes before any process exists, and
+        # the victim directory is untouched because nothing ran. bwrap makes the mount point of
+        # an inner grant by walking the outer one's live directory, which the program can write
+        # to. A symlink planted there (`/oldroot` is how bwrap itself reaches the host while it
+        # builds the sandbox) would send that `mkdir` to the host, outside every grant. So no
+        # grant may sit inside another.
         victim = home_scratch / "victim"
         victim.mkdir()
         outer = home_scratch / "outer"
@@ -588,22 +638,22 @@ class TestGrants:
         assert helper.returncode == 0, helper.stderr
         assert helper.stdout == "/dev/null ''\n"
 
-    def test_a_grant_inside_tmp_is_visible_and_the_rest_of_tmp_is_not(
+    def test_a_grant_inside_tmp_is_refused_and_the_hosts_tmp_is_not_visible(
         self, workspace: Opened, tmp_path: Path
     ) -> None:
+        # The sandbox's /tmp is its own tmpfs, which Landlock lets a program write to, so a grant
+        # inside it would be writable by Landlock's rules whatever its mount says: none may be.
         granted = tmp_path / "granted"
         granted.mkdir()
-        (granted / "f.txt").write_text("in tmp")
         (tmp_path / "sibling.txt").write_text("also in tmp")
         with opened(granted) as handle:
+            with pytest.raises(InvalidPolicyError, match="builds itself"):
+                grant(granted, GrantAccess.READ, handle)
             seen = report(
-                workspace,
-                payloads.ACCESS,
-                json.dumps({"read": [f"{granted}/f.txt", f"{tmp_path}/sibling.txt"]}),
-                grants=(grant(granted, GrantAccess.READ, handle),),
+                workspace, payloads.ACCESS, json.dumps({"read": [f"{tmp_path}/sibling.txt"]})
             )
 
-        assert seen["read"] == {f"{granted}/f.txt": "in tmp", f"{tmp_path}/sibling.txt": "ENOENT"}
+        assert seen["read"] == {f"{tmp_path}/sibling.txt": "ENOENT"}
 
     def test_the_grants_descriptors_are_not_open_in_the_program(
         self, workspace: Opened, home_scratch: Path
@@ -642,10 +692,13 @@ class TestGrants:
                     {
                         "read": [f"/inputs/{connection}/out.txt", str(produced / "out.txt")],
                         "write": [f"/inputs/{connection}/out.txt", f"/inputs/{connection}/new.txt"],
-                        "list": ["/inputs"],
                     }
                 ),
                 inputs=(mount,),
+            )
+            # `/inputs` is made by bwrap and is in no Landlock rule: the namespaces alone show it.
+            parents = report_namespaces_only(
+                workspace, payloads.ACCESS, json.dumps({"list": ["/inputs"]}), inputs=(mount,)
             )
 
         assert seen["read"] == {
@@ -656,7 +709,7 @@ class TestGrants:
             f"/inputs/{connection}/out.txt": "EROFS",
             f"/inputs/{connection}/new.txt": "EROFS",
         }
-        assert seen["listing"] == {"/inputs": [str(connection)]}
+        assert parents["listing"] == {"/inputs": [str(connection)]}
         assert (produced / "out.txt").read_text() == "from the earlier task"
 
     def test_two_inputs_do_not_see_each_other(self, workspace: Opened, tmp_path: Path) -> None:
@@ -755,14 +808,18 @@ class TestConfinement:
 
         seen = report(workspace, payloads.ACCESS, json.dumps(spec))
 
-        assert seen["write"] == {
+        written = dict(seen.mapping("write"))
+        proc = written.pop("/proc/new")
+        assert written == {
             "/new": "EROFS",
             "/usr/new": "EROFS",
             "/etc/new": "EROFS",
             "/dev/new": "EROFS",
-            "/proc/new": "ENOENT",
             "/workspace/ok": "ok",
         }
+        # procfs has no such entry (ENOENT); under Landlock, which gives /proc no right to create
+        # files, creating it is refused first (EACCES). Either way it was not made.
+        assert proc in {"ENOENT", "EACCES"}
         assert set(seen.mapping("mkdir").values()) == {"EROFS"}
 
     def test_only_the_python_runtime_is_there_to_run(self, workspace: Opened) -> None:

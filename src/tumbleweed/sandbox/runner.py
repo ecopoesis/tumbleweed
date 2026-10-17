@@ -18,9 +18,17 @@ call `run` from a thread that ends before the run does.
 
 The launcher passes the sandbox no environment of its own (`--clearenv`) and no descriptor beyond
 the ones the policy names; bwrap closes those before it executes the program.
+
+S15: bwrap also loads the seccomp filter (`tumbleweed.sandbox.seccomp`) and runs
+`tumbleweed-sandbox-exec` first, which applies Landlock and then runs the policy's command
+(`tumbleweed.sandbox.hardening`). It reports on a pipe the program never holds. A run whose launcher
+refused (Landlock required and absent, `no_new_privs` or the filter missing) raises and never ran
+the program; a run that reached the program says in `SandboxResult.hardening` whether Landlock was
+applied.
 """
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -43,6 +51,13 @@ from tumbleweed.sandbox.errors import (
     SandboxUnavailable,
     SandboxUnsupported,
 )
+from tumbleweed.sandbox.hardening import (
+    MAX_REPORT_BYTES,
+    HardeningFds,
+    LauncherReport,
+    helper_source,
+    parse_report,
+)
 from tumbleweed.sandbox.limits import (
     LimitsPlan,
     prlimit_argv,
@@ -51,7 +66,13 @@ from tumbleweed.sandbox.limits import (
 )
 from tumbleweed.sandbox.policy import SandboxPolicy
 from tumbleweed.sandbox.process import kill_and_reap
-from tumbleweed.sandbox.result import SandboxResult, Termination
+from tumbleweed.sandbox.result import (
+    HardeningReport,
+    LandlockState,
+    SandboxResult,
+    Termination,
+)
+from tumbleweed.sandbox.seccomp import filter_program, memfd_with
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +171,7 @@ class SandboxRunner:
         self._plan: LimitsPlan | None = None
         self._plan_at = 0.0
         self._plan_lock = asyncio.Lock()
+        self._warned = False
 
     async def limits_plan(self) -> LimitsPlan:
         """How limits are applied on this host.
@@ -180,9 +202,12 @@ class SandboxRunner:
     async def _probe(self) -> LimitsPlan:
         if not self._use_scope:
             return LimitsPlan(detail="the systemd scope is switched off")
-        found = self._systemd_run or shutil.which("systemd-run")
+        # A bare name is looked up on PATH, never against the current directory: the probe and
+        # every scoped run use the absolute path found here.
+        wanted = self._systemd_run or "systemd-run"
+        found = wanted if Path(wanted).is_absolute() else shutil.which(wanted)
         if found is None:
-            return LimitsPlan(detail="systemd-run is not installed")
+            return LimitsPlan(detail=f"{wanted} is not installed")
         env = _user_manager_env()
         if "XDG_RUNTIME_DIR" not in env:
             return LimitsPlan(detail="no user session (XDG_RUNTIME_DIR is not set)")
@@ -192,12 +217,14 @@ class SandboxRunner:
     async def run(self, policy: SandboxPolicy) -> SandboxResult:
         """Run the policy's command to its end, its limits, or the wall-clock limit.
 
-        Raises `SandboxUnsupported` off Linux, `SandboxUnavailable` when bwrap or prlimit is
-        missing (nothing is ever run without them), `InvalidPolicyError` for a descriptor that is
+        Raises `SandboxUnsupported` off Linux, `SandboxUnavailable` when bwrap, prlimit or
+        libseccomp is missing or the policy requires Landlock and the kernel has none (nothing is
+        ever run without the filter, or without Landlock when it is required),
+        `InvalidPolicyError` for a descriptor that is
         closed or of the wrong kind, and `SandboxLaunchError` when the sandbox could not be set up
         and the program never started (a mount source that is gone, a program that does not exist
-        in the sandbox). A program that fails is a result, not an error. A run that is killed at
-        a limit before bwrap reports on the program is a result too.
+        in the sandbox, a launcher that refused). A program that fails is a result, not an error.
+        A run that is killed at a limit before bwrap reports on the program is a result too.
         """
         if not _platform().startswith("linux"):
             raise SandboxUnsupported(f"sandboxes need Linux namespaces; this host is {_platform()}")
@@ -208,16 +235,28 @@ class SandboxRunner:
         if prlimit is None:
             raise SandboxUnavailable("prlimit (util-linux) is not installed")
         policy.check_descriptors()
+        program = filter_program()  # raises SandboxUnavailable: nothing runs without the filter
         plan = await self.limits_plan()
-        # os.pipe makes both ends close-on-exec; only the write end is passed on, by number.
-        read_fd, write_fd = os.pipe()
-        with os.fdopen(read_fd, "rb", buffering=0) as status_file:
+        # Descriptors only the child needs: closed here once it has been started, or failed to.
+        child_ends: list[int] = []
+        with contextlib.ExitStack() as files:
             try:
+                status_file, status_fd = _pipe()
+                files.enter_context(status_file)
+                child_ends.append(status_fd)
+                report_file, report_fd = _pipe()
+                files.enter_context(report_file)
+                child_ends.append(report_fd)
+                fds = HardeningFds(
+                    seccomp=_child_memfd(child_ends, "tumbleweed-seccomp", program),
+                    helper=_child_memfd(child_ends, "tumbleweed-sandbox-exec", helper_source()),
+                    report=report_fd,
+                )
                 argv = [
                     *scope_argv(plan, policy.limits),
                     *prlimit_argv(plan, policy.limits, prlimit=prlimit),
                     bwrap,
-                    *build_bwrap_argv(policy, status_fd=write_fd),
+                    *build_bwrap_argv(policy, status_fd=status_fd, hardening=fds),
                 ]
                 started_at = time.monotonic()
                 proc = await asyncio.create_subprocess_exec(
@@ -226,20 +265,22 @@ class SandboxRunner:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=_user_manager_env() if plan.scope else {},
-                    pass_fds=[*descriptors_to_pass(policy), write_fd],
+                    pass_fds=[*descriptors_to_pass(policy), *child_ends],
                 )
             except OSError as exc:
                 raise SandboxLaunchError(
                     f"cannot start the sandbox: {exc.strerror or type(exc).__name__}"
                 ) from None
             finally:
-                os.close(write_fd)
-            return await self._supervise(proc, status_file, policy, plan, started_at)
+                for number in child_ends:
+                    os.close(number)
+            return await self._supervise(proc, status_file, report_file, policy, plan, started_at)
 
     async def _supervise(
         self,
         proc: asyncio.subprocess.Process,
         status_file: io.FileIO,
+        report_file: io.FileIO,
         policy: SandboxPolicy,
         plan: LimitsPlan,
         started_at: float,
@@ -295,6 +336,10 @@ class SandboxRunner:
                 await asyncio.shield(kill_and_reap(proc))
         if termination is Termination.EXITED and not status.ran:
             raise SandboxLaunchError(_launch_failure(proc.returncode, err.data))
+        launcher = parse_report(_read_report(report_file))
+        hardening = self._hardening(
+            launcher, termination, proc.returncode, err.data, policy.require_landlock
+        )
         return SandboxResult(
             termination=termination,
             exit_code=exit_code,
@@ -304,8 +349,85 @@ class SandboxRunner:
             stderr_truncated=err.truncated,
             wall_time=timedelta(seconds=time.monotonic() - started_at),
             limits=plan.report(),
+            hardening=hardening,
             max_output_bytes=ByteCount(cap),
         )
+
+    def _hardening(
+        self,
+        launcher: LauncherReport,
+        termination: Termination,
+        returncode: int | None,
+        stderr: bytearray,
+        require_landlock: bool,
+    ) -> HardeningReport:
+        """What the in-sandbox launcher reported, or the error that says the program never ran."""
+        if launcher.refused is not None:
+            message = f"the sandbox refused to run the program: {launcher.refused}"
+            if launcher.landlock_missing:
+                raise SandboxUnavailable(f"{message} (set require_landlock=False on a dev kernel)")
+            raise SandboxLaunchError(message)
+        if launcher.exec_error is not None:
+            raise SandboxLaunchError(f"the sandbox did not start: cannot run {launcher.exec_error}")
+        if launcher.hardening is None:
+            if termination is Termination.EXITED:
+                # Not even the launcher got to report: Python or a module of it is missing.
+                raise SandboxLaunchError(_launch_failure(returncode, stderr))
+            return HardeningReport(
+                landlock=LandlockState.UNKNOWN,
+                detail="the run ended before the in-sandbox launcher reported",
+            )
+        if require_landlock and launcher.hardening.landlock is not LandlockState.APPLIED:
+            # The launcher refuses on its own when told Landlock is required: this is the
+            # launcher's report checked, not trusted.
+            raise SandboxUnavailable(
+                "Landlock is required but the launcher did not apply it "
+                f"({launcher.hardening.landlock.value}): the run is not accepted"
+            )
+        if launcher.hardening.landlock is LandlockState.UNAVAILABLE and not self._warned:
+            self._warned = True
+            log.warning(
+                "sandbox runs without Landlock on this host: %s",
+                launcher.hardening.detail or "the kernel has none",
+            )
+        return launcher.hardening
+
+
+def _pipe() -> tuple[io.FileIO, int]:
+    """A pipe: its reading end as a file object that closes it, and the writing end's number."""
+    read_fd, write_fd = os.pipe()
+    try:
+        return os.fdopen(read_fd, "rb", buffering=0), write_fd
+    except BaseException:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise
+
+
+def _child_memfd(child_ends: list[int], name: str, data: bytes) -> int:
+    """A memfd of `data` for the child, recorded so that the caller closes it."""
+    number = memfd_with(name, data)
+    child_ends.append(number)
+    return number
+
+
+def _read_report(report_file: io.FileIO) -> bytes:
+    """What the launcher wrote, once the run is over: a few lines, already in the pipe.
+
+    Non-blocking, so that a pipe someone still holds open cannot stall the launcher: the writer
+    closed it at its `exec`, and everything in the sandbox is gone by now.
+    """
+    os.set_blocking(report_file.fileno(), False)
+    data = bytearray()
+    while len(data) < MAX_REPORT_BYTES:
+        try:
+            chunk = os.read(report_file.fileno(), MAX_REPORT_BYTES - len(data))
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        data += chunk
+    return bytes(data)
 
 
 def _user_manager_env() -> dict[str, str]:
