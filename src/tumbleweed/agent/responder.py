@@ -19,6 +19,10 @@ The conversation is one callback channel, not a return value:
 The protocol does not bound how long a reply may take. An implementation owes the shell its own
 limits (I9: tokens per turn, iterations, timeouts); the shell only cancels on window close.
 
+The request carries the conversation so far (`ReplyRequest.history`: finished exchanges, oldest
+first), which the shell builds from its transcript; a responder keeps no history of its own, and
+how much of it a model is sent is `tumbleweed.agent.context`'s decision.
+
 Text in events is untrusted (model output, provider error messages): consumers display it as
 plain text and bound it.
 """

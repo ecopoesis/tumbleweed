@@ -18,9 +18,16 @@ from tests.history.support import (
 )
 from tests.shell.fakes import ManualResponder
 from tumbleweed.agent.responder import ReplyDelta, ReplyFailed, ReplyFinished
-from tumbleweed.core.ids import SessionId
+from tumbleweed.core.ids import MessageId, SessionId
+from tumbleweed.core.types import ByteCount
 from tumbleweed.history.errors import HistoryBusyError, HistoryError, HistoryRefusedError
-from tumbleweed.history.records import NewMessage, StoredSession
+from tumbleweed.history.records import (
+    MessageRole,
+    NewMessage,
+    StoredMessage,
+    StoredSession,
+)
+from tumbleweed.history.records import MessageState as StoredState
 from tumbleweed.history.store import (
     NOT_RESTORED,
     RESTORE_BYTES,
@@ -315,7 +322,7 @@ class FakeHistory:
         self.new_sessions = 0
         self.closed = False
 
-    def begin(self, *, limit: int, max_bytes: int = RESTORE_BYTES) -> RestoredSession:
+    def begin(self, *, limit: int, max_bytes: ByteCount = RESTORE_BYTES) -> RestoredSession:
         if self._begin is not None:
             raise self._begin
         session = StoredSession.model_validate(
@@ -389,6 +396,19 @@ class TestTheHistoryIsOptional:
         rig.answer("a", "q")
         assert history.appended == []
 
+    def test_a_bug_while_restoring_does_not_stop_the_shell(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        history = FakeHistory(begin=RuntimeError("detail that must not be logged"))
+
+        with caplog.at_level(logging.ERROR):
+            rig = Rig(tmp_path, opener(history))
+
+        assert history.closed
+        assert "will not be saved" in rig.session.notice
+        assert "detail that must not" not in caplog.text
+        rig.answer("a", "q")
+
     def test_a_save_that_fails_says_so_once_and_stops_saving_this_session(
         self, tmp_path: Path
     ) -> None:
@@ -457,6 +477,63 @@ class TestTheHistoryIsOptional:
         rig = Rig(tmp_path, opener(Throws()))
 
         rig.session.close()  # does not raise
+
+
+class TestARestoreTheTranscriptRefuses:
+    def too_many(self) -> RestoredSession:
+        """A history that returns more than a transcript holds: validated, and still refused."""
+        session = StoredSession.model_validate(
+            {"id": SessionId.new(), "created_at": 1, "updated_at": 1}
+        )
+        messages = tuple(
+            StoredMessage.model_validate(
+                {
+                    "id": MessageId.new(),
+                    "session_id": session.id,
+                    "seq": seq,
+                    "task_id": None,
+                    "role": MessageRole.USER,
+                    "state": StoredState.COMPLETE,
+                    "text": "x",
+                    "error": None,
+                    "created_at": 1,
+                }
+            )
+            for seq in range(1, MAX_MESSAGES + 2)
+        )
+        return RestoredSession(session, messages, None)
+
+    def test_a_fresh_session_is_started_and_the_chat_says_so(self, tmp_path: Path) -> None:
+        class Overfull(FakeHistory):
+            def begin(self, *, limit: int, max_bytes: ByteCount = RESTORE_BYTES) -> RestoredSession:
+                return TestARestoreTheTranscriptRefuses().too_many()
+
+        history = Overfull()
+
+        rig = Rig(tmp_path, opener(history))
+
+        assert rig.transcript.messages == ()
+        assert history.new_sessions == 1  # the unusable session was let go
+        assert "could not be restored" in rig.session.notice
+        assert rig.session.saving
+        rig.answer("fine", "q")
+        assert [m.text for m in history.appended] == ["q", "fine"]
+
+    def test_and_if_the_history_then_fails_it_is_given_up(self, tmp_path: Path) -> None:
+        class Overfull(FakeHistory):
+            def begin(self, *, limit: int, max_bytes: ByteCount = RESTORE_BYTES) -> RestoredSession:
+                return TestARestoreTheTranscriptRefuses().too_many()
+
+            def new_session(self) -> StoredSession:
+                raise HistoryBusyError("The chat history is in use by another shell; try again.")
+
+        history = Overfull()
+
+        rig = Rig(tmp_path, opener(history))
+
+        assert history.closed
+        assert "will not be saved" in rig.session.notice
+        assert not rig.session.saving
 
 
 class TestABadStoredSession:

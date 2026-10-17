@@ -134,6 +134,10 @@ class ChatSession:
         except HistoryError as exc:
             self._give_up(exc)
             return
+        except Exception as exc:  # noqa: BLE001  (restoring is a boundary: the shell must start)
+            logger.error("the chat history could not be restored: %s", type(exc).__name__)
+            self._give_up(HistoryError("The chat history could not be read."))
+            return
         notice = restored.notice or ""
         try:
             self._transcript.replace(tuple(_transcript_message(m) for m in restored.messages))
