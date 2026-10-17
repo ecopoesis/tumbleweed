@@ -39,6 +39,7 @@ import json
 import os
 import socket
 import stat
+import struct
 import sys
 from pathlib import Path
 from typing import Final, NoReturn
@@ -119,11 +120,6 @@ class _RulesetAttr(ctypes.Structure):
         ("handled_access_net", ctypes.c_uint64),
         ("scoped", ctypes.c_uint64),
     )
-
-
-class _PathBeneathAttr(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = (("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32))
 
 
 def handled_access(abi: int) -> int:
@@ -235,7 +231,9 @@ def _add_rule(ruleset: int, kind: str, path: str, abi: int) -> None:
         allowed = rights(kind, abi)
         if not stat.S_ISDIR(os.fstat(fd).st_mode):
             allowed &= _FILE_RIGHTS
-        beneath = _PathBeneathAttr(allowed, fd)
+        # struct landlock_path_beneath_attr { __u64 allowed_access; __s32 parent_fd; } is packed
+        # (12 bytes), which `struct` says without a ctypes layout that Python 3.14 deprecates.
+        beneath = ctypes.create_string_buffer(struct.pack("=Qi", allowed, fd))
         added = _syscall(
             _SYS_LANDLOCK_ADD_RULE,
             ctypes.c_int(ruleset),
