@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.shell.gtk_support import labels_in
 from tests.ui.gtk.support import labels_text, of_type, spec_of
 from tests.ui.runtime.support import flag, number, text
 from tests.ui.spec.support import Json
@@ -17,6 +18,7 @@ from tumbleweed.ui.spec.names import StateKey
 
 if TYPE_CHECKING:
     from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
     from tumbleweed.ui.gtk.context import BuildContext
     from tumbleweed.ui.spec.components import Component
     from tumbleweed.ui.spec.state import StateValue
@@ -243,3 +245,93 @@ class TestKindsThisStepDoesNotRenderYet:
         ]
         assert tool.widget_at("root.children[3].pages[0].content") is None
         assert isinstance(tool.widget_at("root.children[5]"), Gtk.Box)
+
+
+class TestStaleComputedValues:
+    """A computed value held back by the state budget is marked, not shown as if current (#10)."""
+
+    def budget_tool(self) -> "RenderedTool":
+        from tests.ui.spec.support import binary, computed, lit_str, ref, variadic
+        from tumbleweed.ui.gtk import RenderedTool
+
+        state: list[Json] = [text(f"b{i}", max_length=65536) for i in range(62)]
+        state += [
+            text("t", max_length=65536),
+            text("pad", max_length=65536),
+            {
+                **computed("c", "string", variadic("concat", ref("t"), lit_str("!")), ""),
+                "max_length": 65536,
+            },
+            {
+                "kind": "int",
+                "key": "p",
+                "default": 0,
+                "minimum": 0,
+                "maximum": 10,
+                "computed": {
+                    "kind": "if",
+                    "condition": binary("eq", ref("c"), lit_str("!")),
+                    "then": {"kind": "int", "value": 10},
+                    "otherwise": {"kind": "int", "value": 5},
+                },
+            },
+        ]
+        root: Json = {
+            "kind": "box",
+            "children": [
+                {"kind": "label", "bind": "c"},
+                {"kind": "progress", "bind": "p"},
+                {"kind": "heading", "bind": "c"},
+            ],
+        }
+        tool = RenderedTool(spec_of(root, state))
+        tool.runtime.patch_state({f"b{i}": "x" * 65536 for i in range(31)})
+        tool.runtime.patch_state({f"b{i}": "x" * 65536 for i in range(31, 62)})
+        tool.runtime.patch_state({"pad": "p" * 65535})
+        return tool
+
+    def test_a_stale_label_and_progress_bar_say_so_instead_of_showing_the_old_value(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk.text import TextBlock
+        from tumbleweed.ui.runtime import Origin
+
+        tool = self.budget_tool()
+        (bar,) = of_type(tool, Gtk.ProgressBar)
+        blocks = of_type(tool, TextBlock)
+        assert labels_text(tool) == ["!", "!"]
+        assert bar.get_fraction() == 1.0
+        assert "error" not in bar.get_css_classes()
+
+        tool.runtime.store.write(key("t"), "t" * 60000, origin=Origin.USER)
+
+        assert labels_text(tool) == ["Out of date", "Out of date"]
+        assert [block.stale for block in blocks] == [True, True]
+        assert all(
+            "error" in label.get_css_classes() for block in blocks for label in labels_in(block)
+        )
+        assert bar.get_show_text() is True
+        assert bar.get_text() == "Out of date"
+        assert bar.get_fraction() == 0.0
+        assert "error" in bar.get_css_classes()
+        assert tool.runtime.store.value(key("c")) == "!"  # the state still holds the old value
+
+    def test_the_mark_goes_when_the_value_can_be_computed_again(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk.text import TextBlock
+        from tumbleweed.ui.runtime import Origin
+
+        tool = self.budget_tool()
+        (bar,) = of_type(tool, Gtk.ProgressBar)
+        blocks = of_type(tool, TextBlock)
+        tool.runtime.store.write(key("t"), "t" * 60000, origin=Origin.USER)
+
+        tool.runtime.store.write(key("t"), "ab", origin=Origin.USER)
+
+        assert labels_text(tool) == ["ab!", "ab!"]
+        assert [block.stale for block in blocks] == [False, False]
+        assert all(
+            "error" not in label.get_css_classes() for block in blocks for label in labels_in(block)
+        )
+        assert bar.get_show_text() is False
+        assert bar.get_fraction() == 0.5
+        assert "error" not in bar.get_css_classes()

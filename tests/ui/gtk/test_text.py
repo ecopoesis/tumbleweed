@@ -233,6 +233,22 @@ class TestEntries:
 
         assert width(LONG_LINE) == width("") == width("x")
 
+    def test_a_long_value_does_not_change_the_size_an_entry_asks_for_either(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk import RenderedTool
+
+        state: list[Json] = [text("s", "", max_length=65536)]
+        tool = RenderedTool(spec_of({"kind": "entry", "bind": "s"}, state))
+        measure = (Gtk.Orientation.HORIZONTAL, -1)
+        empty = tool.widget.measure(*measure)[:2]
+
+        tool.runtime.patch_state({"s": "W" * 65534})
+        long_value = tool.widget.measure(*measure)[:2]
+        tool.runtime.patch_state({"s": "\u1100\u1161\u11a8" * 20000})
+        cluster = tool.widget.measure(*measure)[:2]
+
+        assert long_value == empty == cluster
+
 
 def present(shell: Shell) -> None:
     shell.window.present()

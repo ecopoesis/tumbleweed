@@ -269,7 +269,7 @@ def _slider(component: Slider, ctx: BuildContext) -> Gtk.Widget:
 
 def _spin(component: Spin, ctx: BuildContext) -> Gtk.Widget:
     key, numeric, adjustment = _numeric(component, ctx)
-    spin = Gtk.SpinButton.new(adjustment, numeric.step, numeric.digits)
+    spin = Gtk.SpinButton.new(adjustment, 1.0, numeric.digits)  # climb rate: GTK's usual
     spin.set_numeric(True)
     harden_text(spin)
     change = _event(component.on_change, component.kind, "change", key)
