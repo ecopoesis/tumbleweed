@@ -216,8 +216,9 @@ shell, voice or `gi` (section 10).
   `tumbleweed-sandbox-exec` (`tumbleweed.sandbox.sandbox_exec`, standard library only). bwrap puts
   its source at `/tumbleweed-sandbox-exec` (`--ro-bind-data`) and runs it with the runtime's own
   interpreter (`RuntimeSpec.interpreter`, `python3 -I -S`), so a runtime needs a Python even when
-  the program is not Python. It confirms `no_new_privs` and that the seccomp filter is loaded
-  (`Seccomp: 2`) and refuses otherwise, reads the environment bwrap built from
+  the program is not Python. It confirms `no_new_privs` and that the sandbox's seccomp filter is
+  loaded (`Seccomp: 2`, and a unix socket cannot be made, which only that filter stops) and
+  refuses otherwise, reads the environment bwrap built from
   `/proc/self/environ` (Python adds `LC_CTYPE` to its own), applies a Landlock ruleset, writes a
   report on a pipe that the `exec` closes (the program never holds it), and `exec`s the program.
   The ruleset is derived from the policy's mounts (`landlock_rules`), so the two cannot drift:

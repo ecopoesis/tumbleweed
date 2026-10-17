@@ -8,9 +8,10 @@ it as a script (`python3 -I -S`). So it uses the standard library only, nothing 
 In order, before the program gets control:
 
 1. Confirm what bwrap was asked to set up: `no_new_privs` is set (Landlock needs it, and it is
-   what stops a setuid binary from undoing the filter) and the seccomp filter is loaded
-   (`Seccomp: 2` in `/proc/self/status`). Without either it refuses, so a bwrap that silently
-   skipped `--seccomp` never runs a program.
+   what stops a setuid binary from undoing the filter) and the sandbox's seccomp filter is loaded
+   (`Seccomp: 2` in `/proc/self/status`, and a unix socket cannot be made, which only that filter
+   prevents). Without either it refuses, so a bwrap that silently skipped `--seccomp` never runs
+   a program.
 2. Read the environment bwrap built from `/proc/self/environ`. Python adds variables to its own
    (`LC_CTYPE`, from PEP 538), and the program must see exactly the policy's.
 3. Restrict the filesystem with Landlock to the paths named on the command line, which the
@@ -36,6 +37,7 @@ import ctypes
 import errno
 import json
 import os
+import socket
 import stat
 import sys
 from pathlib import Path
@@ -264,6 +266,19 @@ def _seccomp_mode() -> int | None:
     return None
 
 
+def _unix_sockets_are_denied() -> bool:
+    """Whether `socket(AF_UNIX)` fails with `EPERM`, which nothing but the sandbox's filter does.
+
+    `Seccomp: 2` says some filter is loaded, and a launcher run under another one (a container
+    runtime's) would pass that. This says it is ours.
+    """
+    try:
+        socket.socket(socket.AF_UNIX).close()
+    except OSError as exc:
+        return exc.errno == errno.EPERM
+    return False
+
+
 def _environment() -> dict[str, str]:
     """The environment this process was started with, as bwrap built it."""
     try:
@@ -328,6 +343,8 @@ def _confine(options: Options) -> dict[str, object]:
         raise Refused("no_new_privs is not set")
     if _seccomp_mode() != 2:
         raise Refused("the seccomp filter is not loaded")
+    if not _unix_sockets_are_denied():
+        raise Refused("the seccomp filter loaded is not the sandbox's: a unix socket can be made")
     abi, why = landlock_abi()
     if abi is None:
         if options.require_landlock:

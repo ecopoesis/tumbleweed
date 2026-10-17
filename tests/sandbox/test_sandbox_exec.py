@@ -7,6 +7,7 @@ the standard library only (it runs in a sandbox that has no `tumbleweed`), and i
 """
 
 import ast
+import ctypes
 import json
 import os
 import subprocess
@@ -175,17 +176,28 @@ def _own_status(field: str) -> str:
     raise AssertionError(field)
 
 
+def _load_filter_that_denies_nothing() -> None:
+    """Load a seccomp filter of another maker's: `Seccomp: 2`, and no rule of ours in it."""
+    lib = ctypes.CDLL("libseccomp.so.2", use_errno=True)
+    lib.seccomp_init.restype = ctypes.c_void_p
+    lib.seccomp_init.argtypes = [ctypes.c_uint32]
+    lib.seccomp_load.argtypes = [ctypes.c_void_p]
+    context = lib.seccomp_init(0x7FFF0000)  # SCMP_ACT_ALLOW
+    assert context
+    assert lib.seccomp_load(context) == 0
+
+
 def _launch(
-    argv: list[str], *, no_new_privs: bool
+    argv: list[str], *, no_new_privs: bool, foreign_filter: bool = False
 ) -> tuple[subprocess.CompletedProcess[bytes], bytes]:
     """Run the launcher on this host (not in a sandbox), and return it with its report."""
     read_fd, write_fd = os.pipe()
 
     def prepare() -> None:
         if no_new_privs:
-            import ctypes
-
             assert ctypes.CDLL(None).prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+        if foreign_filter:
+            _load_filter_that_denies_nothing()
 
     try:
         done = subprocess.run(  # noqa: S603  (our own interpreter and file)
@@ -238,6 +250,26 @@ class TestRefusals:
             "kind": "refused",
             "code": "setup",
             "reason": "the seccomp filter is not loaded",
+        }
+        assert not marker.exists()
+
+    def test_a_filter_that_is_not_the_sandboxs_does_not_pass_for_it(self, tmp_path: Path) -> None:
+        # `Seccomp: 2` is true under a container runtime's filter too: the launcher also tries
+        # the one thing only the sandbox's filter stops.
+        assert _own_status("Seccomp") == "0", "the test runner is under seccomp: cannot check"
+        marker = tmp_path / "ran"
+
+        done, report = _launch(
+            ["--", sys.executable, "-c", f"open({str(marker)!r}, 'w')"],
+            no_new_privs=True,
+            foreign_filter=True,
+        )
+
+        assert done.returncode == launcher.EXIT_REFUSED
+        assert json.loads(report) == {
+            "kind": "refused",
+            "code": "setup",
+            "reason": "the seccomp filter loaded is not the sandbox's: a unix socket can be made",
         }
         assert not marker.exists()
 
