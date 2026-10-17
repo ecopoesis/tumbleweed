@@ -3,6 +3,7 @@
 import asyncio
 import os
 import signal
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -188,6 +189,46 @@ async def environment_names(pid: int) -> set[str]:
         while not (data := await asyncio.to_thread(environ.read_bytes)):  # noqa: ASYNC110
             await asyncio.sleep(0.01)  # bounded: /proc fills in once the process has exec'd
     return {entry.split(b"=")[0].decode() for entry in data.split(b"\0") if entry}
+
+
+class TestWhatTheBrokerIsStartedWith:
+    def test_the_command_is_our_interpreter_and_the_environment_is_the_minimal_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorded: dict[str, object] = {}
+
+        async def fake(*argv: str, **kwargs: object) -> object:
+            recorded["argv"] = argv
+            recorded.update(kwargs)
+            return object()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
+        source = {
+            "HOME": "/home/u",
+            "PATH": "/usr/bin",
+            "XDG_RUNTIME_DIR": "/run/user/1",
+            "ANTHROPIC_API_KEY": "sk-not-for-the-broker",
+            "AWS_SECRET_ACCESS_KEY": "x",
+            "LD_PRELOAD": "/evil.so",
+            "SSH_AUTH_SOCK": "/tmp/ssh-x/agent.1",
+        }
+
+        run(lambda: spawn_broker_process(source, extra_args=("--no-landlock",)))
+
+        assert recorded["argv"] == (
+            sys.executable,
+            "-m",
+            "tumbleweed.broker.daemon",
+            "--no-landlock",
+        )
+        assert recorded["env"] == {
+            "HOME": "/home/u",
+            "PATH": "/usr/bin",
+            "XDG_RUNTIME_DIR": "/run/user/1",
+            "SSH_AUTH_SOCK": "/tmp/ssh-x/agent.1",
+        }
+        assert recorded["start_new_session"] is True  # it outlives a shell that restarts
+        assert "shell" not in recorded  # an argv list, never a shell line
 
 
 class TestTheDaemonAsAProcess:

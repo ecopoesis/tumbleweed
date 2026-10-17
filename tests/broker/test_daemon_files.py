@@ -2,6 +2,9 @@
 
 import asyncio
 import base64
+import json
+import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -11,6 +14,10 @@ from tests.broker.rig import Rig, running
 from tests.ipc.bounded import run
 from tumbleweed.broker.audit import FileAccess
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
+from tumbleweed.broker.deny import DenyRules
+from tumbleweed.broker.fdio import OpenedPath
+from tumbleweed.broker.paths import StoredPath
+from tumbleweed.broker.policy import open_granted
 from tumbleweed.core.ids import RunId, TaskId
 from tumbleweed.core.types import WorkspaceRelPath
 
@@ -238,6 +245,46 @@ class TestReadingUnderAGrant:
         run(scenario)
 
 
+class TestTheLargestAnswersFitAFrame:
+    """Every answer is bounded so that the biggest one still fits the 1 MiB of a frame (I9)."""
+
+    def test_a_read_of_the_most_a_request_may_ask_for(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await granted_task(rig, client)
+                data = bytes(range(256)) * 2048  # 512 KiB, every byte value, in base64
+                (rig.home / "Photos" / "max.bin").write_bytes(data)
+
+                content = await client.read_file(
+                    task, RunId.new(), str(rig.home / "Photos/max.bin")
+                )
+
+                assert decoded(content.data) == data
+
+        run(scenario)
+
+    def test_a_listing_of_the_most_entries_with_the_longest_names(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await granted_task(rig, client)
+                many = rig.home / "Photos" / "many"
+                many.mkdir()
+                for number in range(1001):
+                    (
+                        many / (f"{number:04}x" + "\u00e9" * 125)
+                    ).touch()  # 5 + 250 = 255 bytes, the most
+
+                listing = await client.list_dir(task, RunId.new(), str(many))
+
+                assert len(listing.entries) == 1000
+                assert listing.truncated
+                assert all(len(e.name.encode()) == 255 for e in listing.entries)
+
+        run(scenario)
+
+
 class TestOnceGrants:
     def test_a_once_grant_is_for_its_run_and_used_up_by_it(self) -> None:
         async def scenario() -> None:
@@ -300,6 +347,111 @@ class TestOnceGrants:
 
                 allowed = [e for e in rig.audit_of(FileAccess) if e.outcome == "allowed"]
                 assert [e.consumed for e in allowed] == [False, False]
+
+        run(scenario)
+
+
+class TestASwapAfterTheDecision:
+    """The decision saw one object; what is opened must be that object (S16: `expect=`)."""
+
+    def swap_after_opening_the_grant(
+        self, monkeypatch: pytest.MonkeyPatch, swap: Callable[[], None]
+    ) -> None:
+        real = open_granted
+
+        def opened_then_swapped(stored: StoredPath, *, rules: DenyRules) -> OpenedPath:
+            opened = real(stored, rules=rules)
+            swap()
+            return opened
+
+        monkeypatch.setattr("tumbleweed.broker.service.open_granted", opened_then_swapped)
+
+    def test_a_file_replaced_between_the_decision_and_the_open_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await granted_task(rig, client)
+                photo = rig.home / PHOTO
+
+                def swap() -> None:
+                    photo.rename(rig.home / "Photos" / "a.jpg.old")
+                    photo.write_text("FORGED")
+
+                self.swap_after_opening_the_grant(monkeypatch, swap)
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.read_file(task, RunId.new(), str(photo))
+
+                assert caught.value.reason == "unsafe"
+                assert "FORGED" not in str(caught.value)
+
+        run(scenario)
+
+    def test_a_directory_replaced_between_the_decision_and_the_open_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await granted_task(rig, client)
+                directory = rig.home / "Photos" / "2026"
+
+                def swap() -> None:
+                    directory.rename(rig.home / "Photos" / "2026.old")
+                    directory.mkdir()
+                    (directory / "forged.txt").touch()
+
+                self.swap_after_opening_the_grant(monkeypatch, swap)
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.list_dir(task, RunId.new(), str(directory))
+
+                assert caught.value.reason == "unsafe"
+
+        run(scenario)
+
+
+class TestWhatIsKeptOnRecord:
+    def test_the_consumption_of_a_once_grant_is_in_the_database_before_the_file_is_read(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+                bound = RunId.new()
+                rig.prompts.allow("once")
+                await client.request_read(task, bound, str(rig.home / "Photos"), "x")
+
+                await client.read_file(task, bound, str(rig.home / PHOTO))
+
+                database = sqlite3.connect(
+                    f"file:{rig.config.broker_directory / 'broker.sqlite3'}?mode=ro", uri=True
+                )
+                try:
+                    (record,) = database.execute("SELECT record FROM grants").fetchone()
+                finally:
+                    database.close()
+                assert json.loads(record)["consumed_by"] == str(bound)
+
+        run(scenario)
+
+    def test_the_taint_a_grant_brings_is_in_the_database(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                await granted_task(rig, client)
+
+                database = sqlite3.connect(
+                    f"file:{rig.config.broker_directory / 'broker.sqlite3'}?mode=ro", uri=True
+                )
+                try:
+                    (taint,) = database.execute("SELECT taint FROM tasks").fetchone()
+                finally:
+                    database.close()
+                assert taint == "fs"
 
         run(scenario)
 

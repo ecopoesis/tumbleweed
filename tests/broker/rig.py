@@ -92,6 +92,7 @@ class ScriptedPrompts:
         self.asked: list[GrantPrompt] = []
         self.hang = False
         self.explode = False
+        self.while_asking: Callable[[], None] | None = None  # the user takes their time
 
     def allow(self, scope: str = "task") -> None:
         from tumbleweed.broker.grants import GrantScope
@@ -105,12 +106,15 @@ class ScriptedPrompts:
             raise RuntimeError("the prompt interface broke")
         if self.hang:
             await asyncio.Event().wait()
+        if self.while_asking is not None:
+            self.while_asking()
         return self.answers.pop(0) if self.answers else Denied(reason="user_denied")
 
 
 def canned_result(
     *,
     stdout: bytes = b"",
+    stderr: bytes = b"",
     exit_code: int = 0,
     unenforced: tuple[LimitKind, ...] = (),
     landlock: LandlockState = LandlockState.APPLIED,
@@ -119,7 +123,7 @@ def canned_result(
         termination=Termination.EXITED,
         exit_code=exit_code,
         stdout=stdout,
-        stderr=b"",
+        stderr=stderr,
         stdout_truncated=False,
         stderr_truncated=False,
         wall_time=timedelta(milliseconds=5),

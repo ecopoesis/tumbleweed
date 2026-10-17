@@ -246,6 +246,25 @@ class TestWhatTheBrokerComposes:
         run(scenario)
 
 
+class TestTheLargestAnswerFitsAFrame:
+    def test_the_most_output_a_request_may_ask_for_on_both_streams(self) -> None:
+        async def scenario() -> None:
+            sandbox = FakeSandbox()
+            sandbox.result = canned_result(stdout=bytes(range(256)) * 1024, stderr=b"\xff" * 262144)
+            async with running(sandbox=sandbox) as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+
+                result = await client.run_in_sandbox(
+                    task, RunId.new(), COMMAND, max_output_bytes=256 * 1024
+                )
+
+                assert base64.b64decode(result.stdout) == bytes(range(256)) * 1024
+                assert base64.b64decode(result.stderr) == b"\xff" * 262144
+
+        run(scenario)
+
+
 class TestOnceGrants:
     def test_a_once_grant_is_mounted_in_its_run_and_used_up_by_it(self) -> None:
         async def scenario() -> None:

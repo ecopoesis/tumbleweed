@@ -158,6 +158,28 @@ class TestWhatCannotBeGranted:
 
         run(scenario)
 
+    def test_the_brokers_own_directories_are_refused_wherever_the_data_home_is(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await task_of(client)
+                rig.prompts.allow("task")  # would be accepted, if anyone asked
+                own = [
+                    rig.workspaces / str(task),  # another task's, or this one's: never granted
+                    rig.workspaces,
+                    rig.config.broker_directory,  # the database and the audit log
+                    rig.config.socket_directory,
+                ]
+
+                for path in own:
+                    outcome = await client.request_read(task, RunId.new(), str(path), "x")
+                    assert not outcome.granted, path
+                    assert str(path) not in outcome.message
+
+                assert rig.prompts.asked == []
+
+        run(scenario)
+
     def test_a_path_inside_tmp_is_refused_because_the_sandbox_would_refuse_it(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
@@ -249,6 +271,64 @@ class TestWhatCannotBeGranted:
                 assert not outcome.granted  # it is ~/.ssh, whatever it was called
                 assert rig.audit_of(GrantDecision)[0].reason == "static_deny"
                 assert rig.prompts.asked == []
+
+        run(scenario)
+
+
+class TestTheWorldMovesWhileTheUserDecides:
+    def test_a_directory_that_became_a_protected_one_during_the_prompt_is_not_granted(
+        self,
+    ) -> None:
+        """The user was shown `Photos`. By the time they click, `Photos` has been renamed to
+        `.ssh` (and the real `.ssh` moved away): the grant would be for the key directory. The
+        deny rules are rebuilt when the grant is issued, so the identity is recognised."""
+
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await task_of(client)
+                rig.prompts.allow("task")
+
+                def swap() -> None:
+                    (rig.home / ".ssh").rename(rig.home / ".ssh.moved")
+                    (rig.home / "Photos").rename(rig.home / ".ssh")
+
+                rig.prompts.while_asking = swap
+
+                outcome = await client.request_read(task, RunId.new(), read_path(rig), "x")
+
+                assert not outcome.granted
+                assert rig.audit_of(GrantDecision)[0].reason == "static_deny"
+                with pytest.raises(BrokerRefused):
+                    await client.list_dir(task, RunId.new(), str(rig.home / ".ssh"))
+
+        run(scenario)
+
+    def test_a_directory_swapped_for_another_during_the_prompt_is_granted_as_it_was_shown(
+        self,
+    ) -> None:
+        """What is recorded is what the user was shown (its identity): after a swap the grant
+        covers the old directory, wherever it is now, and not what stands at the name."""
+
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await task_of(client)
+                rig.prompts.allow("task")
+
+                def swap() -> None:
+                    (rig.home / "Photos").rename(rig.home / "Photos.old")
+                    (rig.home / "Photos").mkdir()
+                    (rig.home / "Photos" / "a.jpg").write_text("a stranger's file")
+
+                rig.prompts.while_asking = swap
+
+                outcome = await client.request_read(task, RunId.new(), read_path(rig), "x")
+
+                assert outcome.granted
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.read_file(task, RunId.new(), read_path(rig, "Photos/a.jpg"))
+                assert caught.value.reason == "not_granted"  # the new directory is not covered
 
         run(scenario)
 
@@ -509,6 +589,26 @@ class TestTheAuditLogIsFailClosed:
                 # Nor was the task tainted by a grant that was never made:
                 rig.prompts.allow("task")
                 assert (await client.request_network(task, RunId.new(), "x")).granted
+
+        run(scenario)
+
+    def test_a_task_whose_start_cannot_be_recorded_is_not_made_and_leaves_no_workspace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+
+                def refuse(self: AuditLog, entry: object) -> None:
+                    raise AuditError("the audit log cannot be written")
+
+                monkeypatch.setattr(AuditLog, "append", refuse)
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.start_task()
+                monkeypatch.undo()
+
+                assert caught.value.reason == "unavailable"
+                assert list(rig.workspaces.iterdir()) == []
 
         run(scenario)
 
