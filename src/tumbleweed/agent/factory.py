@@ -12,7 +12,11 @@ from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass
 from typing import final
 
-from tumbleweed.agent.anthropic_provider import AnthropicProvider, build_client
+from tumbleweed.agent.anthropic_provider import (
+    AnthropicProvider,
+    build_client,
+    response_byte_limit,
+)
 from tumbleweed.agent.config import (
     SECRET_ENV_VARIABLES,
     AgentConfig,
@@ -69,7 +73,11 @@ def _build_anthropic(
 ) -> AgentSetup:
     try:
         key = take_api_key(environ, config)
-        client = build_client(api_key=key, base_url=config.base_url)
+        client = build_client(
+            api_key=key,
+            base_url=config.base_url,
+            max_response_bytes=response_byte_limit(config.limits.max_turn_output_tokens),
+        )
         recorder = InvocationRecorder(
             JsonlInvocationLog(shell_data_dir(environ) / "invocations.jsonl"),
             prompt_version=SYSTEM_PROMPT_VERSION,

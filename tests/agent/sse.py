@@ -21,7 +21,9 @@ def event(name: str, data: dict[str, object]) -> bytes:
     return f"event: {name}\ndata: {json.dumps(data)}\n\n".encode()
 
 
-def message_start(input_tokens: int = 12) -> bytes:
+def message_start(
+    input_tokens: int = 12, *, cache_read: int | None = None, cache_creation: int | None = None
+) -> bytes:
     return event(
         "message_start",
         {
@@ -34,7 +36,16 @@ def message_start(input_tokens: int = 12) -> bytes:
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 1},
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 1,
+                    **({} if cache_read is None else {"cache_read_input_tokens": cache_read}),
+                    **(
+                        {}
+                        if cache_creation is None
+                        else {"cache_creation_input_tokens": cache_creation}
+                    ),
+                },
             },
         },
     )

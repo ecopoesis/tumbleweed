@@ -188,9 +188,11 @@ class TestTheKeyStaysSecret:
         server = sse.Server()
 
         def build_client(
-            *, api_key: ApiKey, base_url: str, http_client: object | None = None
+            *, api_key: ApiKey, base_url: str, max_response_bytes: int
         ) -> anthropic.AsyncAnthropic:
             assert base_url == "https://api.anthropic.com"
+            # 16000 tokens by default: 1 MiB plus 256 bytes of framing for each
+            assert max_response_bytes == 1024 * 1024 + 256 * 16_000
             return server.client_with_build(api_key)
 
         monkeypatch.setattr(factory, "build_client", build_client)

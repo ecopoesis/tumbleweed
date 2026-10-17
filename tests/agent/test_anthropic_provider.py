@@ -4,23 +4,26 @@ import asyncio
 import json
 import logging
 import re
+import warnings
 
 import anthropic
 import httpx2
 import pytest
 
 from tests.agent import sse
-from tests.agent.support import MODEL
+from tests.agent.support import MODEL, MemoryLog
 from tumbleweed.agent.anthropic_provider import (
     CONNECT_TIMEOUT,
     MAX_ATTEMPTS,
     READ_TIMEOUT,
     AnthropicProvider,
     build_client,
+    response_byte_limit,
     translate_error,
 )
 from tumbleweed.agent.config import ApiKey
 from tumbleweed.agent.errors import (
+    LimitError,
     ProviderAuthError,
     ProviderError,
     ProviderNetworkError,
@@ -29,7 +32,9 @@ from tumbleweed.agent.errors import (
     ProviderRequestError,
     ProviderTimeoutError,
 )
+from tumbleweed.agent.limits import AgentLimits
 from tumbleweed.agent.llm import (
+    AttemptFailed,
     LlmDone,
     LlmEvent,
     LlmMessage,
@@ -43,6 +48,10 @@ from tumbleweed.agent.llm import (
     ToolUseBlock,
     ToolUseId,
 )
+from tumbleweed.agent.loop import AgentLoop
+from tumbleweed.agent.recorder import InvocationRecorder
+from tumbleweed.agent.tools import ToolRegistry
+from tumbleweed.core.ids import SessionId
 from tumbleweed.core.types import TokenCount
 
 KEY = "sk-ant-test-0123456789abcdefghijklmnop"
@@ -219,6 +228,158 @@ class TestResponses:
             run(sse.Server([sse.stream_response(body)]), request())
 
 
+class TestUsageAndBlocks:
+    def test_cache_tokens_are_reported(self) -> None:
+        body = sse.message_start(cache_read=40, cache_creation=7) + sse.text_block(0, "x")
+        body += sse.message_end()
+
+        done = run(sse.Server([sse.stream_response(body)]), request())[-1]
+
+        assert isinstance(done, LlmDone)
+        assert (done.usage.cache_read_input_tokens, done.usage.cache_creation_input_tokens) == (
+            40,
+            7,
+        )
+
+    def test_an_opaque_block_is_sent_back_without_empty_fields(self) -> None:
+        body = sse.message(sse.thinking_block(0, "pondering", "sig"), sse.text_block(1, "x"))
+
+        done = run(sse.Server([sse.stream_response(body)]), request())[-1]
+
+        assert isinstance(done, LlmDone)
+        assert isinstance(done.content[0], OpaqueBlock)
+        assert done.content[0].payload == {
+            "type": "thinking",
+            "thinking": "pondering",
+            "signature": "sig",
+        }
+
+    def test_a_block_the_provider_alone_understands_is_kept_without_null_fields(self) -> None:
+        block = sse.event(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": {},
+                    "caller": None,
+                },
+            },
+        ) + sse.event("content_block_stop", {"type": "content_block_stop", "index": 0})
+        body = sse.message(block, sse.text_block(1, "x"))
+
+        done = run(sse.Server([sse.stream_response(body)]), request())[-1]
+
+        assert isinstance(done, LlmDone)
+        assert isinstance(done.content[0], OpaqueBlock)
+        assert "caller" not in done.content[0].payload
+
+    def test_a_tool_call_cut_off_by_the_token_limit_reaches_the_loop_as_max_tokens(self) -> None:
+        body = sse.message(
+            sse.text_block(0, "Let me"),
+            sse.tool_block(1, "toolu_01", "add", '{"a": 1, "b'),
+            stop_reason="max_tokens",
+        )
+
+        done = run(sse.Server([sse.stream_response(body)]), request())[-1]
+
+        assert isinstance(done, LlmDone)
+        assert done.stop_reason is StopReason.MAX_TOKENS  # not "could not be understood"
+
+    def test_the_loop_says_the_token_limit_was_reached_for_such_a_call(self) -> None:
+        body = sse.message(
+            sse.tool_block(0, "toolu_01", "add", '{"a": 1, "b'), stop_reason="max_tokens"
+        )
+        server = sse.Server([sse.stream_response(body)])
+
+        async def scenario() -> str:
+            client = server.client(KEY)
+            try:
+                loop = AgentLoop(
+                    provider=InvocationRecorder(MemoryLog(), prompt_version="t").record(
+                        AnthropicProvider(client), session_id=SessionId.new()
+                    ),
+                    registry=ToolRegistry(),
+                    model=MODEL,
+                    system_prompt="s",
+                    limits=AgentLimits(),
+                )
+                with pytest.raises(LimitError) as raised:
+                    await loop.run((), "hi", lambda _text: None)
+                return str(raised.value)
+            finally:
+                await client.close()
+
+        assert "output tokens" in asyncio.run(scenario())
+
+    def test_a_cut_off_tool_call_with_a_tool_use_stop_still_fails(self) -> None:
+        body = sse.message(
+            sse.tool_block(0, "toolu_01", "add", '{"a": 1, "b'), stop_reason="tool_use"
+        )
+
+        with pytest.raises(ProviderError, match="could not be read"):
+            run(sse.Server([sse.stream_response(body)]), request())
+
+
+class TestResponseLimit:
+    def stream_of_tokens(self, tokens: int) -> bytes:
+        return sse.message(sse.text_block(0, *(["a"] * tokens)))
+
+    def test_a_stream_at_the_configured_maximum_passes(self) -> None:
+        tokens = 8000  # as if max_turn_output_tokens were 8000
+        body = self.stream_of_tokens(tokens)
+        assert len(body) < response_byte_limit(tokens)  # the limit has room for the framing
+        server = sse.Server([sse.stream_response(body)])
+
+        async def scenario() -> list[LlmEvent]:
+            client = build_client(
+                api_key=ApiKey(KEY),
+                base_url=sse.BASE_URL,
+                transport=httpx2.MockTransport(server.handler),
+                max_response_bytes=response_byte_limit(tokens),
+            )
+            try:
+                return [e async for e in AnthropicProvider(client).stream(request())]
+            finally:
+                await client.close()
+
+        done = asyncio.run(scenario())[-1]
+
+        assert isinstance(done, LlmDone)
+        assert done.content == (TextBlock(text="a" * tokens),)
+
+    def test_the_limit_grows_with_the_token_limit_up_to_the_documented_maximum(self) -> None:
+        from tumbleweed.agent.limits import MAX_TURN_OUTPUT_TOKENS
+
+        assert response_byte_limit(0) == 1024 * 1024
+        assert response_byte_limit(1000) == 1024 * 1024 + 256 * 1000
+        # 128000 tokens at the heaviest framing (a delta of one character, about 150 bytes) fit.
+        assert response_byte_limit(MAX_TURN_OUTPUT_TOKENS) > 150 * MAX_TURN_OUTPUT_TOKENS
+
+    def test_a_stream_over_the_limit_is_refused(self) -> None:
+        body = self.stream_of_tokens(8000)
+        server = sse.Server([sse.stream_response(body)])
+
+        async def scenario() -> None:
+            client = build_client(
+                api_key=ApiKey(KEY),
+                base_url=sse.BASE_URL,
+                transport=httpx2.MockTransport(server.handler),
+                max_response_bytes=len(body) // 2,
+            )
+            try:
+                async for _ in AnthropicProvider(client).stream(request()):
+                    pass
+            finally:
+                await client.close()
+
+        with pytest.raises(ProviderError, match="larger than expected"):
+            asyncio.run(scenario())
+
+
 class TestModelTextIsCleaned:
     def test_empty_text_deltas_are_not_events(self) -> None:
         body = sse.message(sse.text_block(0, "", "a", "", "", "b"))
@@ -323,8 +484,29 @@ class TestClient:
         assert isinstance(timeout, httpx2.Timeout)
         assert (timeout.connect, timeout.read) == (CONNECT_TIMEOUT, READ_TIMEOUT)
         assert (CONNECT_TIMEOUT, READ_TIMEOUT) == (10.0, 60.0)
+        assert timeout.read == 60.0  # the default, as built
         assert timeout.write is not None
         assert timeout.pool is not None
+
+    def test_a_read_timeout_given_to_the_client_is_the_one_it_has(self) -> None:
+        client = build_client(api_key=ApiKey(KEY), base_url=sse.BASE_URL, read_timeout=0.5)
+
+        timeout = client.timeout
+        assert isinstance(timeout, httpx2.Timeout)
+        assert timeout.read == 0.5
+
+    def test_the_only_warning_filter_we_add_is_the_one_for_pydantic_serializer_warnings(
+        self,
+    ) -> None:
+        build_client(api_key=ApiKey(KEY), base_url=sse.BASE_URL)
+
+        ours = [
+            f
+            for f in warnings.filters
+            if f[0] == "ignore" and f[1] is not None and "serializer warnings" in f[1].pattern
+        ]
+        assert len(ours) == 1
+        assert ours[0][2] is UserWarning
 
     def test_the_key_is_passed_explicitly_not_read_from_the_environment(
         self, monkeypatch: pytest.MonkeyPatch
@@ -404,11 +586,17 @@ class TestErrors:
         with pytest.raises(ProviderRateLimitedError, match="in 17 seconds"):
             run(server, request())
 
-    @pytest.mark.parametrize("value", ["soon", "-5", "0", "999999", ""])
+    @pytest.mark.parametrize("value", ["soon", "-5", "0", ""])
     def test_a_retry_after_that_is_not_sane_is_ignored(self, value: str) -> None:
         server = sse.Server([sse.error_response(429, headers={"retry-after": value})])
 
         with pytest.raises(ProviderRateLimitedError, match="in a moment"):
+            run(server, request())
+
+    def test_a_retry_after_of_hours_is_reported_as_later(self) -> None:
+        server = sse.Server([sse.error_response(429, headers={"retry-after": "999999"})])
+
+        with pytest.raises(ProviderRateLimitedError, match="Try again later"):
             run(server, request())
 
     def test_an_error_event_in_the_middle_of_the_stream_fails_after_the_text_so_far(self) -> None:
@@ -459,19 +647,44 @@ class TestErrors:
         assert len(server.requests) == MAX_ATTEMPTS
         assert delays == [1.0, 2.0]
 
-    @pytest.mark.parametrize(("asked", "waited"), [("99999", [1.0, 2.0]), ("3000", [10.0, 10.0])])
-    def test_a_retry_after_of_hours_or_days_never_makes_us_wait_that_long(
-        self, asked: str, waited: list[float]
+    @pytest.mark.parametrize("asked", ["11", "3000", "99999", "999999999"])
+    def test_a_retry_after_longer_than_we_wait_is_reported_at_once_not_retried(
+        self, asked: str
     ) -> None:
         server = sse.Server([sse.error_response(429, headers={"retry-after": asked})])
         delays: list[float] = []
 
-        with pytest.raises(ProviderRateLimitedError):
+        with pytest.raises(ProviderRateLimitedError) as raised:
             run_with(server, request(), delays=delays)
 
-        assert delays == waited
-        assert max(delays) <= 10.0
-        assert len(server.requests) == MAX_ATTEMPTS
+        assert delays == []  # no sleep, no second request: the answer is "later"
+        assert len(server.requests) == 1
+        assert raised.value.retry_after == int(asked)
+
+    def test_a_retry_after_at_the_cap_is_still_waited_for(self) -> None:
+        server = sse.Server(
+            [
+                sse.error_response(429, headers={"retry-after": "10"}),
+                sse.stream_response(sse.message(sse.text_block(0, "ok"))),
+            ]
+        )
+        delays: list[float] = []
+
+        run_with(server, request(), delays=delays)
+
+        assert delays == [10.0]
+
+    def test_each_failed_try_is_announced_so_that_it_can_be_recorded(self) -> None:
+        server = sse.Server(
+            [sse.error_response(529), sse.stream_response(sse.message(sse.text_block(0, "ok")))]
+        )
+
+        events = run_with(server, request(), delays=[])
+
+        failed = [e for e in events if isinstance(e, AttemptFailed)]
+        assert len(failed) == 1
+        assert failed[0].error_kind == "overloaded"
+        assert str(failed[0].request_id) == "req_err"
 
     def test_a_short_retry_after_is_honoured(self) -> None:
         server = sse.Server(

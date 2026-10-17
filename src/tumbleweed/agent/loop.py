@@ -29,7 +29,7 @@ Limits (I9), each ending the reply with a `LimitError` whose message says which:
 import asyncio
 import contextlib
 from collections.abc import Callable
-from typing import final
+from typing import assert_never, final
 
 from tumbleweed.agent.errors import (
     LimitError,
@@ -161,6 +161,8 @@ class AgentLoop:
                     if not reply.strip():
                         raise ProviderError("The model sent an empty reply.")
                     return reply
+                case _ as unreachable:
+                    assert_never(unreachable)
         raise LimitError(
             f"The reply needed more than {self._limits.max_iterations} model calls and was stopped."
         )

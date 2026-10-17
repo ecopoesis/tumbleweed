@@ -4,7 +4,8 @@ These models are what the agent loop and a provider (the Anthropic SDK, the scri
 on, so nothing of an SDK's types leaks past the provider, and a proxy or another vendor can be put
 behind the same protocol (DECISIONS D3).
 
-A provider streams one model call: any number of `TextDelta`s and `UsageUpdate`s, then exactly one
+A provider streams one model call: any number of `TextDelta`s, `UsageUpdate`s and (if it retried)
+`AttemptFailed`s, then exactly one
 `LlmDone` with the complete assistant turn (text, tool calls, and whatever the provider needs to
 see again on the next call), why it stopped and what it cost. A stream that ends without its
 `LlmDone` is a failure, not a short answer: the provider raises. It reports every failure by raising
@@ -202,7 +203,25 @@ class UsageUpdate(BaseModel):
     usage: Usage
 
 
-type LlmEvent = Annotated[TextDelta | UsageUpdate | LlmDone, Field(discriminator="kind")]
+@final
+class AttemptFailed(BaseModel):
+    """One try of the call failed and the provider is about to try again: what it cost, and why.
+
+    The recorder writes a record for it, so a retried call leaves one record per attempt.
+    `error_kind` is a `tumbleweed.agent.errors.ErrorKind` value (this module cannot import it).
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    kind: Literal["attempt_failed"] = "attempt_failed"
+    error_kind: str = Field(max_length=32)
+    request_id: ProviderRequestId | None = None
+    usage: Usage | None = None
+
+
+type LlmEvent = Annotated[
+    TextDelta | UsageUpdate | AttemptFailed | LlmDone, Field(discriminator="kind")
+]
 
 
 class LlmProvider(Protocol):

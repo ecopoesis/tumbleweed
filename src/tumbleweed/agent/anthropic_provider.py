@@ -9,7 +9,9 @@ that can name headers, and a hostile server can put anything in it, the API key 
 kept is the status code, the provider's request ID, the usage reported so far, and the type name.
 
 A stream is complete only if it ended with `message_stop` and a stop reason. One that just stops is
-a failure ("ended unexpectedly"), so a half-written answer is never taken for a finished one.
+a failure ("ended unexpectedly"), so a half-written answer is never taken for a finished one. A
+tool call cut off by the token limit is noted and the stream read to its end: the stop reason
+decides (`tool_use` fails the reply, `max_tokens` and the others reach the loop's own messages).
 
 Client (`build_client`): the base URL is configurable (a proxy later); the key is passed
 explicitly, so the SDK never reads credentials from the environment; redirects are not followed
@@ -19,10 +21,13 @@ the SDK's own retries are off, because it sleeps for whatever `Retry-After` says
 server says so), and `AnthropicProvider` retries a rate limit, an overload or a dropped connection
 twice itself with a delay of at most `MAX_RETRY_DELAY` seconds, and only if nothing of the answer
 has arrived. Timeouts are bounded (connect 10 s, 30 s to send, 60 s between chunks of a stream, 10 s
-for a pooled connection), and the size of a response is bounded in the transport: 2 MiB for a stream
-(a reply is at most 64 KiB of text), 64 KiB of an error body (cut, not refused). The agent loop's
-reply timeout bounds the total, retries included. No `thinking` parameter is sent: the models' own
-defaults apply, and `effort` only if configured.
+for a pooled connection), and the size of a response is bounded in the transport, on the bytes as
+they arrive: `response_byte_limit(max_tokens)` for a stream (1 MiB plus 256 bytes of SSE framing per
+output token the reply may use), 64 KiB of an error body (cut, not refused). Compression would
+defeat that, because the HTTP library decompresses above the transport, so the request says
+`Accept-Encoding: identity` and the transport refuses any response with another encoding before a
+byte of it is decoded. The agent loop's reply timeout bounds the total, retries included. No
+`thinking` parameter is sent: the models' own defaults apply, and `effort` only if configured.
 """
 
 import asyncio
@@ -56,7 +61,9 @@ from tumbleweed.agent.errors import (
     ProviderRequestError,
     ProviderTimeoutError,
 )
+from tumbleweed.agent.limits import DEFAULT_TURN_OUTPUT_TOKENS
 from tumbleweed.agent.llm import (
+    AttemptFailed,
     ContentBlock,
     LlmDone,
     LlmEvent,
@@ -84,9 +91,12 @@ READ_TIMEOUT: Final = 60.0
 POOL_TIMEOUT: Final = 10.0
 MAX_ATTEMPTS: Final = 3
 MAX_RETRY_DELAY: Final = 10.0
-MAX_RESPONSE_BYTES: Final = ByteCount(2 * 1024 * 1024)
+BASE_RESPONSE_BYTES: Final = ByteCount(1024 * 1024)
+RESPONSE_BYTES_PER_TOKEN: Final = 256  # the SSE framing of one event is about 150 bytes
 MAX_ERROR_BODY_BYTES: Final = ByteCount(64 * 1024)
-_MAX_RETRY_AFTER_SECONDS = 3600
+_IDENTITY_ENCODINGS = frozenset({"", "identity"})
+_MAX_RETRY_AFTER_VALUE = 10**9
+_MAX_RETRY_AFTER_SHOWN = 3600
 # The status an in-stream `error` event stands for, by its type (API docs, "Errors").
 _STREAM_ERROR_STATUS = {
     "authentication_error": 401,
@@ -100,17 +110,30 @@ _SDK_LOGGERS = ("anthropic", "httpx2", "httpcore2")
 _OBJECT = TypeAdapter(dict[str, JsonValue])
 
 
+def response_byte_limit(max_output_tokens: int) -> ByteCount:
+    """How many bytes of stream a reply of up to `max_output_tokens` tokens may take."""
+    return ByteCount(BASE_RESPONSE_BYTES + RESPONSE_BYTES_PER_TOKEN * max_output_tokens)
+
+
 def _harden_sdk_output() -> None:
     """Keep the SDK's and the HTTP libraries' diagnostics out of every log and stderr (I6).
 
     At DEBUG the SDK logs whole request bodies (the prompts) and the text of exceptions, which a
     hostile proxy or server can fill with anything, our key included, so `ANTHROPIC_LOG=debug` must
-    not be able to put them in the shell's log: those loggers are held at WARNING. Pydantic's own
-    warnings (a server's value of the wrong type, say) quote the value, so they are not printed.
+    not be able to put them in the shell's log: those loggers are held at WARNING.
+
+    The SDK builds its models without validating them, so a server's value of the wrong type
+    (a string where a number goes) makes pydantic's serializer warn, and the warning quotes the
+    value, to stderr. That happens inside the SDK, where we cannot pass `warnings=False`, so
+    exactly that warning (pydantic's "serializer warnings" `UserWarning`) is ignored. This is a
+    process-wide filter and is set once, at start-up from `build_client` on the main thread, before
+    the worker thread exists; nothing changes warning filters from the worker (that would not be
+    thread-safe). Everything else that warns still does. Our own uses are covered at the source:
+    serialisation with `warnings=False`, token counts checked by us.
     """
     for name in _SDK_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
-    warnings.filterwarnings("ignore", category=UserWarning, module=r"pydantic(\.|$)")
+    warnings.filterwarnings("ignore", message=r"Pydantic serializer warnings", category=UserWarning)
 
 
 @final
@@ -138,23 +161,47 @@ class _BoundedStream(httpx2.AsyncByteStream):
 
 
 @final
+class _RefusedStream(httpx2.AsyncByteStream):
+    """A body that is not read: it fails at the first read, with nothing decoded."""
+
+    def __init__(self, inner: httpx2.AsyncByteStream) -> None:
+        self._inner = inner
+
+    def __aiter__(self) -> "_RefusedStream":
+        return self
+
+    async def __anext__(self) -> bytes:
+        raise ProviderError("The model provider's response uses an encoding that is not accepted.")
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+
+@final
 class BoundedTransport(httpx2.AsyncBaseTransport):
     """Bounds what a server can make us read, before any parser sees it (I9)."""
 
-    def __init__(self, inner: httpx2.AsyncBaseTransport) -> None:
+    def __init__(self, inner: httpx2.AsyncBaseTransport, *, max_response_bytes: int) -> None:
         self._inner = inner
+        self._max_response_bytes = max_response_bytes
 
     async def handle_async_request(self, request: httpx2.Request) -> httpx2.Response:
         response = await self._inner.handle_async_request(request)
-        failed = response.status_code >= 300
+        body: httpx2.AsyncByteStream = response.stream  # type: ignore[assignment]  # async: see above
+        encoding = response.headers.get("content-encoding", "").strip().lower()
+        if encoding not in _IDENTITY_ENCODINGS:
+            # We asked for no encoding. A server that compresses anyway could send a few
+            # megabytes that become gigabytes above this layer, where the count is not ours.
+            body = _RefusedStream(body)
+        else:
+            failed = response.status_code >= 300
+            body = _BoundedStream(
+                body, MAX_ERROR_BODY_BYTES if failed else self._max_response_bytes, truncate=failed
+            )
         return httpx2.Response(
             status_code=response.status_code,
             headers=response.headers,
-            stream=_BoundedStream(
-                response.stream,  # type: ignore[arg-type]  # an async transport's body is async
-                MAX_ERROR_BODY_BYTES if failed else MAX_RESPONSE_BYTES,
-                truncate=failed,
-            ),
+            stream=body,
             extensions=response.extensions,
         )
 
@@ -168,14 +215,20 @@ def build_client(
     base_url: str,
     transport: httpx2.AsyncBaseTransport | None = None,
     read_timeout: float = READ_TIMEOUT,
+    max_response_bytes: int | None = None,
 ) -> anthropic.AsyncAnthropic:
     """The SDK client, as the module docstring describes it.
 
     `transport` replaces the network, for tests; the bounds apply to it as well.
+    `max_response_bytes` is how much of a stream to read (default: for the default token limit).
     """
     _harden_sdk_output()
     http_client = anthropic.DefaultAsyncHttpxClient(
-        transport=BoundedTransport(transport or httpx2.AsyncHTTPTransport()),
+        transport=BoundedTransport(
+            transport or httpx2.AsyncHTTPTransport(),
+            max_response_bytes=max_response_bytes
+            or response_byte_limit(DEFAULT_TURN_OUTPUT_TOKENS),
+        ),
         follow_redirects=False,
         trust_env=False,
     )
@@ -183,6 +236,7 @@ def build_client(
         http_client=http_client,
         api_key=api_key.reveal(),
         base_url=base_url,
+        default_headers={"Accept-Encoding": "identity"},
         timeout=anthropic.Timeout(
             connect=CONNECT_TIMEOUT, write=WRITE_TIMEOUT, read=read_timeout, pool=POOL_TIMEOUT
         ),
@@ -238,7 +292,8 @@ def _content(message: anthropic.types.Message) -> tuple[ContentBlock, ...]:
                 )
             )
         else:
-            payload = block.model_dump(mode="json", exclude_none=True)
+            # (`warnings=False`: pydantic's serialization warning would quote what the server sent)
+            payload = block.to_dict(mode="json", exclude_none=True, warnings=False)
             blocks.append(OpaqueBlock(payload=_OBJECT.validate_python(payload)))
     return tuple(blocks)
 
@@ -271,7 +326,7 @@ def _retry_after(exc: anthropic.APIStatusError) -> int | None:
         seconds = int(exc.response.headers.get("retry-after", ""))
     except ValueError:
         return None
-    return seconds if 1 <= seconds <= _MAX_RETRY_AFTER_SECONDS else None
+    return seconds if 1 <= seconds <= _MAX_RETRY_AFTER_VALUE else None
 
 
 def translate_error(exc: Exception) -> ProviderError:
@@ -311,7 +366,13 @@ def translate_error(exc: Exception) -> ProviderError:
         wait = _retry_after(exc)
         return ProviderRateLimitedError(
             "The model provider's rate limit was reached."
-            + (f" Try again in {wait} seconds." if wait else " Try again in a moment."),
+            + (
+                f" Try again in {wait} seconds."
+                if wait and wait <= _MAX_RETRY_AFTER_SHOWN
+                else " Try again later."
+                if wait
+                else " Try again in a moment."
+            ),
             request_id=request_id,
             retry_after=wait,
         )
@@ -328,7 +389,7 @@ def translate_error(exc: Exception) -> ProviderError:
 def _retryable(error: ProviderError) -> bool:
     return isinstance(
         error, ProviderRateLimitedError | ProviderOverloadedError | ProviderNetworkError
-    ) and not isinstance(error, ProviderTimeoutError)
+    )
 
 
 @final
@@ -365,8 +426,16 @@ class AnthropicProvider:
             except ProviderError as error:
                 if started_answer or attempt >= self._max_attempts or not _retryable(error):
                     raise
+                if (
+                    isinstance(error, ProviderRateLimitedError)
+                    and (error.retry_after or 0) > self._max_retry_delay
+                ):
+                    raise  # asked to wait longer than we will: say so now, do not retry early
                 delay = self._delay(error, attempt)
                 logger.info("retrying the model call in %.1f s (attempt %d)", delay, attempt + 1)
+                yield AttemptFailed(
+                    error_kind=error.kind.value, request_id=error.request_id, usage=error.usage
+                )
                 await self._sleep(delay)
 
     def _delay(self, error: ProviderError, attempt: int) -> float:
@@ -400,6 +469,7 @@ class AnthropicProvider:
             ) as stream:
                 request_id = _request_id(stream.request_id)
                 stopped = False
+                bad_tool_json = False
                 tool_json = ""
                 async for event in stream:
                     if (
@@ -414,18 +484,19 @@ class AnthropicProvider:
                         and event.content_block.type == "tool_use"
                     ):
                         # The SDK's parser is tolerant: it turns a cut-off input into a partial
-                        # object. A tool call is run only if its input is the whole of valid JSON.
-                        if not isinstance(json.loads(tool_json or "{}"), dict):
-                            raise ProviderError(
-                                "The model sent a tool call that could not be read."
-                            )
+                        # object. A tool call is run only if its input is the whole of valid
+                        # JSON. One cut off by the token limit is no reason to stop reading: the
+                        # stop reason decides below.
+                        try:
+                            if not isinstance(json.loads(tool_json or "{}"), dict):
+                                bad_tool_json = True
+                        except ValueError:
+                            bad_tool_json = True
                     elif event.type == "text":
                         if event.text:  # an endless stream of empty deltas is not a reply
                             yield TextDelta(text=event.text)
                     elif event.type in {"message_start", "message_delta"}:
-                        with warnings.catch_warnings():  # (no await inside: the filter is ours)
-                            warnings.simplefilter("ignore")
-                            reported = _usage(stream.current_message_snapshot.usage)
+                        reported = _usage(stream.current_message_snapshot.usage)
                         usage = reported
                         yield UsageUpdate(usage=reported)
                     elif event.type == "message_stop":
@@ -433,14 +504,14 @@ class AnthropicProvider:
                 final = await stream.get_final_message()
             if not stopped or final.stop_reason is None:
                 raise ProviderError("The model provider's answer ended unexpectedly.")
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                done = LlmDone(
-                    content=_content(final),
-                    stop_reason=_stop_reason(final.stop_reason),
-                    usage=_usage(final.usage),
-                    request_id=request_id,
-                )
+            if bad_tool_json and final.stop_reason == "tool_use":
+                raise ProviderError("The model sent a tool call that could not be read.")
+            done = LlmDone(
+                content=_content(final),
+                stop_reason=_stop_reason(final.stop_reason),
+                usage=_usage(final.usage),
+                request_id=request_id,
+            )
         except Exception as exc:  # noqa: BLE001  (every one, translated: see the module docstring)
             error = translate_error(exc)
             if error.usage is None:

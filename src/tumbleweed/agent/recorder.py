@@ -7,7 +7,8 @@ provider itself calls a provider's `stream`). The wrapper passes the events on u
 the call ends, however it ends, appends one JSONL record: `InvocationId`, `SessionId`,
 `TaskId | None`, the model, token usage (the last the provider reported, also for a call that
 failed or was cut short), latency, the stop reason, the provider's request ID, how it ended
-(`ok`, `error`, `cancelled`, `timeout`, `aborted`) and, for a failure, the `ErrorKind`.
+(`ok`, `error`, `cancelled`, `timeout`, `aborted`) and, for a failure, the `ErrorKind`. A call the
+provider retried (`AttemptFailed`) has one record per attempt, numbered by `attempt`.
 
 What a record never holds (I6): the API key, any prompt, message or tool text, a provider's error
 text. It is built only from validated, closed or length-capped fields, so there is nothing to
@@ -34,6 +35,7 @@ from pydantic import BaseModel, ConfigDict
 
 from tumbleweed.agent.errors import ErrorKind, ProviderError
 from tumbleweed.agent.llm import (
+    AttemptFailed,
     LlmDone,
     LlmEvent,
     LlmProvider,
@@ -63,6 +65,8 @@ class InvocationRecord(BaseModel):
     task_id: TaskId | None
     model: ModelName
     prompt_version: str
+    attempt: int
+    """1 for the first try of a call; a call the provider retried has one record per try."""
     started_at: datetime
     latency: timedelta
     outcome: Literal["ok", "error", "cancelled", "timeout", "aborted"]
@@ -112,6 +116,13 @@ class JsonlInvocationLog:
             return
         if size > self._max_bytes:
             self._path.replace(self._path.with_name(self._path.name + ".1"))
+
+
+def _error_kind(value: str) -> ErrorKind:
+    try:
+        return ErrorKind(value)
+    except ValueError:
+        return ErrorKind.INTERNAL
 
 
 @final
@@ -177,6 +188,7 @@ class InvocationRecorder:
         task_id: TaskId | None,
         timed_out: Callable[[], bool],
     ) -> AsyncGenerator[LlmEvent]:
+        attempt = 1
         invocation_id = InvocationId.new()
         started_at = self._clock()
         started = self._monotonic()
@@ -186,8 +198,36 @@ class InvocationRecorder:
         usage: Usage | None = None
         done: LlmDone | None = None
         events = provider.stream(request)
+
+        def record() -> InvocationRecord:
+            return InvocationRecord(
+                invocation_id=invocation_id,
+                session_id=session_id,
+                task_id=task_id,
+                model=request.model,
+                prompt_version=self._prompt_version,
+                attempt=attempt,
+                started_at=started_at,
+                latency=timedelta(seconds=max(0.0, self._monotonic() - started)),
+                outcome=outcome,
+                error_kind=error_kind,
+                stop_reason=done.stop_reason if done else None,
+                usage=done.usage if done else usage,
+                request_id=done.request_id if done else request_id,
+            )
+
         try:
             async for event in events:
+                if isinstance(event, AttemptFailed):
+                    # The provider is about to retry: this try gets its record, the next a new one.
+                    outcome, error_kind = "error", _error_kind(event.error_kind)
+                    request_id, usage = event.request_id, event.usage or usage
+                    self._write(record())
+                    attempt += 1
+                    invocation_id = InvocationId.new()
+                    started_at, started = self._clock(), self._monotonic()
+                    outcome, error_kind, request_id, usage = "aborted", None, None, None
+                    continue
                 if isinstance(event, UsageUpdate):
                     usage = event.usage
                 elif isinstance(event, LlmDone):
@@ -209,22 +249,7 @@ class InvocationRecorder:
                 aclose = getattr(events, "aclose", None)
                 if aclose is not None:
                     await aclose()
-            self._write(
-                InvocationRecord(
-                    invocation_id=invocation_id,
-                    session_id=session_id,
-                    task_id=task_id,
-                    model=request.model,
-                    prompt_version=self._prompt_version,
-                    started_at=started_at,
-                    latency=timedelta(seconds=max(0.0, self._monotonic() - started)),
-                    outcome=outcome,
-                    error_kind=error_kind,
-                    stop_reason=done.stop_reason if done else None,
-                    usage=done.usage if done else usage,
-                    request_id=done.request_id if done else request_id,
-                )
-            )
+            self._write(record())
 
     def _write(self, record: InvocationRecord) -> None:
         try:

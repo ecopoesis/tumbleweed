@@ -4,7 +4,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import stat
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from tests.agent.support import MODEL, MemoryLog, RaisingProvider
 from tumbleweed.agent.errors import ErrorKind, ProviderNetworkError, ProviderRateLimitedError
 from tumbleweed.agent.fake import FakeProvider, FakeToolCall, FakeTurn
 from tumbleweed.agent.llm import (
+    AttemptFailed,
     LlmDone,
     LlmEvent,
     LlmMessage,
@@ -23,6 +26,7 @@ from tumbleweed.agent.llm import (
     TextBlock,
     TextDelta,
     Usage,
+    UsageUpdate,
 )
 from tumbleweed.agent.recorder import (
     MAX_RECORD_BYTES,
@@ -225,6 +229,54 @@ class TestRecords:
 
         assert [r.outcome for r in log.records] == ["timeout"]
 
+    def test_a_retried_call_has_one_record_per_attempt(self) -> None:
+        log = MemoryLog()
+        recorder = InvocationRecorder(log, prompt_version="v1")
+
+        class Retrying:
+            async def stream(self, request: LlmRequest) -> AsyncIterator[LlmEvent]:
+                usage = Usage(input_tokens=TokenCount(9), output_tokens=TokenCount(1))
+                yield UsageUpdate(usage=usage)
+                yield AttemptFailed(
+                    error_kind="overloaded", request_id=ProviderRequestId("req_one"), usage=usage
+                )
+                yield AttemptFailed(error_kind="network")
+                yield TextDelta(text="ok")
+                yield LlmDone(
+                    content=(TextBlock(text="ok"),),
+                    stop_reason=StopReason.END_TURN,
+                    usage=Usage(input_tokens=TokenCount(9), output_tokens=TokenCount(2)),
+                    request_id=ProviderRequestId("req_three"),
+                )
+
+        events = asyncio.run(consume(recorder, Retrying()))
+
+        assert [e.kind for e in events] == ["usage", "text_delta", "done"]  # the notices are ours
+        first, second, third = log.records
+        assert [r.attempt for r in log.records] == [1, 2, 3]
+        assert len({r.invocation_id for r in log.records}) == 3
+        assert (first.outcome, first.error_kind) == ("error", ErrorKind.OVERLOADED)
+        assert first.request_id == ProviderRequestId("req_one")
+        assert first.usage is not None
+        assert first.usage.input_tokens == 9
+        assert (second.outcome, second.error_kind) == ("error", ErrorKind.NETWORK)
+        assert second.usage is None
+        assert (third.outcome, third.request_id) == ("ok", ProviderRequestId("req_three"))
+
+    def test_an_attempt_notice_with_a_kind_we_do_not_know_is_recorded_as_internal(self) -> None:
+        log = MemoryLog()
+
+        class Odd:
+            async def stream(self, request: LlmRequest) -> AsyncIterator[LlmEvent]:
+                yield AttemptFailed(error_kind="made_up")
+                yield LlmDone(
+                    content=(TextBlock(text="ok"),), stop_reason=StopReason.END_TURN, usage=Usage()
+                )
+
+        asyncio.run(consume(InvocationRecorder(log, prompt_version="v1"), Odd()))
+
+        assert log.records[0].error_kind is ErrorKind.INTERNAL
+
     def test_a_prompt_version_that_could_not_be_logged_safely_is_refused(self) -> None:
         with pytest.raises(ValueError, match="prompt_version"):
             InvocationRecorder(MemoryLog(), prompt_version="v1\nINJECTED")
@@ -248,6 +300,7 @@ class TestTheFile:
             "task_id",
             "model",
             "prompt_version",
+            "attempt",
             "started_at",
             "latency",
             "outcome",
@@ -269,6 +322,20 @@ class TestTheFile:
 
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+    def test_a_directory_made_for_the_log_is_private_whatever_the_umask(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "fresh" / "shell" / "invocations.jsonl"
+        before = os.umask(0)
+        try:
+            recorder = InvocationRecorder(JsonlInvocationLog(path), prompt_version="v1")
+            asyncio.run(consume(recorder, FakeProvider([FakeTurn()])))
+        finally:
+            os.umask(before)
+
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
     def test_a_file_that_was_too_open_is_tightened_and_so_is_its_directory(
         self, tmp_path: Path

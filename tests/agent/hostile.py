@@ -11,6 +11,7 @@ with no pytest filters in the way.
 """
 
 import asyncio
+import gzip
 import json
 import logging
 import sys
@@ -191,7 +192,52 @@ def _giant_delta(total: int) -> Behaviour:
     return behave
 
 
+def _gzipped(body: bytes, *, status: int = 200, encoding: str = "gzip") -> Behaviour:
+    """A body that is small on the wire and huge once decoded."""
+    compressed = gzip.compress(body, 9)
+
+    async def behave(exchange: Exchange) -> None:
+        await exchange.respond(
+            status,
+            compressed,
+            headers={"content-encoding": encoding},
+            length=len(compressed),
+            content_type="text/event-stream" if status == 200 else "application/json",
+        )
+
+    return behave
+
+
+def _flood_with_status(status: int, total: int, headers: dict[str, str]) -> Behaviour:
+    async def behave(exchange: Exchange) -> None:
+        await exchange.respond(status, b"", headers=headers)
+        while exchange.sent < total:
+            await exchange.send(b"x" * CHUNK)
+
+    return behave
+
+
 SCENARIOS: dict[str, Behaviour] = {
+    "stop_reason_but_no_message_stop": stream_of(
+        sse.message_start(),
+        sse.text_block(0, "x"),
+        sse.event(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 3},
+            },
+        ),
+    ),
+    "gzip_stream": _gzipped(b'event: ping\ndata: {"type": "ping"}\n\n' * 400_000),
+    "gzip_error_body": _gzipped(b"x" * 20_000_000, status=500),
+    "br_stream": _gzipped(b"not really brotli", encoding="br"),
+    "deflate_stream": _gzipped(b"not really deflate", encoding="deflate"),
+    "stacked_encodings": _gzipped(b"x" * 1000, encoding="identity, gzip"),
+    "redirect_with_a_huge_body": _flood_with_status(
+        307, 6 * 1024 * 1024, {"location": "http://127.0.0.1:9/"}
+    ),
     # B1: a stream that just ends is not a finished reply.
     "no_message_stop": stream_of(sse.message_start(), sse.text_block(0, "half a rep")),
     "no_message_delta": stream_of(
@@ -304,6 +350,7 @@ async def play(
     *,
     read_timeout: float = 5.0,
     transport: httpx2.AsyncBaseTransport | None = None,
+    max_response_bytes: int = 2 * 1024 * 1024,
 ) -> tuple[Outcome, Server]:
     """Run the provider against `behaviour`; its events, the error it ended with, the server."""
     async with Server(behaviour) as running:
@@ -312,6 +359,7 @@ async def play(
             base_url=running.url,
             read_timeout=read_timeout,
             transport=transport,
+            max_response_bytes=max_response_bytes,
         )
 
         async def no_sleep(_seconds: float) -> None:

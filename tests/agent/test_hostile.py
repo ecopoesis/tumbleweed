@@ -17,7 +17,7 @@ import pytest
 
 from tests.agent import hostile
 from tests.agent.hostile import CANARY, SCENARIOS, Exchange, Server, play, request
-from tumbleweed.agent.anthropic_provider import MAX_ERROR_BODY_BYTES, MAX_RESPONSE_BYTES
+from tumbleweed.agent.anthropic_provider import MAX_ERROR_BODY_BYTES
 from tumbleweed.agent.errors import (
     ErrorKind,
     ProviderAuthError,
@@ -30,12 +30,20 @@ from tumbleweed.agent.errors import (
 from tumbleweed.agent.llm import LlmDone, TextDelta, UsageUpdate
 
 ROOT = Path(__file__).resolve().parents[2]
+LIMIT = 2 * 1024 * 1024  # what `play` allows a stream
 UNDERSTOOD = "could not be understood"
 GENERIC = (ProviderError, UNDERSTOOD)
 
 EXPECTED: dict[str, tuple[type[ProviderError], str]] = {
     "no_message_stop": (ProviderError, "ended unexpectedly"),
     "no_message_delta": (ProviderError, "ended unexpectedly"),
+    "stop_reason_but_no_message_stop": (ProviderError, "ended unexpectedly"),
+    "gzip_stream": (ProviderError, "encoding that is not accepted"),
+    "gzip_error_body": (ProviderError, "encoding that is not accepted"),
+    "br_stream": (ProviderError, "encoding that is not accepted"),
+    "deflate_stream": (ProviderError, "encoding that is not accepted"),
+    "stacked_encodings": (ProviderError, "encoding that is not accepted"),
+    "redirect_with_a_huge_body": (ProviderRequestError, "redirect"),
     "empty_body": GENERIC,
     "not_sse": GENERIC,
     "out_of_order": GENERIC,
@@ -46,7 +54,7 @@ EXPECTED: dict[str, tuple[type[ProviderError], str]] = {
     "usage_is_text": GENERIC,
     "usage_is_negative": GENERIC,
     "usage_is_a_float": GENERIC,
-    "partial_tool_json": GENERIC,
+    "partial_tool_json": (ProviderError, "tool call that could not be read"),
     "tool_json_with_a_lone_surrogate": GENERIC,
     "tool_name_is_huge": GENERIC,
     "error_event_with_the_key": (ProviderRequestError, "rejected the request"),
@@ -132,7 +140,7 @@ class TestBounds:
 
         assert isinstance(outcome.error, ProviderError)
         assert "larger than expected" in str(outcome.error)
-        assert network.read <= MAX_RESPONSE_BYTES + 256 * 1024  # one read past the limit, at most
+        assert network.read <= LIMIT + 256 * 1024  # one read past the limit, at most
 
     def test_one_giant_delta_is_refused_without_being_buffered_whole(self) -> None:
         network = hostile.CountingTransport()
@@ -141,7 +149,7 @@ class TestBounds:
 
         assert isinstance(outcome.error, ProviderError)
         assert "larger than expected" in str(outcome.error)
-        assert network.read <= MAX_RESPONSE_BYTES + 256 * 1024
+        assert network.read <= LIMIT + 256 * 1024
         assert not any(isinstance(e, TextDelta) for e in outcome.events)
 
     def test_an_error_body_is_cut_not_refused_so_the_status_still_decides(self) -> None:
@@ -152,10 +160,42 @@ class TestBounds:
         assert type(outcome.error) is ProviderOverloadedError
         assert network.read <= 3 * (MAX_ERROR_BODY_BYTES + 256 * 1024)  # (three attempts)
 
-    def test_the_limits_are_what_the_docs_say(self) -> None:
-        assert MAX_RESPONSE_BYTES == 2 * 1024 * 1024
+    def test_a_redirect_body_is_cut_like_any_error_body(self) -> None:
+        network = hostile.CountingTransport()
+
+        outcome, _ = asyncio.run(play(SCENARIOS["redirect_with_a_huge_body"], transport=network))
+
+        assert "redirect" in str(outcome.error)
+        assert network.read <= MAX_ERROR_BODY_BYTES + 256 * 1024
+
+    def test_the_limit_for_error_bodies_is_what_the_docs_say(self) -> None:
         assert MAX_ERROR_BODY_BYTES == 64 * 1024
-        assert MAX_RESPONSE_BYTES > 8 * 64 * 1024  # a 64 KiB reply, with room for SSE framing
+
+
+class TestCompression:
+    """Decompression happens above the transport, where the byte count is not ours (I9)."""
+
+    def test_the_request_asks_for_no_encoding(self) -> None:
+        outcome, server = asyncio.run(play(hostile.stream_of(_complete())))
+
+        assert outcome.error is None
+        assert server.exchanges[0].headers["accept-encoding"] == "identity"
+
+    @pytest.mark.parametrize(
+        "name",
+        ["gzip_stream", "gzip_error_body", "br_stream", "deflate_stream", "stacked_encodings"],
+    )
+    def test_a_compressed_response_is_refused_before_a_byte_of_it_is_decoded(
+        self, name: str
+    ) -> None:
+        network = hostile.CountingTransport()
+
+        outcome, _ = asyncio.run(play(SCENARIOS[name], transport=network))
+
+        assert type(outcome.error) is ProviderError
+        assert "encoding that is not accepted" in str(outcome.error)
+        assert network.read == 0  # not even the compressed body was pulled off the socket
+        assert not any(isinstance(e, TextDelta) for e in outcome.events)
 
 
 class TestTheKeyGoesNowhereElse:
