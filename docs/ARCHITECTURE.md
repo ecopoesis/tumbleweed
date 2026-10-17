@@ -157,8 +157,8 @@ shell, voice or `gi` (section 10).
   again, so a path swapped for a symlink after the check cannot change what is mounted (the
   mount *sources*; a mount point's parents are another matter, below). bwrap closes the
   descriptors before the program runs. A grant may be, contain or be inside none of `/proc`,
-  `/dev`, `/sys`, `/workspace`, `/inputs`, another grant or a runtime path, and may not replace
-  `/tmp`. No nesting, because bwrap makes the mount point of an inner grant by walking the live
+  `/dev`, `/sys`, `/workspace`, `/inputs`, `/tmp`, another grant or a runtime path (a grant inside
+  `/tmp` would inherit Landlock's write rule for it). No nesting, because bwrap makes the mount point of an inner grant by walking the live
   directory of the outer one, which the program can write to: a symlink planted there
   (`/oldroot`, which bwrap itself uses to reach the host while it builds the sandbox) would send
   that `mkdir` to the host, outside every grant. The broker keeps its grants apart (S17).
@@ -203,13 +203,25 @@ shell, voice or `gi` (section 10).
   compat entry point cannot reach a syscall by a number the list does not know. The Landlock calls
   are never denied. A name libseccomp does not know is an error, never a silent gap, and the
   launcher never runs without the filter (`SandboxUnavailable`).
-  **Unix sockets.** `connect` cannot be matched by address family: the `sockaddr` is behind a
+  **Sockets are an allowlist of families.** `socket` and `socketpair` answer `EAFNOSUPPORT` for
+  every family but `AF_INET` and `AF_INET6` (both confined by the sandbox's own network
+  namespace) and, for `socketpair` only, `AF_UNIX` stream and seqpacket. `AF_VSOCK` would reach
+  the host and other guests outside the namespace; `AF_ALG`, `AF_PACKET`, `AF_NETLINK` and the
+  rest are kernel attack surface (netlink is only needed to configure interfaces, which a sandbox
+  has no right to; glibc's `if_nameindex` uses it, so a program lists interfaces from
+  `/proc/net/dev`). `connect` cannot be matched by address family: the `sockaddr` is behind a
   pointer and a filter sees only registers. So the filter refuses what a program needs to have a
-  socket to connect with: `socket(AF_UNIX, ...)`, and `socketpair(AF_UNIX, ...)` of every type but
-  stream and seqpacket (a datagram socket from `socketpair` can be `connect`ed to a path
-  afterwards, verified; a connected stream or seqpacket one answers `EISCONN`). What this breaks
-  inside a sandbox: servers and clients on unix sockets, so syslog, `multiprocessing` managers and
-  D-Bus clients. asyncio's event loop still works (it wakes itself through a stream socketpair).
+  socket to connect to a unix address with: `socket(AF_UNIX, ...)`, and `socketpair(AF_UNIX,
+  ...)` of every type but stream and seqpacket (a datagram socket from `socketpair` can be
+  `connect`ed to a path afterwards, verified; a connected stream or seqpacket one answers
+  `EISCONN`). What this breaks inside a sandbox: servers and clients on unix sockets, so syslog,
+  `multiprocessing` managers and D-Bus clients. asyncio's event loop still works (it wakes itself
+  through a stream socketpair). **Integer arguments are compared masked to 32 bits**: the kernel
+  truncates an `int`, a filter sees the whole register, so `(1 << 32) | AF_UNIX` was `AF_UNIX` to
+  the kernel and a different number to a 64-bit compare (the first round's live escape). Every
+  rule on an `int` uses `MASKED_EQ` with `0xFFFFFFFF`, and a family with any high bit, or at or
+  above the kernel's `AF_MAX`, is refused whole. `personality` is allowed only as `PER_LINUX`
+  (0), and `kcmp`, `memfd_secret` and `process_madvise` are denied.
   The filter is a deny list, so what it does not name is allowed; that is not an escape because the
   program also has no capabilities, no nested user namespaces, a read-only root and Landlock.
 - **The in-sandbox launcher and Landlock (S15).** The first process in the sandbox is
@@ -217,10 +229,16 @@ shell, voice or `gi` (section 10).
   its source at `/tumbleweed-sandbox-exec` (`--ro-bind-data`) and runs it with the runtime's own
   interpreter (`RuntimeSpec.interpreter`, `python3 -I -S`), so a runtime needs a Python even when
   the program is not Python. It confirms `no_new_privs` and that the sandbox's seccomp filter is
-  loaded (`Seccomp: 2`, and a unix socket cannot be made, which only that filter stops) and
-  refuses otherwise, reads the environment bwrap built from
-  `/proc/self/environ` (Python adds `LC_CTYPE` to its own), applies a Landlock ruleset, writes a
-  report on a pipe that the `exec` closes (the program never holds it), and `exec`s the program.
+  loaded (`Seccomp: 2`, and a unix socket cannot be made, also with a high bit on the family,
+  which only that filter stops) and refuses otherwise. It runs with **no environment of the
+  policy's** (`--clearenv`, no `--setenv`): the program's variables arrive as `--env NAME VALUE`
+  arguments and are applied only to the program, so a `LD_PRELOAD` cannot run code in the
+  launcher before Landlock (the policy refuses `LD_*`, `GCONV_PATH`, `LOCPATH`, `NLSPATH`,
+  `MALLOC_*`, `GLIBC_TUNABLES`, `HOSTALIASES` and `RES_OPTIONS` as well, as defence in depth;
+  `PYTHON*` is the program's business and the launcher runs `python3 -I`). It reads the
+  environment bwrap built from `/proc/self/environ` (Python adds `LC_CTYPE` to its own), applies a
+  Landlock ruleset, writes a report on a pipe that the `exec` closes (the program never holds it),
+  and `exec`s the program.
   The ruleset is derived from the policy's mounts (`landlock_rules`), so the two cannot drift:
   the runtime, inputs and read grants allow read and execute; the workspace, write grants, `/tmp`
   and `/dev/shm` are writable (but no sockets or device nodes can be created in them); `/dev`
@@ -235,8 +253,10 @@ shell, voice or `gi` (section 10).
   keep host abstract sockets out), and, on kernels before ABI 2 and 3, renames across
   directories and truncation. Executing is allowed wherever reading is, as the mounts allow it.
 - **`require_landlock`.** A policy field, true unless set otherwise, which is what the target
-  needs. With it true, a kernel that has no usable Landlock (`ENOSYS`, `EOPNOTSUPP`) makes the run
-  raise `SandboxUnavailable` before the program starts, so a weaker sandbox is never what runs
+  needs. With it true, a kernel that has no usable Landlock (`ENOSYS`, `EOPNOTSUPP`, or `EPERM`,
+  which is an outer seccomp filter refusing the call; any other answer is a refusal, not "no
+  Landlock") makes the run raise `SandboxUnavailable` before the program starts, and so does a
+  report that does not say Landlock was applied (the runner checks it, it does not trust it), so a weaker sandbox is never what runs
   by accident. A dev kernel without it (Docker Desktop's, #44) sets it false, and then every
   result says so: `SandboxResult.hardening.landlock` is `unavailable`, with the kernel's answer in
   `detail`. Where Landlock is there it is always applied, whatever the flag says. Any other failure
@@ -452,7 +472,7 @@ Each invariant names where it is enforced. Reviews check every change against th
   explicit grants, no host sockets (Wayland, X11, D-Bus, PipeWire, broker, shell, host
   loopback), user namespace with nested userns disabled, `no_new_privs`, all capabilities
   dropped, a seccomp filter (architecture-checked, non-native ABIs killed; no keyring calls and
-  no unix sockets), a Landlock ruleset and a pids limit (both required on the target; on dev/CI
+  no unix sockets or families beyond inet), a Landlock ruleset and a pids limit (both required on the target; on dev/CI
   hosts without them the run reports their absence), CPU/memory/time/output limits, killed with
   its parent.
 - **I4 — Generated UI is inert data.** The renderer accepts only the schema. No Pango markup
@@ -625,10 +645,11 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   tests are required in CI (Ubuntu kernel); on Docker Desktop's kernel, which has none (#44), they
   skip with the kernel's answer, and so a local `TUMBLEWEED_CI=1 scripts/test-linux` there fails
   exactly those (`TestWithLandlock`): that is the guard working, not a bug. The ABI tests that
-  need x86_64 are not defined on other machines, so they neither skip nor fail there. The sandbox tests that are not about Landlock set `require_landlock` by whether the kernel
-  has it, so on a dev kernel they run without it and in CI they run with it required. The
-  refusal and the "no Landlock" report are tested everywhere, by hiding the Landlock syscalls
-  behind a seccomp filter. A macOS job runs the platform-neutral subset.
+  need x86_64 are skipped elsewhere with that reason, so a local `TUMBLEWEED_CI=1` run on Apple
+  silicon fails them too. The sandbox tests that are not about Landlock set `require_landlock` by
+  whether the kernel has it, so on a dev kernel they run without it and in CI they run with it
+  required. The refusal and the "no Landlock" report are tested everywhere, by hiding the
+  Landlock syscalls behind a seccomp filter. A macOS job runs the platform-neutral subset.
 - **Target**: NixOS (aarch64 and x86_64) booting into Cage running `tumbleweed-shell`, with a
   fallback Sway session, a VT2 login, and btrfs home snapshots, as a VM image for
   UTM/Parallels (S26–S27).
