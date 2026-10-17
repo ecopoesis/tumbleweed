@@ -112,6 +112,8 @@ def exec_command(policy: SandboxPolicy, fds: HardeningFds) -> list[str]:
     ]
     if policy.require_landlock:
         argv.append("--require-landlock")
+    for var in sorted(policy.env, key=lambda item: item.name):
+        argv += ["--env", var.name, var.value]
     for rule in landlock_rules(policy):
         argv += [rule.kind.value, rule.path]
     return [*argv, "--", *policy.command]

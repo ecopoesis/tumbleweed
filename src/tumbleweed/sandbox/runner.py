@@ -337,7 +337,9 @@ class SandboxRunner:
         if termination is Termination.EXITED and not status.ran:
             raise SandboxLaunchError(_launch_failure(proc.returncode, err.data))
         launcher = parse_report(_read_report(report_file))
-        hardening = self._hardening(launcher, termination, proc.returncode, err.data)
+        hardening = self._hardening(
+            launcher, termination, proc.returncode, err.data, policy.require_landlock
+        )
         return SandboxResult(
             termination=termination,
             exit_code=exit_code,
@@ -357,6 +359,7 @@ class SandboxRunner:
         termination: Termination,
         returncode: int | None,
         stderr: bytearray,
+        require_landlock: bool,
     ) -> HardeningReport:
         """What the in-sandbox launcher reported, or the error that says the program never ran."""
         if launcher.refused is not None:
@@ -373,6 +376,13 @@ class SandboxRunner:
             return HardeningReport(
                 landlock=LandlockState.UNKNOWN,
                 detail="the run ended before the in-sandbox launcher reported",
+            )
+        if require_landlock and launcher.hardening.landlock is not LandlockState.APPLIED:
+            # The launcher refuses on its own when told Landlock is required: this is the
+            # launcher's report checked, not trusted.
+            raise SandboxUnavailable(
+                "Landlock is required but the launcher did not apply it "
+                f"({launcher.hardening.landlock.value}): the run is not accepted"
             )
         if launcher.hardening.landlock is LandlockState.UNAVAILABLE and not self._warned:
             self._warned = True

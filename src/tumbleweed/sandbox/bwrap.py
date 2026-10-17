@@ -77,8 +77,11 @@ def build_bwrap_argv(
         # A file of the root tmpfs, so before the remount below makes it read-only.
         argv += ["--ro-bind-data", str(hardening.helper), HELPER_TARGET]
     argv += ["--remount-ro", "/", "--chdir", WORKSPACE_TARGET]
-    for var in sorted(policy.env, key=lambda item: item.name):
-        argv += ["--setenv", var.name, var.value]
+    if hardening is None:
+        for var in sorted(policy.env, key=lambda item: item.name):
+            argv += ["--setenv", var.name, var.value]
+    # With the hardening, the launcher gets an empty environment and the program's own variables
+    # as arguments (see `exec_command`): a `LD_PRELOAD` must not run in the launcher.
     command = policy.command if hardening is None else exec_command(policy, hardening)
     return [*argv, "--", *command]
 

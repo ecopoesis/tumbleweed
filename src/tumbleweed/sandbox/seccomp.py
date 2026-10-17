@@ -13,17 +13,31 @@ escape. The list is below, with the reason for each group.
   libseccomp's x86_64 programs treat the x32 bit (`0x40000000`) as a foreign ABI too, so the x32 and
   i386 entry points, and the 32-bit ARM one on aarch64, cannot be used to reach a syscall
   by a number the list does not know. No other architecture is ever added to the filter.
-- Denials return `EPERM`, so a program gets an ordinary error it can handle. `clone3` returns
+- Denials return `EPERM` (`EAFNOSUPPORT` for sockets), so a program gets an ordinary error it can
+  handle. `clone3` returns
   `ENOSYS` instead: its flags are in a struct behind a pointer, which seccomp cannot read, so it
   cannot be filtered by flag, and glibc falls back to `clone`, whose flags are arguments.
-- `connect` cannot be filtered by address family: the family is in the `sockaddr` the second
-  argument points to, and a filter sees only the argument registers. What can be filtered is how a
-  program gets a socket it could `connect` to a unix address with: `socket(AF_UNIX, ...)`, and
-  `socketpair(AF_UNIX, SOCK_DGRAM, ...)` (a datagram socket can be re-`connect`ed after
-  `socketpair`; a stream or seqpacket one is already connected and answers `EISCONN`). Both are
-  denied. What this breaks inside a sandbox: listening on or connecting to a unix socket, and
-  anything built on one (syslog, the `multiprocessing` managers, D-Bus clients). What it keeps:
-  `socketpair(AF_UNIX, SOCK_STREAM)`, which asyncio's event loop uses to wake itself.
+- **Sockets are an allowlist of families.** `socket` and `socketpair` return `EAFNOSUPPORT` for
+  every family but `AF_INET` and `AF_INET6` (`socket`; both confined by the sandbox's own network
+  namespace, so `AF_INET` reaches nothing) and `AF_UNIX` (`socketpair`, stream and seqpacket
+  only). Everything else is closed: `AF_VSOCK` reaches the host and other guests outside the
+  network namespace, `AF_ALG`, `AF_PACKET`, `AF_NETLINK`, `AF_BLUETOOTH`, ... are kernel attack
+  surface (netlink would be needed only for interface or route setup, which a sandbox has no
+  rights to and no use for). `connect` itself cannot be filtered by address family: the family is
+  in the `sockaddr` the second argument points to, and a filter sees only the argument registers.
+  What can be filtered is how a program gets a socket it could `connect` to a unix address with:
+  `socket(AF_UNIX, ...)`, and `socketpair(AF_UNIX, SOCK_DGRAM, ...)` (a datagram socket can be
+  re-`connect`ed after `socketpair`; a stream or seqpacket one is already connected and answers
+  `EISCONN`). Both are denied. What this breaks inside a sandbox: listening on or connecting to a
+  unix socket, and anything built on one (syslog, the `multiprocessing` managers, D-Bus clients).
+  What it keeps: `socketpair(AF_UNIX, SOCK_STREAM)`, which asyncio's event loop uses to wake
+  itself.
+- **Integer arguments are always compared masked to 32 bits.** The kernel truncates an `int`
+  argument, a filter sees the whole 64-bit register, so `(1 << 32) | AF_UNIX` is `AF_UNIX` to the
+  kernel and a different number to an unmasked compare (it was a live escape in the first round).
+  Every rule on an `int` or `unsigned int` argument therefore uses `SCMP_CMP_MASKED_EQ` with
+  `0xFFFFFFFF`, and a value with any bit above 31 set is refused outright where the argument is a
+  family or a persona. `clone`'s flags are an `unsigned long` and compared as the full word.
 - The Landlock calls are never denied: `tumbleweed-sandbox-exec` makes them after bwrap has
   loaded this filter.
 
@@ -46,6 +60,7 @@ _SCMP_ACT_ALLOW: Final = 0x7FFF0000
 _SCMP_ACT_KILL_PROCESS: Final = 0x80000000
 _SCMP_ACT_ERRNO_BASE: Final = 0x00050000
 _SCMP_FLTATR_ACT_BADARCH: Final = 2
+_SCMP_CMP_GE: Final = 5
 _SCMP_CMP_EQ: Final = 4
 _SCMP_CMP_MASKED_EQ: Final = 7
 _SCMP_NR_UNKNOWN: Final = -1  # __NR_SCMP_ERROR; below it (-101...) are names this arch lacks
@@ -56,6 +71,16 @@ SOCK_RAW: Final = 3
 SOCK_RDM: Final = 4
 # SOCK_NONBLOCK and SOCK_CLOEXEC are OR-ed into the type argument above this.
 SOCK_TYPE_MASK: Final = 0xF
+INT_MASK: Final = 0xFFFFFFFF
+"""The width of a C `int` argument: what the kernel keeps of the register."""
+AF_INET: Final = 2
+AF_INET6: Final = 10
+# Families below the kernel's AF_MAX (46 on 6.x): socket(2) refuses the rest itself with
+# EAFNOSUPPORT, and the filter refuses everything from here up (and any high bit) for it.
+FAMILY_LIMIT: Final = 46
+SOCKET_FAMILIES: Final = frozenset({AF_INET, AF_INET6})
+"""The families `socket` may create: both stay inside the sandbox's network namespace."""
+PER_LINUX: Final = 0
 
 # Every flag of `clone` that creates a namespace. `CLONE_NEWTIME` is not one of them: it is not a
 # valid flag of `clone` (its bit is part of the exit signal), only of `unshare` and `clone3`.
@@ -126,6 +151,11 @@ DENIED_SYSCALLS: Final = (
     "iopl",
     "ioperm",
     "modify_ldt",
+    # Compare kernel objects of other processes (a probe for what ptrace would reach), and
+    # memory or madvise on another process: nothing in a sandbox needs them.
+    "kcmp",
+    "memfd_secret",
+    "process_madvise",
 )
 """The syscalls refused with `EPERM`, whatever their arguments."""
 
@@ -221,8 +251,14 @@ def _check(result: int, what: str) -> None:
         raise SandboxUnavailable(f"libseccomp: {what} failed: {os.strerror(-result)}")
 
 
+def _masked(arg: int, value: int) -> _Compare:
+    """`arg` equals `value` as a C `int`: the kernel's view, not the register's."""
+    return _Compare(arg, _SCMP_CMP_MASKED_EQ, INT_MASK, value)
+
+
 def _rules(ctx: int) -> None:
     eperm = _errno_action(errno.EPERM)
+    unsupported = _errno_action(errno.EAFNOSUPPORT)
     for name in DENIED_SYSCALLS:
         _add(ctx, eperm, name)
     for name in ENOSYS_SYSCALLS:
@@ -230,17 +266,31 @@ def _rules(ctx: int) -> None:
     for value in CLONE_NEW_FLAGS.values():
         # Any one bit set denies: a `MASKED_EQ` of a single bit is "that bit is set".
         _add(ctx, eperm, "clone", (_Compare(0, _SCMP_CMP_MASKED_EQ, value, value),))
-    _add(ctx, eperm, "socket", (_Compare(0, _SCMP_CMP_EQ, AF_UNIX),))
+    # Families: a value of FAMILY_LIMIT or more (a high bit too) is refused whole; below it, each
+    # family that is not allowed is refused by its masked value. One action for all of them, so
+    # that rules that overlap (a high bit on a refused family) cannot disagree.
+    _add(ctx, unsupported, "socket", (_Compare(0, _SCMP_CMP_GE, FAMILY_LIMIT),))
+    _add(ctx, unsupported, "socketpair", (_Compare(0, _SCMP_CMP_GE, FAMILY_LIMIT),))
+    for family in range(FAMILY_LIMIT):
+        if family not in SOCKET_FAMILIES:
+            _add(ctx, unsupported, "socket", (_masked(0, family),))
+        if family != AF_UNIX:
+            _add(ctx, unsupported, "socketpair", (_masked(0, family),))
     for socket_type in (SOCK_DGRAM, SOCK_RAW, SOCK_RDM):
         _add(
             ctx,
-            eperm,
+            unsupported,
             "socketpair",
             (
-                _Compare(0, _SCMP_CMP_EQ, AF_UNIX),
+                _masked(0, AF_UNIX),
                 _Compare(1, _SCMP_CMP_MASKED_EQ, SOCK_TYPE_MASK, socket_type),
             ),
         )
+    # personality(2): only PER_LINUX (0) is allowed; every other persona (READ_IMPLIES_EXEC,
+    # ADDR_NO_RANDOMIZE, the compat ones) and any high bit is refused. That includes the query
+    # (0xffffffff), which a filter cannot allow beside a range (libseccomp takes one comparison
+    # per argument in a rule) and which nothing in a sandbox needs.
+    _add(ctx, eperm, "personality", (_Compare(0, _SCMP_CMP_GE, PER_LINUX + 1),))
 
 
 @functools.cache
@@ -251,9 +301,10 @@ def filter_program() -> bytes:
     libseccomp is missing or cannot build it, so that nothing ever runs without the filter.
     """
     lib = _library()
-    ctx = lib.seccomp_init(_SCMP_ACT_ALLOW)
-    if not ctx:
+    created: object = lib.seccomp_init(_SCMP_ACT_ALLOW)  # c_void_p: an int, or None for NULL
+    if not isinstance(created, int) or created == 0:
         raise SandboxUnavailable("libseccomp could not create a filter")
+    ctx = created
     try:
         # Native architecture only (seccomp_init adds it), and a foreign one is killed.
         _check(

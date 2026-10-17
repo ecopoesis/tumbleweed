@@ -12,8 +12,10 @@ In order, before the program gets control:
    (`Seccomp: 2` in `/proc/self/status`, and a unix socket cannot be made, which only that filter
    prevents). Without either it refuses, so a bwrap that silently skipped `--seccomp` never runs
    a program.
-2. Read the environment bwrap built from `/proc/self/environ`. Python adds variables to its own
-   (`LC_CTYPE`, from PEP 538), and the program must see exactly the policy's.
+2. Build the program's environment: what bwrap built, read from `/proc/self/environ` (Python adds
+   variables to its own, `LC_CTYPE` from PEP 538), plus the policy's variables, which arrive as
+   `--env NAME VALUE` arguments. This process itself runs with none of the policy's environment,
+   so that a `LD_PRELOAD` there cannot run code here before Landlock is applied.
 3. Restrict the filesystem with Landlock to the paths named on the command line, which the
    launcher derived from the policy's mounts (`--read`, `--write`, `--devices`), plus, where the
    kernel's Landlock ABI has it (6), the scope that stops it connecting to abstract unix sockets
@@ -37,7 +39,7 @@ import ctypes
 import errno
 import json
 import os
-import socket
+import platform
 import stat
 import struct
 import sys
@@ -178,7 +180,12 @@ def _syscall(number: int, *args: object) -> int:
 
 
 def landlock_abi() -> tuple[int | None, str | None]:
-    """The kernel's Landlock ABI version, or `None` and why there is none."""
+    """The kernel's Landlock ABI version, or `None` and why there is none.
+
+    No Landlock means the answers `_UNAVAILABLE_ERRNOS` (no syscall, not enabled in the LSM list,
+    or an outer seccomp filter refusing it). Any other answer is not "unavailable" but something
+    unexpected, and raises `Refused`: it is not a kernel to run on without looking.
+    """
     result = _syscall(
         _SYS_LANDLOCK_CREATE_RULESET,
         ctypes.c_void_p(None),
@@ -188,7 +195,10 @@ def landlock_abi() -> tuple[int | None, str | None]:
     if result >= 1:
         return result, None
     code = ctypes.get_errno()
-    return None, f"landlock_create_ruleset: {errno.errorcode.get(code, code)} ({os.strerror(code)})"
+    what = f"landlock_create_ruleset: {errno.errorcode.get(code, code)} ({os.strerror(code)})"
+    if code not in _UNAVAILABLE_ERRNOS:
+        raise Refused(what)
+    return None, what
 
 
 def _fail(what: str) -> Refused:
@@ -264,21 +274,48 @@ def _seccomp_mode() -> int | None:
     return None
 
 
+_SYS_SOCKET: Final = {"x86_64": 41, "aarch64": 198}
+
+
+def _socket_errno(family: int) -> int | None:
+    """What `socket(family, SOCK_STREAM, 0)` answers as a raw syscall: an errno, `None` if it works.
+
+    Raw, so that `family` can carry bits above 31, which a C `int` (and Python's `socket`) cannot.
+    """
+    number = _SYS_SOCKET.get(platform.machine())
+    if number is None:
+        raise Refused(f"unsupported architecture {platform.machine()!r}")
+    libc = _libc()
+    libc.syscall.restype = ctypes.c_long
+    result = int(
+        libc.syscall(
+            ctypes.c_long(number), ctypes.c_long(family), ctypes.c_long(1), ctypes.c_long(0)
+        )
+    )
+    if result >= 0:
+        os.close(result)
+        return None
+    return ctypes.get_errno()
+
+
 def _unix_sockets_are_denied() -> bool:
-    """Whether `socket(AF_UNIX)` fails with `EPERM`, which nothing but the sandbox's filter does.
+    """Whether a unix socket cannot be made, also with a high bit on the family.
 
     `Seccomp: 2` says some filter is loaded, and a launcher run under another one (a container
-    runtime's) would pass that. This says it is ours.
+    runtime's) would pass that. Nothing but the sandbox's filter refuses `AF_UNIX` with
+    `EAFNOSUPPORT`, so this says it is ours, and that it masks the family to 32 bits.
     """
-    try:
-        socket.socket(socket.AF_UNIX).close()
-    except OSError as exc:
-        return exc.errno == errno.EPERM
-    return False
+    refused = (errno.EAFNOSUPPORT, errno.EPERM)
+    return _socket_errno(1) in refused and _socket_errno((1 << 32) | 1) in refused
 
 
-def _environment() -> dict[str, str]:
-    """The environment this process was started with, as bwrap built it."""
+def _environment(extra: list[tuple[str, str]]) -> dict[str, str]:
+    """The program's environment: what bwrap built (`PWD`), plus the policy's variables (`extra`).
+
+    This process runs with no environment of the policy's: they reach it as arguments and are
+    applied only here, to the program, so that a `LD_PRELOAD` in the policy cannot run code in the
+    launcher before Landlock.
+    """
     try:
         raw = Path("/proc/self/environ").read_bytes()
     except OSError as exc:
@@ -288,6 +325,8 @@ def _environment() -> dict[str, str]:
         name, found, value = os.fsdecode(entry).partition("=")
         if found:
             env[name] = value
+    for name, value in extra:
+        env[name] = value
     return env
 
 
@@ -298,6 +337,7 @@ class Options:
         self.report_fd: int | None = None
         self.require_landlock = False
         self.rules: list[tuple[str, str]] = []
+        self.env: list[tuple[str, str]] = []
         self.command: list[str] = []
 
 
@@ -305,7 +345,8 @@ _RULE_FLAGS: Final = {"--read": "read", "--write": "write", "--devices": "device
 
 
 def parse_args(argv: list[str]) -> Options:
-    """Parse `--report-fd N [--require-landlock] [--read|--write|--devices PATH]... -- COMMAND`."""
+    """Parse `--report-fd N [--require-landlock] [--env NAME VALUE]... [--read|--write|--devices
+    PATH]... -- COMMAND`."""
     options = Options()
     index = 0
     while index < len(argv):
@@ -319,6 +360,12 @@ def parse_args(argv: list[str]) -> Options:
         elif word == "--report-fd" and index + 1 < len(argv) and argv[index + 1].isdigit():
             options.report_fd = int(argv[index + 1])
             index += 2
+        elif word == "--env" and index + 2 < len(argv):
+            name = argv[index + 1]
+            if not name or "=" in name or "\0" in name:
+                raise Refused(f"bad environment variable name {name!r}")
+            options.env.append((name, argv[index + 2]))
+            index += 3
         elif word in _RULE_FLAGS and index + 1 < len(argv):
             options.rules.append((_RULE_FLAGS[word], argv[index + 1]))
             index += 2
@@ -374,7 +421,7 @@ def main(argv: list[str] | None = None) -> NoReturn:
     assert options.report_fd is not None  # noqa: S101  (parse_args checked it)
     fd = options.report_fd
     try:
-        env = _environment()
+        env = _environment(options.env)
         hardening = _confine(options)
     except Refused as exc:
         _report(fd, {"kind": "refused", "code": exc.code, "reason": str(exc)})
