@@ -333,5 +333,5 @@ would be told, one problem per line, with exit status 1 and no window. The rende
 `tumbleweed.ui.runtime` (state, expressions, handlers; no GTK, unit-tested without a display) and
 `tumbleweed.ui.gtk` (the thin adapter; `pytest -m gtk` in the container). It creates no popover,
 dialog, tooltip or drag icon from a spec, so that the canvas can never cover the trusted chrome
-(a `dropdown` is a list in place; DECISIONS D11), and images, tables, text views, tabs and expanders
+(a `dropdown` is a list in place; DECISIONS D14), and images, tables, text views, tabs and expanders
 show as a placeholder until S11.
