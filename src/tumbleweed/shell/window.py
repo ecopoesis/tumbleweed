@@ -23,6 +23,7 @@ from tumbleweed.shell.chat_panel import ChatPanel
 from tumbleweed.shell.chrome import ChromeRegion
 from tumbleweed.shell.status_strip import StatusStrip
 from tumbleweed.shell.viewmodel.chat import ChatController
+from tumbleweed.shell.viewmodel.session import ChatSession, HistoryOpener
 from tumbleweed.shell.viewmodel.transcript import Transcript
 
 WINDOW_TITLE = "Tumbleweed"
@@ -34,16 +35,24 @@ SIDE_PANEL_WIDTH = 380
 class ShellWindow(Adw.ApplicationWindow):
     """The one window of the shell."""
 
-    def __init__(self, application: Adw.Application, responder: Responder) -> None:
+    def __init__(
+        self,
+        application: Adw.Application,
+        responder: Responder,
+        open_history: HistoryOpener | None = None,
+    ) -> None:
         super().__init__(application=application)
         self.set_title(WINDOW_TITLE)
         self.set_default_size(*DEFAULT_SIZE)
 
         self.transcript = Transcript()
         self.controller = ChatController(self.transcript, responder)
+        # Restores the last session into the transcript before the panel is built from it.
+        self.session = ChatSession(self.transcript, self.controller, open_history)
+        self.session.start()
         self.chrome = ChromeRegion()
         self.canvas = CanvasView()
-        self.chat_panel = ChatPanel(self.controller, self.transcript)
+        self.chat_panel = ChatPanel(self.controller, self.transcript, self.session)
         self.chat_panel.set_size_request(SIDE_PANEL_WIDTH, -1)
         self.status_strip = StatusStrip()
 
@@ -108,12 +117,16 @@ class ShellWindow(Adw.ApplicationWindow):
         return True
 
     def shutdown(self) -> None:
-        """Stop the reply in flight, and stop observing it, before the widgets go away.
+        """Stop the reply in flight, and stop observing it, before the widgets go away; then save
+        what it left (the failed reply) and release the chat history.
 
         A window that is destroyed outright gets no `close-request`, so whoever ends the window
         calls this: the `close-request` handler does, and so does the application when it quits.
         """
-        self.chat_panel.shutdown()
+        try:
+            self.chat_panel.shutdown()
+        finally:
+            self.session.close()
 
     def _on_close_request(self, _window: Gtk.Window) -> bool:
         self.shutdown()

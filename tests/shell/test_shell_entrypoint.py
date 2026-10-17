@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -42,12 +43,16 @@ PASSED_ON = (
 )
 
 
-def minimal_environment(*, display: bool) -> dict[str, str]:
-    return {
+def minimal_environment(*, display: bool, data_home: Path) -> dict[str, str]:
+    """What the shell is started with. Its data home is a scratch directory: the shell keeps the
+    chat history there, and a test must not write into the real one."""
+    environment = {
         name: os.environ[name]
         for name in PASSED_ON
         if name in os.environ and (display or name not in DISPLAY_VARIABLES)
     }
+    environment["XDG_DATA_HOME"] = str(data_home)
+    return environment
 
 
 @pytest.mark.parametrize(
@@ -61,14 +66,14 @@ def minimal_environment(*, display: bool) -> dict[str, str]:
     ids=["SIGTERM", "SIGINT", "SIGTERM-with-warnings-as-errors"],
 )
 def test_the_shell_starts_headless_and_quits_cleanly_on_a_stop_signal(
-    stop_signal: signal.Signals, python_flags: tuple[str, ...]
+    stop_signal: signal.Signals, python_flags: tuple[str, ...], tmp_path: Path
 ) -> None:
     process = subprocess.Popen(  # noqa: S603  (argv list, no shell, our own interpreter)
         [sys.executable, *python_flags, "-m", "tumbleweed.shell"],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        env=minimal_environment(display=True),
+        env=minimal_environment(display=True, data_home=tmp_path),
     )
     assert process.stderr is not None
     log = b""
@@ -97,14 +102,16 @@ def test_the_shell_starts_headless_and_quits_cleanly_on_a_stop_signal(
         process.stderr.close()
 
 
-def test_without_a_display_the_shell_says_so_in_one_line_and_exits_1_without_a_traceback() -> None:
+def test_without_a_display_the_shell_says_so_in_one_line_and_exits_1_without_a_traceback(
+    tmp_path: Path,
+) -> None:
     result = subprocess.run(
         [sys.executable, "-m", "tumbleweed.shell"],
         capture_output=True,
         text=True,
         check=False,
         timeout=START_DEADLINE,
-        env=minimal_environment(display=False),
+        env=minimal_environment(display=False, data_home=tmp_path),
         stdin=subprocess.DEVNULL,
     )
 

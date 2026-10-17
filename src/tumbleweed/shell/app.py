@@ -1,5 +1,6 @@
 """The Adw application: creates the window, owns the shortcuts and runs the main loop."""
 
+import functools
 import logging
 import os
 import signal
@@ -7,10 +8,13 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import final
 
+from tumbleweed.agent.config import shell_data_dir
 from tumbleweed.agent.factory import build_agent
 from tumbleweed.agent.responder import Responder
+from tumbleweed.history.store import HistoryStore
 from tumbleweed.shell._gi import Adw, Gdk, Gio, GLib, GLibUnix
 from tumbleweed.shell.dispatch import GlibDispatcher
+from tumbleweed.shell.viewmodel.session import HistoryOpener
 from tumbleweed.shell.window import ShellWindow
 
 logger = logging.getLogger(__name__)
@@ -46,9 +50,11 @@ class ShellApplication(Adw.Application):
         responder: Responder,
         *,
         flags: Gio.ApplicationFlags = Gio.ApplicationFlags.NON_UNIQUE,
+        open_history: HistoryOpener | None = None,
     ) -> None:
         super().__init__(application_id=APPLICATION_ID, flags=flags)
         self._responder = responder
+        self._open_history = open_history
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
@@ -61,7 +67,7 @@ class ShellApplication(Adw.Application):
     def do_activate(self) -> None:
         window = self.get_active_window()
         if window is None:
-            window = ShellWindow(self, self._responder)
+            window = ShellWindow(self, self._responder, self._open_history)
             logger.info("shell window created")
         window.present()
 
@@ -116,6 +122,8 @@ def run(argv: Sequence[str] = (PROGRAM,)) -> int:
 
     The responder is the agent (a model) or the echo placeholder, per the configuration
     (`tumbleweed.agent.config`); the API key is taken out of the process environment on the way.
+    The chat is kept in `$XDG_DATA_HOME/tumbleweed/shell/` (`tumbleweed.history`) and the last
+    session is restored on start.
 
     Without a display it says so in one line and returns 1: GTK would otherwise print criticals
     and fail inside `do_activate` with a traceback, then exit 0.
@@ -127,7 +135,11 @@ def run(argv: Sequence[str] = (PROGRAM,)) -> int:
         )
         return 1
     agent = build_agent(os.environ, GlibDispatcher())
-    app = ShellApplication(agent.responder)
+    # The history is opened when the window is made (and may refuse: the shell then runs without).
+    app = ShellApplication(
+        agent.responder,
+        open_history=functools.partial(HistoryStore.open, shell_data_dir(os.environ)),
+    )
     try:
         with quit_on_signals(app):
             return app.run(list(argv))

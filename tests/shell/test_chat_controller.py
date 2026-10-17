@@ -564,6 +564,9 @@ class TestAbortGuards:
                 if message.state is MessageState.FAILED:
                     raise RuntimeError("observer bug")
 
+            def messages_replaced(self, messages: tuple[TranscriptMessage, ...]) -> None:
+                return
+
         responder = ManualResponder()
         transcript, controller = setup(responder)
         controller.send("q")
