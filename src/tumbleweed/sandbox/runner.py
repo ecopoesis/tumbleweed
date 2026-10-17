@@ -217,11 +217,13 @@ class SandboxRunner:
     async def run(self, policy: SandboxPolicy) -> SandboxResult:
         """Run the policy's command to its end, its limits, or the wall-clock limit.
 
-        Raises `SandboxUnsupported` off Linux, `SandboxUnavailable` when bwrap or prlimit is
-        missing (nothing is ever run without them), `InvalidPolicyError` for a descriptor that is
+        Raises `SandboxUnsupported` off Linux, `SandboxUnavailable` when bwrap, prlimit or
+        libseccomp is missing or the policy requires Landlock and the kernel has none (nothing is
+        ever run without the filter, or without Landlock when it is required),
+        `InvalidPolicyError` for a descriptor that is
         closed or of the wrong kind, and `SandboxLaunchError` when the sandbox could not be set up
         and the program never started (a mount source that is gone, a program that does not exist
-        in the sandbox). A program that fails is a result, not an error. A run that is killed at
+        in the sandbox, a launcher that refused). A program that fails is a result, not an error. A run that is killed at
         a limit before bwrap reports on the program is a result too.
         """
         if not _platform().startswith("linux"):
