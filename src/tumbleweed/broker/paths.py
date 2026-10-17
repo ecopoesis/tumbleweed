@@ -169,6 +169,10 @@ class ResolvedPath(PolicyModel):
             if self.components[: len(root.components)] != root.components:
                 return None
             depth = len(root.components)
+            # And the object at that depth must be the one that was granted, not another that
+            # has the same inode number on a file system that was swapped in under the name.
+            if len(self.chain) <= depth or self.chain[depth] != root.identity:
+                return None
         return self.components[depth:]
 
 
