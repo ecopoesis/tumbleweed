@@ -268,12 +268,6 @@ where to add it. Landlock's scope covers abstract unix sockets only; pathname so
 seccomp and the mounts. The 32-bit ARM check cannot be run on Apple silicon or in CI, so it is
 proved on the exported program (`tests/sandbox/bpf.py`) rather than on a live AArch32 call.
 
-The rlimit fallback has no total memory limit, no pids limit (`RLIMIT_NPROC` was measured and rejected: bwrap's first fork is
-counted against all of the uid's processes) and no CPU quota (reported). Unlike the rest, the scope path cannot be run in
-the container or in CI, where there is no user manager: its command lines and the probe's decision
-are unit-tested, the wrapper is exercised with a stand-in `systemd-run`, and S27's VM test is where
-the real thing runs (#73).
-
 ## D16 — Chat history: SQLite in WAL, one owner per session by `flock`, the model's context taken from the transcript (2026-10-17, accepted)
 
 **Context.** S04 keeps the chat across restarts. Shells are non-unique (S02), so two can have the store open;
