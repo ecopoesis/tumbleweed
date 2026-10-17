@@ -267,3 +267,39 @@ is a deny list; a new dangerous syscall is allowed until it is added, and `DENIE
 where to add it. Landlock's scope covers abstract unix sockets only; pathname sockets rest on
 seccomp and the mounts. The 32-bit ARM check cannot be run on Apple silicon or in CI, so it is
 proved on the exported program (`tests/sandbox/bpf.py`) rather than on a live AArch32 call.
+
+The rlimit fallback has no total memory limit, no pids limit (`RLIMIT_NPROC` was measured and rejected: bwrap's first fork is
+counted against all of the uid's processes) and no CPU quota (reported). Unlike the rest, the scope path cannot be run in
+the container or in CI, where there is no user manager: its command lines and the probe's decision
+are unit-tested, the wrapper is exercised with a stand-in `systemd-run`, and S27's VM test is where
+the real thing runs (#73).
+
+## D16 — Chat history: SQLite in WAL, one owner per session by `flock`, the model's context taken from the transcript (2026-10-17, accepted)
+
+**Context.** S04 keeps the chat across restarts. Shells are non-unique (S02), so two can have the store open;
+the file is the user's to edit, so it is untrusted; the S03 `Conversation` trimmed by message count and bytes
+and lived in the agent. (The number D16 leaves D14 and D15 to S10 and S15, which were in flight when this was
+written; renumber at merge if they were not used.)
+**Decision.** (1) *Store.* SQLite in WAL mode (`$XDG_DATA_HOME/tumbleweed/shell/chat.sqlite3`), typed
+repositories over validated records, versioned atomic migrations, and a schema that must equal what the
+migrations produce, exactly. (2) *Who owns the last session.* A session has one owner: a shell claims it with an
+exclusive `flock` on a file named after it and holds it until it moves on or exits; the last session is the newest
+by activity among those nobody holds. (3) *Bad files.* Refuse what is not ours (a symlink, another owner,
+not a regular file, a foreign or newer database) and run without history; repair the mode of what is ours;
+if the newest session's rows are invalid, do not restore it and start a fresh one, leaving the data in place. Never
+delete a file on suspicion. (4) *Context.* The responder keeps no history: the request carries the transcript's
+finished exchanges and `agent.context` keeps the system prompt, the new message and the newest turns that fit
+120,000 estimated tokens, where a text's tokens are estimated as its UTF-8 bytes plus 16 per message.
+**Alternatives rejected.** Sharing a session between shells (two transcripts that cannot see each other's
+messages would interleave writes and each model would see half the conversation). A heartbeat column for liveness
+(a wall-clock timeout is a guess, and the window between a crash and expiry restores nothing). POSIX byte-range
+locks on one file (they belong to the process, so closing any descriptor to the file drops them, and two claims in
+one process do not conflict). A tokenizer, or characters divided by four (a new dependency per model; and neither is an upper bound,
+which would turn an under-count into a failed reply). A `Conversation` in the agent seeded by the shell (a second
+source of truth that "new session" and restore would both have to keep in step). Refusing a file or directory of ours whose mode is too open (that would
+lose the user's history over a stray `chmod`, so the mode is set and logged; the API key file is refused instead,
+because it is a secret).
+**Consequences.** The estimate overcounts ordinary English by three to four times, so the model sees about 30,000
+real tokens of history, not the window's worth; the budget is one constant (`agent.context`). A crash in the middle of
+a reply loses that reply. A session claimed by a shell that hangs stays claimed until it ends. The oldest sessions
+are deleted (20 kept, 1000 messages each). There is no way yet to browse older sessions: S04 restores the last one only.

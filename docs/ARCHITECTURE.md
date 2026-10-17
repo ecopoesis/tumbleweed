@@ -531,6 +531,11 @@ Each invariant names where it is enforced. Reviews check every change against th
   stream, 64 KiB of an error body), after asking for `Accept-Encoding: identity` and refusing any
   response that is encoded anyway, because the HTTP library decompresses above the transport and
   the count would no longer be ours. Tool inputs, results and runtime are bounded by `agent.tools`.
+  The chat history (`tumbleweed.history`, D16) bounds what it keeps (20 sessions, 1000 messages
+  per session) and what a read can return: at most the newest `limit` rows of one session and 4
+  MiB of their text, a value or row over 128 KiB fails the read, and every record is validated. What is sent to the
+  model is bounded by `agent.context`: a token budget over the system prompt, the history and the
+  new message.
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input.
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps
@@ -582,6 +587,47 @@ server dies; a socket file found at its path is then removed only if it is a soc
 user, and any other file (a regular file, a directory, a symlink, another user's socket) is left
 alone and refused. A second server on a live path is refused and the first is not disturbed.
 
+**Chat history** (`tumbleweed.history`, D16). `$XDG_DATA_HOME/tumbleweed/shell/chat.sqlite3`, with
+`chat.locks/` beside it, in directories of mode 0700 (the files 0600), created by the shell.
+
+- *Schema.* Versioned migrations (`PRAGMA user_version`; the file is marked with an
+  `application_id`), each atomic, run under `BEGIN IMMEDIATE` so that shells starting together
+  migrate once. A file is used only if its schema is exactly what the migrations make (no extra
+  trigger, view or column), and never migrated down: a newer version is refused and left alone.
+- *Concurrency.* Shells are non-unique, so several may have the file open. WAL mode, a 2 s busy
+  timeout (a write that waits longer fails with a notice, it does not freeze the window), every
+  write `BEGIN IMMEDIATE`. **A session has one owner at a time.** A shell claims the session it
+  restores or creates with an exclusive `flock` on `chat.locks/<SessionId>.lock`, held until it
+  starts another session or exits (the kernel drops it if the shell dies). "The last session" is
+  the one with the newest activity (its latest message; ties go to the newer `SessionId`) that
+  no running shell holds, among the newest eight; a second shell therefore starts a session of its
+  own while the first runs. Starting a session deletes up to 20 sessions beyond the newest 20, never
+  one a shell holds.
+- *What is stored.* Exactly what the transcript shows: message ID, role, text, whether a reply
+  completed or failed (and its one-line reason), the `TaskId` (`None` until S19) and the time. A
+  reply is saved when it ends, so a crash mid-reply loses that reply and keeps the question. No
+  key, configuration, provider metadata or tool result is ever stored (I6); text the user types is
+  stored as typed, so a secret the user pastes into the chat is stored like any other message.
+- *The file is untrusted input* (the user can edit it, and so can anything that wrote it). The
+  directory and file are opened with `O_NOFOLLOW` and examined through the descriptor: a symlink,
+  another owner, a non-regular file or a second hard link is **refused**; a mode other than
+  0700/0600 on something of ours is **repaired** and logged. After SQLite opens the file by path
+  it is compared with the descriptor (device and inode), and the `-wal`, `-shm` and `-journal`
+  files are checked the same way. SQLite runs in defensive mode with `ATTACH` off and limits on a
+  value, a statement and an expression; text is read as bytes and decoded strictly; every row is
+  validated into a typed record. A file that cannot be used at all (not a database, not ours, a
+  newer schema, unsafe) is **refused**: the shell starts without history, says so, and leaves the
+  file as it is. A usable file whose newest session holds anything invalid is **not restored**:
+  a fresh session starts, with a notice, and the old data is left in place.
+- *Restore.* The newest messages of the session, at most 998 (`MAX_MESSAGES` minus room for one
+  exchange, so a restored chat can always go on) and at most 4 MiB of text (so that a file of
+  maximal valid messages cannot make the window slow to open), become the transcript. "New session" cancels the reply in
+  flight, starts a fresh session and empties the transcript, which is also the way out of a full one.
+- *The model's context.* The agent keeps no history: each request carries the transcript's finished
+  exchanges, and `agent.context` keeps the system prompt, the new message and the newest turns that
+  fit a token budget. Tokens are estimated as UTF-8 bytes plus a per-message overhead, an upper
+  bound for any text (D16).
+
 ## 10. Code layout and layering
 
 ```
@@ -608,6 +654,7 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
 - `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
   import `gi`.
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
+- `history` never imports `shell` or `agent`; the shell depends on it through `ChatHistory`.
 - The Anthropic SDK is imported only by `agent.anthropic_provider`; the rest of the agent, and
   everything else, uses the `LlmProvider` interface (D3). `agent` runs its asyncio loop on its own
   worker thread and reaches the GTK main thread only through a dispatcher the shell injects (D11).
