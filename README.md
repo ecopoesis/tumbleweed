@@ -270,6 +270,17 @@ The results say which limits the host could not enforce. In the container that i
 a test: `TUMBLEWEED_REQUIRE_DOCKER=1` (the Docker build-context check) and `TUMBLEWEED_REQUIRE_GIT=1`
 (the lock-age check needs the git history; the macOS CI jobs set it).
 
+Inside the namespaces every sandbox also runs under a seccomp filter (no `ptrace`, mounts,
+keyring calls, unix sockets, nested namespaces, `io_uring`, ...) and, first, a launcher,
+`tumbleweed-sandbox-exec`, that confines the filesystem to the policy's mounts with Landlock. The
+target requires Landlock, so `SandboxPolicy.require_landlock` is true unless you say otherwise
+and a kernel without it refuses to run anything. Docker Desktop's kernel has none (#44): there
+the Landlock tests skip with the kernel's answer, and a script of yours that runs a sandbox
+there must set `require_landlock=False`, after which each result says `hardening.landlock` is
+`unavailable`. In CI (an Ubuntu kernel) the Landlock tests are required, and the log of the Linux
+job lists each one as run (`-v -rP`); a local `TUMBLEWEED_CI=1 scripts/test-linux` on Docker
+Desktop fails exactly those and the x86-only ABI tests, which is the guard working.
+
 ### Test markers
 
 | Marker | Needs | Notes |
