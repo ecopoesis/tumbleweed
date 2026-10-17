@@ -15,32 +15,80 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 LINT = "from importlinter.cli import lint_imports_command; lint_imports_command()"
 
-# (file to append to, the import to plant, the contract that must report BROKEN)
-VIOLATIONS = {
+SANDBOX = "sandbox never imports broker, agent, shell, voice, ui.gtk, gi or an LLM SDK"
+
+# (file to append to, the import to plant, the contract that must report BROKEN, and modules that
+# the copy needs for the import to mean something: ones that do not exist yet in this step's tree)
+VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
     "core imports gi": (
         "core/ids.py",
         "import gi",
         "core never imports gi",
+        (),
     ),
     "the view-model imports gi": (
         "shell/viewmodel/transcript.py",
         "import gi",
         "the shell view-model never imports gi",
+        (),
     ),
     "the view-model imports gi indirectly, through the GTK adapter": (
         "shell/viewmodel/chat.py",
         "import tumbleweed.shell.window",
         "the shell view-model never imports gi",
+        (),
     ),
     "the agent imports gi": (
         "agent/responder.py",
         "import gi",
         "agent never imports gi",
+        (),
     ),
     "the agent imports the shell": (
         "agent/echo.py",
         "import tumbleweed.shell.viewmodel.transcript",
         "agent never imports shell",
+        (),
+    ),
+    "the sandbox imports gi": ("sandbox/policy.py", "import gi", SANDBOX, ()),
+    "the sandbox imports the shell": (
+        "sandbox/runner.py",
+        "import tumbleweed.shell.viewmodel.transcript",
+        SANDBOX,
+        (),
+    ),
+    "the sandbox imports the agent": (
+        "sandbox/limits.py",
+        "import tumbleweed.agent.responder",
+        SANDBOX,
+        (),
+    ),
+    "the sandbox imports the broker": (
+        "sandbox/bwrap.py",
+        "import tumbleweed.broker",
+        SANDBOX,
+        ("broker/__init__.py",),
+    ),
+    "the sandbox imports voice": (
+        "sandbox/result.py",
+        "import tumbleweed.voice",
+        SANDBOX,
+        ("voice/__init__.py",),
+    ),
+    "the sandbox imports the GTK adapter": (
+        "sandbox/errors.py",
+        "import tumbleweed.ui.gtk",
+        SANDBOX,
+        ("ui/gtk/__init__.py",),
+    ),
+    "the sandbox imports the Anthropic SDK": ("sandbox/runner.py", "import anthropic", SANDBOX, ()),
+    "the sandbox imports the OpenAI SDK": ("sandbox/policy.py", "import openai", SANDBOX, ()),
+    "the sandbox imports LiteLLM": ("sandbox/limits.py", "import litellm", SANDBOX, ()),
+    "the sandbox imports the shell's GTK window": (
+        "sandbox/process.py",
+        "import tumbleweed.shell.window",
+        SANDBOX,
+        (),
     ),
 }
 
@@ -80,15 +128,21 @@ def test_the_copy_of_the_project_passes_its_own_contracts(project: Path) -> None
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "0 broken" in result.stdout
-    assert all(status(result.stdout, contract) == "KEPT" for _, _, contract in VIOLATIONS.values())
+    assert all(
+        status(result.stdout, contract) == "KEPT" for _, _, contract, _ in VIOLATIONS.values()
+    )
 
 
 @pytest.mark.parametrize(
-    ("target", "planted", "contract"), VIOLATIONS.values(), ids=list(VIOLATIONS)
+    ("target", "planted", "contract", "stubs"), VIOLATIONS.values(), ids=list(VIOLATIONS)
 )
 def test_a_forbidden_import_breaks_its_contract(
-    project: Path, target: str, planted: str, contract: str
+    project: Path, target: str, planted: str, contract: str, stubs: tuple[str, ...]
 ) -> None:
+    for stub in stubs:
+        module = project / "src" / "tumbleweed" / stub
+        module.parent.mkdir(parents=True, exist_ok=True)
+        module.touch()
     file = project / "src" / "tumbleweed" / target
     file.write_text(file.read_text() + f"\n{planted}\n")
 

@@ -140,6 +140,72 @@ concurrently, on that one connection.
   refused. The client checks the server too, so it never talks to a socket another user put at
   the broker's path.
 
+### Sandbox launcher
+
+`tumbleweed.sandbox` (S14) runs one argv list, never a shell, in bubblewrap. The broker builds a
+`SandboxPolicy` and hands it to a `SandboxRunner`; the package imports none of the broker, agent,
+shell, voice or `gi` (section 10).
+
+- **What the program sees.** An empty root, mounted read-only after everything else is in place,
+  with: the runtime (`RuntimeSpec`: an allowlist of read-only mounts, `/usr`, the merged-usr
+  symlinks and the dynamic loader's two files of `/etc` in the container and CI, a store closure on
+  NixOS; nothing from a home directory is accepted); a fresh `/proc` and a minimal read-only `/dev`;
+  size-limited tmpfs mounts at `/tmp` and `/dev/shm`; the task workspace read-write at
+  `/workspace` (the working directory); retained workspaces read-only at `/inputs/<ConnectionId>`;
+  and each grant at its host path. Workspace, inputs and grants are bound by the descriptor the
+  broker opened and verified (`--bind-fd`, `--ro-bind-fd`), never by a path bwrap would resolve
+  again, so a path swapped for a symlink after the check cannot change what is mounted (the
+  mount *sources*; a mount point's parents are another matter, below). bwrap closes the
+  descriptors before the program runs. A grant may be, contain or be inside none of `/proc`,
+  `/dev`, `/sys`, `/workspace`, `/inputs`, another grant or a runtime path, and may not replace
+  `/tmp`. No nesting, because bwrap makes the mount point of an inner grant by walking the live
+  directory of the outer one, which the program can write to: a symlink planted there
+  (`/oldroot`, which bwrap itself uses to reach the host while it builds the sandbox) would send
+  that `mkdir` to the host, outside every grant. The broker keeps its grants apart (S17).
+- **Flags.** `--unshare-all --unshare-user --disable-userns --die-with-parent --new-session
+  --clearenv --cap-drop ALL`, plus a hostname of its own. There is no network option until S22:
+  the sandbox's `lo` is its own, and no host interface, host loopback or host abstract socket is
+  there.
+- **Environment.** Empty, plus the variables the policy lists, each of which must be on the
+  policy's allowlist (otherwise the policy is refused, not trimmed). A name that looks like a
+  secret (`key`, `token`, `secret`, `passw`, `credential`, `auth`, `anthropic`) is refused even on
+  the allowlist (I6). bwrap adds `PWD`. The fixed allowlist of a real run is S17's (the launcher
+  only enforces the one it is given).
+- **Limits (I9).** Wall time and output are the launcher's: stdout and stderr are read
+  concurrently, each cut at `max_output_bytes`, and exceeding the cap or the wall clock `SIGKILL`s
+  bwrap, which takes the sandbox's PID namespace down with it (`--die-with-parent`). CPU time, file
+  size, core dumps and open files (256) are `prlimit` rlimits (soft equal to hard, so a CPU
+  overrun is an uncatchable `SIGKILL`). `RLIMIT_NPROC` is deliberately not
+  used for `pids`: measured in the container (kernel 6.12), bwrap's first fork is counted against
+  every process of the uid in the parent namespace, so a limit low enough to stop a fork bomb
+  also stops the sandbox from starting wherever the user has that many processes. Memory, `pids.max` and a CPU quota come from `systemd-run --user --scope` when the
+  host has a systemd user manager whose controllers are delegated. The launcher proves that
+  once, by starting a scope and reading the limits the kernel reports for it; a limit it did not
+  see applied is not counted. Otherwise memory is `RLIMIT_AS` per process, there is no `pids`
+  limit and no CPU quota, and **every result says so** (`LimitsReport.unenforced`, with the reason
+  in `detail`). The container and CI have no user manager, so they run the rlimit path; the scope
+  path is tested against a stand-in for `systemd-run` there (it cannot show a kernel enforcing the
+  limits), and on the target (S27) the scope is expected; its real verification is #73. The probe is repeated
+  every 60 s while the plan has no scope, and the scope is run by the absolute path of the
+  `systemd-run` the probe ran.
+- **Failure.** A program that fails is a result. A sandbox that could not be set up (a mount
+  source gone, a program that does not exist, user namespaces refused, a scope that cannot be
+  started) raises `SandboxLaunchError` with bwrap's own message and runs nothing: there is no
+  fallback to an unconfined run. bwrap reports the program's exit status only once it has run it,
+  which is how the two are told apart.
+- **Known gaps, by design of the step.** The seccomp filter and Landlock are S15's. Until then a
+  read-only bind of a directory that holds a Unix socket still allows `connect()` to it from the
+  sandbox (#15); the policy core's deny rules (S16) keep the broker, runtime and display sockets'
+  directories from being granted, and S15 adds the seccomp and Landlock denials. Memory is per
+  process without a scope, so a program that starts many processes multiplies it; `memfd` and
+  SysV shared memory are not address space of the process and escape `RLIMIT_AS` (the scope's
+  memory limit covers them; without one, the open-file limit and the wall clock are what bound
+  them); a fork bomb is bounded only by the wall clock (and the memory its processes use) without a scope;
+  nothing bounds the disk a program writes to its workspace beyond the per-file limit; and the
+  program inherits the launcher's session keyring until S15 (#15). S17 must refuse, on the
+  target, runs on a host that lacks the pids or memory-total limit; these and the other gaps are
+  tracked in #74.
+
 ## 3. Request flow
 
 1. The user speaks (push-to-talk or wake word) or types. Speech goes through the STT backend;
@@ -486,8 +552,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   for tests of the btrfs backend, and the backend is instead exercised end to end in the S27
   NixOS VM test. Any other skip of such a test still fails the run. Live tests never run in CI
   either: `TUMBLEWEED_LIVE` is refused when `TUMBLEWEED_CI` is set, and under the guard a
-  `live` test may not also be marked `gtk` or `linux`, so none is ever a guarded test. Landlock tests are required in CI (Ubuntu kernel); they may skip on Docker
-  Desktop kernels without Landlock. A macOS job runs the platform-neutral subset.
+  `live` test may not also be marked `gtk` or `linux`, so none is ever a guarded test. Landlock
+  tests are required in CI (Ubuntu kernel); they may skip on Docker Desktop kernels without
+  Landlock. A macOS job runs the platform-neutral subset.
 - **Target**: NixOS (aarch64 and x86_64) booting into Cage running `tumbleweed-shell`, with a
   fallback Sway session, a VT2 login, and btrfs home snapshots, as a VM image for
   UTM/Parallels (S26–S27).

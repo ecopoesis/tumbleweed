@@ -72,6 +72,9 @@ jobs:
     env:
       # Beats .python-version for every uv command in the job, `uv run` included.
       UV_PYTHON: ${{ matrix.python }}
+      # The lock-age check needs the full git history (fetch-depth: 0 below). With this set, a
+      # checkout that lost it fails the check instead of skipping it quietly (tests/test_lock.py).
+      TUMBLEWEED_REQUIRE_GIT: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

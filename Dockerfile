@@ -10,7 +10,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Runtime: GTK 4 and libadwaita typelibs, weston (headless display), fonts for Pango,
 # bubblewrap, slirp4netns and libseccomp (the sandbox, S14-S22), dbus-daemon (a private session
-# bus for the test that lists what the shell exports on it), and sudo (for the second user below).
+# bus for the test that lists what the shell exports on it), sudo (for the second user below) and
+# git (the lock-file tests that build scratch repositories; the image has no history of its own, so
+# the lock-age check runs on the macOS jobs).
 # Build: a toolchain, Python headers and the -dev packages PyGObject and pycairo compile against.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -21,6 +23,7 @@ RUN apt-get update \
         fonts-dejavu-core \
         gir1.2-adw-1 \
         gir1.2-gtk-4.0 \
+        git \
         libcairo2-dev \
         libgirepository-2.0-dev \
         libseccomp2 \

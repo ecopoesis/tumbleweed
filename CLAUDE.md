@@ -92,7 +92,8 @@ All of these must pass before a commit is pushed. CI runs the same commands.
   whole (`importorskip`, `allow_module_level`): skip per test, with markers. The only skip
   the guard lets through is the `btrfs` gate's own, raised in setup (it always fires in CI, so
   a `linux` + `btrfs` test never runs there: reserve `btrfs` for tests of the btrfs backend);
-  any other skip of such a test fails. A `live` test may not also be marked `gtk` or `linux`.
+  any other skip of such a test fails. Under `TUMBLEWEED_CI` a `live` test may not also be
+  marked `gtk` or `linux`.
 - Security properties get negative tests: prove the forbidden thing actually fails.
 - Keep logic GTK-free so it can be unit-tested; GTK tests cover the adapter.
 

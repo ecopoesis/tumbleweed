@@ -154,3 +154,28 @@ is a constant.
 versions as soon as `regex` is. Break opportunities stay our own small set (the UAX 14 spaces and
 U+200B), because `regex` has no line breaker and an over-inserted U+200B is harmless.
 
+
+## D13 — The sandbox's limits: `prlimit` between systemd-run and bwrap, and a proof that the scope works (2026-10-16, accepted)
+
+**Context.** S14 needs CPU, memory, pids, file-size and time limits, with cgroup limits where the
+host has them and a reported fallback where it does not. Two choices were not obvious: how to set
+rlimits for a program that bwrap starts, and when to trust `systemd-run --user --scope`.
+**Decision.** (1) rlimits are set by `prlimit(1)` in the command line
+(`[systemd-run --user --scope ...] prlimit ... bwrap ... -- command`), not by a `preexec_fn`:
+Python between `fork` and `exec` can deadlock a process that has threads, and the broker will have
+them; and with `prlimit` after `systemd-run`, an address-space limit never applies to systemd-run
+itself. Without `prlimit` nothing runs. (2) The scope is used only if a probe shows it works: the
+launcher starts a scope with a memory limit, `TasksMax` and `CPUQuota`, and a constant program in it
+reads `memory.max`, `pids.max` and `cpu.max` of its own cgroup. A limit not seen applied is
+reported as unenforced in every result, and memory then falls back to `RLIMIT_AS`. A host whose
+user manager has no delegated controllers therefore says so instead of pretending. (3) bwrap's
+`--json-status-fd` is how a setup failure is told from a program that failed: bwrap writes
+`child-pid` as soon as its namespaces exist (before any mount, so it proves nothing) and
+`exit-code` only once the program it started has ended, by exit or by signal. A run that ends
+without an `exit-code` is a `SandboxLaunchError` carrying bwrap's message.
+**Consequences.** The probe costs one scope per runner, and one a minute while the host has none.
+The rlimit fallback has no total memory limit, no pids limit (`RLIMIT_NPROC` was measured and rejected: bwrap's first fork is
+counted against all of the uid's processes) and no CPU quota (reported). Unlike the rest, the scope path cannot be run in
+the container or in CI, where there is no user manager: its command lines and the probe's decision
+are unit-tested, the wrapper is exercised with a stand-in `systemd-run`, and S27's VM test is where
+the real thing runs (#73).

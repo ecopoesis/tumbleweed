@@ -182,6 +182,23 @@ user is refused, as a client and as a server, need a second uid: the Linux image
 more), so those tests run in `scripts/test-linux` and are skipped on a Mac, where the same rule
 is covered with a fake credentials provider.
 
+### Sandbox
+
+`tumbleweed.sandbox` ([ARCHITECTURE: Sandbox launcher](docs/ARCHITECTURE.md)) runs one argv list in
+bubblewrap: no network, only its workspace and what it was granted, hard limits. It is a library
+for the broker (S17) and has no command of its own yet. Its policy and bubblewrap argument builder
+are tested on every OS; running a sandbox needs Linux, so on a Mac use the container:
+
+```sh
+scripts/test-linux uv run pytest tests/sandbox -v
+```
+
+The results say which limits the host could not enforce. In the container that is the memory total,
+`pids.max` and the CPU quota, because there is no systemd user manager (`systemd-run --user
+--scope`); the rlimits still apply. Two switches make a missing tool fail a run instead of skipping
+a test: `TUMBLEWEED_REQUIRE_DOCKER=1` (the Docker build-context check) and `TUMBLEWEED_REQUIRE_GIT=1`
+(the lock-age check needs the git history; the macOS CI jobs set it).
+
 ### Test markers
 
 | Marker | Needs | Notes |
