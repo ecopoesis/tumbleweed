@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,8 @@ from tumbleweed.sandbox.sandbox_exec import landlock_abi
 pytestmark = pytest.mark.linux
 
 REPO = Path(__file__).resolve().parents[2]
+# What the second launcher in the layered tests must allow for the payload to run at all.
+BASE_RULES = ["--read", "/usr", "--read", "/proc", "--devices", "/dev", "--write", "/workspace"]
 
 
 @pytest.fixture(autouse=True)
@@ -183,7 +186,11 @@ class TestWithLandlock:
 
     @staticmethod
     def two_directories(
-        workspace: Opened, tmp_path: Path, rules: list[str], *, layered: bool = True
+        workspace: Opened,
+        tmp_path: Path,
+        rules: Callable[[Path, Path], list[str]],
+        *,
+        layered: bool = True,
     ) -> SandboxResult:
         """Two granted writable directories, `named` and `other`, and a second launcher in the
         sandbox (its source is in `named`) that restricts further with the given rules.
@@ -201,7 +208,7 @@ class TestWithLandlock:
             f"{named}/sandbox_exec.py",
             "--report-fd",
             "2",
-            *rules,
+            *rules(named, other),
             "--",
             *payload,
         ]
@@ -221,10 +228,10 @@ class TestWithLandlock:
         self, workspace: Opened, tmp_path: Path
     ) -> None:
         landlock_or_skip()
-        named_rules = [
-            "--read", "/usr", "--read", "/proc", "--devices", "/dev",
-            "--write", "/workspace", "--write", str(tmp_path / "named"),
-        ]  # fmt: skip
+
+        def named_rules(named: Path, other: Path) -> list[str]:
+            return [*BASE_RULES, "--write", str(named)]
+
         control = self.two_directories(workspace, tmp_path / "c", named_rules, layered=False)
         result = self.two_directories(workspace, tmp_path / "l", named_rules)
 
@@ -249,11 +256,9 @@ class TestWithLandlock:
         self, workspace: Opened, tmp_path: Path
     ) -> None:
         landlock_or_skip()
-        rules = [
-            "--read", "/usr", "--read", "/proc", "--devices", "/dev",
-            "--write", "/workspace", "--write", str(tmp_path / "named"),
-            "--read", str(tmp_path / "other"),
-        ]  # fmt: skip
+
+        def rules(named: Path, other: Path) -> list[str]:
+            return [*BASE_RULES, "--write", str(named), "--read", str(other)]
 
         result = self.two_directories(workspace, tmp_path, rules)
 
@@ -269,7 +274,9 @@ class TestWithLandlock:
         self, workspace: Opened, tmp_path: Path
     ) -> None:
         landlock_or_skip()
-        rules = ["--read", "/usr", "--read", "/does/not/exist"]
+
+        def rules(named: Path, other: Path) -> list[str]:
+            return ["--read", "/usr", "--read", "/does/not/exist"]
 
         result = self.two_directories(workspace, tmp_path, rules)
 
@@ -284,7 +291,9 @@ class TestWithLandlock:
     ) -> None:
         landlock_or_skip()
         # A second launcher asking for more than the first allowed gets no more than the first.
-        rules = ["--read", "/", "--write", "/"]
+
+        def rules(named: Path, other: Path) -> list[str]:
+            return ["--read", "/", "--write", "/"]
 
         result = self.two_directories(workspace, tmp_path, rules)
 

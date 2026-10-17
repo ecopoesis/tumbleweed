@@ -223,8 +223,8 @@ class SandboxRunner:
         `InvalidPolicyError` for a descriptor that is
         closed or of the wrong kind, and `SandboxLaunchError` when the sandbox could not be set up
         and the program never started (a mount source that is gone, a program that does not exist
-        in the sandbox, a launcher that refused). A program that fails is a result, not an error. A run that is killed at
-        a limit before bwrap reports on the program is a result too.
+        in the sandbox, a launcher that refused). A program that fails is a result, not an error.
+        A run that is killed at a limit before bwrap reports on the program is a result too.
         """
         if not _platform().startswith("linux"):
             raise SandboxUnsupported(f"sandboxes need Linux namespaces; this host is {_platform()}")
