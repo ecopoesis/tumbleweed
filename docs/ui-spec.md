@@ -3,12 +3,14 @@
 The model emits a UI spec as JSON. A fixed renderer builds GTK widgets from it and trusts
 nothing else. This is the contract between the two ([ARCHITECTURE section 4](ARCHITECTURE.md),
 [D5](DECISIONS.md), invariants I1, I4 and I9). It is implemented, without GTK, in
-[`src/tumbleweed/ui/spec/`](../src/tumbleweed/ui/spec/), described for machines by
+[`src/tumbleweed/ui/spec/`](../src/tumbleweed/ui/spec/) (what a spec is) and
+[`src/tumbleweed/ui/runtime/`](../src/tumbleweed/ui/runtime/) (what it does: [section 7](#evaluation),
+[section 9](#9-handlers)), described for machines by
 [`schemas/ui-spec.v1.json`](../schemas/ui-spec.v1.json) (shape, types and bounds; **looser than the
 models**, because JSON Schema cannot say what [section 10](#10-what-is-checked-across-the-spec)
 lists, nor the character rules for text and paths, nor the size budgets: it is a guide for
 writing a spec, never a validator), and tested in
-[`tests/ui/spec/`](../tests/ui/spec/).
+[`tests/ui/spec/`](../tests/ui/spec/) and [`tests/ui/runtime/`](../tests/ui/runtime/).
 
 Parts of this page are generated from the code and checked against it by
 `tests/ui/spec/test_docs.py`: the limits, the kinds and their fields, the port types, and every
@@ -18,9 +20,9 @@ adjuster and a CSV viewer) or parts of them. Regenerate them with
 written between `limit` comments and regenerated the same way, and a test fails on a bare number
 that is a limit. The two tables of components (bindings and events) are compared with the data the
 tests use. The rest is prose. Every rule it states about what is accepted or refused is covered by
-a test in `tests/ui/spec/`; what it says about the runtime (evaluation, events, the sandbox, the
-debounce floor) and about the tool store is the contract that S10, S20 and S23 implement and test,
-not something this step tests.
+a test in `tests/ui/spec/`, and every rule of evaluation and of handlers by a test in
+`tests/ui/runtime/`; what it says about the sandbox, the debounce floor and the tool store is the
+contract that S20 and S23 implement and test.
 
 ## 1. How a spec is accepted
 
@@ -303,7 +305,10 @@ after canonicalisation, which writes `1e16` as `10000000000000000`, `5.0` as `5`
   any size that stands for a double (see below), and is then stored as a float, so `5`, `5.0`
   and `5e0` are one value;
 - in a `json` value a number is a finite double, an integer being accepted by the same test (and
-  stored as a float if it is beyond 2**53 - 1, so that it reads back as the same value).
+  stored as a float if it is beyond 2**53 - 1, so that it reads back as the same value). Inside a
+  `json` value whether a number was written as an integer or with a fraction does not survive
+  canonicalisation (`5.0` is written `5`): do not give meaning to the difference. A value whose type
+  matters belongs in an `int` or `float` entry, a table column or a list.
 
 An integer **stands for a double** if it is exactly that double (`5`, `10000000000000000`,
 2**100) or if it is how canonical JSON writes the nearest one: JCS writes a double from 2**53 up
@@ -538,7 +543,7 @@ fails, as `add.left` or `concat[1]`:
   numbers. They are `bool`s. Comparing an `enum` entry with a string literal also checks that the
   literal is one of its options, and so does a literal that an `if` can produce; comparing two
   `enum` entries needs an option in common (otherwise it is always false, or always true for
-  `ne`).
+  `ne`), and so does an enum entry that an `if` can produce on either side.
 - `and`, `or` and `not` take bools and are a `bool`.
 - `if` takes a `bool` and two branches of one type, or two numbers (then a `float` if either is
   one). Both branches are always checked.
@@ -547,9 +552,12 @@ fails, as `add.left` or `concat[1]`:
 
 Nothing converts between a number and a string, a bool and a number, or a float and an int. A
 computed entry or an assignment must have a type that fits its target: `bool` to `bool`, `int`
-to `int`, `int` or `float` to `float`, `string` to `string` or to an `enum` (the literals the
-expression can produce, directly or through `if`, must be options; what a `concat` or a `ref`
-gives is for the runtime to check).
+to `int`, `int` or `float` to `float`, `string` to `string` or to an `enum`. An `enum` entry must be
+able to take what is assigned: every literal the expression can produce, directly or through `if`,
+must be one of its options, and every `enum` entry it can produce the same way must share an option
+with the target (an assignment from an enum with no option in common never takes effect). What a
+`concat` or a `ref` of a `string` gives is for the runtime to check, and a value that is no option
+leaves the entry as it was.
 
 ### Limits of an expression
 
@@ -560,33 +568,54 @@ wherever it was built.
 
 ### Evaluation
 
-The syntax and the types above are what this step defines and checks. The interpreter is S10's.
-The meaning below is part of the contract so that a spec means the same everywhere, and S10
-implements it:
+The syntax and the types above are what `tumbleweed.ui.spec` defines and checks. The meaning below is
+what `tumbleweed.ui.runtime` implements (`interpreter`, `store`, `writes`), with a test for each
+rule in `tests/ui/runtime/`, so that a spec means the same everywhere:
 
-- The interpreter is total: no expression raises. `div` by zero is `0.0`.
+- The interpreter is total: no expression raises, whatever the state it reads. `div` by zero is
+  `0.0`. It is also iterative, so a caller close to the recursion limit still gets a value.
 - An `int` result is clamped to +-(2**53 - 1). A `float` result that is infinite becomes the
   largest finite float of that sign, and one that is not a number becomes `0.0`.
-- `round` rounds halves away from zero. `min` and `max` of mixed numbers are `float`s, and so is
-  an `if` whose branches are an `int` and a `float`: the value of the chosen branch is converted
-  to a float, whichever branch it is (`if(c, 1, 2.5)` is `1.0` when `c` is true).
+- `round` rounds halves away from zero (`0.49999999999999994` rounds to `0`). `min` and `max` of
+  mixed numbers are `float`s, and so is an `if` whose branches are an `int` and a `float`: the value
+  of the chosen branch is converted to a float, whichever branch it is (`if(c, 1, 2.5)` is `1.0`
+  when `c` is true). Every operand is evaluated, as every branch is type-checked; nothing has a side
+  effect, so this changes no result.
 - `eq` and `ne` compare numbers by value (`1` equals `1.0`) and strings by code point, with no
   normalisation.
+- `concat` stops at <!-- limit: MAX_STRING_LENGTH -->65,536<!-- /limit --> characters, the longest a `string` entry can be, so that an
+  expression that repeats a long string cannot build one of hundreds of megabytes. Nothing else
+  that an entry can hold is cut short by it.
 - `format_number` writes the number rounded half away from zero to `decimals` places, with `.`
   before the decimals, `-` for a negative number (never `-0`), and, with `grouping`, a `,`
-  between groups of three digits of the whole part. It never depends on the locale.
+  between groups of three digits of the whole part. It never depends on the locale. A float is
+  rounded as the shortest decimal that reads back as it (what `repr`, and JSON, write), which is
+  the number a person sees: `2.675` to two places is `2.68`, although the double nearest it is a
+  hair below.
 - When a value is written to an entry (by a computed entry, a `set` handler or a widget), a number is
-  clamped into `minimum` and `maximum`, a string is cut to `max_length` characters, and an
-  `enum` entry given a string that is not one of its options keeps its old value. Values that
-  arrive from `patch_state` or a sandbox are not clamped: they are checked by `check_value` and
-  refused whole.
+  clamped into `minimum` and `maximum`, an `int` written to a `float` entry becomes a float, a
+  string is cut to `max_length` characters, and an `enum` entry given a string that is not one of
+  its options keeps its old value. Values that arrive from `patch_state` or a sandbox are not
+  clamped: they are checked by `check_value` and refused whole.
 - A write (by a widget, a `set` handler or a computed value) that would take the text of the
   state over `MAX_STATE_TEXT_BYTES` and makes that text grow is not applied: the entry keeps its
   old value. A write that shrinks the text, or leaves it the same size, is applied even when the
   state is over the budget, so that a state that got there can recover. The state is all its
-  entries, computed ones included, as `validate_patch(current=...)` counts them.
+  entries, computed ones included, as `validate_patch(current=...)` counts them. An edit of a
+  widget that is not applied puts the widget back to the entry's value and fires no handler.
+- A computed entry whose write is held back keeps a value that no longer matches its expression:
+  it is **stale**, and so is every computed entry that reads a stale one, until a recomputation
+  applies. The renderer shows "Out of date" in place of a stale value, never the old value as if it
+  were current. Whenever a write makes the text of the state smaller, the stale entries are
+  evaluated again, and again (up to twice more) while a pass frees more room, since an entry that
+  comes earlier in the order may fit only after a later one has shrunk. They catch up when room
+  appears.
 - Computed entries are evaluated in `computed_order()` and re-evaluated, in that order,
-  whenever an entry they read changes.
+  whenever an entry they read changes. A `set` handler's assignments are applied together, so the
+  computed entries are re-evaluated once, after all of them.
+- Listeners are told of every write, whether or not the value changed, so that a widget reloads a
+  rewritten file ([section 13](#13-for-the-steps-that-use-this)); a computed entry is announced
+  when its value or its stale mark changes.
 
 ## 8. Components
 
@@ -622,6 +651,22 @@ component; `expander` shows or hides its `child`. A container has at most <!-- l
 the two. A heading's `level` is 1 to 3. `image` has `alt` text for accessibility. `text_view`
 is read-only unless `editable`. All text a component shows is plain text.
 
+**Text on the screen is bounded (I9).** A renderer lays text out on the thread that also serves the
+trusted chrome, and laying out text takes time that grows faster than its length, so what is shown is
+bounded, though the state holds the whole value. The reference renderer shows at most 8,192
+characters of one `label`, `heading`, bound text or `entry`, followed by ` (cut)` for the labels,
+and at most <!-- limit: MAX_STRING_LENGTH -->65,536<!-- /limit --> characters in all in a tool
+(`tumbleweed.ui.gtk.budget.MAX_SHOWN_PER_TOOL`, a renderer constant that happens to equal that
+limit, not a spec limit): text blocks, button and check box labels, entry texts and placeholders, and
+the options of a `dropdown` all count. A text that does not fit is replaced by a line saying so
+(and shown when room appears, which is when another text shrinks), an option that does not fit is
+left out of its list (which ends in a line saying that more are not shown, and gets them when room
+appears), and a text shown is laid out at most once per frame, the latest value only. A `dropdown`
+is a list in place, never a popup. An `entry` shows a text of up to 8,192 characters whole and
+editable; a longer text, or one the budget has no room for, is shown cut (or as a line saying so),
+read-only and with a warning icon: the state still holds it all, and an edit would otherwise write
+the cut text over it.
+
 What a widget shows or edits is an entry named by `bind`. The entry's declaration supplies range,
 options and limits, so they are written once. Which kinds of entry a component accepts:
 
@@ -650,7 +695,20 @@ the range at most 2**53 - 1 wide, and, for a `slider` or `spin` bound to an entr
 range. These are rules of numeric safety, not of taste: how many positions the step makes is up
 to the author (a range of a million in steps of 0.01 is a fine slider). A `progress` has no step,
 so the step of its entry is not checked for it. A `float` entry without a `step` leaves the step
-to the renderer.
+to the renderer, which uses a power of ten about a hundredth of the range, so a `slider` or `spin` bound to a float entry
+without a `step` needs a range at least as wide as the smallest normal float (a narrower one leaves no step
+that is not subnormal, and is refused).
+A `spin` also needs a step above 1e-10, declared or chosen: GTK ignores a change of that size or
+less, so a smaller step could never be taken with its arrows (a `slider` has no such limit). What a
+user types into a `spin` is taken only if it is a finite number inside the range (a whole number
+for an `int`); anything else (`abc`, `1,5`, `0x10`, `inf`, an empty field, a number outside the
+range) is dropped and the text of the value it holds comes back, and neither the state nor a handler
+is touched. A value that a step or page increment of a `slider` or `spin` produced (the arrows, the
+keyboard, the scroll wheel) is the value held plus whole steps, added as decimals, when it lies
+within a millionth of a step of that: so 50.0 in steps of 0.01 reads 50.09, not 50.08999999999998.
+That is the widget's doing, a transform of stepped values only and no part of evaluation: a typed
+number (parsed exactly), a dragged position, a patched value and a default are never changed, and
+neither is a value that is not whole steps from the one held, whatever its magnitude.
 
 A component's events name a handler, or none:
 
@@ -704,7 +762,12 @@ A handler has a `name` and a `kind`.
 
 Handlers fire only when a user acts on a widget. A change of state from anywhere else (a
 computed entry updating, a `set` or sandbox result, `patch_state`, the model) never fires a
-handler, so handlers cannot trigger one another.
+handler, so handlers cannot trigger one another. The runtime tracks where every change came from
+(`tumbleweed.ui.runtime.Origin`) and the widgets tell an edit by the user from the runtime putting a
+value into them, so that the second is never taken for the first. An `on_change` handler fires after
+the edit has been written, and does not fire if the write was held back ([evaluation](#evaluation))
+or the edit left the entry's value as it was (a slider moved between two positions that round to the
+same number).
 
 ## 10. What is checked across the spec
 
@@ -719,7 +782,8 @@ When a `UiSpec` is built, besides each part's own rules:
 - every `set` target and `sandbox` output is a declared, non-computed entry, and every `sandbox`
   input is a declared entry;
 - every literal an expression can produce for an `enum` entry, through `if` as well, is one of its
-  options, and two `enum` entries compared have an option in common;
+  options, and two `enum` entries compared or assigned (through `if` as well) have an option in
+  common;
 - a slider, spin button or progress bar has a range and a step it can work with
   ([section 8](#8-components)), and a `text_view` with `on_change` is `editable`;
 - the component tree and the expressions are within their limits, and the text in the defaults of
@@ -798,11 +862,16 @@ one means, is `tumbleweed.ui/2`.
 
 ## 13. For the steps that use this
 
-- **Runtime (S10, S11).** `UiSpec.declarations()`, `computed_order()` and `check_value` for typed
-  state; the [evaluation rules](#evaluation), each with a test; handlers fire only from user input
-  events (origin tracking). Equal values assigned to an `image` entry (a handler rewriting the same
-  file) must still refresh the widget: notify on assignment, not on change. Keep the state within
-  `MAX_STATE_TEXT_BYTES` (`value_text_bytes`).
+- **Runtime (S10, S11).** `tumbleweed.ui.runtime.UiRuntime` holds a spec's state and handlers
+  (`StateStore`, `evaluate`, `coerce_for_write`), built on `UiSpec.declarations()`,
+  `computed_order()` and `check_value`; the [evaluation rules](#evaluation) each have a test, and
+  handlers fire only from user input events (origin tracking). `sandbox` and `agent` handlers go to
+  sinks passed to the runtime (`SandboxSink`, `AgentSink`; S20, S12). Equal values assigned to an
+  `image` entry (a handler rewriting the same file) refresh the widget: the store notifies on
+  assignment, not on change. The state is kept within `MAX_STATE_TEXT_BYTES`. The GTK adapter
+  (`tumbleweed.ui.gtk`) creates no popup, dialog, tooltip or drag icon from a spec (a `dropdown` is
+  a list in place, ARCHITECTURE I5), and shows an image, table, text view, tabs and expander as a
+  placeholder until S11.
 - **Agent (S12).** `parse_ui_spec` for text and `validate_ui_spec` for a tool call's arguments;
   return `SpecError.problems` to the model; `UiSpec.validate_patch(patch, current=...)` for
   `patch_state`; the system prompt section is generated from `schemas/ui-spec.v1.json` and this

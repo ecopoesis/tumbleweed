@@ -13,7 +13,7 @@ JSON Schema is `schemas/ui-spec.v1.json`, and the limits are in `limits`.
 from tumbleweed.ui.spec.check import ExprType, check_expr, computed_order, expr_type_of, references
 from tumbleweed.ui.spec.errors import SpecError, SpecTooLargeError
 from tumbleweed.ui.spec.parse import parse_ui_spec, validate_ui_spec
-from tumbleweed.ui.spec.spec import SPEC_VERSION, UiSpec
+from tumbleweed.ui.spec.spec import SPEC_VERSION, SPIN_MIN_STEP, UiSpec, default_float_step
 from tumbleweed.ui.spec.state import StateDecl, StateValue, check_value, port_type_of
 from tumbleweed.ui.spec.values import (
     PORT_TYPES,
@@ -26,6 +26,7 @@ from tumbleweed.ui.spec.values import (
 __all__ = [
     "PORT_TYPES",
     "SPEC_VERSION",
+    "SPIN_MIN_STEP",
     "ExprType",
     "FileRef",
     "ImageRef",
@@ -39,6 +40,7 @@ __all__ = [
     "check_expr",
     "check_value",
     "computed_order",
+    "default_float_step",
     "expr_type_of",
     "parse_ui_spec",
     "port_type_of",

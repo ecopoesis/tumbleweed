@@ -223,6 +223,39 @@ rejected: bwrap's first fork is counted against all of the uid's processes) and 
 no user manager: its command lines and the probe's decision are unit-tested, the wrapper is
 exercised with a stand-in `systemd-run`, and S27's VM test is where the real thing runs (#73).
 
+The rlimit fallback has no total memory limit, no pids limit (`RLIMIT_NPROC` was measured and rejected: bwrap's first fork is
+counted against all of the uid's processes) and no CPU quota (reported). Unlike the rest, the scope path cannot be run in
+the container or in CI, where there is no user manager: its command lines and the probe's decision
+are unit-tested, the wrapper is exercised with a stand-in `systemd-run`, and S27's VM test is where
+the real thing runs (#73).
+
+## D14 — Spec content never creates a surface of its own: dropdowns are lists in place (2026-10-16, accepted)
+
+**Context.** Clipping the canvas contains what is drawn in the window's own surface (I5), and
+nothing else: a popover, a dialog, a tooltip and a drag icon are windows of their own, which can
+cover the trusted chrome whatever the canvas clips (verified in S02, #53). A spec makes the renderer
+build widgets, so each widget that can open one is a way for a spec to reach the chrome. `Gtk.DropDown`
+opens a popover; a `Gtk.Entry` and a `Gtk.SpinButton` can open a context menu or an emoji chooser (a
+right click, Menu, Shift+F10, a long press, Ctrl+.) and can start a drag of selected text.
+**Decision.** The renderer builds no widget that creates a surface. A `dropdown` is a `Gtk.ListBox`
+of the enum's options in a scrolled window of bounded height (`ChoiceList`); selecting a row chooses
+the option. Text entries and spin buttons are hardened (`tumbleweed.ui.gtk.guard`): the actions that
+open a popover are disabled, the long-press gesture is removed, a capture-phase click denies the
+secondary button to the text's own gestures, and any other press first drops the selection, since a
+drag starts only from a press inside one, and a touch-only click claims every touchscreen
+sequence (the selection bubble, handles and magnifier are popups too). No tooltip is set anywhere. Containment was considered
+instead (a popover constrained to the canvas) and rejected: GTK offers no way to bound a popover to
+a region, so nothing could be proved about it.
+**Consequences.** A dropdown takes room in the layout (up to about 180 px, then it scrolls) where a
+`Gtk.DropDown` takes one line, which is acceptable for at most 64 options. Selecting text in an
+entry and dragging it out is not possible, Shift-click does not extend a selection, and a touch
+can focus an entry but not place its cursor or select. The pointer
+path (a right click) is covered by the structure of the controllers and by the keyboard and touch
+paths' tests, not by a synthesised click, because the headless compositor has no way to inject one.
+`tests/ui/gtk/test_no_surfaces.py` enumerates the toplevels and native widgets under the window
+after every golden spec and a hostile one, with a control that shows the search is not blind. S18
+still closes or blocks non-chrome surfaces while a prompt is pending, as defence in depth.
+
 ## D15 — Seccomp refuses how a program gets a unix socket, not `connect`; the launcher is shipped as data (2026-10-17, accepted)
 
 **Context.** S15 must stop `connect()` to a unix socket in a granted directory (#15: a read-only

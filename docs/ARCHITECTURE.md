@@ -333,9 +333,14 @@ contains:
 `patch_state` from the model changes state and recomputes computed entries, but never
 triggers `sandbox` or `agent` handlers. Handlers fire only from user input events.
 
-The renderer is split into a GTK-free runtime (state store, expression interpreter, binding
-resolution, handler dispatch; unit-tested without a display) and a thin GTK adapter. Unknown
-or invalid nodes render as an error placeholder; nothing in a spec can crash the shell.
+The renderer is split into a GTK-free runtime (`tumbleweed.ui.runtime`: state store,
+expression interpreter, binding resolution, handler dispatch; unit-tested without a display)
+and a thin GTK adapter (`tumbleweed.ui.gtk`). A spec that does not validate is never rendered, so
+a malformed node cannot reach the renderer; a node that is valid and still cannot be built (or
+cannot show its entry) renders as an error placeholder and the rest of the tool renders, so
+nothing in a spec can crash the shell. Every change of state carries its origin (user, handler,
+patch, sandbox, computed), and only a user's action on a widget fires a handler. Until S11 an
+image, table, text view, tabs or expander renders as a placeholder.
 
 ## 5. Saved tools
 
@@ -489,8 +494,15 @@ Each invariant names where it is enforced. Reviews check every change against th
   hostile widget in the canvas can neither paint over the region, nor take clicks meant for it,
   nor push it out of the window (`tumbleweed.shell.canvas`; proven with real layout and
   rendering in `tests/shell/test_chrome_isolation.py`). Clipping does not reach other surfaces:
-  popovers, dialogs, tooltips and drag icons are separate windows, so the renderer must not
-  create them from a spec (tracked in #53, S10).
+  popovers, dialogs, tooltips and drag icons are separate windows, so the renderer creates none
+  from a spec (#53): a `dropdown` is a list in place and not a `Gtk.DropDown` (D14), a text entry or
+  spin button cannot open its context menu or emoji chooser or start a drag
+  (`tumbleweed.ui.gtk.guard`; touchscreen sequences are claimed too, so no selection bubble or
+  handles), no tooltip is ever set, and `tests/ui/gtk/test_no_surfaces.py`
+  looks for any toplevel, native surface, popover-bearing widget, tooltip or drag source besides
+  the shell's own window after every golden spec and a hostile one has been rendered and used.
+  Whatever later adds a widget to the renderer (S11) or a tooltip (S12's disabled `sandbox`
+  handlers) keeps to this, or says why a surface is contained.
   **Every model-supplied string** shown in chrome (reasons, task titles, tool names and
   descriptions, spec titles) is plain, length-capped, and labelled as coming from the
   assistant. What is being granted is rendered from the structured capability. While a
@@ -521,6 +533,12 @@ Each invariant names where it is enforced. Reviews check every change against th
   `regex`, D10), which breaks the grapheme clusters and the unbroken runs that would make a label
   wider than the window or quadratic to measure, and a long message is shown as a column of small
   labels.
+  The renderer bounds the total as well (`tumbleweed.ui.gtk.budget`): a label shows at most 8,192
+  characters then ` (cut)`, a tool at most 65,536 characters in all (`MAX_SHOWN_PER_TOOL`, a renderer
+  constant, not a spec limit; labels, buttons, options and entries all count), what does not fit is
+  replaced by a mark or left out until room appears, and text updates are applied once per frame
+  with the latest value (an 80 KB spec of 441 labels bound to one 64K string used to take minutes
+  to lay out, with the chrome frozen; a test holds it to seconds).
   The agent's limits are enforced in three places: `agent.limits` holds the values and refuses
   out-of-range settings; `agent.loop` enforces iterations per reply, output tokens per reply, the
   bytes of reply text (`MAX_REPLY_BYTES`, the hard guarantee that a reply fits a transcript message;
@@ -606,7 +624,8 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
 - `broker` and `sandbox` never import `agent`, `shell`, `voice`, `ui.gtk` or any LLM SDK.
 - `sandbox` never imports `broker`.
 - `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
-  import `gi`.
+  import `gi`; `ui.runtime` also never imports `ui.gtk` or the shell, so it cannot reach GTK
+  through them.
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
 - The Anthropic SDK is imported only by `agent.anthropic_provider`; the rest of the agent, and
   everything else, uses the `LlmProvider` interface (D3). `agent` runs its asyncio loop on its own

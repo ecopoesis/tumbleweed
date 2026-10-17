@@ -597,6 +597,31 @@ class TestParsedJsonTakesTheSameRoad:
         with pytest.raises(SpecError, match="nested too deeply"):
             descend(sys.getrecursionlimit() - base - 100)
 
+    def test_a_caller_near_the_stack_limit_gets_a_spec_error_not_a_recursion_error(self) -> None:
+        # The validators of an expression recurse (up to 16 deep), so a caller a few frames from
+        # the limit used to get a RecursionError out of the model (#62). Sweep the headroom:
+        # every depth gives a spec or a SpecError, and some depth reaches the validators.
+        text = golden_text("tip_calculator")
+        base = len(inspect.stack(0))
+        outcomes: set[str] = set()
+
+        def descend(levels: int) -> None:
+            if levels:
+                descend(levels - 1)
+                return
+            try:
+                parse_ui_spec(text)
+            except SpecError as error:
+                outcomes.add(str(error))
+            else:
+                outcomes.add("parsed")
+
+        for headroom in range(10, 60):
+            descend(sys.getrecursionlimit() - base - headroom)
+
+        assert "parsed" in outcomes
+        assert any("too little stack" in outcome for outcome in outcomes)
+
     def test_the_deepest_nesting_that_pydantic_parses_is_not_cut_short(self) -> None:
         # The walk allows what the text path allows, and no more: 200 levels, the root included.
         value: object = []

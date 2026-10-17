@@ -1,0 +1,146 @@
+"""Keeps a spec's text entries from opening surfaces of their own (I5, #53).
+
+A `Gtk.Text` (inside `Gtk.Entry` and `Gtk.SpinButton`) can open a popover, which is a window of its
+own that clipping cannot contain: its context menu (a right click, the Menu key, Shift+F10, a long
+press) and the emoji chooser (Ctrl+.). It can also start a drag, which has a drag icon, from
+selected text. `harden_text` turns each off:
+
+- the actions `menu.popup` and `misc.insert-emoji` are disabled (the keyboard routes);
+- the long-press gesture is removed (the touch route);
+- a click gesture in the capture phase claims a secondary button press, which denies the text's own
+  gestures the sequence, so no context menu opens (the pointer route), and on any other press it
+  drops the selection first, since a drag starts only from a press inside one;
+- a second, touch-only click gesture claims every touch sequence, so the selection bubble, the
+  selection handles and the magnifier (popups of their own) never start; a tap still focuses the
+  text, but a touch cannot place the cursor or select (a keyboard can).
+
+Selecting and typing, and copy and paste with the shortcuts, work as before.
+"""
+
+import re
+import warnings
+from collections.abc import Callable
+from typing import Protocol
+
+from tumbleweed.shell._gi import Gdk, GObject, Gtk
+
+
+class _Selectable(Protocol):
+    def select_region(self, start_pos: int, end_pos: int) -> None: ...
+
+
+class _Claimable(Protocol):
+    def set_state(self, state: Gtk.EventSequenceState) -> bool: ...
+
+
+def on_press(button: int, gesture: _Claimable, text: _Selectable) -> None:
+    """What a press of `button` does in the capture phase: see the module docstring."""
+    if button == Gdk.BUTTON_SECONDARY:
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+    else:
+        text.select_region(0, 0)
+
+
+class _Focusable(Protocol):
+    def grab_focus(self) -> bool: ...
+
+
+def on_touch(gesture: _Claimable, text: _Focusable) -> None:
+    """A touch on the text: claimed (so its selection bubble and handles never start), and the
+    text takes the focus, as a tap would give it."""
+    gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+    text.grab_focus()
+
+
+def harden_text(widget: Gtk.Editable) -> Callable[[], None]:
+    """Apply the measures above to the `Gtk.Text` inside an entry or spin button.
+
+    Returns the function that disconnects the handlers, which refer back to the widget.
+    """
+    delegate = widget.get_delegate()  # the Gtk.Text inside an entry or a spin button
+    if not isinstance(delegate, Gtk.Text):
+        raise TypeError("the widget has no Gtk.Text to harden")
+    delegate.action_set_enabled("menu.popup", False)
+    delegate.action_set_enabled("misc.insert-emoji", False)
+    controllers = delegate.observe_controllers()
+    for position in reversed(range(controllers.get_n_items())):
+        controller = controllers.get_item(position)
+        if isinstance(controller, Gtk.GestureLongPress):
+            delegate.remove_controller(controller)
+    click = Gtk.GestureClick(button=0)  # every button
+    click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    pressed = click.connect(
+        "pressed",
+        lambda gesture, _presses, _x, _y: on_press(gesture.get_current_button(), gesture, widget),
+    )
+    touch = Gtk.GestureClick(touch_only=True)
+    touch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    touched = touch.connect(
+        "pressed", lambda gesture, _presses, _x, _y: on_touch(gesture, delegate)
+    )
+    delegate.add_controller(click)
+    delegate.add_controller(touch)
+
+    def disconnect() -> None:
+        click.disconnect(pressed)
+        touch.disconnect(touched)
+
+    return disconnect
+
+
+_SPIN_INPUT_WARNING = "g_value_get_double: assertion 'G_VALUE_HOLDS_DOUBLE (value)' failed"
+_SPIN_FILTER = (
+    "ignore",
+    re.compile(re.escape(_SPIN_INPUT_WARNING), re.IGNORECASE),
+    GObject.Warning,
+    None,
+    0,
+)
+_spin_users = 0
+
+
+def quiet_spin_input_marshalling() -> Callable[[], None]:
+    """Silence the one GLib warning that connecting to a spin button's `input` signal causes, for
+    as long as a spin button that does is alive. Returns the function that ends it (call it once,
+    when the spin button's tool is closed).
+
+    PyGObject reads the signal's out parameter (`new_value`, a pointer) as a double, and GLib says
+    so on every emission: `g_value_get_double: assertion 'G_VALUE_HOLDS_DOUBLE (value)' failed`.
+    PyGObject turns that into a `GObject.Warning`; where warnings are errors (the tests) the
+    handler then never runs, and elsewhere it is noise on stderr for every number typed. Tracked
+    upstream-side in #81.
+
+    The workaround is a `warnings` filter, not a GLib log handler: it ignores this exact message in
+    this one category and nothing else, so every other GLib warning still takes PyGObject's own
+    road (a warning, or an error where warnings are errors), and it is inserted in front of the
+    filters in force (a test that makes warnings errors included) and taken out again when the
+    spin button's tool is closed. Filters are restored by `warnings.catch_warnings`, so call this
+    where the spin button is built.
+    """
+    global _spin_users
+    if (
+        _SPIN_FILTER not in warnings.filters
+    ):  # (a test's `catch_warnings` may have restored it away)
+        warnings.filterwarnings(
+            "ignore", message=re.escape(_SPIN_INPUT_WARNING), category=GObject.Warning
+        )
+    _spin_users += 1
+    released = False
+
+    def release() -> None:
+        global _spin_users
+        nonlocal released
+        if released:
+            return
+        released = True
+        _spin_users -= 1
+        if _spin_users == 0 and _SPIN_FILTER in warnings.filters:
+            # `warnings.filters` is a list at runtime, typed as a read-only sequence.
+            warnings.filters.remove(_SPIN_FILTER)  # type: ignore[attr-defined]
+
+    return release
+
+
+def spin_filter_users() -> int:
+    """How many spin buttons are alive that need the filter (for the tests)."""
+    return _spin_users

@@ -30,6 +30,7 @@ dependencies = [
 [project.scripts]
 tumbleweed-shell = "tumbleweed.shell.launch:main"
 tumbleweed-sandbox-exec = "tumbleweed.sandbox.sandbox_exec:main"
+tumbleweed-render = "tumbleweed.shell.render:main"
 
 [dependency-groups]
 dev = [
@@ -227,6 +228,13 @@ name = "ui.spec never imports gi (ARCHITECTURE section 10)"
 type = "forbidden"
 source_modules = ["tumbleweed.ui.spec"]
 forbidden_modules = ["gi"]
+
+# Indirect imports count, so the runtime cannot reach GTK through the adapter or the shell either.
+[[tool.importlinter.contracts]]
+name = "ui.runtime never imports gi, the GTK adapter or the shell (ARCHITECTURE section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.ui.runtime"]
+forbidden_modules = ["gi", "tumbleweed.ui.gtk", "tumbleweed.shell"]
 
 [[tool.importlinter.contracts]]
 name = "agent never imports gi (ARCHITECTURE section 10)"
