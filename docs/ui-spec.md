@@ -735,8 +735,9 @@ computed entry updating, a `set` or sandbox result, `patch_state`, the model) ne
 handler, so handlers cannot trigger one another. The runtime tracks where every change came from
 (`tumbleweed.ui.runtime.Origin`) and the widgets tell an edit by the user from the runtime putting a
 value into them, so that the second is never taken for the first. An `on_change` handler fires after
-the edit has been written, and does not fire if the write was held back
-([evaluation](#evaluation)).
+the edit has been written, and does not fire if the write was held back ([evaluation](#evaluation))
+or the edit left the entry's value as it was (a slider moved between two positions that round to the
+same number).
 
 ## 10. What is checked across the spec
 

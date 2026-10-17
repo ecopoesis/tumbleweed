@@ -59,13 +59,26 @@ def use_every_widget(shell: Shell) -> None:
     pump(0.1)
 
 
+def is_idle_tooltip_window(widget: object) -> bool:
+    """GTK's own tooltip window, which it creates under a window the first time a pointer moves
+    over it (so it is there or not depending on the pointer, not on the spec), and keeps hidden
+    unless a widget asks for a tooltip, which none does (checked in `assert_no_surface`)."""
+    from tumbleweed.shell._gi import Gtk
+
+    return (
+        type(widget).__name__ == "GtkTooltipWindow"
+        and isinstance(widget, Gtk.Widget)
+        and not widget.get_mapped()
+    )
+
+
 def surfaces_below(window: object) -> list[object]:
     """Every native surface-bearing widget under the window that is not the window itself."""
     from tumbleweed.shell._gi import Gtk
 
     assert isinstance(window, Gtk.Window)
     below = list(descendants(window))[1:]  # the window is the first of its own descendants
-    return [w for w in below if isinstance(w, Gtk.Native)]
+    return [w for w in below if isinstance(w, Gtk.Native) and not is_idle_tooltip_window(w)]
 
 
 POPOVER_BEARING = (

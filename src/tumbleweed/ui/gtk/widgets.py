@@ -19,7 +19,7 @@ placeholder saying so.
 
 from typing import Literal, assert_never
 
-from tumbleweed.shell._gi import Gtk
+from tumbleweed.shell._gi import GLib, Gtk
 from tumbleweed.shell.viewmodel.display import display_text
 from tumbleweed.ui.gtk.choice import ChoiceList
 from tumbleweed.ui.gtk.context import BuildContext
@@ -193,8 +193,10 @@ def _entry(component: Entry, ctx: BuildContext) -> Gtk.Widget:
     harden_text(entry)
     change = _event(component.on_change, component.kind, "change", key)
     activate = _event(component.on_activate, component.kind, "activate", key)
+    editing = False  # inside this entry's own `changed`: its text must not be replaced there
+    sync_pending = False
 
-    def update(value: StateValue, stale: bool) -> None:
+    def show(value: StateValue) -> None:
         text = _text_value(value)
         fits = len(text) * 4 <= ENTRY_CAPACITY_BYTES or len(text.encode()) <= ENTRY_CAPACITY_BYTES
         entry.set_editable(fits)
@@ -205,7 +207,35 @@ def _entry(component: Entry, ctx: BuildContext) -> Gtk.Widget:
         if entry.get_text() != text:
             entry.set_text(text)
 
-    entry.connect("changed", lambda _entry: ctx.user_input(key, entry.get_text(), change))
+    def sync() -> bool:
+        nonlocal sync_pending
+        sync_pending = False
+        with ctx.programmatic():
+            show(ctx.runtime.store.value(key))  # whatever the state holds by now
+        return GLib.SOURCE_REMOVE
+
+    def update(value: StateValue, stale: bool) -> None:
+        nonlocal sync_pending
+        if not editing:
+            show(value)
+        elif not sync_pending and entry.get_text() != _text_value(value):
+            # The state answered an edit with another text (a handler rewrote it, the budget
+            # refused it): replacing the text inside its own `changed` signal makes GTK run
+            # away (every replacement is announced again), so it is done once that signal is over.
+            sync_pending = True
+            GLib.idle_add(sync)
+
+    def on_changed(_entry: Gtk.Entry) -> None:
+        nonlocal editing
+        if ctx.updating:
+            return
+        editing = True
+        try:
+            ctx.user_input(key, entry.get_text(), change)
+        finally:
+            editing = False
+
+    entry.connect("changed", on_changed)
     if activate is not None:
         entry.connect("activate", lambda _entry: ctx.user_event(activate))
     ctx.bind(key, entry, update)

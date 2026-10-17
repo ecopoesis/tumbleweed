@@ -109,9 +109,17 @@ class BuildContext:
     # --- events --------------------------------------------------------------------------
 
     def user_input(self, key: StateKey, value: Value, event: UiEvent | None) -> Dispatch | None:
-        """The user edited a widget. Ignored while the runtime is the one changing it."""
+        """The user edited a widget. Ignored while the runtime is the one changing it.
+
+        An edit that leaves the state as it was fires no handler (the widget is still written
+        back to the state's value). That is for GTK, which does not always announce a change at
+        once: a slider or a switch that the runtime has just set can report it after
+        `programmatic()` has ended, and that report is no edit. A real edit changes the value.
+        """
         if self.updating:
             return None
+        if self._holds(key, value):
+            event = None
         return self._guarded(lambda: self.runtime.user_input(key, value, event=event))
 
     def user_event(self, event: UiEvent) -> Dispatch | None:
@@ -119,6 +127,10 @@ class BuildContext:
         if self.updating:
             return None
         return self._guarded(lambda: self.runtime.user_event(event))
+
+    def _holds(self, key: StateKey, value: Value) -> bool:
+        held = self.runtime.store.value(key)
+        return type(held) is type(value) and held == value
 
     @staticmethod
     def _guarded(action: Callable[[], Dispatch]) -> Dispatch:
