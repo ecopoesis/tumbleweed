@@ -24,6 +24,7 @@ from tumbleweed.broker.client import BrokerClient
 from tumbleweed.broker.config import BrokerConfig
 from tumbleweed.broker.daemon import BrokerDaemon, start_broker
 from tumbleweed.broker.prompts import Allowed, Denied, GrantPrompt, PromptAnswer
+from tumbleweed.broker.service import Sandbox
 from tumbleweed.core.types import ByteCount, CanonicalPath
 from tumbleweed.ipc.limits import IpcLimits
 from tumbleweed.ipc.peercred import PeerCredentialsProvider
@@ -248,6 +249,7 @@ async def running(
     require_scope_limits: bool = False,
     before_start: Callable[[BrokerConfig], None] | None = None,
     socket_at: Path | None = None,
+    runner: Sandbox | None = None,
 ) -> AsyncIterator[Rig]:
     """A started broker over a fake user in a scratch home, closed on exit."""
     with scratch_home() as root, short_directory() as short:
@@ -270,7 +272,7 @@ async def running(
             socket,
             environ={},
             prompts=script,
-            sandbox=fake,
+            sandbox=fake if runner is None else runner,
             clock=clock,
             limits=limits,
             credentials=credentials,
