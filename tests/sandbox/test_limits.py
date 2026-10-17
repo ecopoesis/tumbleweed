@@ -1,6 +1,7 @@
 """How limits are applied and reported, on every OS: command lines, probe, platform check."""
 
 import asyncio
+import time
 import dataclasses
 from datetime import timedelta
 from pathlib import Path
@@ -428,11 +429,54 @@ class TestReprobe:
             now[0] += REPROBE_SECONDS - 1
             seen.append((await runner.limits_plan()).scope)  # too soon
             now[0] += 2
+            seen.append((await runner.limits_plan()).scope)  # answered by the old plan
+            await runner.wait_for_probe()
             seen.append((await runner.limits_plan()).scope)
             return seen
 
-        assert asyncio.run(scenario()) == [False, False, True]
+        assert asyncio.run(scenario()) == [False, False, False, True]
         assert len(fake.calls()) == 2
+
+    def test_a_hanging_reprobe_does_not_stall_the_callers(
+        self, fake: FakeSystemd, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1")
+        now = self.clock(monkeypatch)
+        fake.fail()
+        runner = SandboxRunner(systemd_run=str(fake.path))
+
+        async def scenario() -> tuple[float, bool]:
+            await runner.limits_plan()
+            fake.hang()  # the next probe never finishes (until its own 10 s timeout)
+            now[0] += REPROBE_SECONDS + 1
+            started = time.monotonic()
+            plan = await runner.limits_plan()
+            took = time.monotonic() - started
+            await runner.aclose()  # the probe is cancelled, and its process killed
+            return took, plan.scope
+
+        took, scope = asyncio.run(scenario())
+
+        assert took < 2.0, "the caller waited for the probe"
+        assert not scope
+
+    def test_one_reprobe_runs_at_a_time(
+        self, fake: FakeSystemd, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1")
+        now = self.clock(monkeypatch)
+        fake.fail()
+        runner = SandboxRunner(systemd_run=str(fake.path))
+
+        async def scenario() -> None:
+            await runner.limits_plan()
+            now[0] += REPROBE_SECONDS + 1
+            await asyncio.gather(*(runner.limits_plan() for _ in range(5)))
+            await runner.wait_for_probe()
+
+        asyncio.run(scenario())
+
+        assert len(fake.calls()) == 2  # the first probe, and one re-probe for the five callers
 
     def test_a_plan_with_a_scope_is_never_probed_again(
         self, fake: FakeSystemd, monkeypatch: pytest.MonkeyPatch
