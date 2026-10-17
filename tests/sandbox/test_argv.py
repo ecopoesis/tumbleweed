@@ -36,6 +36,7 @@ COVERED_FIELDS = {
     "grants": "TestGrants",
     "env": "TestEnvironment",
     "env_allowlist": "TestEnvironment",
+    "require_landlock": "tests/sandbox/test_hardening.py::TestPolicyFields",
 }
 
 

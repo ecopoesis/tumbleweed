@@ -30,6 +30,7 @@ from tests.sandbox.support import (
     opened,
     policy,
     report,
+    report_namespaces_only,
     run_sandbox,
     sandboxed_python,
 )
@@ -121,7 +122,9 @@ class TestRunning:
     def test_a_program_that_does_not_exist_is_a_launch_error_with_bwrap_saying_why(
         self, workspace: Opened
     ) -> None:
-        with pytest.raises(SandboxLaunchError, match=r"did not start.*execvp /no/such/program"):
+        with pytest.raises(
+            SandboxLaunchError, match=r"did not start.*/no/such/program: No such file"
+        ):
             run_sandbox(policy(workspace, "/no/such/program"))
 
     def test_a_runtime_mount_that_vanished_is_a_launch_error(self, workspace: Opened) -> None:
@@ -262,7 +265,10 @@ class TestNetwork:
         with listening(name.replace("@", "\0", 1), family=socket.AF_UNIX):
             assert host_can_connect(name.replace("@", "\0", 1), socket.AF_UNIX)
 
-            seen = report(workspace, payloads.VISIBILITY, "[]", json.dumps([name]), "[]")
+            # In the namespaces alone: with seccomp on, the socket cannot even be made (EPERM).
+            seen = report_namespaces_only(
+                workspace, payloads.VISIBILITY, "[]", json.dumps([name]), "[]"
+            )
 
         assert seen["connect"] == {name: "ECONNREFUSED"}
         assert name[1:] not in str(seen["proc_net_unix"])
@@ -301,7 +307,7 @@ class TestHostSockets:
             for address in [*map(str, paths), *abstract]:
                 assert host_can_connect(address.replace("@", "\0", 1), socket.AF_UNIX), address
 
-            seen = report(
+            seen = report_namespaces_only(
                 workspace,
                 payloads.VISIBILITY,
                 json.dumps([str(path) for path in paths] + [str(runtime), str(x11), "/run"]),
@@ -363,7 +369,9 @@ class TestHome:
             "/media",
         ]
 
-        seen = report(
+        # The namespaces alone: Landlock leaves `/` and `/etc` unlistable, which would hide
+        # whether the mounts do.
+        seen = report_namespaces_only(
             workspace,
             payloads.ACCESS,
             json.dumps({"read": probes, "list": [str(home), "/", "/etc", str(home.parent)]}),
@@ -382,7 +390,7 @@ class TestHome:
     def test_the_root_holds_only_the_runtime_and_the_sandboxs_own_directories(
         self, workspace: Opened
     ) -> None:
-        seen = report(workspace, payloads.SELF)
+        seen = report_namespaces_only(workspace, payloads.SELF)
 
         assert set(map(str, seen.items("root"))) <= {
             "bin",
@@ -760,9 +768,10 @@ class TestConfinement:
             "/usr/new": "EROFS",
             "/etc/new": "EROFS",
             "/dev/new": "EROFS",
-            "/proc/new": "ENOENT",
+            "/proc/new": seen.mapping("write")["/proc/new"],  # ENOENT, EACCES under Landlock
             "/workspace/ok": "ok",
         }
+        assert seen.mapping("write")["/proc/new"] in {"ENOENT", "EACCES"}
         assert set(seen.mapping("mkdir").values()) == {"EROFS"}
 
     def test_only_the_python_runtime_is_there_to_run(self, workspace: Opened) -> None:
