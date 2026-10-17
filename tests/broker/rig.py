@@ -7,6 +7,7 @@ data and its sockets live elsewhere (a short path, for the socket address).
 """
 
 import asyncio
+import os
 import shutil
 import tempfile
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import final
 
 from tests.broker.support import World, make_world
+from tests.ipc.paths import unchecked_socket_path as unchecked
 from tumbleweed.broker.audit import AuditEntry, read_entries
 from tumbleweed.broker.client import BrokerClient
 from tumbleweed.broker.config import BrokerConfig
@@ -132,6 +134,7 @@ class FakeSandbox:
 
     def __init__(self) -> None:
         self.policies: list[SandboxPolicy] = []
+        self.inodes: list[tuple[int, tuple[int, ...]]] = []  # of the descriptors, during the run
         self.result = canned_result()
         self.plan = LimitsPlan(
             scope=True, scope_memory=True, scope_pids=True, scope_cpu=True, systemd_run="/x"
@@ -145,6 +148,13 @@ class FakeSandbox:
 
     async def run(self, policy: SandboxPolicy) -> SandboxResult:
         self.policies.append(policy)
+        policy.check_descriptors()  # every descriptor is open, and of the right kind, now
+        self.inodes.append(
+            (
+                os.fstat(policy.workspace.fd).st_ino,
+                tuple(os.fstat(grant.source.fd).st_ino for grant in policy.grants),
+            )
+        )
         self.started.set()
         if self.fail_with is not None:
             raise self.fail_with
@@ -237,6 +247,7 @@ async def running(
     credentials: PeerCredentialsProvider | None = None,
     require_scope_limits: bool = False,
     before_start: Callable[[BrokerConfig], None] | None = None,
+    socket_at: Path | None = None,
 ) -> AsyncIterator[Rig]:
     """A started broker over a fake user in a scratch home, closed on exit."""
     with scratch_home() as root, short_directory() as short:
@@ -253,7 +264,7 @@ async def running(
         if before_start is not None:
             before_start(final)
         fake, script, clock = sandbox or FakeSandbox(), prompts or ScriptedPrompts(), Clock()
-        socket = directory.socket_path("broker")
+        socket = directory.socket_path("broker") if socket_at is None else unchecked(socket_at)
         daemon = await start_broker(
             final,
             socket,
