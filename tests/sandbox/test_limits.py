@@ -279,6 +279,34 @@ class TestRunnerPlan:
 
         assert len(fake.calls()) == 1
 
+    def test_a_bare_name_is_found_on_path_and_used_by_its_absolute_path(
+        self, fake: FakeSystemd, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1")
+        monkeypatch.setenv("PATH", str(fake.directory))
+        fake.canned(ALL_LIMITS)
+        runner = SandboxRunner(systemd_run="systemd-run")
+
+        plan = asyncio.run(runner.limits_plan())
+
+        assert plan.scope
+        assert plan.systemd_run == str(fake.path)
+
+    def test_a_bare_name_is_never_resolved_against_the_current_directory(
+        self, fake: FakeSystemd, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1")
+        monkeypatch.setenv("PATH", "/nonexistent")
+        monkeypatch.chdir(fake.directory)  # a `systemd-run` is right here, and must not be used
+        fake.canned(ALL_LIMITS)
+        runner = SandboxRunner(systemd_run="systemd-run")
+
+        plan = asyncio.run(runner.limits_plan())
+
+        assert not plan.scope
+        assert plan.detail == "systemd-run is not installed"
+        assert fake.calls() == []
+
     def test_switching_the_scope_off_never_calls_systemd(
         self, fake: FakeSystemd, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -202,9 +202,12 @@ class SandboxRunner:
     async def _probe(self) -> LimitsPlan:
         if not self._use_scope:
             return LimitsPlan(detail="the systemd scope is switched off")
-        found = self._systemd_run or shutil.which("systemd-run")
+        # A bare name is looked up on PATH, never against the current directory: the probe and
+        # every scoped run use the absolute path found here.
+        wanted = self._systemd_run or "systemd-run"
+        found = wanted if Path(wanted).is_absolute() else shutil.which(wanted)
         if found is None:
-            return LimitsPlan(detail="systemd-run is not installed")
+            return LimitsPlan(detail=f"{wanted} is not installed")
         env = _user_manager_env()
         if "XDG_RUNTIME_DIR" not in env:
             return LimitsPlan(detail="no user session (XDG_RUNTIME_DIR is not set)")
