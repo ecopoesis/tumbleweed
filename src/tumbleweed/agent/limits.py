@@ -30,10 +30,6 @@ MAX_TOOL_INPUT_BYTES: Final = ByteCount(64 * 1024)
 MAX_TOOL_RESULT_BYTES: Final = ByteCount(16 * 1024)
 TOOL_TIMEOUT: Final = timedelta(seconds=30)
 
-# What a conversation keeps between replies: the newest turns that fit both limits.
-MAX_HISTORY_MESSAGES: Final = 40
-MAX_HISTORY_BYTES: Final = ByteCount(256 * 1024)
-
 
 @final
 class AgentLimits(BaseModel):

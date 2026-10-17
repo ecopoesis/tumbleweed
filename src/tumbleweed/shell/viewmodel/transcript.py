@@ -18,10 +18,15 @@ here, at the entry point:
 A delta is validated on its own, and a running byte count enforces the cap, so a reply of any
 number of deltas costs time proportional to its length, not to its length times the delta count.
 One reply streams at a time, and no user message is accepted while it does.
+
+`replace` swaps the whole conversation for another (a session restored from the chat history, or an
+empty one for a new session, S04). The messages it takes are `TranscriptMessage`s, which validate
+themselves with the full checks (they cannot be the checked-text kind), and the same caps apply.
 """
 
 import enum
 import re
+from collections.abc import Sequence
 from typing import Final, Protocol, Self, assert_never, final
 
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
@@ -127,6 +132,10 @@ class TranscriptObserver(Protocol):
 
     def message_changed(self, message: TranscriptMessage) -> None: ...
 
+    def messages_replaced(self, messages: tuple[TranscriptMessage, ...]) -> None:
+        """The conversation was replaced by `messages` (see `Transcript.replace`)."""
+        ...
+
 
 def _clean(value: object, what: str) -> str:
     """Return `value` as safe text: exactly a `str`, with NUL and lone surrogates replaced."""
@@ -203,6 +212,33 @@ class Transcript:
         if len(self._messages) + 2 > MAX_MESSAGES:  # one slot is kept for the reply
             raise TranscriptError(f"the transcript is full ({MAX_MESSAGES} messages)")
         return self._add(Role.USER, cleaned, MessageState.COMPLETE)
+
+    def replace(self, messages: Sequence[TranscriptMessage]) -> None:
+        """Replace every message with `messages` (oldest first) and tell the observers once.
+
+        Raises `ReplyInFlightError` while a reply streams, `TranscriptError` for more than
+        `MAX_MESSAGES`, and `InvalidValueError` for anything that is not a `TranscriptMessage`, a
+        message that is still streaming, or an ID that occurs twice. Nothing changes then.
+        """
+        if self._streaming is not None:
+            raise ReplyInFlightError("a reply is still streaming")
+        if len(messages) > MAX_MESSAGES:
+            raise TranscriptError(f"a transcript holds at most {MAX_MESSAGES} messages")
+        positions: dict[MessageId, int] = {}
+        for position, message in enumerate(messages):
+            raw: object = message  # the annotation is for the checker; callers can pass anything
+            if type(raw) is not TranscriptMessage:
+                raise InvalidValueError(f"expected a TranscriptMessage, got {type(raw).__name__}")
+            if message.state is MessageState.STREAMING:
+                raise InvalidValueError("a message that is still streaming cannot be restored")
+            if message.id in positions:
+                raise InvalidValueError(f"message {message.id} occurs twice")
+            positions[message.id] = position
+        self._messages = list(messages)
+        self._positions = positions
+        self._streaming_bytes = 0
+        for observer in tuple(self._observers):
+            observer.messages_replaced(tuple(self._messages))
 
     def begin_assistant(self) -> TranscriptMessage:
         """Open an empty assistant message in the `STREAMING` state and return it."""
