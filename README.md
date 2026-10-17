@@ -73,8 +73,9 @@ is hidden), F9 shows or hides the side panel, Ctrl+Q quits. (Ctrl, also on a Mac
 in the terminal quit the same way. Text from the chat is shown as plain text, never as markup, and
 very long or hostile text (a 5000-character grapheme cluster, 64 KiB with no spaces) cannot widen the
 window or freeze it: it is shown with zero-width spaces added. Ctrl+C and Copy in a message's menu put
-the message's own text on the clipboard, without them; a selection that is only primary (pasted with
-a middle click) or dragged out still has them.
+the message's own text on the clipboard, without them, and so does dragging the selection out. A
+selection pasted with a middle click (the primary selection) still has them: GTK puts its laid-out text
+there, and replacing it makes the label drop the selection (#63 stays open for it).
 
 The command takes no arguments but `--help` and `--version`; anything else, a file name included, is
 refused with a one-line error and exit status 2. The application is non-unique: it claims no
@@ -153,7 +154,10 @@ reply_timeout_seconds = 120             # wall-clock, retries and tools included
 `base_url` must be `https` (plain `http` only to `localhost`, for a local proxy) with a valid port: the
 key is sent there. The client follows no redirects and ignores `HTTP_PROXY`, `ALL_PROXY` and
 `SSL_CERT_FILE`, so the key goes only to that URL. A rate limit, an overload or a dropped connection is
-retried twice, a few seconds apart; a response is read up to 2 MiB.
+retried twice, a few seconds apart (a `Retry-After` of more than 10 s is reported at once instead). The
+request says `Accept-Encoding: identity` and a compressed response is refused, so that the size of a
+stream, bounded as it arrives (1 MiB plus 256 bytes per output token the reply may use; 64 KiB of an error
+body), is the size of what is read.
 
 A reply's size is bounded by bytes (64 KiB, the transcript's own cap), not by the token limit, which
 counts thinking tokens and so is about cost and time. Errors (no key, no network, rate limit, overload, a timeout, a limit reached) appear under
@@ -197,9 +201,11 @@ passes. `tests/test_lock.py` checks that nothing in the lock is younger.
 
 The runtime dependencies are `pydantic`, `PyGObject`, `regex` (a UAX 29 grapheme-cluster
 segmenter for the transcript's display transform; DECISIONS D10, with `types-regex` for the type
-checker) and `anthropic` (the official Claude SDK, behind our provider interface; it brings
-`httpx2`, `jiter` and a few small pure-Python packages, all locked for the three platforms, and
-1.13 is the newest release inside the cooldown today). A new one needs its justification in the PR and a lock for macOS and Linux.
+checker), `anthropic` (the official Claude SDK, behind our provider interface; it brings `jiter` and a
+few small pure-Python packages, all locked for the three platforms, and 1.13 is the newest release
+inside the cooldown today) and `httpx2`, the SDK's HTTP library, which is a direct dependency because
+`agent.anthropic_provider` imports it: for the transport that bounds a response, for refusing
+redirects and environment proxies, and for its exception types. A new one needs its justification in the PR and a lock for macOS and Linux.
 
 - To update: `uv lock --upgrade`, which re-resolves with the window as of today.
 - To take a newer release of one package before its week is up (a security fix), add

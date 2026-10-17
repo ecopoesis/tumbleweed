@@ -455,9 +455,11 @@ Each invariant names where it is enforced. Reviews check every change against th
   bytes of reply text (`MAX_REPLY_BYTES`, the hard guarantee that a reply fits a transcript message;
   tokens do not bound bytes) and the reply timeout around the whole run, tool calls included;
   `agent.runtime` allows one reply at a time and bounds the user's message. The size of what a
-  server can make the shell read is bounded in the transport (`agent.anthropic_provider`: 2 MiB
-  of a stream, 64 KiB of an error body), and tool inputs, results and runtime are bounded by
-  `agent.tools`.
+  server can make the shell read is bounded in the transport (`agent.anthropic_provider`, counted
+  on the bytes as they arrive: 1 MiB plus 256 bytes per output token the reply may use for a
+  stream, 64 KiB of an error body), after asking for `Accept-Encoding: identity` and refusing any
+  response that is encoded anyway, because the HTTP library decompresses above the transport and
+  the count would no longer be ours. Tool inputs, results and runtime are bounded by `agent.tools`.
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input.
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps

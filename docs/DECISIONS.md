@@ -185,9 +185,12 @@ logged by type and place, never by message (`describe_unexpected`). A stream tha
 text). The SDK's, `httpx2`'s and `httpcore2`'s loggers are held at WARNING, so `ANTHROPIC_LOG=debug`
 cannot put prompts or a hostile error text in the log. The client follows no redirects (a 307 would resend the key), ignores the environment's proxy variables
 (a proxy would see the key, or get it in clear text for a loopback `http` base URL), bounds the size of a
-response in the transport, and does not use the SDK's retries, which sleep for whatever `Retry-After` says:
-the provider retries a rate limit, an overload or a dropped connection twice, a capped 10 s apart, and only
-before any of the answer has arrived. **Not done: refusal fallbacks.** The API can re-run a refused request
+response in the transport (identity encoding only: a compressed response is refused unread, since decoding
+happens above the transport; the limit follows the configured token limit), and does not use the SDK's
+retries, which sleep for whatever `Retry-After` says: the provider retries a rate limit, an overload or a
+dropped connection twice, a capped 10 s apart, only before any of the answer has arrived, and not at all
+when `Retry-After` asks for more than the cap (the rate limit is reported at once). Each attempt gets its own
+invocation record. A tool call cut off by the token limit does not fail the stream: the stop reason decides. **Not done: refusal fallbacks.** The API can re-run a refused request
 on another model server-side (`fallbacks`, a beta header); it is Claude-API-only and would not survive a
 proxy `base_url`, so a refusal is shown as "The model declined to answer." Deferred, tracked in #70.
 **Consequences.** A user debugging a provider
