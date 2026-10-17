@@ -11,7 +11,7 @@ queue as the dispatcher.
 
 Thread affinity: `start`, `cancel` (the handle's) and `close` belong to the main thread, which is
 the one that built the responder; they refuse any other. All state the main thread owns (the active
-reply, the conversation) is touched only there: the worker never reads or writes it, it posts
+reply) is touched only there: the worker never reads or writes it, it posts
 callbacks that do. Events reach the sink only through `MainThreadDispatcher.post`, so the sink sees
 them on the thread that sent the message, as the `Responder` protocol requires (the sink raises
 `WrongThreadError` otherwise).
@@ -19,7 +19,10 @@ them on the thread that sent the message, as the `Responder` protocol requires (
 Cancellation: the handle's `cancel` ends the reply at once on the main thread (nothing posted
 later is delivered) and cancels the loop's task on the worker, which closes the provider's stream
 and records the invocation as cancelled. A reply ends exactly once: finished, failed, or cancelled.
-Only a finished reply is added to the conversation.
+
+The responder remembers nothing between replies. The conversation so far arrives in each request
+(`ReplyRequest.history`, which the shell builds from its transcript: finished exchanges only), and
+`tumbleweed.agent.context` decides how much of it the model is sent.
 """
 
 import asyncio
@@ -30,7 +33,7 @@ import threading
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Final, Protocol, final
 
-from tumbleweed.agent.conversation import Conversation
+from tumbleweed.agent.context import fit_history
 from tumbleweed.agent.errors import AgentBusyError, AgentError, LimitError, describe_unexpected
 from tumbleweed.agent.limits import MAX_USER_TEXT_BYTES, AgentLimits
 from tumbleweed.agent.llm import LlmMessage, LlmProvider
@@ -164,6 +167,7 @@ class AgentResponder:
     ) -> None:
         self._dispatcher = dispatcher
         self._limits = limits
+        self._system_prompt = system_prompt
         self._session_id = SessionId.new()
         self._loop = AgentLoop(
             provider=recorder.record(provider, session_id=self._session_id),
@@ -173,7 +177,6 @@ class AgentResponder:
             limits=limits,
         )
         self._cleanup = cleanup
-        self._conversation = Conversation()
         self._worker = _Worker()
         self._active: _Run | None = None
         self._closed = False
@@ -195,9 +198,8 @@ class AgentResponder:
         run = _Run(sink)
         self._active = run
         try:
-            run.future = self._worker.submit(
-                self._drive(run, self._conversation.messages, request.text)
-            )
+            history = fit_history(self._system_prompt, request.history, request.text)
+            run.future = self._worker.submit(self._drive(run, history, request.text))
         except BaseException:
             self._active = None
             raise
@@ -227,7 +229,7 @@ class AgentResponder:
 
     async def _drive(self, run: _Run, history: tuple[LlmMessage, ...], text: str) -> None:
         try:
-            reply = await self._loop.run(
+            await self._loop.run(
                 history, text, lambda piece: self._post(run, ReplyDelta(text=piece))
             )
         except AgentError as exc:
@@ -238,30 +240,24 @@ class AgentResponder:
             logger.error("the reply failed unexpectedly: %s", describe_unexpected(exc))
             self._post(run, ReplyFailed(reason=_INTERNAL_FAILURE))
         else:
-            self._post(run, ReplyFinished(), commit=(text, reply))
+            self._post(run, ReplyFinished())
 
-    def _post(self, run: _Run, event: ReplyEvent, *, commit: tuple[str, str] | None = None) -> None:
+    def _post(self, run: _Run, event: ReplyEvent) -> None:
         try:
-            self._dispatcher.post(functools.partial(self._deliver, run, event, commit))
+            self._dispatcher.post(functools.partial(self._deliver, run, event))
         except Exception:
             logger.exception("could not hand an event to the main thread")
 
     # On the main thread, through the dispatcher.
 
-    def _deliver(self, run: _Run, event: ReplyEvent, commit: tuple[str, str] | None) -> None:
+    def _deliver(self, run: _Run, event: ReplyEvent) -> None:
         if run.ended:
             return
-        try:
-            if not isinstance(event, ReplyDelta):
-                run.ended = True
-                if self._active is run:
-                    self._active = None
-                if commit is not None:
-                    self._conversation.commit(*commit)
-        finally:
-            # The reply must end whatever happens to its record: a terminal event that is not
-            # emitted leaves the chat busy for ever.
-            run.sink.emit(event)
+        if not isinstance(event, ReplyDelta):
+            run.ended = True
+            if self._active is run:
+                self._active = None
+        run.sink.emit(event)
 
 
 @final

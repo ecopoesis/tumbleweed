@@ -18,9 +18,12 @@ are not thread-safe.
 
 import logging
 import threading
+from collections.abc import Sequence
 from typing import assert_never, final
 
 from tumbleweed.agent.responder import (
+    MAX_CONTEXT_TURNS,
+    ContextTurn,
     ReplyDelta,
     ReplyEvent,
     ReplyFailed,
@@ -31,7 +34,12 @@ from tumbleweed.agent.responder import (
 )
 from tumbleweed.core.errors import InvalidValueError, TumbleweedError
 from tumbleweed.core.ids import MessageId
-from tumbleweed.shell.viewmodel.transcript import Transcript
+from tumbleweed.shell.viewmodel.transcript import (
+    MessageState,
+    Role,
+    Transcript,
+    TranscriptMessage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +58,30 @@ def describe_error(error: BaseException) -> str:
     except Exception:  # noqa: BLE001  (a __str__ that raises must not cost us the error report)
         return type(error).__name__
     return text or type(error).__name__
+
+
+def context_turns(messages: Sequence[TranscriptMessage]) -> tuple[ContextTurn, ...]:
+    """The finished exchanges of `messages`, oldest first: what the model may be told of the
+    conversation so far (ARCHITECTURE section 2: text turns of replies that finished).
+
+    A turn is a user message directly followed by an assistant message that completed. A reply that
+    failed or was cancelled, a user message nothing answered (the shell ended first), and a reply
+    with no text leave no turn, so what is sent always alternates and starts with the user. Only
+    the newest `MAX_CONTEXT_TURNS` are built.
+    """
+    pairs: list[tuple[TranscriptMessage, TranscriptMessage]] = []
+    pending: TranscriptMessage | None = None
+    for message in messages:
+        if message.role is Role.USER:
+            pending = message
+        elif (
+            pending is not None and message.state is MessageState.COMPLETE and message.text.strip()
+        ):
+            pairs.append((pending, message))
+            pending = None
+        else:
+            pending = None
+    return tuple(ContextTurn(user=u.text, assistant=a.text) for u, a in pairs[-MAX_CONTEXT_TURNS:])
 
 
 @final
@@ -160,9 +192,10 @@ class ChatController:
         failures of the responder show in the transcript as a failed reply instead.
         """
         user = self._transcript.add_user(text)
+        history = context_turns(self._transcript.messages[:-1])  # everything before this message
         reply = _Reply(self._transcript, self._transcript.begin_assistant().id)
         self._reply = reply
-        request = ReplyRequest(message_id=user.id, text=user.text)
+        request = ReplyRequest(message_id=user.id, text=user.text, history=history)
         try:
             handle = self._responder.start(request, reply)
         except TumbleweedError as exc:

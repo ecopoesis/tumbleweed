@@ -27,17 +27,36 @@ from typing import Annotated, Literal, Protocol, final
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from tumbleweed.agent.limits import MAX_REPLY_BYTES, MAX_USER_TEXT_BYTES
 from tumbleweed.core.ids import MessageId
+
+MAX_CONTEXT_TURNS = 500  # half of the transcript's 1000 messages
+
+
+@final
+class ContextTurn(BaseModel):
+    """One finished exchange of the conversation: what the user said, and the reply that ended.
+
+    Lengths are in characters, which is at most the bytes the limits are in: a cheap bound on what
+    a request can carry. What the model is actually sent is decided by `tumbleweed.agent.context`.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    user: str = Field(max_length=MAX_USER_TEXT_BYTES)
+    assistant: str = Field(max_length=MAX_REPLY_BYTES)
 
 
 @final
 class ReplyRequest(BaseModel):
-    """What the user asked: the user message to answer, with its text."""
+    """What the user asked: the user message to answer, with its text, and the conversation so
+    far (finished exchanges only, oldest first): the responder keeps no history of its own."""
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     message_id: MessageId
     text: str
+    history: tuple[ContextTurn, ...] = Field(default=(), max_length=MAX_CONTEXT_TURNS)
 
 
 @final
@@ -99,6 +118,8 @@ class Responder(Protocol):
 
 
 __all__ = [
+    "MAX_CONTEXT_TURNS",
+    "ContextTurn",
     "ReplyDelta",
     "ReplyEvent",
     "ReplyFailed",
