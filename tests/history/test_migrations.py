@@ -21,6 +21,7 @@ from tumbleweed.history.schema import (
     Migration,
     expected_signature,
     migrate,
+    schema_signature,
 )
 from tumbleweed.history.store import HistoryStore
 
@@ -64,12 +65,7 @@ class TestFreshDatabase:
         Database.open(directory).close()
 
         with raw(directory) as connection:
-            rows = connection.execute(
-                "SELECT type, name, tbl_name, sql FROM sqlite_master "
-                "WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY type, name"
-            ).fetchall()
-
-        assert tuple(rows) == expected_signature(len(MIGRATIONS), MIGRATIONS)
+            assert schema_signature(connection) == expected_signature(len(MIGRATIONS), MIGRATIONS)
 
     def test_opening_it_again_changes_nothing(self, tmp_path: Path) -> None:
         directory = history_directory(tmp_path)

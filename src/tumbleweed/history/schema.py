@@ -7,9 +7,11 @@ find the schema current and do nothing. A migration is atomic: it applies comple
 A shell never migrates a file down: a version newer than its own is refused.
 
 The file is untrusted, so a schema is trusted only if it is *exactly* what the migrations produce
-(`schema_signature`): every table, index, trigger and view with its original SQL. A file that has
-an extra trigger or view, a missing column, a changed constraint, another application's tables or
-another `application_id` is refused before anything is read from or written to it. The expected
+(`schema_signature`): every table, index (automatic ones included, with what SQLite says each
+is), trigger and view with its original SQL. A file that has an extra trigger or view, a missing
+column or UNIQUE constraint, a changed constraint, another application's tables or another
+`application_id` is refused, by `verify`, which writes nothing, before the file is switched to WAL
+or touched in any other way. The expected
 signature of each version is computed by running the migrations on an in-memory database.
 
 To change the schema, append a `Migration` with the next version; never edit an earlier one.
@@ -77,23 +79,50 @@ def _integer(
 
 
 def schema_signature(connection: sqlite3.Connection) -> Signature:
-    """Every user-defined object of the schema as (type, name, table, SQL), sorted."""
+    """Every object of the schema as (kind, name, table, detail), sorted.
+
+    The objects of `sqlite_master`, the automatic indexes (`sqlite_autoindex_*`, which a UNIQUE
+    constraint makes and whose SQL is NULL) included, and for every table what SQLite says its
+    indexes are: whether each is unique, where it came from (a constraint or a `CREATE INDEX`),
+    and its columns. A missing UNIQUE constraint therefore shows. (A plain index that is renamed
+    and given no SQL to pose as an automatic one is counted by SQLite itself as the constraint's
+    index, so it passes; what such a file cannot do is make a read return more than its budget,
+    see `MessageRepository.newest`.)
+    """
     rows: list[tuple[object, ...]] = connection.execute(
-        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' "
-        "ESCAPE '\\' ORDER BY type, name"
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
     ).fetchall()
     found: list[tuple[str, str, str, str]] = []
+    tables: list[str] = []
     for row in rows:
         values = tuple(_text(value) for value in row)
         if len(values) != 4:
             raise HistoryCorruptError("The chat history database could not be read.")
         found.append((values[0], values[1], values[2], values[3]))
-    return tuple(found)
+        if values[0] == "table":
+            tables.append(values[1])
+    for table in tables:
+        indexes: list[tuple[object, ...]] = connection.execute(
+            'SELECT name, "unique", origin, partial FROM pragma_index_list(?) ORDER BY name',
+            (table,),
+        ).fetchall()
+        for name, unique, origin, partial in indexes:
+            index = _text(name)
+            found.append(
+                ("index_list", table, index, f"{_text(unique)}|{_text(origin)}|{_text(partial)}")
+            )
+            columns: list[tuple[object, ...]] = connection.execute(
+                "SELECT seqno, name FROM pragma_index_info(?) ORDER BY seqno", (index,)
+            ).fetchall()
+            found.extend(("index_info", index, _text(n), _text(c)) for n, c in columns)
+    return tuple(sorted(found))
 
 
 def _text(value: object) -> str:
     if value is None:
-        return ""  # a NULL `sql` (an automatic index): it cannot match anything we wrote
+        return ""  # a NULL `sql` (an automatic index)
+    if isinstance(value, int):
+        return str(value)
     if isinstance(value, str):
         return value
     if isinstance(value, bytes):
@@ -144,6 +173,33 @@ def _refuse_foreign(connection: sqlite3.Connection, migrations: tuple[Migration,
     return version
 
 
+def _rollback(connection: sqlite3.Connection) -> None:
+    if connection.in_transaction:
+        connection.execute("ROLLBACK")
+
+
+def verify(connection: sqlite3.Connection, migrations: tuple[Migration, ...] = MIGRATIONS) -> int:
+    """The file's schema version, once it is known to be ours; refuses what is not. Writes nothing.
+
+    The three things looked at (`user_version`, `application_id`, the schema) are read in one read
+    transaction, so a shell that migrates in between cannot make a half-migrated file look
+    foreign. A refusal is believed only if it holds again under the write lock, where nobody can
+    be migrating.
+    """
+    connection.execute("BEGIN")
+    try:
+        return _refuse_foreign(connection, migrations)
+    except HistoryRefusedError:
+        pass
+    finally:
+        _rollback(connection)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        return _refuse_foreign(connection, migrations)
+    finally:
+        _rollback(connection)
+
+
 def migrate(connection: sqlite3.Connection, migrations: tuple[Migration, ...] = MIGRATIONS) -> None:
     """Bring the database to the newest version, or refuse it. See the module docstring.
 
@@ -152,7 +208,7 @@ def migrate(connection: sqlite3.Connection, migrations: tuple[Migration, ...] = 
     _validate_migrations(migrations)
     latest = migrations[-1].version
     # No write lock for the common case: a database that is already current.
-    if _refuse_foreign(connection, migrations) == latest:
+    if verify(connection, migrations) == latest:
         return
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -166,6 +222,5 @@ def migrate(connection: sqlite3.Connection, migrations: tuple[Migration, ...] = 
             connection.execute(f"PRAGMA application_id = {APPLICATION_ID}")
         connection.execute("COMMIT")
     except BaseException:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
+        _rollback(connection)
         raise

@@ -6,7 +6,9 @@ section 9).
 
 **Who owns "the last session".** Shells are non-unique, so several may run at once. The last
 session is the one with the newest activity (`updated_at`, set by every appended message; ties
-broken by the larger, time-sortable `SessionId`) *that no other running shell holds*. A shell
+broken by the larger, time-sortable `SessionId`) *that has messages and that no other running shell
+holds*; an empty session is nobody's last session, and is deleted when its shell closes or moves
+on, so an accidental second shell leaves nothing that could hide the real chat. A shell
 claims the session it restores or creates (`tumbleweed.history.claims`), so two shells never write
 into one session, and a second shell started while the first is running gets the next-newest
 unclaimed session, or a fresh one. The claim is the shell's for as long as it runs or until it
@@ -34,7 +36,7 @@ from typing import Final, Protocol, Self, final
 
 from tumbleweed.core.ids import SessionId
 from tumbleweed.core.types import ByteCount
-from tumbleweed.history.claims import LOCKS_DIRECTORY, Claim, SessionClaims
+from tumbleweed.history.claims import Claim, SessionClaims
 from tumbleweed.history.db import Database
 from tumbleweed.history.errors import HistoryCorruptError, HistoryError, HistoryRefusedError
 from tumbleweed.history.records import (
@@ -128,7 +130,7 @@ class HistoryStore:
         """Open the history in `directory`. Raises `HistoryError`s; the shell then runs without."""
         database = Database.open(directory, migrations=migrations)
         try:
-            claims = SessionClaims(directory / LOCKS_DIRECTORY)
+            claims = SessionClaims(database.directory_fd)
         except BaseException:
             database.close()
             raise
@@ -167,15 +169,8 @@ class HistoryStore:
     def new_session(self) -> StoredSession:
         self._require_open()
         previous, claim = self._session, self._claim
-        session = self._start()
-        if previous is not None and claim is not None:
-            try:
-                if self._sessions.delete_if_empty(previous.id):
-                    claim.forget()  # an unused session is not kept, nor its lock file
-            except HistoryError:
-                logger.warning("could not delete the unused previous session")
-            finally:
-                claim.release()
+        session = self._start()  # the previous claim is held until this has worked
+        self._let_go(previous, claim)
         return session
 
     def append(self, message: NewMessage) -> None:
@@ -185,17 +180,30 @@ class HistoryStore:
         self._messages.append(self._session.id, message)
 
     def close(self) -> None:
+        """Release the session, deleting it if it has no messages (an unused session, such as an
+        accidental second shell leaves, is not kept), and close the file. Idempotent."""
         if self._closed:
             return
         self._closed = True
         try:
-            if self._claim is not None:
-                self._claim.release()
+            self._let_go(self._session, self._claim)
         finally:
             try:
                 self._claims.close()
             finally:
                 self._database.close()
+
+    def _let_go(self, session: StoredSession | None, claim: Claim | None) -> None:
+        """Give up `claim` on `session`, and delete both if the session is empty."""
+        if claim is None:
+            return
+        try:
+            if session is not None and self._sessions.delete_if_empty(session.id):
+                claim.forget()
+        except HistoryError:
+            logger.warning("could not delete an unused chat session")
+        finally:
+            claim.release()
 
     def _start(self) -> StoredSession:
         """Create a session, claim it, make it the current one, and prune the oldest.
@@ -217,19 +225,28 @@ class HistoryStore:
         return session
 
     def _prune(self) -> None:
-        """Delete up to `PRUNE_BATCH` of the oldest sessions beyond `MAX_SESSIONS`, in one write,
-        skipping any that another shell holds."""
+        """Delete up to `PRUNE_BATCH` of the oldest sessions with messages beyond the newest
+        `MAX_SESSIONS` of them, and up to as many empty ones, in one write; nothing another shell
+        holds, and no write at all if there is nothing to delete. Empty sessions do not count
+        towards `MAX_SESSIONS`, so they cannot push a real chat out."""
         claims: list[Claim] = []
         try:
-            for session_id in self._sessions.beyond(MAX_SESSIONS, PRUNE_BATCH):
+            candidates = (
+                *self._sessions.beyond(MAX_SESSIONS, PRUNE_BATCH),
+                *self._sessions.empty(PRUNE_BATCH),
+            )
+            for session_id in candidates:
                 if (claim := self._claims.try_claim(session_id)) is not None:
                     claims.append(claim)
-            self._sessions.delete([claim.session_id for claim in claims])
+            if claims:
+                self._sessions.delete([claim.session_id for claim in claims])
         except HistoryError:
             logger.warning("could not prune old chat sessions")
-        finally:
             for claim in claims:
-                try:
-                    claim.forget()
-                except HistoryError:
-                    logger.warning("could not remove a lock file")
+                claim.release()  # still in the file: their lock files stay
+            return
+        for claim in claims:
+            try:
+                claim.forget()
+            except HistoryError:
+                logger.warning("could not remove a lock file")

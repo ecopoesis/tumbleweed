@@ -89,6 +89,24 @@ def message_from_row(row: Row) -> StoredMessage:
         raise HistoryCorruptError(_CORRUPT) from None
 
 
+SCAN_WINDOW: Final = 1000
+_NON_EMPTY: Final = (
+    "SELECT id, created_at, updated_at FROM (SELECT id, created_at, updated_at FROM sessions "
+    "ORDER BY updated_at DESC, id DESC LIMIT ?) AS s "
+    "WHERE EXISTS (SELECT 1 FROM messages WHERE session_id = s.id) "
+)
+
+
+def _ids(rows: list[Row]) -> tuple[SessionId, ...]:
+    ids: list[SessionId] = []
+    for row in rows:
+        try:
+            ids.append(SessionId(_text(row[0])))
+        except (ValueError, HistoryError):
+            logger.warning("skipped a session row whose id is not valid")
+    return tuple(ids)
+
+
 @final
 class SessionRepository:
     def __init__(self, database: Database) -> None:
@@ -110,14 +128,17 @@ class SessionRepository:
         return session_from_row(rows[0]) if rows else None
 
     def newest(self, limit: int) -> tuple[StoredSession, ...]:
-        """The `limit` most recently active sessions, newest first. A row that is not a valid
-        session is skipped (and logged): one bad row must not hide the others."""
+        """The `limit` most recently active sessions that have messages, newest first. A row that
+        is not a valid session is skipped (and logged): one bad row must not hide the others.
+
+        Sessions with no messages are not "the last session": an accidental second shell leaves
+        one, and it must not hide the chat before it. Only the newest `SCAN_WINDOW` sessions are
+        looked at, so a file of millions of rows costs the same as one of a few.
+        """
         if not 1 <= limit <= MAX_SEQUENCE:
             raise ValueError("limit must be positive")
         rows = self._database.query(
-            "SELECT id, created_at, updated_at FROM sessions "
-            "ORDER BY updated_at DESC, id DESC LIMIT ?",
-            (limit,),
+            _NON_EMPTY + "ORDER BY updated_at DESC, id DESC LIMIT ?", (SCAN_WINDOW, limit)
         )
         sessions: list[StoredSession] = []
         for row in rows:
@@ -128,20 +149,29 @@ class SessionRepository:
         return tuple(sessions)
 
     def beyond(self, keep: int, batch: int) -> tuple[SessionId, ...]:
-        """Up to `batch` sessions older than the newest `keep`, oldest first, for deleting."""
+        """Up to `batch` sessions with messages older than the newest `keep` of them, oldest
+        first, for deleting. Empty sessions do not count towards `keep`."""
         if not (1 <= batch <= MAX_SEQUENCE and 0 <= keep <= MAX_SEQUENCE):
             raise ValueError("batch must be positive and keep not negative")
         rows = self._database.query(
-            "SELECT id FROM sessions ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
-            (batch, keep),
+            _NON_EMPTY + "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            (SCAN_WINDOW, batch, keep),
         )
-        ids: list[SessionId] = []
-        for (value,) in rows:
-            try:
-                ids.append(SessionId(_text(value)))
-            except (ValueError, HistoryError):
-                logger.warning("skipped a session row whose id is not valid")
-        return tuple(reversed(ids))
+        return tuple(reversed(_ids(rows)))
+
+    def empty(self, batch: int) -> tuple[SessionId, ...]:
+        """Up to `batch` of the oldest sessions without messages (among the newest
+        `SCAN_WINDOW`), for deleting if nobody holds them."""
+        if not 1 <= batch <= MAX_SEQUENCE:
+            raise ValueError("batch must be positive")
+        rows = self._database.query(
+            "SELECT id FROM (SELECT id, updated_at FROM sessions "
+            "ORDER BY updated_at DESC, id DESC LIMIT ?) AS s "
+            "WHERE NOT EXISTS (SELECT 1 FROM messages WHERE session_id = s.id) "
+            "ORDER BY updated_at ASC, id ASC LIMIT ?",
+            (SCAN_WINDOW, batch),
+        )
+        return _ids(rows)
 
     def delete(self, session_ids: Sequence[SessionId]) -> None:
         """Delete sessions and, through the foreign key, their messages, in one transaction."""
@@ -237,26 +267,35 @@ class MessageRepository:
             (str(session_id), limit),
         )
         total = 0
-        oldest: int | None = None
+        measured: list[int] = []
+        previous: int | None = None
         for row in sizes:
             seq, size = row
             if type(seq) is not int or type(size) is not int or size < 0:
                 raise HistoryCorruptError(_CORRUPT)
+            if previous is not None and seq >= previous:
+                raise HistoryCorruptError(_CORRUPT)  # positions are unique, and the read is ordered
+            previous = seq
             if total + size > max_bytes:
                 break
             total += size
-            oldest = seq
-        if oldest is None:
+            measured.append(seq)
+        if not measured:
             return ()
         rows = self._database.query(
             f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE session_id = ? AND seq >= ? "  # noqa: S608
             "ORDER BY seq DESC LIMIT ?",
-            (str(session_id), oldest, limit),
+            (str(session_id), measured[-1], len(measured)),
         )
         messages = [message_from_row(row) for row in rows]
-        for message in messages:
-            if message.session_id != session_id:
-                raise HistoryCorruptError(_CORRUPT)
+        # Exactly what was measured: the same positions, within the byte budget. A file whose
+        # rows changed between the reads, or that has two rows for a position, is refused.
+        if [m.seq for m in messages] != measured:
+            raise HistoryCorruptError(_CORRUPT)
+        if any(m.session_id != session_id for m in messages):
+            raise HistoryCorruptError(_CORRUPT)
+        if sum(len(m.text.encode("utf-8")) for m in messages) > max_bytes:
+            raise HistoryCorruptError(_CORRUPT)
         messages.reverse()
         return tuple(messages)
 

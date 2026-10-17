@@ -149,5 +149,5 @@ def closing_every_store(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     try:
         yield
     finally:
-        for item in opened:
+        for item in reversed(opened):  # a store before the database it opened
             item.close()

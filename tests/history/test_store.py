@@ -1,6 +1,10 @@
 """Round trips through the store, the bounds on what it keeps and reads, and who owns the last
 session."""
 
+import fcntl
+import os
+import sqlite3
+from contextlib import AbstractContextManager
 from pathlib import Path
 
 import pytest
@@ -18,13 +22,21 @@ from tests.history.support import (
 )
 from tumbleweed.core.ids import MessageId, SessionId, TaskId
 from tumbleweed.core.types import ByteCount
+from tumbleweed.history.claims import SessionClaims
 from tumbleweed.history.errors import HistoryError, HistoryRefusedError
 from tumbleweed.history.records import (
     MAX_MESSAGES_PER_SESSION,
     MAX_SESSIONS,
+    EpochMillis,
 )
 from tumbleweed.history.repository import SessionRepository
-from tumbleweed.history.store import PRUNE_BATCH, RESTORE_BYTES, RESTORE_CANDIDATES
+from tumbleweed.history.store import (
+    NOT_RESTORED,
+    PRUNE_BATCH,
+    RESTORE_BYTES,
+    RESTORE_CANDIDATES,
+    HistoryStore,
+)
 
 
 class TestRoundTrip:
@@ -189,7 +201,7 @@ class TestBounds:
                 "SELECT count(*) FROM messages WHERE session_id NOT IN (SELECT id FROM sessions)"
             ).fetchone()
         assert len(kept) == MAX_SESSIONS
-        assert str(ids[-1]) in kept
+        assert str(ids[-2]) in kept  # (the last one is empty: closing deleted it)
         assert str(ids[0]) not in kept
         assert orphans == (0,)  # the messages went with their sessions
         locks = list((history_directory(tmp_path) / "chat.locks").iterdir())
@@ -201,9 +213,11 @@ class TestBounds:
         total = MAX_SESSIONS + PRUNE_BATCH * 3
         with raw(directory) as connection:
             for index in range(total):
+                session = SessionId.new()
                 connection.execute(
-                    "INSERT INTO sessions VALUES (?, 1, ?)", (str(SessionId.new()), index + 1)
+                    "INSERT INTO sessions VALUES (?, 1, ?)", (str(session), index + 1)
                 )
+                insert_message(connection, session, 1)
         store = open_store(tmp_path)
         store.begin(limit=10)
 
@@ -214,10 +228,58 @@ class TestBounds:
                 (count,) = connection.execute("SELECT count(*) FROM sessions").fetchone()
             counts.append(count)
 
-        # One batch per start (the new session and the unused old one come and go).
-        assert counts[0] in range(total - PRUNE_BATCH - 1, total - PRUNE_BATCH + 2)
-        assert counts[1] in range(total - 2 * PRUNE_BATCH - 2, total - 2 * PRUNE_BATCH + 3)
+        # One batch per start; the new, still empty session is in the count.
+        assert counts[0] == total + 1 - PRUNE_BATCH
+        assert counts[1] == counts[0] - PRUNE_BATCH  # (+1 new session, -1 the unused old one)
         store.close()
+
+    def test_nothing_is_written_when_there_is_nothing_to_prune(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = open_store(tmp_path)
+        store.begin(limit=10)
+        store.append(user("x"))
+        writes: list[str] = []
+        real = store._database.write  # noqa: SLF001  (counting what the store writes)
+
+        def counting_write() -> AbstractContextManager[sqlite3.Connection]:
+            writes.append("write")
+            return real()
+
+        monkeypatch.setattr(store._database, "write", counting_write)  # noqa: SLF001
+        store._prune()  # noqa: SLF001
+
+        assert writes == []
+        store.close()
+
+    def test_empty_sessions_are_pruned_and_never_push_out_a_real_chat(self, tmp_path: Path) -> None:
+        directory = history_directory(tmp_path)
+        store = open_store(tmp_path)
+        store.begin(limit=10)
+        chats = []
+        for index in range(MAX_SESSIONS):
+            store.append(user(f"real chat {index}"))
+            chats.append(store.new_session().id)
+        store.close()
+        with raw(directory) as connection:  # a crowd of empty sessions, newer than every chat
+            for index in range(PRUNE_BATCH):
+                connection.execute(
+                    "INSERT INTO sessions VALUES (?, 1, ?)", (str(SessionId.new()), 10**12 + index)
+                )
+
+        second = open_store(tmp_path)
+        second.begin(limit=10)
+        second.new_session()
+        second.close()
+
+        with raw(directory) as connection:
+            kept = {row[0] for row in connection.execute("SELECT id FROM sessions")}
+            empties = connection.execute(
+                "SELECT count(*) FROM sessions WHERE NOT EXISTS "
+                "(SELECT 1 FROM messages WHERE session_id = sessions.id)"
+            ).fetchone()
+        assert all(str(chat) in kept for chat in chats[: MAX_SESSIONS - 1])
+        assert empties == (0,)
 
     def test_a_session_that_another_shell_holds_is_never_pruned(self, tmp_path: Path) -> None:
         holder = open_store(tmp_path)
@@ -400,3 +462,163 @@ class TestAFailureToWrite:
         restored = open_store(tmp_path).begin(limit=10)
 
         assert [(m.seq, m.text) for m in restored.messages] == [(1, "once"), (2, "next")]
+
+
+class TestAnAccidentalSecondShell:
+    def test_it_does_not_hide_the_real_chat_from_the_next_start(self, tmp_path: Path) -> None:
+        clock = Ticks()
+        first = open_store(tmp_path, clock)
+        real = first.begin(limit=10).session
+        first.append(user("my real chat"))
+        accident = open_store(tmp_path, clock)  # started by mistake while the first runs
+        accident.begin(limit=10)
+        accident.close()
+        first.close()
+
+        third = open_store(tmp_path, clock)
+        restored = third.begin(limit=10)
+        third.close()
+
+        assert restored.session.id == real.id
+        assert [m.text for m in restored.messages] == ["my real chat"]
+
+    def test_an_unused_session_is_deleted_when_its_shell_closes_lock_file_and_all(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_store(tmp_path)
+        unused = store.begin(limit=10).session
+
+        store.close()
+
+        with raw(history_directory(tmp_path)) as connection:
+            assert connection.execute("SELECT count(*) FROM sessions").fetchone() == (0,)
+        assert not (history_directory(tmp_path) / "chat.locks" / f"{unused.id}.lock").exists()
+
+    def test_a_session_with_messages_is_kept_when_its_shell_closes(self, tmp_path: Path) -> None:
+        store = open_store(tmp_path)
+        used = store.begin(limit=10).session
+        store.append(user("x"))
+        store.close()
+
+        with raw(history_directory(tmp_path)) as connection:
+            ids = {row[0] for row in connection.execute("SELECT id FROM sessions")}
+        assert ids == {str(used.id)}
+
+    def test_an_empty_session_that_is_newer_than_the_chat_is_not_the_last_session(
+        self, tmp_path: Path
+    ) -> None:
+        clock = Ticks()
+        store = open_store(tmp_path, clock)
+        real = store.begin(limit=10).session
+        store.append(user("real"))
+        store.close()
+        with raw(history_directory(tmp_path)) as connection:  # left by a shell that crashed
+            insert_session(connection, SessionId.new(), 10**13)
+
+        restored = open_store(tmp_path, clock).begin(limit=10)
+
+        assert restored.session.id == real.id
+        assert [m.text for m in restored.messages] == ["real"]
+
+    def test_empty_sessions_do_not_count_towards_the_cap(self, tmp_path: Path) -> None:
+        store = open_store(tmp_path)
+        store.begin(limit=10)
+        first = None
+        for index in range(MAX_SESSIONS):
+            store.append(user(f"chat {index}"))
+            created = store.new_session()
+            first = first or created
+        # MAX_SESSIONS chats and one empty session: nothing real is pruned by the empty one.
+        store.close()
+        with raw(history_directory(tmp_path)) as connection:
+            (count,) = connection.execute("SELECT count(*) FROM sessions").fetchone()
+        assert count == MAX_SESSIONS
+
+
+class TestTheClaimsAndTheClockAndTheOrder:
+    def test_a_lock_file_removed_between_open_and_flock_is_not_a_claim(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = open_store(tmp_path)
+        session = store.begin(limit=10).session
+        store.append(user("x"))
+        store.close()
+        locks = history_directory(tmp_path) / "chat.locks"
+        real = fcntl.flock
+
+        def unlinking(descriptor: int, operation: int) -> None:
+            # Another shell pruned this session between our open and our lock.
+            (locks / f"{session.id}.lock").unlink()
+            real(descriptor, operation)
+
+        monkeypatch.setattr(fcntl, "flock", unlinking)
+        claims = SessionClaims(os.open(history_directory(tmp_path), os.O_RDONLY | os.O_DIRECTORY))
+
+        assert claims.try_claim(session.id) is None  # it would have locked a file nobody else sees
+
+        claims.close()
+
+    def test_the_clock_going_backwards_never_makes_a_session_older(self, tmp_path: Path) -> None:
+        times = iter([EpochMillis(5_000), EpochMillis(1_000), EpochMillis(2_000)])
+        store = HistoryStore.open(history_directory(tmp_path), clock=lambda: next(times))
+        session = store.begin(limit=10).session  # created at 5000
+        store.append(user("late clock"))  # the clock now says 1000
+        store.append(user("later"))  # and 2000
+        store.close()
+
+        with raw(history_directory(tmp_path)) as connection:
+            updated = connection.execute(
+                "SELECT updated_at FROM sessions WHERE id = ?", (str(session.id),)
+            ).fetchone()
+            created = connection.execute("SELECT created_at FROM messages ORDER BY seq").fetchall()
+        assert updated == (5_000,)
+        assert created == [(1_000,), (2_000,)]  # the message times are what the clock said
+
+    def test_a_damaged_newest_session_means_a_fresh_one_not_an_older_chat_in_its_place(
+        self, tmp_path: Path
+    ) -> None:
+        clock = Ticks()
+        store = open_store(tmp_path, clock)
+        older = store.begin(limit=10).session
+        store.append(user("the older chat, which is fine"))
+        store.close()
+        directory = history_directory(tmp_path)
+        damaged = SessionId.new()
+        with raw(directory) as connection:
+            insert_session(connection, damaged, 10**13)
+            insert_message(connection, damaged, 1, role="nobody")
+
+        restored = open_store(tmp_path, clock).begin(limit=10)
+
+        assert restored.notice == NOT_RESTORED
+        assert restored.messages == ()
+        assert restored.session.id not in (older.id, damaged)
+        with raw(directory) as connection:  # both old sessions are untouched
+            assert connection.execute("SELECT count(*) FROM messages").fetchone() == (2,)
+
+    def test_new_session_keeps_the_old_claim_until_the_new_one_works(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        first = open_store(tmp_path)
+        held = first.begin(limit=10).session
+        first.append(user("held"))
+
+        def failing(self: SessionRepository, session_id: SessionId, now: EpochMillis) -> None:
+            raise HistoryError("disk full")
+
+        monkeypatch.setattr(SessionRepository, "create", failing)
+        with pytest.raises(HistoryError):
+            first.new_session()
+        monkeypatch.undo()
+
+        other = open_store(tmp_path)
+        restored = other.begin(limit=10)
+        assert restored.session.id != held.id  # still the first shell's
+        first.append(user("and it still can write"))
+        other.close()
+        first.close()
+
+    def test_the_session_cap_and_the_scan_are_the_documented_ones(self) -> None:
+        assert MAX_SESSIONS == 20
+        assert PRUNE_BATCH == 20
+        assert RESTORE_CANDIDATES == 8

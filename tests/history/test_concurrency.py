@@ -124,7 +124,9 @@ class TestAShellThatDies:
             holder.send_signal(signal.SIGKILL)
             holder.wait(timeout=DEADLINE)
 
-            restored = HistoryStore.open(history_directory(tmp_path)).begin(limit=10)
+            third = HistoryStore.open(history_directory(tmp_path))
+            restored = third.begin(limit=10)
+            third.close()
 
             assert str(restored.session.id) == held  # the kernel dropped the lock with the process
         finally:

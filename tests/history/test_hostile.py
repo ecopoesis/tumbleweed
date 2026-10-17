@@ -114,6 +114,7 @@ class TestBadRows:
             {"task": "tool_01j9z3c7q4v8s2k5m6n7p8r9t0"},
             {"created": -5},
             {"created": 2**62},
+            {"text": " \n "},
         ],
         ids=[
             "bad id",
@@ -129,6 +130,7 @@ class TestBadRows:
             "task of another type",
             "negative time",
             "time overflow",
+            "blank user message",
         ],
     )
     def test_a_row_the_models_refuse(self, tmp_path: Path, cell: dict[str, object]) -> None:

@@ -44,7 +44,9 @@ def main(argv: list[str]) -> None:
     wait_for(go)
     if mode == "hold":
         store = HistoryStore.open(directory)
-        report({"session": str(store.begin(limit=10).session.id)})
+        session = store.begin(limit=10).session.id
+        store.append(user("held"))  # an empty session is nobody's last one
+        report({"session": str(session)})
         time.sleep(DEADLINE)
         return
     tag, count = argv[3], int(argv[4])

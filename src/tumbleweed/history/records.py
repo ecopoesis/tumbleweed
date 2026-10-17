@@ -54,6 +54,8 @@ def _problem(role: MessageRole, state: MessageState, text: str, error: str | Non
         return "a failed message carries an error, and only a failed one does"
     if role is MessageRole.USER and state is not MessageState.COMPLETE:
         return "a user message is complete"
+    if role is MessageRole.USER and not text.strip():
+        return "a user message is not blank"  # the chat refuses one, and a provider would too
     if _UNSAFE_TEXT.search(text) is not None:
         return "the text holds a NUL or a lone surrogate"
     limit = MAX_USER_BYTES if role is MessageRole.USER else MAX_ASSISTANT_BYTES

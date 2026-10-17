@@ -18,12 +18,11 @@ that holds the claim, while it deletes the session.
 import fcntl
 import logging
 import os
-from pathlib import Path
 from typing import final
 
 from tumbleweed.core.ids import SessionId
 from tumbleweed.history.errors import HistoryError
-from tumbleweed.history.files import open_private_directory, open_private_file, same_file
+from tumbleweed.history.files import open_private_file, open_private_subdirectory, same_file
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +62,12 @@ class Claim:
 class SessionClaims:
     """The claims of one directory of lock files."""
 
-    def __init__(self, directory: Path) -> None:
-        self._directory = open_private_directory(directory)
+    def __init__(self, history_directory: int) -> None:
+        """The claims in `chat.locks/` under the directory the descriptor `history_directory`
+        holds (opened relative to it, `O_NOFOLLOW`, so the path is not looked at again)."""
+        self._directory = open_private_subdirectory(
+            history_directory, LOCKS_DIRECTORY, "lock directory"
+        )
         self._closed = False
 
     def close(self) -> None:

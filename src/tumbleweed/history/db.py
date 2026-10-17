@@ -13,7 +13,8 @@
   never half way. A file system that cannot do WAL (some network ones) is refused.
 - **Hostile content.** `SQLITE_DBCONFIG_DEFENSIVE` and untrusted-schema mode are on, `ATTACH` is
   disallowed, and limits bound a value or row (`MAX_VALUE_BYTES`; a longer one fails the read
-  instead of being loaded) and a statement (`MAX_SQL_BYTES`). Text is read as
+  instead of being loaded) a statement (`MAX_SQL_BYTES`) and an expression's depth
+  (`MAX_EXPRESSION_DEPTH`). Text is read as
   bytes and decoded strictly by the caller, so invalid UTF-8 is an error of ours, not SQLite's.
   The schema must be exactly ours (`tumbleweed.history.schema`).
 - **Errors.** Every `sqlite3.Error` leaves this module as a `HistoryError` with a fixed message
@@ -45,9 +46,11 @@ from tumbleweed.history.files import (
     check_sidecar,
     open_private_directory,
     open_private_file,
+    same_directory,
     same_file,
+    same_path,
 )
-from tumbleweed.history.schema import MIGRATIONS, Migration, migrate
+from tumbleweed.history.schema import MIGRATIONS, Migration, migrate, verify
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,7 @@ BUSY_TIMEOUT: Final = timedelta(seconds=2)
 # A message is at most 64 KiB; this bounds a hostile row.
 MAX_VALUE_BYTES: Final = ByteCount(128 * 1024)
 MAX_SQL_BYTES: Final = ByteCount(16 * 1024)
+MAX_EXPRESSION_DEPTH: Final = 64
 _MINIMUM_SQLITE: Final = (3, 37, 0)  # STRICT tables
 
 # SQLite's primary result codes (https://sqlite.org/rescode.html), the low byte of an error code.
@@ -63,6 +67,19 @@ _BUSY: Final = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 _DAMAGED: Final = frozenset({11, 18, 20, 24, 25, 26})  # CORRUPT TOOBIG MISMATCH FORMAT RANGE NOTADB
 
 type Row = tuple[object, ...]
+
+
+def sqlite_path(directory_fd: int, directory: Path) -> tuple[str, bool]:
+    """The path string to give SQLite, and whether it is pinned to the directory we hold.
+
+    On Linux `/proc/self/fd/<n>/...` names the open directory itself, whatever happens to its
+    path afterwards (SQLite derives the side files from it: measured). Elsewhere it is the plain
+    path, which `Database.open` then checks.
+    """
+    proc = Path(f"/proc/self/fd/{directory_fd}")
+    if proc.is_dir():
+        return f"{proc}/{DATABASE_NAME}", True
+    return str(directory / DATABASE_NAME), False
 
 
 def _primary_code(error: sqlite3.Error) -> int | None:
@@ -109,8 +126,9 @@ class Database:
             file_fd = open_private_file(directory_fd, DATABASE_NAME)
             for suffix in SIDECAR_SUFFIXES:
                 check_sidecar(directory_fd, DATABASE_NAME + suffix)
+            path, pinned = sqlite_path(directory_fd, directory)
             connection = sqlite3.connect(
-                str(directory / DATABASE_NAME),
+                path,
                 timeout=BUSY_TIMEOUT.total_seconds(),
                 autocommit=True,
             )
@@ -118,7 +136,9 @@ class Database:
             deadline = time.monotonic() + BUSY_TIMEOUT.total_seconds()
             while True:
                 try:
-                    cls._prepare(connection, directory_fd, file_fd, migrations)
+                    cls._prepare(
+                        connection, (directory, directory_fd), (path, pinned, file_fd), migrations
+                    )
                     break
                 except sqlite3.Error as exc:
                     # SQLite answers BUSY at once, without its busy handler, to some statements
@@ -140,14 +160,23 @@ class Database:
     @staticmethod
     def _prepare(
         connection: sqlite3.Connection,
-        directory_fd: int,
-        file_fd: int,
+        directory: tuple[Path, int],
+        opened: tuple[str, bool, int],
         migrations: tuple[Migration, ...],
     ) -> None:
-        mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
-        # SQLite has opened the file by now: it must be the one we examined.
-        if not same_file(directory_fd, DATABASE_NAME, file_fd):
+        directory_path, directory_fd = directory
+        path, pinned, file_fd = opened
+        # Reads only: a file that is not ours is refused before it is switched to WAL or written.
+        verify(connection, migrations)
+        # SQLite has opened the file by now, by the string it was given: that must be the file we
+        # examined, in the directory we hold.
+        if not (
+            same_path(path, file_fd)
+            and same_file(directory_fd, DATABASE_NAME, file_fd)
+            and (pinned or same_directory(directory_path, directory_fd))
+        ):
             raise HistoryRefusedError("The chat history file was replaced while opening.")
+        mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
         for suffix in SIDECAR_SUFFIXES:
             check_sidecar(directory_fd, DATABASE_NAME + suffix)
         if mode is None or mode[0] != b"wal":
@@ -156,6 +185,11 @@ class Database:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA secure_delete = ON")
         migrate(connection, migrations)
+
+    @property
+    def directory_fd(self) -> int:
+        """The descriptor of the history directory, for opening what lives beside the database."""
+        return self._directory_fd
 
     def query(self, sql: str, parameters: Sequence[object] = ()) -> list[Row]:
         """The rows of a read. Text comes back as `bytes`: decode it strictly."""
@@ -196,8 +230,11 @@ class Database:
         self._closed = True
         try:
             self._connection.close()
-        finally:
+            # Only now: closing any descriptor of the file drops the locks SQLite holds on it
+            # (POSIX), so ours must outlive the connection. If closing failed, leaving it open
+            # is the safe side.
             os.close(self._file_fd)
+        finally:
             os.close(self._directory_fd)
 
 
@@ -210,3 +247,4 @@ def _configure(connection: sqlite3.Connection) -> None:
     connection.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
     connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
     connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, MAX_SQL_BYTES)
+    connection.setlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH, MAX_EXPRESSION_DEPTH)

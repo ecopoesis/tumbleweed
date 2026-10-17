@@ -67,6 +67,14 @@ class TestNewMessage:
                 text="x",
             )
 
+    @pytest.mark.parametrize("text", ["", "   ", "\n\t \u00a0"])
+    def test_a_blank_user_message_is_refused(self, text: str) -> None:
+        with pytest.raises((InvalidValueError, ValidationError), match="blank"):
+            user(text)
+
+    def test_a_blank_failed_reply_is_fine_it_carries_the_reason(self) -> None:
+        assert failed("").text == ""
+
     def test_a_user_message_cannot_have_failed(self) -> None:
         with pytest.raises((InvalidValueError, ValidationError)):
             NewMessage(
