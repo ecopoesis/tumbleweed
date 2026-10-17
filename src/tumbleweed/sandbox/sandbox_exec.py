@@ -93,6 +93,9 @@ _ALL_V1: Final = (
 _FILE_RIGHTS: Final = EXECUTE | WRITE_FILE | READ_FILE | TRUNCATE
 
 _PR_GET_NO_NEW_PRIVS: Final = 39
+# `os.O_PATH` is Linux's only, so type checkers on macOS do not know it; the value is the same on
+# every architecture this runs on.
+_O_PATH: Final = int(getattr(os, "O_PATH", 0o10000000))
 _UNAVAILABLE_ERRNOS: Final = (errno.ENOSYS, errno.EOPNOTSUPP, errno.EPERM)
 
 
@@ -223,7 +226,7 @@ def apply_landlock(rules: list[tuple[str, str]], abi: int) -> None:
 def _add_rule(ruleset: int, kind: str, path: str, abi: int) -> None:
     try:
         # No following: a mount point is the mount's own root, never a link.
-        fd = os.open(path, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
+        fd = os.open(path, _O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW)
     except OSError as exc:
         raise Refused(f"cannot open {path} for the Landlock ruleset: {exc.strerror}") from None
     try:

@@ -190,7 +190,7 @@ class TestWithLandlock:
         """
         named, other = tmp_path / "named", tmp_path / "other"
         for directory in (named, other):
-            directory.mkdir()
+            directory.mkdir(parents=True)
             (directory / "file").write_text(f"secret of {directory.name}")
         (named / "sandbox_exec.py").write_bytes(helper_source())
         payload = [PYTHON, "-c", payloads.TWO_DIRECTORIES, str(named), str(other)]

@@ -3,8 +3,8 @@
 import asyncio
 import json
 import os
+import platform
 import subprocess
-import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -37,9 +37,8 @@ PYTHON = "/usr/bin/python3"  # the system Python the runtime mounts; the venv's 
 
 def landlock_available() -> bool:
     """Whether the kernel running these tests has Landlock (`False` anywhere but Linux)."""
-    if not sys.platform.startswith("linux"):
-        return False
-    return landlock_abi()[0] is not None
+    # platform, not sys.platform: mypy would take the latter for a fact and flag the rest.
+    return platform.system() == "Linux" and landlock_abi()[0] is not None
 
 
 class Opened:

@@ -357,7 +357,10 @@ def comm():
 attempt("list_root", lambda: os.listdir("/"))
 attempt("list_etc", lambda: os.listdir("/etc"))
 attempt("write_proc", comm)
-attempt("make_socket_file", lambda: os.mknod("/workspace/s", stat.S_IFSOCK | 0o600))
+def make_socket_file():
+    os.mknod("/workspace/s", stat.S_IFSOCK | 0o600)
+    os.unlink("/workspace/s")
+attempt("make_socket_file", make_socket_file)
 attempt("read_loader_cache", lambda: open("/etc/ld.so.cache", "rb").read(4))
 print(json.dumps(out))
 """

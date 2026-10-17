@@ -5,6 +5,7 @@ listener on loopback), shows that the host can reach it, and then shows that the
 A test that only looked for something that is not there would pass vacuously.
 """
 
+import fcntl
 import json
 import os
 import shutil
@@ -467,10 +468,18 @@ class TestGrants:
                 ],
                 "mkdir": [str(tree["ro_dir"] / "d"), str(tree["rw_dir"] / "d")],
                 "unlink": [str(tree["ro_dir"] / "a.txt"), str(tree["rw_dir"] / "c.txt")],
-                "list": [str(home_scratch), str(tree["ro_dir"]), str(tree["other"])],
+                "list": [str(tree["ro_dir"]), str(tree["other"])],
             }
 
             seen = report(workspace, payloads.ACCESS, json.dumps(spec), grants=grants)
+            # The directories between `/` and the grants are made by bwrap and are in no
+            # Landlock rule, so only the namespaces alone can show what they hold.
+            parents = report_namespaces_only(
+                workspace,
+                payloads.ACCESS,
+                json.dumps({"list": [str(home_scratch)]}),
+                grants=grants,
+            )
 
         read = seen.mapping("read")
         assert read[str(tree["ro_dir"] / "a.txt")] == "photo"
@@ -502,7 +511,12 @@ class TestGrants:
         }
         listing = seen.mapping("listing")
         # The parent of the grants shows the granted names and nothing else of the host's.
-        assert listing[str(home_scratch)] == ["journal.txt", "notes.txt", "photos", "scratch"]
+        assert parents.mapping("listing")[str(home_scratch)] == [
+            "journal.txt",
+            "notes.txt",
+            "photos",
+            "scratch",
+        ]
         assert listing[str(tree["ro_dir"])] == ["a.txt", "sub"]
         assert listing[str(tree["other"])] == "ENOENT"
         # And the host agrees on what changed: the writes through the writable grants landed,
@@ -541,6 +555,32 @@ class TestGrants:
 
         assert seen["read"] == {f"{granted}/mine.txt": "the directory that was granted"}
 
+    def test_a_grant_descriptor_above_the_open_file_limit_is_still_mounted(
+        self, workspace: Opened, tmp_path: Path
+    ) -> None:
+        # The sandbox runs under `--nofile=256`; a descriptor numbered above it is inherited all
+        # the same, since the limit stops new descriptors and does not close old ones.
+        (tmp_path / "f.txt").write_text("high")
+
+        class At:
+            def __init__(self, number: int) -> None:
+                self.fd = number
+
+        with opened(tmp_path) as handle:
+            high = fcntl.fcntl(handle.fd, fcntl.F_DUPFD_CLOEXEC, 300)
+            try:
+                assert high >= 300
+                seen = report(
+                    workspace,
+                    payloads.ACCESS,
+                    json.dumps({"read": [f"{tmp_path}/f.txt"]}),
+                    grants=(grant(tmp_path, GrantAccess.READ, At(high)),),
+                )
+            finally:
+                os.close(high)
+
+        assert seen["read"] == {f"{tmp_path}/f.txt": "high"}
+
     def test_a_path_descriptor_opened_with_o_path_is_mounted_too(
         self, workspace: Opened, home_scratch: Path
     ) -> None:
@@ -557,13 +597,15 @@ class TestGrants:
 
         assert seen["read"] == {f"{directory}/f.txt": "via O_PATH"}
 
-    def test_a_grant_inside_a_writable_grant_is_refused_so_a_planted_symlink_reaches_nothing(
+    def test_a_grant_inside_a_writable_grant_is_a_policy_refusal_and_bwrap_never_runs(
         self, workspace: Opened, home_scratch: Path
     ) -> None:
-        # bwrap makes the mount point of an inner grant by walking the outer one's live
-        # directory, which the program can write to. A symlink planted there (`/oldroot` is how
-        # bwrap itself reaches the host while it builds the sandbox) would send that `mkdir`
-        # to the host, outside every grant. So no grant may sit inside another.
+        # This tests the policy, not bubblewrap: the refusal comes before any process exists, and
+        # the victim directory is untouched because nothing ran. bwrap makes the mount point of
+        # an inner grant by walking the outer one's live directory, which the program can write
+        # to. A symlink planted there (`/oldroot` is how bwrap itself reaches the host while it
+        # builds the sandbox) would send that `mkdir` to the host, outside every grant. So no
+        # grant may sit inside another.
         victim = home_scratch / "victim"
         victim.mkdir()
         outer = home_scratch / "outer"
@@ -650,10 +692,13 @@ class TestGrants:
                     {
                         "read": [f"/inputs/{connection}/out.txt", str(produced / "out.txt")],
                         "write": [f"/inputs/{connection}/out.txt", f"/inputs/{connection}/new.txt"],
-                        "list": ["/inputs"],
                     }
                 ),
                 inputs=(mount,),
+            )
+            # `/inputs` is made by bwrap and is in no Landlock rule: the namespaces alone show it.
+            parents = report_namespaces_only(
+                workspace, payloads.ACCESS, json.dumps({"list": ["/inputs"]}), inputs=(mount,)
             )
 
         assert seen["read"] == {
@@ -664,7 +709,7 @@ class TestGrants:
             f"/inputs/{connection}/out.txt": "EROFS",
             f"/inputs/{connection}/new.txt": "EROFS",
         }
-        assert seen["listing"] == {"/inputs": [str(connection)]}
+        assert parents["listing"] == {"/inputs": [str(connection)]}
         assert (produced / "out.txt").read_text() == "from the earlier task"
 
     def test_two_inputs_do_not_see_each_other(self, workspace: Opened, tmp_path: Path) -> None:

@@ -6,8 +6,9 @@ that needs no Linux.
 
 The order matters to bwrap, which carries its operations out in the order given:
 runtime first, then the sandbox's own `/proc`, `/dev`, tmpfs mounts, then the workspace, inputs
-and grants (shallowest target first, so that a grant inside another grant is mounted over it),
-and last the read-only remount of the root, which would otherwise be a writable tmpfs.
+and grants (shallowest target first; no grant may be inside another, which the policy refuses,
+so the order only keeps the arguments stable), the launcher's own file, and last the read-only
+remount of the root, which would otherwise be a writable tmpfs.
 """
 
 from tumbleweed.sandbox.hardening import HardeningFds, exec_command
