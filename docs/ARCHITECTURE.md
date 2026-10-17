@@ -623,8 +623,8 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   `live` test may not also be marked `gtk` or `linux`, so none is ever a guarded test. Landlock
   tests are required in CI (Ubuntu kernel); on Docker Desktop's kernel, which has none (#44), they
   skip with the kernel's answer, and so a local `TUMBLEWEED_CI=1 scripts/test-linux` there fails
-  exactly those (and the x86-only ABI tests on Apple silicon): that is the guard working, not a
-  bug. The sandbox tests that are not about Landlock set `require_landlock` by whether the kernel
+  exactly those (`TestWithLandlock`): that is the guard working, not a bug. The ABI tests that
+  need x86_64 are not defined on other machines, so they neither skip nor fail there. The sandbox tests that are not about Landlock set `require_landlock` by whether the kernel
   has it, so on a dev kernel they run without it and in CI they run with it required. The
   refusal and the "no Landlock" report are tested everywhere, by hiding the Landlock syscalls
   behind a seccomp filter. A macOS job runs the platform-neutral subset.

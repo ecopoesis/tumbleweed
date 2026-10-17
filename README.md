@@ -279,7 +279,8 @@ the Landlock tests skip with the kernel's answer, and a script of yours that run
 there must set `require_landlock=False`, after which each result says `hardening.landlock` is
 `unavailable`. In CI (an Ubuntu kernel) the Landlock tests are required, and the log of the Linux
 job lists each one as run (`-v -rP`); a local `TUMBLEWEED_CI=1 scripts/test-linux` on Docker
-Desktop fails exactly those and the x86-only ABI tests, which is the guard working.
+Desktop fails exactly those (`TestWithLandlock` in `tests/sandbox/test_landlock.py`), which is the
+guard working.
 
 ### Test markers
 
