@@ -268,6 +268,30 @@ class TestOnlyTheTranscriptIsStored:
 
 
 class TestNewSession:
+    def test_new_session_then_quit_then_start_gives_an_empty_chat(self, tmp_path: Path) -> None:
+        first = Rig(tmp_path)
+        first.answer("old answer", "old question")
+        first.session.new_session()
+        first.session.close()
+
+        second = Rig(tmp_path)
+
+        assert second.transcript.messages == ()  # what the user cleared is not shown again
+        assert ("user", "old question", "complete") in stored(tmp_path)  # but it is in the file
+
+    def test_an_accidental_second_shell_leaves_the_real_chat_for_the_next_start(
+        self, tmp_path: Path
+    ) -> None:
+        first = Rig(tmp_path)
+        first.answer("real answer", "real question")
+        accident = Rig(tmp_path)
+        accident.session.close()
+        first.session.close()
+
+        third = Rig(tmp_path)
+
+        assert [m.text for m in third.transcript.messages] == ["real question", "real answer"]
+
     def test_the_transcript_is_emptied_and_the_old_session_kept(self, tmp_path: Path) -> None:
         rig = Rig(tmp_path)
         rig.answer("old answer", "old question")
@@ -388,14 +412,14 @@ class FakeHistory:
         if self._begin is not None:
             raise self._begin
         session = StoredSession.model_validate(
-            {"id": SessionId.new(), "created_at": 1, "updated_at": 1}
+            {"id": SessionId.new(), "created_at": 1, "updated_at": 1, "user_started": False}
         )
         return RestoredSession(session, (), None)
 
     def new_session(self) -> StoredSession:
         self.new_sessions += 1
         return StoredSession.model_validate(
-            {"id": SessionId.new(), "created_at": 1, "updated_at": 1}
+            {"id": SessionId.new(), "created_at": 1, "updated_at": 1, "user_started": False}
         )
 
     def append(self, message: NewMessage) -> None:
@@ -530,6 +554,9 @@ class TestTheHistoryIsOptional:
         assert rig.transcript.messages == ()
         assert "could not be claimed" in rig.session.notice
         assert not rig.session.saving
+        rig.answer("b", "q2")
+        # No session is current any more: the request does not name the old one.
+        assert rig.responder.requests[-1].session_id is None
 
     def test_closing_closes_the_history_even_if_that_raises(self, tmp_path: Path) -> None:
         class Throws(FakeHistory):
@@ -545,7 +572,7 @@ class TestARestoreTheTranscriptRefuses:
     def too_many(self) -> RestoredSession:
         """A history that returns more than a transcript holds: validated, and still refused."""
         session = StoredSession.model_validate(
-            {"id": SessionId.new(), "created_at": 1, "updated_at": 1}
+            {"id": SessionId.new(), "created_at": 1, "updated_at": 1, "user_started": False}
         )
         messages = tuple(
             StoredMessage.model_validate(
