@@ -595,18 +595,22 @@ alone and refused. A second server on a live path is refused and the first is no
   migrate once. A file is used only if its schema is exactly what the migrations make (no extra
   trigger, view or column), and never migrated down: a newer version is refused and left alone.
 - *Concurrency.* Shells are non-unique, so several may have the file open. WAL mode, a 2 s busy
-  timeout (each write that waits longer fails and the chat says so; it does not freeze the window
-  for more than that per write), every write `BEGIN IMMEDIATE`. **A session has one owner at a
+  timeout (each write that waits longer fails and the chat says so; each write waits at most about
+  2 s), every write `BEGIN IMMEDIATE`. **A session has one owner at a
   time.** A shell claims the session it restores or creates with an exclusive `flock` on
   `chat.locks/<SessionId>.lock`, held until it starts another session or exits (the kernel drops it
   if the shell dies). "The last session" is the one with the newest activity (its latest message;
-  ties go to the newer `SessionId`) *that has messages* and that no running shell holds, among the
-  newest eight such sessions; a second shell therefore gets an older chat, or else an empty one,
-  while the first runs. A session with no messages is deleted when its shell closes or starts
-  another, so an accidental second shell leaves nothing that could hide the real chat; empty
-  sessions are never "the last session" and do not count towards the cap. Starting a session
-  deletes (in one write) up to 20 sessions with messages beyond the newest 20, and up to 20 empty
-  ones, never one a shell holds. Only the newest 1000 sessions are looked at.
+  ties go to the newer `SessionId`) *that is kept* (it has messages, or was made empty by the
+  user's "New session": `sessions.user_started`, schema v2) and that no running shell holds, among
+  the newest eight such sessions; a second shell therefore gets an older chat, or else an empty one,
+  while the first runs. The empty session a shell makes by itself at start is not kept: it is deleted
+  when that shell closes or starts another session, and one a killed shell left is deleted by the next
+  shell's pruning; so an accidental second shell leaves nothing that could hide the real chat. An
+  empty session the user made *is* kept (it restores as an empty chat: "New session", quit, start
+  gives an empty chat), but only the newest one: starting another session replaces it. Starting a
+  session deletes (in one write) up to 20 kept sessions beyond the newest 20, and up to 20
+  auto-created empty ones, never one a shell holds. Only the newest 1000 sessions are looked at
+  (`SCAN_WINDOW`).
 - *What is stored.* Exactly what the transcript shows: message ID, role, text, whether a reply
   completed or failed (and its one-line reason), the `TaskId` (`None` until S19) and the time. A
   reply is saved when it ends, so a crash mid-reply loses that reply and keeps the question. No
@@ -616,11 +620,11 @@ alone and refused. A second server on a live path is refused and the first is no
   chain `tumbleweed/`, `shell/`, `chat.locks/` is opened component by component with
   `O_NOFOLLOW` and examined through each descriptor, and the files relative to them: a symlink,
   another owner, a non-regular file or a second hard link is **refused**; a mode other than
-  0700/0600 on something of ours is **repaired** and logged. SQLite is given
-  `/proc/self/fd/<n>/chat.sqlite3` on Linux, which names the directory we hold whatever happens to
-  its path, and elsewhere the path, which is compared (device and inode) with the descriptor
-  once SQLite has opened it, together with the directory and the `-wal`, `-shm` and `-journal`
-  files; the residual window is described in `history.files`. A file that is not ours is
+  0700/0600 on something of ours is **repaired** and logged. SQLite opens the file by path itself
+  (a `/proc/self/fd/<n>` path would only be resolved to the plain one), so once it has, that path
+  is compared (device and inode) with the descriptor, as are the directory and the `-wal`, `-shm`
+  and `-journal` files, and a redirected ancestor is refused before anything is written; the
+  residual window is described in `history.files`. A file that is not ours is
   checked, read-only, before it is switched to WAL or written to. SQLite runs in defensive mode
   with `ATTACH` off and limits on a value, a statement and an expression's depth; text is read as
   bytes and decoded strictly; every row is validated into a typed record, and a read refuses

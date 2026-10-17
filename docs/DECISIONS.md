@@ -277,8 +277,12 @@ and lived in the agent.
 repositories over validated records, versioned atomic migrations, and a schema that must equal what the
 migrations produce, exactly. (2) *Who owns the last session.* A session has one owner: a shell claims it with an
 exclusive `flock` on a file named after it and holds it until it moves on or exits; the last session is the newest
-by activity among those that have messages and that nobody holds (an empty session is deleted when its
-shell moves on, so an accidental second shell cannot hide the real chat). (3) *Bad files.* Refuse what is not ours (a symlink, another owner,
+by activity among the kept ones that nobody holds, a kept session being one with messages or one the user
+made empty with "New session" (`user_started`, schema v2): "New session", quit, start gives an empty chat; the
+empty session a shell makes by itself is deleted when it closes or moves on (or reaped if its shell was
+killed), so an accidental second shell cannot hide the real chat; only the newest user-started empty session is
+kept. Only the newest 1000 sessions are looked at (`SCAN_WINDOW`), so a file of millions of rows costs what a
+small one does. (3) *Bad files.* Refuse what is not ours (a symlink, another owner,
 not a regular file, a foreign or newer database) and run without history; repair the mode of what is ours;
 if the newest session's rows are invalid, do not restore it and start a fresh one, leaving the data in place. Never
 delete a file on suspicion. (4) *Context.* The responder keeps no history: the request carries the transcript's
@@ -297,6 +301,7 @@ because it is a secret).
 can be traced to the conversation it belonged to. **S19 must carry `TaskId` through `TranscriptMessage` and
 `ContextTurn`** (messages are stored with it, always `None` today, but the transcript and the requests do not
 have it yet), so that task-scoped context and the I12 taint filter can apply to restored history. The estimate overcounts ordinary English by three to four times, so the model sees about 30,000
-real tokens of history, not the window's worth; the budget is one constant (`agent.context`). A crash in the middle of
+real tokens of history, not the window's worth; the budget is `history_budget` in `agent.context`: the 200,000-token window less the longest reply the
+configuration allows and a reserve, never more than 120,000. A crash in the middle of
 a reply loses that reply. A session claimed by a shell that hangs stays claimed until it ends. The oldest sessions
 are deleted (20 kept, 1000 messages each). There is no way yet to browse older sessions: S04 restores the last one only. What is deferred is in #80.

@@ -188,21 +188,30 @@ D16).
 It lives in `$XDG_DATA_HOME/tumbleweed/shell/chat.sqlite3` (default `~/.local/share/...`), in directories of
 mode 0700 and files of mode 0600, and holds only what the chat shows: no API key, no configuration (what you
 type is stored as you typed it, so do not paste a secret into the chat). To forget everything, quit the shell
-and delete `chat.sqlite3*` and `chat.locks/` there. It keeps the newest 20 sessions that have messages, of at
-most 1000 messages each; a session with no messages is deleted when its shell ends or starts another one.
-Each write waits at most 2 seconds for another shell's, then is reported and skipped (opening, restoring and
-starting a session are a few writes each), so the window is never held for longer than that per write.
+and delete `chat.sqlite3*` and `chat.locks/` there. A `tumbleweed/` or `shell/` directory that is a symlink is
+refused (the shell then runs without history, and says so). It keeps the newest 20 sessions that have
+messages, of at most 1000 messages each. Each write waits at most about 2 seconds for another shell's, then
+fails and is reported (opening, restoring and starting a session are a few writes each), so no one write
+holds the window for longer than that.
+
+**New session and quitting.** An empty session you made with the **New session** button is kept: it is the
+last session, so after you quit and start again the chat is empty (your old chat is still in the file, but is
+not shown: there is no session browser yet, #80). Only the one newest such session is kept, and one that got
+messages is an ordinary session. The empty session a shell makes by itself when it starts is not kept: it is
+deleted when that shell closes or starts another session, and one left by a shell that was killed is deleted
+by the next shell that starts a session.
 
 Two shells can run at once, and each owns its own session: a session a running shell holds is never taken by
-another. A shell started while another runs gets the newest session that has messages and that nobody holds
-(an older chat, if there is one) or else an empty chat. An accidental second shell therefore leaves nothing
-behind: its empty session is deleted when it closes, and the next start restores the real chat. If a message
-cannot be saved (the disk is full, another shell held the file for too long) the chat says so above the
-messages and the rest of that session is not saved; **New session** tries the history again. If the file
-cannot be used (not a database, a symlink, another user's, written by a newer version) the shell starts
-anyway, says so above the chat, and does not save; it leaves the file alone. If the last session's data is
-damaged, a new session starts and the old data stays in the file. The mode of a directory or file of yours
-that is too open is corrected, with a log line. Deferred pieces (a session browser, and others) are in #80.
+another. A shell started while another runs gets the newest session that has messages (or that you started
+empty) and that nobody holds, which is an older chat if there is one, or else an empty chat. An accidental
+second shell therefore leaves nothing behind: its empty session is deleted when it closes, and the next start
+restores the real chat. If a message cannot be saved (the disk is full, another shell held the file for too
+long) the chat says so above the messages and the rest of that session is not saved; **New session** tries
+the history again. If the file cannot be used (not a database, a symlink, another user's, written by a newer
+version) the shell starts anyway, says so above the chat, and does not save; it leaves the file alone. If the
+last session's data is damaged, a new session starts and the old data stays in the file. The mode of a
+directory or file of yours that is too open is corrected, with a log line. Deferred pieces (a session
+browser, and others) are in #80.
 
 ### Checks
 
