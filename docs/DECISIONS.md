@@ -217,8 +217,42 @@ user manager has no delegated controllers therefore says so instead of pretendin
 `exit-code` only once the program it started has ended, by exit or by signal. A run that ends
 without an `exit-code` is a `SandboxLaunchError` carrying bwrap's message.
 **Consequences.** The probe costs one scope per runner, and one a minute while the host has none.
-The rlimit fallback has no total memory limit, no pids limit (`RLIMIT_NPROC` was measured and rejected: bwrap's first fork is
-counted against all of the uid's processes) and no CPU quota (reported). Unlike the rest, the scope path cannot be run in
-the container or in CI, where there is no user manager: its command lines and the probe's decision
-are unit-tested, the wrapper is exercised with a stand-in `systemd-run`, and S27's VM test is where
-the real thing runs (#73).
+The rlimit fallback has no total memory limit, no pids limit (`RLIMIT_NPROC` was measured and
+rejected: bwrap's first fork is counted against all of the uid's processes) and no CPU quota
+(reported). Unlike the rest, the scope path cannot be run in the container or in CI, where there is
+no user manager: its command lines and the probe's decision are unit-tested, the wrapper is
+exercised with a stand-in `systemd-run`, and S27's VM test is where the real thing runs (#73).
+
+## D15 — Seccomp refuses how a program gets a unix socket, not `connect`; the launcher is shipped as data (2026-10-17, accepted)
+
+**Context.** S15 must stop `connect()` to a unix socket in a granted directory (#15: a read-only
+bind does not), refuse the kernel keyring (#15), apply Landlock from inside the sandbox, and fail
+safe where there is no Landlock. Three things were not obvious: how a filter can refuse `connect`
+by address family, how code gets into a sandbox that has only the runtime, and how the launcher
+tells the broker what it applied.
+**Decision.** (1) The filter cannot see the `sockaddr` `connect` points to, so it does not try:
+it refuses `socket(AF_UNIX)` and `socketpair(AF_UNIX)` of every type but stream and seqpacket. A
+datagram socket made by `socketpair` can be `connect`ed to a path afterwards (checked, and
+tested against a listener in a granted directory), so `socketpair` needed the same treatment as
+`socket`; a stream or seqpacket pair is already connected. The alternative, refusing `connect`
+altogether, would also end TCP when S22 adds `net.full`. The cost is documented: no unix socket
+servers or clients in a sandbox, and asyncio's event loop keeps working. (2) The launcher is a
+stdlib-only Python script that bwrap writes into the sandbox from a memfd (`--ro-bind-data`) and
+that the runtime's interpreter runs (`python3 -I -S`), so it needs no `tumbleweed` on the sandbox's
+`PYTHONPATH`, which would be a host mount. The price is that every runtime has a Python
+(`RuntimeSpec.interpreter`), which S20's runtime has anyway. A C helper would avoid it and bring a
+toolchain into the build; Python was the plan's choice (ABI detection "via ctypes"). (3) The
+launcher reports on a pipe it passes as a number and closes at its `exec`, as JSON lines, parsed
+with strict models; it never writes to stdout or stderr, which the program shares. It reads its
+environment from `/proc/self/environ`, because Python adds `LC_CTYPE` to its own. (4) The Landlock
+ruleset is computed from the policy's mounts by a pure function and given as arguments, so the
+mounts and the ruleset are one fact. `require_landlock` is a policy field that defaults to true, and
+a missing Landlock is `SandboxUnavailable` before the program starts; false records "unavailable"
+in every result. (5) Tests prove each denial against a control run in the namespaces alone, since
+the sandbox has no capabilities and many denials would otherwise look the same.
+**Consequences.** Every sandbox run costs a Python start (about 20 ms). A kernel without Landlock
+needs `require_landlock=False`, and the broker (S17) must decide where that is allowed. The filter
+is a deny list; a new dangerous syscall is allowed until it is added, and `DENIED_SYSCALLS` is
+where to add it. Landlock's scope covers abstract unix sockets only; pathname sockets rest on
+seccomp and the mounts. The 32-bit ARM check cannot be run on Apple silicon or in CI, so it is
+proved on the exported program (`tests/sandbox/bpf.py`) rather than on a live AArch32 call.

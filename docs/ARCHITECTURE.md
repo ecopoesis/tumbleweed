@@ -178,33 +178,82 @@ shell, voice or `gi` (section 10).
   overrun is an uncatchable `SIGKILL`). `RLIMIT_NPROC` is deliberately not
   used for `pids`: measured in the container (kernel 6.12), bwrap's first fork is counted against
   every process of the uid in the parent namespace, so a limit low enough to stop a fork bomb
-  also stops the sandbox from starting wherever the user has that many processes. Memory, `pids.max` and a CPU quota come from `systemd-run --user --scope` when the
+  also stops the sandbox from starting wherever the user has that many processes. Memory,
+  `pids.max` and a CPU quota come from `systemd-run --user --scope` when the
   host has a systemd user manager whose controllers are delegated. The launcher proves that
   once, by starting a scope and reading the limits the kernel reports for it; a limit it did not
   see applied is not counted. Otherwise memory is `RLIMIT_AS` per process, there is no `pids`
   limit and no CPU quota, and **every result says so** (`LimitsReport.unenforced`, with the reason
   in `detail`). The container and CI have no user manager, so they run the rlimit path; the scope
   path is tested against a stand-in for `systemd-run` there (it cannot show a kernel enforcing the
-  limits), and on the target (S27) the scope is expected; its real verification is #73. The probe is repeated
-  every 60 s while the plan has no scope, and the scope is run by the absolute path of the
-  `systemd-run` the probe ran.
+  limits), and on the target (S27) the scope is expected; its real verification is #73. The probe
+  is repeated every 60 s while the plan has no scope, and the scope is run by the absolute path
+  of the `systemd-run` the probe ran (a bare name is looked up on `PATH`, never in the current
+  directory).
+- **Seccomp (S15).** bwrap loads a filter built with libseccomp through ctypes
+  (`tumbleweed.sandbox.seccomp`; `seccomp_export_bpf` into a memfd, passed with `--seccomp`). It
+  allows by default and refuses with `EPERM`: `ptrace` and the other cross-process memory calls,
+  the mount family (old and new API), `keyctl`/`add_key`/`request_key`, `bpf`, `perf_event_open`,
+  `userfaultfd`, `io_uring_*`, `kexec_*`, the module calls, `unshare`, `setns`, `clone` with any
+  `CLONE_NEW*` flag, and some machine operations (`reboot`, `swapon`, clock setting, ...); the
+  complete list is `DENIED_SYSCALLS`. `clone3` returns `ENOSYS`: its flags are in a struct behind
+  a pointer, which a filter cannot read, and glibc then falls back to `clone`, whose flags it can.
+  A system call of any ABI but the native one kills the whole process (i386 and x32 on x86_64,
+  32-bit ARM on aarch64; libseccomp's x86_64 programs treat the x32 bit as a foreign ABI), so a
+  compat entry point cannot reach a syscall by a number the list does not know. The Landlock calls
+  are never denied. A name libseccomp does not know is an error, never a silent gap, and the
+  launcher never runs without the filter (`SandboxUnavailable`).
+  **Unix sockets.** `connect` cannot be matched by address family: the `sockaddr` is behind a
+  pointer and a filter sees only registers. So the filter refuses what a program needs to have a
+  socket to connect with: `socket(AF_UNIX, ...)`, and `socketpair(AF_UNIX, ...)` of every type but
+  stream and seqpacket (a datagram socket from `socketpair` can be `connect`ed to a path
+  afterwards, verified; a connected stream or seqpacket one answers `EISCONN`). What this breaks
+  inside a sandbox: servers and clients on unix sockets, so syslog, `multiprocessing` managers and
+  D-Bus clients. asyncio's event loop still works (it wakes itself through a stream socketpair).
+  The filter is a deny list, so what it does not name is allowed; that is not an escape because the
+  program also has no capabilities, no nested user namespaces, a read-only root and Landlock.
+- **The in-sandbox launcher and Landlock (S15).** The first process in the sandbox is
+  `tumbleweed-sandbox-exec` (`tumbleweed.sandbox.sandbox_exec`, standard library only). bwrap puts
+  its source at `/tumbleweed-sandbox-exec` (`--ro-bind-data`) and runs it with the runtime's own
+  interpreter (`RuntimeSpec.interpreter`, `python3 -I -S`), so a runtime needs a Python even when
+  the program is not Python. It confirms `no_new_privs` and that the seccomp filter is loaded
+  (`Seccomp: 2`) and refuses otherwise, reads the environment bwrap built from
+  `/proc/self/environ` (Python adds `LC_CTYPE` to its own), applies a Landlock ruleset, writes a
+  report on a pipe that the `exec` closes (the program never holds it), and `exec`s the program.
+  The ruleset is derived from the policy's mounts (`landlock_rules`), so the two cannot drift:
+  the runtime, inputs and read grants allow read and execute; the workspace, write grants, `/tmp`
+  and `/dev/shm` are writable (but no sockets or device nodes can be created in them); `/dev`
+  allows reading and writing its device files; `/proc` is read-only. Nothing else is allowed, `/`
+  and `/etc` cannot even be listed, and a path that is mounted but not in the ruleset is blocked
+  (`tests/sandbox/test_landlock.py`). Rights are those of the kernel's ABI as detected
+  (`landlock_create_ruleset` with the version flag): ABI 1 rights always, `REFER` from ABI 2,
+  `TRUNCATE` from ABI 3, and from ABI 6 (Linux 6.12) the scope that stops connecting to abstract
+  unix sockets made outside the sandbox. Not covered, and not claimed: ioctls on device files,
+  signals, the network (a sandbox has none), pathname unix sockets (Landlock's scope covers
+  abstract ones; seccomp is what keeps a program from making a socket at all, and the namespaces
+  keep host abstract sockets out), and, on kernels before ABI 2 and 3, renames across
+  directories and truncation. Executing is allowed wherever reading is, as the mounts allow it.
+- **`require_landlock`.** A policy field, true unless set otherwise, which is what the target
+  needs. With it true, a kernel that has no usable Landlock (`ENOSYS`, `EOPNOTSUPP`) makes the run
+  raise `SandboxUnavailable` before the program starts, so a weaker sandbox is never what runs
+  by accident. A dev kernel without it (Docker Desktop's, #44) sets it false, and then every
+  result says so: `SandboxResult.hardening.landlock` is `unavailable`, with the kernel's answer in
+  `detail`. Where Landlock is there it is always applied, whatever the flag says. Any other failure
+  of the launcher (a missing mount path, `no_new_privs` unset, a filter not loaded) refuses too.
 - **Failure.** A program that fails is a result. A sandbox that could not be set up (a mount
   source gone, a program that does not exist, user namespaces refused, a scope that cannot be
-  started) raises `SandboxLaunchError` with bwrap's own message and runs nothing: there is no
-  fallback to an unconfined run. bwrap reports the program's exit status only once it has run it,
-  which is how the two are told apart.
-- **Known gaps, by design of the step.** The seccomp filter and Landlock are S15's. Until then a
-  read-only bind of a directory that holds a Unix socket still allows `connect()` to it from the
-  sandbox (#15); the policy core's deny rules (S16) keep the broker, runtime and display sockets'
-  directories from being granted, and S15 adds the seccomp and Landlock denials. Memory is per
-  process without a scope, so a program that starts many processes multiplies it; `memfd` and
-  SysV shared memory are not address space of the process and escape `RLIMIT_AS` (the scope's
-  memory limit covers them; without one, the open-file limit and the wall clock are what bound
-  them); a fork bomb is bounded only by the wall clock (and the memory its processes use) without a scope;
-  nothing bounds the disk a program writes to its workspace beyond the per-file limit; and the
-  program inherits the launcher's session keyring until S15 (#15). S17 must refuse, on the
-  target, runs on a host that lacks the pids or memory-total limit; these and the other gaps are
-  tracked in #74.
+  started, a launcher that refused) raises `SandboxLaunchError` with the message of whoever
+  refused (bwrap, or the launcher's own) and runs nothing: there is no fallback to an unconfined
+  run. bwrap reports the program's exit status only once it has run it, which is how a setup that
+  failed is told from a program that did; the launcher's report is how a launcher that refused or
+  could not `exec` is told from a program that failed.
+- **Known gaps.** Memory is per process without a scope, so a program that starts many processes
+  multiplies it; `memfd` and SysV shared memory are not address space of the process and escape
+  `RLIMIT_AS` (the scope's memory limit covers them; without one, the open-file limit and the wall
+  clock are what bound them); a fork bomb is bounded only by the wall clock (and the memory its
+  processes use) without a scope; and nothing bounds the disk a program writes to its workspace
+  beyond the per-file limit. S17 must refuse, on the target, runs on a host that lacks the pids or
+  memory-total limit; these and the other gaps are tracked in #74.
 
 ## 3. Request flow
 
@@ -401,9 +450,10 @@ Each invariant names where it is enforced. Reviews check every change against th
 - **I3 — Sandbox defaults.** No network, no home directory except the workspace, inputs and
   explicit grants, no host sockets (Wayland, X11, D-Bus, PipeWire, broker, shell, host
   loopback), user namespace with nested userns disabled, `no_new_privs`, all capabilities
-  dropped, a seccomp filter (architecture-checked, non-native ABIs killed), a Landlock
-  ruleset and a pids limit (both required on the target; on dev/CI hosts without them the
-  run reports their absence), CPU/memory/time/output limits, killed with its parent.
+  dropped, a seccomp filter (architecture-checked, non-native ABIs killed; no keyring calls and
+  no unix sockets), a Landlock ruleset and a pids limit (both required on the target; on dev/CI
+  hosts without them the run reports their absence), CPU/memory/time/output limits, killed with
+  its parent.
 - **I4 — Generated UI is inert data.** The renderer accepts only the schema. No Pango markup
   from model text (plain text only; the shell puts untrusted text into labels through
   `tumbleweed.shell._widgets.plain_label`, and `tests/shell/test_markup_lint.py` rejects the GTK
@@ -571,8 +621,13 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   NixOS VM test. Any other skip of such a test still fails the run. Live tests never run in CI
   either: `TUMBLEWEED_LIVE` is refused when `TUMBLEWEED_CI` is set, and under the guard a
   `live` test may not also be marked `gtk` or `linux`, so none is ever a guarded test. Landlock
-  tests are required in CI (Ubuntu kernel); they may skip on Docker Desktop kernels without
-  Landlock. A macOS job runs the platform-neutral subset.
+  tests are required in CI (Ubuntu kernel); on Docker Desktop's kernel, which has none (#44), they
+  skip with the kernel's answer, and so a local `TUMBLEWEED_CI=1 scripts/test-linux` there fails
+  exactly those (and the x86-only ABI tests on Apple silicon): that is the guard working, not a
+  bug. The sandbox tests that are not about Landlock set `require_landlock` by whether the kernel
+  has it, so on a dev kernel they run without it and in CI they run with it required. The
+  refusal and the "no Landlock" report are tested everywhere, by hiding the Landlock syscalls
+  behind a seccomp filter. A macOS job runs the platform-neutral subset.
 - **Target**: NixOS (aarch64 and x86_64) booting into Cage running `tumbleweed-shell`, with a
   fallback Sway session, a VT2 login, and btrfs home snapshots, as a VM image for
   UTM/Parallels (S26–S27).
