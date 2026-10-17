@@ -1,5 +1,82 @@
 {
   "$defs": {
+    "DirEntry": {
+      "additionalProperties": false,
+      "description": "One name in a directory. A symlink is reported as one and never followed.",
+      "properties": {
+        "entry": {
+          "enum": [
+            "file",
+            "directory",
+            "symlink",
+            "other"
+          ],
+          "title": "Entry",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 255,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "size": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Size"
+        }
+      },
+      "required": [
+        "name",
+        "entry",
+        "size"
+      ],
+      "title": "DirEntry",
+      "type": "object"
+    },
+    "DirListing": {
+      "additionalProperties": false,
+      "description": "The names in a directory, sorted, at most `MAX_DIR_ENTRIES`. `skipped` counts names left\nout because they hold control or format characters (they cannot be shown safely).",
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/DirEntry"
+          },
+          "maxItems": 1000,
+          "title": "Entries",
+          "type": "array"
+        },
+        "kind": {
+          "const": "dir_listing",
+          "title": "Kind",
+          "type": "string"
+        },
+        "skipped": {
+          "minimum": 0,
+          "title": "Skipped",
+          "type": "integer"
+        },
+        "truncated": {
+          "title": "Truncated",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "entries",
+        "truncated",
+        "skipped"
+      ],
+      "title": "DirListing",
+      "type": "object"
+    },
     "Echo": {
       "additionalProperties": false,
       "description": "Send back this text. Answered with `Echoed`. A diagnostic and a test vehicle.",
@@ -42,6 +119,51 @@
         "text"
       ],
       "title": "Echoed",
+      "type": "object"
+    },
+    "EndTask": {
+      "additionalProperties": false,
+      "description": "End a task: its once and task grants are revoked, its runs stopped.",
+      "properties": {
+        "kind": {
+          "const": "end_task",
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task"
+      ],
+      "title": "EndTask",
+      "type": "object"
+    },
+    "EnvPair": {
+      "additionalProperties": false,
+      "description": "A variable the caller sets in the sandbox. Only the broker's allowlist is accepted.",
+      "properties": {
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "value": {
+          "maxLength": 256,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "title": "EnvPair",
       "type": "object"
     },
     "ErrorCode": {
@@ -97,6 +219,91 @@
       "title": "ErrorFrame",
       "type": "object"
     },
+    "FileContent": {
+      "additionalProperties": false,
+      "description": "What was read: `size` bytes, as base64 text in `data`.",
+      "properties": {
+        "data": {
+          "maxLength": 699052,
+          "title": "Data",
+          "type": "string"
+        },
+        "kind": {
+          "const": "file_content",
+          "title": "Kind",
+          "type": "string"
+        },
+        "size": {
+          "maximum": 524288,
+          "minimum": 0,
+          "title": "Size",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "size",
+        "data"
+      ],
+      "title": "FileContent",
+      "type": "object"
+    },
+    "GrantOutcome": {
+      "additionalProperties": false,
+      "description": "The answer to `RequestGrant`: granted (`grant`, `scope`), already covered, or denied.\n\n`message` is fixed text that names the rule, never the path.",
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "pattern": "^grt_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Grant"
+        },
+        "granted": {
+          "title": "Granted",
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "grant_outcome",
+          "title": "Kind",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 300,
+          "title": "Message",
+          "type": "string"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "enum": [
+                "once",
+                "task"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Scope"
+        }
+      },
+      "required": [
+        "kind",
+        "granted",
+        "grant",
+        "scope",
+        "message"
+      ],
+      "title": "GrantOutcome",
+      "type": "object"
+    },
     "Hello": {
       "additionalProperties": false,
       "description": "The handshake: the protocol version the sender speaks.",
@@ -118,6 +325,93 @@
         "version"
       ],
       "title": "Hello",
+      "type": "object"
+    },
+    "ListDir": {
+      "additionalProperties": false,
+      "description": "List a directory under a grant of the task, named by its absolute path.",
+      "properties": {
+        "kind": {
+          "const": "list_dir",
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "run": {
+          "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Run",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "run",
+        "path"
+      ],
+      "title": "ListDir",
+      "type": "object"
+    },
+    "ListWorkspace": {
+      "additionalProperties": false,
+      "description": "List a directory of the task's workspace (its root when `path` is null).",
+      "properties": {
+        "kind": {
+          "const": "list_workspace",
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Path"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "path"
+      ],
+      "title": "ListWorkspace",
+      "type": "object"
+    },
+    "NetworkAccess": {
+      "additionalProperties": false,
+      "description": "`net.full`. Can be granted (and taints the task); the sandbox gets a network in S22.",
+      "properties": {
+        "kind": {
+          "const": "net.full",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "NetworkAccess",
       "type": "object"
     },
     "Ping": {
@@ -152,6 +446,147 @@
       "title": "Pong",
       "type": "object"
     },
+    "ReadAccess": {
+      "additionalProperties": false,
+      "description": "`fs.read` of the file or directory at the absolute path `path`.",
+      "properties": {
+        "kind": {
+          "const": "fs.read",
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "path"
+      ],
+      "title": "ReadAccess",
+      "type": "object"
+    },
+    "ReadFile": {
+      "additionalProperties": false,
+      "description": "Read a regular file under a grant of the task, named by its absolute path.",
+      "properties": {
+        "kind": {
+          "const": "read_file",
+          "title": "Kind",
+          "type": "string"
+        },
+        "max_bytes": {
+          "default": 524288,
+          "maximum": 524288,
+          "minimum": 1,
+          "title": "Max Bytes",
+          "type": "integer"
+        },
+        "path": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "run": {
+          "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Run",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "run",
+        "path"
+      ],
+      "title": "ReadFile",
+      "type": "object"
+    },
+    "ReadWorkspaceFile": {
+      "additionalProperties": false,
+      "description": "Read a regular file of the task's own workspace. No symlink is followed (I11).",
+      "properties": {
+        "kind": {
+          "const": "read_workspace_file",
+          "title": "Kind",
+          "type": "string"
+        },
+        "max_bytes": {
+          "default": 524288,
+          "maximum": 524288,
+          "minimum": 1,
+          "title": "Max Bytes",
+          "type": "integer"
+        },
+        "path": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "path"
+      ],
+      "title": "ReadWorkspaceFile",
+      "type": "object"
+    },
+    "Refused": {
+      "additionalProperties": false,
+      "description": "The broker would not: `reason` is a closed set, `message` fixed text.",
+      "properties": {
+        "kind": {
+          "const": "refused",
+          "title": "Kind",
+          "type": "string"
+        },
+        "message": {
+          "maxLength": 300,
+          "title": "Message",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "unknown_task",
+            "invalid_request",
+            "denied",
+            "not_granted",
+            "not_found",
+            "unsafe",
+            "too_large",
+            "busy",
+            "unavailable",
+            "timeout",
+            "failed"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "reason",
+        "message"
+      ],
+      "title": "Refused",
+      "type": "object"
+    },
     "RequestFrame": {
       "additionalProperties": false,
       "description": "A request: `body` is for the receiver to handle, and to answer under the same `id`.",
@@ -160,7 +595,16 @@
           "discriminator": {
             "mapping": {
               "echo": "#/$defs/Echo",
-              "ping": "#/$defs/Ping"
+              "end_task": "#/$defs/EndTask",
+              "list_dir": "#/$defs/ListDir",
+              "list_workspace": "#/$defs/ListWorkspace",
+              "ping": "#/$defs/Ping",
+              "read_file": "#/$defs/ReadFile",
+              "read_workspace_file": "#/$defs/ReadWorkspaceFile",
+              "request_grant": "#/$defs/RequestGrant",
+              "revoke_grant": "#/$defs/RevokeGrant",
+              "run_in_sandbox": "#/$defs/RunInSandbox",
+              "start_task": "#/$defs/StartTask"
             },
             "propertyName": "kind"
           },
@@ -170,6 +614,33 @@
             },
             {
               "$ref": "#/$defs/Echo"
+            },
+            {
+              "$ref": "#/$defs/StartTask"
+            },
+            {
+              "$ref": "#/$defs/EndTask"
+            },
+            {
+              "$ref": "#/$defs/RequestGrant"
+            },
+            {
+              "$ref": "#/$defs/RevokeGrant"
+            },
+            {
+              "$ref": "#/$defs/ReadWorkspaceFile"
+            },
+            {
+              "$ref": "#/$defs/ReadFile"
+            },
+            {
+              "$ref": "#/$defs/ListWorkspace"
+            },
+            {
+              "$ref": "#/$defs/ListDir"
+            },
+            {
+              "$ref": "#/$defs/RunInSandbox"
             }
           ],
           "title": "Body"
@@ -193,6 +664,63 @@
       "title": "RequestFrame",
       "type": "object"
     },
+    "RequestGrant": {
+      "additionalProperties": false,
+      "description": "Ask for `access` for `run` of `task`. The user decides, in a trusted prompt (I2).\n\n`reason` is model text: the broker bounds it and shows it as quoted, never as a fact.",
+      "properties": {
+        "access": {
+          "discriminator": {
+            "mapping": {
+              "fs.read": "#/$defs/ReadAccess",
+              "fs.write": "#/$defs/WriteAccess",
+              "net.full": "#/$defs/NetworkAccess"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ReadAccess"
+            },
+            {
+              "$ref": "#/$defs/WriteAccess"
+            },
+            {
+              "$ref": "#/$defs/NetworkAccess"
+            }
+          ],
+          "title": "Access"
+        },
+        "kind": {
+          "const": "request_grant",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 500,
+          "title": "Reason",
+          "type": "string"
+        },
+        "run": {
+          "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Run",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "run",
+        "access",
+        "reason"
+      ],
+      "title": "RequestGrant",
+      "type": "object"
+    },
     "ResponseFrame": {
       "additionalProperties": false,
       "description": "The successful answer to the request with the same `id`.",
@@ -200,8 +728,16 @@
         "body": {
           "discriminator": {
             "mapping": {
+              "dir_listing": "#/$defs/DirListing",
               "echoed": "#/$defs/Echoed",
-              "pong": "#/$defs/Pong"
+              "file_content": "#/$defs/FileContent",
+              "grant_outcome": "#/$defs/GrantOutcome",
+              "pong": "#/$defs/Pong",
+              "refused": "#/$defs/Refused",
+              "revoked": "#/$defs/Revoked",
+              "run_result": "#/$defs/RunResult",
+              "task_ended": "#/$defs/TaskEnded",
+              "task_started": "#/$defs/TaskStarted"
             },
             "propertyName": "kind"
           },
@@ -211,6 +747,30 @@
             },
             {
               "$ref": "#/$defs/Echoed"
+            },
+            {
+              "$ref": "#/$defs/TaskStarted"
+            },
+            {
+              "$ref": "#/$defs/TaskEnded"
+            },
+            {
+              "$ref": "#/$defs/GrantOutcome"
+            },
+            {
+              "$ref": "#/$defs/Revoked"
+            },
+            {
+              "$ref": "#/$defs/FileContent"
+            },
+            {
+              "$ref": "#/$defs/DirListing"
+            },
+            {
+              "$ref": "#/$defs/RunResult"
+            },
+            {
+              "$ref": "#/$defs/Refused"
             }
           ],
           "title": "Body"
@@ -232,6 +792,327 @@
         "body"
       ],
       "title": "ResponseFrame",
+      "type": "object"
+    },
+    "RevokeGrant": {
+      "additionalProperties": false,
+      "properties": {
+        "grant": {
+          "pattern": "^grt_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Grant",
+          "type": "string"
+        },
+        "kind": {
+          "const": "revoke_grant",
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "grant"
+      ],
+      "title": "RevokeGrant",
+      "type": "object"
+    },
+    "Revoked": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "revoked",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "Revoked",
+      "type": "object"
+    },
+    "RunInSandbox": {
+      "additionalProperties": false,
+      "description": "Run `command` in a sandbox of `task`: its workspace, and every read grant that applies.",
+      "properties": {
+        "command": {
+          "items": {
+            "maxLength": 32768,
+            "type": "string"
+          },
+          "maxItems": 256,
+          "minItems": 1,
+          "title": "Command",
+          "type": "array"
+        },
+        "cpu_seconds": {
+          "default": 30,
+          "maximum": 120,
+          "minimum": 1,
+          "title": "Cpu Seconds",
+          "type": "integer"
+        },
+        "env": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EnvPair"
+          },
+          "maxItems": 8,
+          "title": "Env",
+          "type": "array"
+        },
+        "kind": {
+          "const": "run_in_sandbox",
+          "title": "Kind",
+          "type": "string"
+        },
+        "max_output_bytes": {
+          "default": 65536,
+          "maximum": 262144,
+          "minimum": 1,
+          "title": "Max Output Bytes",
+          "type": "integer"
+        },
+        "run": {
+          "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Run",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        },
+        "wall_seconds": {
+          "default": 30,
+          "maximum": 120,
+          "minimum": 1,
+          "title": "Wall Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "run",
+        "command"
+      ],
+      "title": "RunInSandbox",
+      "type": "object"
+    },
+    "RunResult": {
+      "additionalProperties": false,
+      "description": "How a run that started ended. `unenforced` names the limits this host could not apply\nand `landlock` whether Landlock confined the program: both are the launcher's own report.",
+      "properties": {
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Exit Code"
+        },
+        "kind": {
+          "const": "run_result",
+          "title": "Kind",
+          "type": "string"
+        },
+        "landlock": {
+          "enum": [
+            "applied",
+            "unavailable",
+            "unknown"
+          ],
+          "title": "Landlock",
+          "type": "string"
+        },
+        "mounted_grants": {
+          "maximum": 64,
+          "minimum": 0,
+          "title": "Mounted Grants",
+          "type": "integer"
+        },
+        "stderr": {
+          "maxLength": 349528,
+          "title": "Stderr",
+          "type": "string"
+        },
+        "stderr_truncated": {
+          "title": "Stderr Truncated",
+          "type": "boolean"
+        },
+        "stdout": {
+          "maxLength": 349528,
+          "title": "Stdout",
+          "type": "string"
+        },
+        "stdout_truncated": {
+          "title": "Stdout Truncated",
+          "type": "boolean"
+        },
+        "termination": {
+          "enum": [
+            "exited",
+            "timed_out",
+            "output_limit"
+          ],
+          "title": "Termination",
+          "type": "string"
+        },
+        "unenforced": {
+          "items": {
+            "enum": [
+              "memory_total",
+              "pids",
+              "cpu_rate"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "title": "Unenforced",
+          "type": "array"
+        },
+        "wall_milliseconds": {
+          "minimum": 0,
+          "title": "Wall Milliseconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "termination",
+        "exit_code",
+        "stdout",
+        "stderr",
+        "stdout_truncated",
+        "stderr_truncated",
+        "wall_milliseconds",
+        "unenforced",
+        "landlock",
+        "mounted_grants"
+      ],
+      "title": "RunResult",
+      "type": "object"
+    },
+    "StartTask": {
+      "additionalProperties": false,
+      "description": "End `previous` (if it is a live task of this connection) and start a new task.\n\nThe new task starts with the taint of `previous`, unless `fresh_context` (I12): the broker\nowns taint, the caller only says whether the model's context carries over.",
+      "properties": {
+        "fresh_context": {
+          "title": "Fresh Context",
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "start_task",
+          "title": "Kind",
+          "type": "string"
+        },
+        "previous": {
+          "anyOf": [
+            {
+              "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Previous"
+        }
+      },
+      "required": [
+        "kind",
+        "previous",
+        "fresh_context"
+      ],
+      "title": "StartTask",
+      "type": "object"
+    },
+    "TaskEnded": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "task_ended",
+          "title": "Kind",
+          "type": "string"
+        },
+        "revoked_grants": {
+          "maximum": 1000000,
+          "minimum": 0,
+          "title": "Revoked Grants",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "revoked_grants"
+      ],
+      "title": "TaskEnded",
+      "type": "object"
+    },
+    "TaskStarted": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "task_started",
+          "title": "Kind",
+          "type": "string"
+        },
+        "taint": {
+          "items": {
+            "enum": [
+              "fs",
+              "net"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Taint",
+          "type": "array"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "taint"
+      ],
+      "title": "TaskStarted",
+      "type": "object"
+    },
+    "WriteAccess": {
+      "additionalProperties": false,
+      "description": "`fs.write` of `path`. Modelled, and refused by the write gate until S21.",
+      "properties": {
+        "kind": {
+          "const": "fs.write",
+          "title": "Kind",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "path"
+      ],
+      "title": "WriteAccess",
       "type": "object"
     }
   },
