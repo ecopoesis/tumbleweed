@@ -38,6 +38,21 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         "the shell view-model never imports gi",
         (),
     ),
+    "ui.runtime imports gi": (
+        "ui/runtime/store.py",
+        "import gi",
+        "ui.runtime never imports gi",
+    ),
+    "ui.runtime imports the GTK adapter": (
+        "ui/runtime/runtime.py",
+        "import tumbleweed.ui.gtk",
+        "ui.runtime never imports gi",
+    ),
+    "ui.runtime imports the shell": (
+        "ui/runtime/values.py",
+        "import tumbleweed.shell._widgets",
+        "ui.runtime never imports gi",
+    ),
     "the agent imports gi": (
         "agent/responder.py",
         "import gi",
