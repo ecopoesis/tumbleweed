@@ -10,7 +10,9 @@ and grants (shallowest target first, so that a grant inside another grant is mou
 and last the read-only remount of the root, which would otherwise be a writable tmpfs.
 """
 
+from tumbleweed.sandbox.hardening import HardeningFds, exec_command
 from tumbleweed.sandbox.policy import (
+    HELPER_TARGET,
     WORKSPACE_TARGET,
     GrantAccess,
     OpenedDescriptor,
@@ -21,12 +23,22 @@ from tumbleweed.sandbox.policy import (
 HOSTNAME = "tumbleweed-sandbox"
 
 
-def build_bwrap_argv(policy: SandboxPolicy, *, status_fd: int | None = None) -> list[str]:
+def build_bwrap_argv(
+    policy: SandboxPolicy,
+    *,
+    status_fd: int | None = None,
+    hardening: HardeningFds | None = None,
+) -> list[str]:
     """The arguments to give `bwrap`, program name excluded, ending in `--` and the command.
 
     `status_fd` is a descriptor number bwrap writes its JSON status to (the launcher reads it to
     tell a sandbox that never started from a program that failed). Descriptors that policy mounts
     are named by their number, so the caller must pass exactly those to the child.
+
+    With `hardening` (the runner always gives it) the seccomp filter is loaded, and the command
+    that runs is `tumbleweed-sandbox-exec`, which applies Landlock and then runs the policy's
+    command. Without it, the arguments are the namespaces alone: no run uses that, but the tests
+    use it to prove what the namespaces do by themselves.
     """
     argv = [
         "--unshare-all",
@@ -42,6 +54,8 @@ def build_bwrap_argv(policy: SandboxPolicy, *, status_fd: int | None = None) -> 
     ]
     if status_fd is not None:
         argv += ["--json-status-fd", str(status_fd)]
+    if hardening is not None:
+        argv += ["--seccomp", str(hardening.seccomp)]
     for link in policy.runtime.symlinks:
         argv += ["--symlink", link.target, link.link]
     for mount in policy.runtime.mounts:
@@ -58,10 +72,14 @@ def build_bwrap_argv(policy: SandboxPolicy, *, status_fd: int | None = None) -> 
     for grant in sorted(policy.grants, key=lambda item: (item.target.count("/"), item.target)):
         flag = "--bind-fd" if grant.access is GrantAccess.WRITE else "--ro-bind-fd"
         argv += [flag, _fd(grant.source, f"the grant at {grant.target}"), grant.target]
+    if hardening is not None:
+        # A file of the root tmpfs, so before the remount below makes it read-only.
+        argv += ["--ro-bind-data", str(hardening.helper), HELPER_TARGET]
     argv += ["--remount-ro", "/", "--chdir", WORKSPACE_TARGET]
     for var in sorted(policy.env, key=lambda item: item.name):
         argv += ["--setenv", var.name, var.value]
-    return [*argv, "--", *policy.command]
+    command = policy.command if hardening is None else exec_command(policy, hardening)
+    return [*argv, "--", *command]
 
 
 def descriptors_to_pass(policy: SandboxPolicy) -> list[int]:

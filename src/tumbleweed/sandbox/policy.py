@@ -31,11 +31,20 @@ from tumbleweed.sandbox.errors import InvalidPolicyError
 
 WORKSPACE_TARGET: Final = "/workspace"
 INPUTS_TARGET: Final = "/inputs"
+HELPER_TARGET: Final = "/tumbleweed-sandbox-exec"
+"""Where `tumbleweed-sandbox-exec` is put inside the sandbox (S15): bwrap makes this file."""
 # Paths of the sandbox that are not the policy's to hand out, nor anything inside them: bwrap makes
 # them itself, or (the workspace and inputs) a mount point inside would be created in the host's
 # directory. /tmp is the sandbox's own tmpfs: a grant may sit inside it (the mount point is made
 # in the tmpfs), but not replace it.
-RESERVED_TARGETS: Final = ("/proc", "/dev", "/sys", WORKSPACE_TARGET, INPUTS_TARGET)
+RESERVED_TARGETS: Final = (
+    "/proc",
+    "/dev",
+    "/sys",
+    WORKSPACE_TARGET,
+    INPUTS_TARGET,
+    HELPER_TARGET,
+)
 TMPFS_TARGET: Final = "/tmp"  # noqa: S108
 
 MAX_PATH_BYTES: Final = 4096
@@ -85,6 +94,9 @@ class MountPath(PatternStr, pattern=rf"(?:/{_COMPONENT})+", expects="a normalise
     """
 
     __slots__ = ()
+
+
+DEFAULT_INTERPRETER: Final = MountPath("/usr/bin/python3")
 
 
 def check_mount_path(path: MountPath) -> None:
@@ -310,8 +322,16 @@ class RuntimeSpec:
 
     mounts: tuple[MountPath, ...]
     symlinks: tuple[RuntimeSymlink, ...] = ()
+    interpreter: MountPath = DEFAULT_INTERPRETER
+    """The Python that runs `tumbleweed-sandbox-exec` (stdlib only) inside the sandbox, as a path
+    in it: it must be inside one of the mounts. The program itself need not be Python."""
 
     def __post_init__(self) -> None:
+        check_mount_path(_require_type(self.interpreter, MountPath, "the runtime's interpreter"))
+        if not _is_runtime_path(self.interpreter):
+            raise InvalidPolicyError(
+                f"the interpreter {self.interpreter!r} is not under a system program directory"
+            )
         mounts = _require_tuple(self.mounts, MountPath, "runtime mounts", MAX_RUNTIME_MOUNTS)
         symlinks = _require_tuple(self.symlinks, RuntimeSymlink, "runtime symlinks", 16)
         homes = _home_directories()
@@ -410,6 +430,10 @@ class SandboxPolicy:
       empty one; a variable whose name is not on the allowlist, or that looks like a secret, is
       refused rather than dropped.
     - `limits`: see `SandboxLimits`.
+    - `require_landlock`: refuse to run (`SandboxUnavailable`) when the kernel has no Landlock,
+      which is what the target needs: a sandbox there that silently lost a layer would be a
+      weaker one nobody chose. A dev kernel without it (Docker Desktop's, #44) sets this false,
+      and each result then records that no Landlock was applied (`SandboxResult.hardening`).
 
     There is no network option: a sandbox never has one in S14, and S22 adds it as its own
     field.
@@ -423,9 +447,11 @@ class SandboxPolicy:
     grants: tuple[GrantMount, ...] = ()
     env: tuple[EnvVar, ...] = ()
     env_allowlist: frozenset[EnvName] = frozenset()
+    require_landlock: bool = True
 
     def __post_init__(self) -> None:
         self._check_command()
+        _require_type(self.require_landlock, bool, "require_landlock")
         descriptor_number(self.workspace, "the workspace")
         _require_type(self.runtime, RuntimeSpec, "runtime")
         _require_type(self.limits, SandboxLimits, "limits")
