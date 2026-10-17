@@ -609,8 +609,10 @@ alone and refused. A second server on a live path is refused and the first is no
   empty session the user made *is* kept (it restores as an empty chat: "New session", quit, start
   gives an empty chat), but only the newest one: starting another session (in any shell) deletes the empty user-started
   ones that nobody holds. Starting a
-  session deletes (in one write) up to 20 kept sessions beyond the newest 20, and up to 20
-  auto-created empty ones, never one a shell holds. Only the newest 1000 sessions are looked at
+  session deletes (in one write) up to 20 sessions with messages beyond the newest 20 of them (empty
+  sessions never count towards the cap, so New session cannot push a chat out), and up to 20
+  auto-created empty ones, never one a shell holds. Closing a shell whose empty user-started session
+  is kept also deletes the other shells' unheld ones. Only the newest 1000 sessions are looked at
   (`SCAN_WINDOW`).
 - *What is stored.* Exactly what the transcript shows: message ID, role, text, whether a reply
   completed or failed (and its one-line reason), the `TaskId` (`None` until S19) and the time. A
