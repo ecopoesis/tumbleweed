@@ -43,14 +43,17 @@ class TextBudget:
     def total(self) -> int:
         return self._total
 
-    def claim(self, owner: object, wanted: int) -> bool:
+    def claim(self, owner: object, wanted: int, *, keep: bool = False) -> bool:
         """Make `owner`'s claim `wanted` characters (replacing its last): False if it won't fit.
 
         A claim that does not fit is dropped (the owner shows a mark of a few characters), which
-        gives back what it held.
+        gives back what it held. With `keep` it is made whatever the total is: that is for the
+        entry the user is typing in, which must not turn into a mark under their fingers. The
+        total can then pass the budget by at most one entry's cap (the user types in one), and
+        the next claim that has to fit sees it.
         """
         old = self._claims.get(owner, 0)
-        if self._total - old + wanted > MAX_SHOWN_PER_TOOL:
+        if not keep and self._total - old + wanted > MAX_SHOWN_PER_TOOL:
             self._total -= old
             self._claims[owner] = 0
             if old:

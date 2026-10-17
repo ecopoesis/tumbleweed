@@ -703,9 +703,12 @@ less, so a smaller step could never be taken with its arrows (a `slider` has no 
 user types into a `spin` is taken only if it is a finite number inside the range (a whole number
 for an `int`); anything else (`abc`, `1,5`, `0x10`, `inf`, an empty field, a number outside the
 range) is dropped and the text of the value it holds comes back, and neither the state nor a handler
-is touched. A value stepped with the arrows or the keyboard is rounded to the decimals of the step
-and of the value it was stepped from, so that 50.0 in steps of 0.01 reads 50.09, not
-50.08999999999998; a typed or patched value with more digits is kept as it is, and shown whole.
+is touched. A value that a step or page increment of a `slider` or `spin` produced (the arrows, the
+keyboard, the scroll wheel) is the value held plus whole steps, added as decimals, when it lies
+within a millionth of a step of that: so 50.0 in steps of 0.01 reads 50.09, not 50.08999999999998.
+That is the widget's doing, a transform of stepped values only and no part of evaluation: a typed
+number (parsed exactly), a dragged position, a patched value and a default are never changed, and
+neither is a value that is not whole steps from the one held, whatever its magnitude.
 
 A component's events name a handler, or none:
 

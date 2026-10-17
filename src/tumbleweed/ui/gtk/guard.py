@@ -17,10 +17,12 @@ selected text. `harden_text` turns each off:
 Selecting and typing, and copy and paste with the shortcuts, work as before.
 """
 
+import re
+import warnings
 from collections.abc import Callable
 from typing import Protocol
 
-from tumbleweed.shell._gi import Gdk, GLib, Gtk
+from tumbleweed.shell._gi import Gdk, GObject, Gtk
 
 
 class _Selectable(Protocol):
@@ -86,30 +88,59 @@ def harden_text(widget: Gtk.Editable) -> Callable[[], None]:
     return disconnect
 
 
-_marshal_handler_installed = False
+_SPIN_INPUT_WARNING = "g_value_get_double: assertion 'G_VALUE_HOLDS_DOUBLE (value)' failed"
+_SPIN_FILTER = (
+    "ignore",
+    re.compile(re.escape(_SPIN_INPUT_WARNING), re.IGNORECASE),
+    GObject.Warning,
+    None,
+    0,
+)
+_spin_users = 0
 
 
-def quiet_spin_input_marshalling() -> None:
-    """Silence the one GLib warning that connecting to a spin button's `input` signal causes.
+def quiet_spin_input_marshalling() -> Callable[[], None]:
+    """Silence the one GLib warning that connecting to a spin button's `input` signal causes, for
+    as long as a spin button that does is alive. Returns the function that ends it (call it once,
+    when the spin button's tool is closed).
 
     PyGObject reads the signal's out parameter (`new_value`, a pointer) as a double, and GLib says
-    so (`g_value_get_double: assertion 'G_VALUE_HOLDS_DOUBLE (value)' failed`) on every emission.
-    Where warnings are errors (the tests) that stops the handler from running at all, and elsewhere
-    it is noise on stderr for every number typed. The handler is for that one message in GLib's
-    GObject domain; every other message goes where it went before. Done once per process.
+    so on every emission: `g_value_get_double: assertion 'G_VALUE_HOLDS_DOUBLE (value)' failed`.
+    PyGObject turns that into a `GObject.Warning`; where warnings are errors (the tests) the
+    handler then never runs, and elsewhere it is noise on stderr for every number typed. Tracked
+    upstream-side in #81.
+
+    The workaround is a `warnings` filter, not a GLib log handler: it ignores this exact message in
+    this one category and nothing else, so every other GLib warning still takes PyGObject's own
+    road (a warning, or an error where warnings are errors), and it is inserted in front of the
+    filters in force (a test that makes warnings errors included) and taken out again when the
+    spin button's tool is closed. Filters are restored by `warnings.catch_warnings`, so call this
+    where the spin button is built.
     """
-    global _marshal_handler_installed
-    if _marshal_handler_installed:
-        return
-    _marshal_handler_installed = True
+    global _spin_users
+    if (
+        _SPIN_FILTER not in warnings.filters
+    ):  # (a test's `catch_warnings` may have restored it away)
+        warnings.filterwarnings(
+            "ignore", message=re.escape(_SPIN_INPUT_WARNING), category=GObject.Warning
+        )
+    _spin_users += 1
+    released = False
 
-    def handler(domain: str | None, level: GLib.LogLevelFlags, message: str, _data: object) -> None:
-        if "g_value_get_double" not in message:
-            GLib.log_default_handler(domain, level, message, None)
+    def release() -> None:
+        global _spin_users
+        nonlocal released
+        if released:
+            return
+        released = True
+        _spin_users -= 1
+        if _spin_users == 0 and _SPIN_FILTER in warnings.filters:
+            # `warnings.filters` is a list at runtime, typed as a read-only sequence.
+            warnings.filters.remove(_SPIN_FILTER)  # type: ignore[attr-defined]
 
-    GLib.log_set_handler(
-        "GLib-GObject",
-        GLib.LogLevelFlags.LEVEL_WARNING | GLib.LogLevelFlags.LEVEL_CRITICAL,
-        handler,
-        None,
-    )
+    return release
+
+
+def spin_filter_users() -> int:
+    """How many spin buttons are alive that need the filter (for the tests)."""
+    return _spin_users

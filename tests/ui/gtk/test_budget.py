@@ -571,3 +571,140 @@ class TestEntryUpdatesAreCoalescedToo:
 
         assert typed.get_text() == "abc"
         assert other.get_text() == ""  # the other entry is for a different entry of the state
+
+
+class TestRoomIsAnnounced:
+    """`on_room` fires when room appears, and not when none does (unit tests of the budget)."""
+
+    def test_a_claim_that_shrinks_announces_room_if_someone_waits(self) -> None:
+        budget = TextBudget()
+        told: list[int] = []
+        budget.on_room = lambda: told.append(1)
+        owner, waiting = object(), object()
+        budget.claim(owner, 100)
+        budget.wait_for_room(waiting, lambda: None)
+
+        budget.claim(owner, 60)
+
+        assert told == [1]
+
+    def test_a_claim_that_does_not_shrink_announces_nothing(self) -> None:
+        budget = TextBudget()
+        told: list[int] = []
+        budget.on_room = lambda: told.append(1)
+        owner, waiting = object(), object()
+        budget.claim(owner, 100)
+        budget.wait_for_room(waiting, lambda: None)
+
+        budget.claim(owner, 100)
+        budget.claim(owner, 150)
+
+        assert told == []
+
+    def test_a_refused_claim_gives_back_what_the_owner_held_and_says_so(self) -> None:
+        budget = TextBudget()
+        told: list[int] = []
+        budget.on_room = lambda: told.append(1)
+        owner, other, waiting = object(), object(), object()
+        budget.claim(owner, 100)
+        budget.claim(other, MAX_SHOWN_PER_TOOL - 100)
+        budget.wait_for_room(waiting, lambda: None)
+
+        refused = budget.claim(owner, 5000)  # does not fit: the 100 it held are free again
+
+        assert refused is False
+        assert told == [1]
+        assert budget.total == MAX_SHOWN_PER_TOOL - 100
+
+    def test_nobody_waiting_means_nothing_is_announced(self) -> None:
+        budget = TextBudget()
+        told: list[int] = []
+        budget.on_room = lambda: told.append(1)
+        owner = object()
+        budget.claim(owner, 100)
+
+        budget.claim(owner, 10)
+
+        assert told == []
+
+    def test_a_kept_claim_is_made_whatever_the_total(self) -> None:
+        budget = TextBudget()
+        full, typing = object(), object()
+        budget.claim(full, MAX_SHOWN_PER_TOOL)
+
+        assert budget.claim(typing, 1) is False
+        assert budget.claim(typing, 5, keep=True) is True
+        assert budget.total == MAX_SHOWN_PER_TOOL + 5  # over by what the user is typing
+
+
+class TestRoomFromTheUsersOwnEdits:
+    def test_deleting_text_in_an_entry_lets_a_waiting_label_show_without_any_flush(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk import RenderedTool
+
+        state: list[Json] = [text("e", "x" * 8000, max_length=65536)]
+        kids: list[Json] = [{"kind": "entry", "bind": "e"}]
+        kids += [{"kind": "label", "bind": "e"} for _ in range(8)]  # the eighth does not fit
+        tool = RenderedTool(spec_of(many_of(kids), state))
+        (entry,) = of_type(tool, Gtk.Entry)
+        assert labels_text(tool)[-1] == NOT_SHOWN
+
+        entry.get_buffer().delete_text(10, -1)  # the user deletes nearly all of it
+
+        assert pump_until(lambda: labels_text_now(tool)[-1] == "x" * 10)  # no flush by hand
+
+    def test_a_not_shown_text_block_comes_back_when_room_appears(self) -> None:
+        from tumbleweed.ui.gtk import RenderedTool
+
+        state: list[Json] = [text("a", "q" * 8000, max_length=65536)]
+        tool = RenderedTool(spec_of(many({"kind": "label", "bind": "a"}, 9), state))
+        assert labels_text(tool)[-1] == NOT_SHOWN
+
+        tool.runtime.patch_state({"a": "q"})
+
+        assert pump_until(lambda: labels_text_now(tool) == ["q"] * 9)
+
+
+class TestTheEntryBeingTypedInKeepsItsText:
+    def test_typing_in_an_entry_when_the_budget_is_exactly_full_does_not_turn_it_into_a_mark(
+        self,
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk import RenderedTool
+
+        # 8,189 + seven of 8,192 + a placeholder of 3 is exactly the budget: no room for a letter.
+        state: list[Json] = [
+            text("t", "t" * 8189, max_length=65536),
+            text("s", "x" * 8192, max_length=65536),
+        ]
+        kids: list[Json] = [{"kind": "entry", "bind": "t"}]
+        kids += [{"kind": "entry", "bind": "s", "placeholder": "ppp"}]
+        kids += [{"kind": "entry", "bind": "s"} for _ in range(6)]
+        kids += [{"kind": "entry", "bind": "s"}]  # the ninth entry: refused
+        tool = RenderedTool(spec_of(many_of(kids), state))
+        entries = of_type(tool, Gtk.Entry)
+        first = entries[0]
+        assert first.get_text() == "t" * 8189
+        assert entries[-1].get_text() == NOT_SHOWN  # the budget is full
+
+        for letter in "abc":
+            first.get_buffer().insert_text(len(first.get_text()), letter, -1)  # keystrokes
+            assert first.get_text().endswith(letter)
+            assert first.get_text() != NOT_SHOWN
+            assert first.get_editable() is True
+
+        assert str(tool.runtime.store.value("t")).endswith("abc")  # type: ignore[arg-type]
+
+
+def labels_text_now(tool: "RenderedTool") -> list[str]:
+    """What the labels show right now, with no flush."""
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk.text import TextBlock
+
+    return [w.shown_text for w in _all(tool) if isinstance(w, TextBlock)] + [
+        w.get_text()
+        for w in _all(tool)
+        if isinstance(w, Gtk.Label)
+        and not isinstance(w.get_parent(), TextBlock)
+        and isinstance(w.get_parent(), Gtk.Box | Gtk.Grid)
+    ]

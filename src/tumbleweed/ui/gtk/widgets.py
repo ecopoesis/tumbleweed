@@ -18,7 +18,7 @@ placeholder saying so.
 """
 
 from collections.abc import Callable
-from typing import Literal, assert_never
+from typing import Literal, assert_never, final
 
 from tumbleweed.shell._gi import Gtk
 from tumbleweed.shell.viewmodel.display import display_text
@@ -207,7 +207,7 @@ def _entry(component: Entry, ctx: BuildContext) -> Gtk.Widget:
         # would write the cut text over the state's value. The state keeps all of it.
         shown = text[:MAX_SHOWN_PER_TEXT]
         whole = len(text) <= MAX_SHOWN_PER_TEXT
-        if ctx.budget.fits(entry, shown):
+        if ctx.budget.claim(entry, len(shown), keep=editing):
             ctx.budget.stop_waiting(entry)
         else:
             shown, whole = NOT_SHOWN, False
@@ -288,27 +288,43 @@ def _check(component: Check, ctx: BuildContext) -> Gtk.Widget:
     return check
 
 
+@final
+class _Memory:
+    """What a slider or spin button was last told, and by whom."""
+
+    def __init__(self) -> None:
+        self.programmatic: float | None = None  # the value the runtime last gave the adjustment
+        self.typed = False  # the value being set is what the user typed: exact, never snapped
+
+
 def _number_changed(
     adjustment: Gtk.Adjustment,
     numeric: NumericRange,
     ctx: BuildContext,
     key: StateKey,
     change: UiEvent | None,
+    memory: _Memory,
 ) -> Callable[[object], None]:
     """The `value-changed` handler of a slider or spin button.
 
-    Stepping adds the step to the value again and again, and floating point leaves noise (50.0 in
-    steps of 0.01 gives 50.08999999999998): the value is snapped to the decimals of the step and of
-    what the entry held, in the widget and in the state. A value with more digits than that (typed,
-    patched, a default) is not touched.
+    A report of the value the runtime last set is not an edit, however late GTK makes it (a
+    handler that writes back a tiny value would otherwise be answered with an edit, and again,
+    for ever). Of what is left, a value that is the held value stepped by a whole number of steps
+    or pages is cleaned of floating-point noise (50.0 in steps of 0.01 gives 50.08999999999998),
+    in the widget and the state; a typed value and a dragged one are exactly what they are.
     """
 
     def on_changed(_widget: object) -> None:
         if ctx.updating:
             return
         value = adjustment.get_value()
+        if memory.programmatic is not None and value == memory.programmatic:
+            return
+        memory.programmatic = None
         held = number_of(ctx.runtime.store.value(key))
-        snapped = numeric.snap(value, 0.0 if held is None else held)
+        snapped = value
+        if not memory.typed and held is not None:
+            snapped = numeric.snap_step(value, held)
         if snapped != value:
             with ctx.programmatic():
                 adjustment.set_value(snapped)
@@ -326,12 +342,18 @@ def _slider(component: Slider, ctx: BuildContext) -> Gtk.Widget:
     scale.set_hexpand(True)
     change = _event(component.on_change, component.kind, "change", key)
 
+    memory = _Memory()
+
     def update(value: StateValue, stale: bool) -> None:
         number = number_of(value)
-        if number is not None and adjustment.get_value() != float(number):
-            adjustment.set_value(float(number))
+        if number is not None:
+            memory.programmatic = float(number)
+            if adjustment.get_value() != float(number):
+                adjustment.set_value(float(number))
 
-    ctx.connect(scale, "value-changed", _number_changed(adjustment, numeric, ctx, key, change))
+    ctx.connect(
+        scale, "value-changed", _number_changed(adjustment, numeric, ctx, key, change, memory)
+    )
     ctx.bind(key, scale, update)
     return scale
 
@@ -343,7 +365,8 @@ def _spin(component: Spin, ctx: BuildContext) -> Gtk.Widget:
     # `digits`, or with an exponent (1e-300), which is how a float is shown whole. What is typed
     # is checked by `on_input` instead.
     spin.set_numeric(False)
-    quiet_spin_input_marshalling()
+    ctx.on_close(quiet_spin_input_marshalling())
+    memory = _Memory()
     ctx.on_close(harden_text(spin))
     change = _event(component.on_change, component.kind, "change", key)
 
@@ -369,19 +392,27 @@ def _spin(component: Spin, ctx: BuildContext) -> Gtk.Widget:
         # never set, and write 0.)
         parsed = numeric.parse(spin.get_text())
         if parsed is not None:
-            adjustment.set_value(float(parsed))
+            memory.typed = True
+            try:
+                adjustment.set_value(float(parsed))
+            finally:
+                memory.typed = False
         show_whole()
         return 0  # not handled: the default parse comes next
 
     def update(value: StateValue, stale: bool) -> None:
         number = number_of(value)
         # Through the adjustment: the spin button's own `set_value` ignores a change under 1e-10.
-        if number is not None and adjustment.get_value() != float(number):
-            adjustment.set_value(float(number))
+        if number is not None:
+            memory.programmatic = float(number)
+            if adjustment.get_value() != float(number):
+                adjustment.set_value(float(number))
 
     ctx.connect(spin, "output", output)
     ctx.connect(spin, "input", on_input)
-    ctx.connect(spin, "value-changed", _number_changed(adjustment, numeric, ctx, key, change))
+    ctx.connect(
+        spin, "value-changed", _number_changed(adjustment, numeric, ctx, key, change, memory)
+    )
     ctx.bind(key, spin, update)
     show_whole()  # the first text, whatever GTK would have written (a default off the grid)
     return spin

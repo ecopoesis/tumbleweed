@@ -261,3 +261,143 @@ class TestNumericRange:
         assert 0 < numeric.page <= numeric.width
         assert 0 <= numeric.digits <= 10
         assert 0.0 <= numeric.fraction(low) <= numeric.fraction(high) <= 1.0
+
+
+class TestSnapStep:
+    """Only what a step or page increment produced is cleaned of floating-point noise."""
+
+    def numeric(self, step: float | None, maximum: float = 100.0) -> NumericRange:
+        fields: dict[str, float] = {"minimum": 0.0, "maximum": maximum}
+        if step is not None:
+            fields["step"] = step
+        return range_of(real("x", 0.0, **fields))
+
+    def test_a_noisy_step_is_the_held_value_plus_the_step_as_decimals(self) -> None:
+        numeric = self.numeric(0.01)
+        held = 50.0
+        for _ in range(9):
+            held = numeric.snap_step(held + 0.01, held)
+
+        assert held == 50.09  # not 50.08999999999998
+
+    def test_stepping_down_and_by_several_steps_at_once(self) -> None:
+        numeric = self.numeric(0.1)
+
+        assert numeric.snap_step(0.30000000000000004, 0.2) == 0.3
+        assert numeric.snap_step(0.2 - 0.1, 0.2) == 0.1
+        assert numeric.snap_step(0.1 * 3, 0.0) == 0.3  # a held arrow steps three at a time
+
+    def test_a_page_increment_is_recognised_too(self) -> None:
+        numeric = self.numeric(0.01, maximum=100.0)  # a page is a tenth of the range: 10.0
+
+        assert numeric.snap_step(0.07 + 10.0, 0.07) == 10.07
+
+    def test_the_digits_of_the_held_value_are_kept_and_none_is_invented(self) -> None:
+        numeric = self.numeric(0.1)
+
+        assert numeric.snap_step(0.123 + 0.1, 0.123) == 0.223
+
+    @pytest.mark.parametrize(
+        ("value", "held", "step"),
+        [
+            (4e-10, 0.0, 0.01),  # typed "0.0000000004"
+            (3000000.678, 3000000.0, 0.01),  # typed, at a large magnitude
+            (2.0000000001, 2.0, 0.1),  # typed, a hair from the held value
+            (0.123456789, 0.5, 0.01),  # dragged to a position of its own
+            (5e-324, 0.5, 0.01),  # a tiny value
+            (1e-22, 0.0, 1e-22 * 3),  # not a whole step of this step
+        ],
+    )
+    def test_a_value_that_is_not_a_stepped_one_is_returned_exactly(
+        self, value: float, held: float, step: float
+    ) -> None:
+        numeric = self.numeric(step, maximum=max(100.0, held * 2, step * 10))
+
+        assert numeric.snap_step(value, held) == value
+
+    def test_a_tiny_range_and_step_are_stepped_exactly(self) -> None:
+        numeric = range_of(real("x", 0.0, minimum=0.0, maximum=1e-20, step=1e-22))
+
+        assert numeric.snap_step(1e-22, 0.0) == 1e-22
+        assert numeric.snap_step(3e-22, 2e-22) == 3e-22
+        assert numeric.snap_step(0.0, 1e-22) == 0.0  # back to the start, a whole step
+
+    def test_a_huge_magnitude_is_stepped_without_losing_the_step(self) -> None:
+        numeric = range_of(real("x", 0.0, minimum=0.0, maximum=4e15, step=0.5))
+
+        assert numeric.snap_step(3000000.5 + 0.5, 3000000.5) == 3000001.0
+
+    def test_the_tolerance_is_a_millionth_of_a_step(self) -> None:
+        numeric = self.numeric(1.0)
+
+        assert numeric.snap_step(1.0 + 0.9e-6, 0.0) == 1.0  # within: it was a step
+        assert numeric.snap_step(1.0 + 1.1e-6, 0.0) == 1.0 + 1.1e-6  # outside: it was not
+        assert numeric.snap_step(5.0 - 0.9e-6, 0.0) == 5.0
+
+    def test_at_most_twenty_steps_in_one_move(self) -> None:
+        numeric = self.numeric(0.1)
+
+        assert numeric.snap_step(2.0 + 1e-12, 0.0) == 2.0
+        assert numeric.snap_step(2.1 + 1e-12, 0.0) == 2.1 + 1e-12
+
+    def test_an_int_entry_is_never_snapped(self) -> None:
+        numeric = range_of(number("n", 0, minimum=0, maximum=100))
+
+        assert numeric.snap_step(5.0000001, 5) == 5.0000001
+
+
+class TestParse:
+    """What a user may type into a spin button, strictly."""
+
+    def float_range(self) -> NumericRange:
+        return range_of(real("x", 0.5, minimum=-10.0, maximum=10.0, step=0.01))
+
+    def int_range(self) -> NumericRange:
+        return range_of(number("n", 5, minimum=0, maximum=100))
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("0.3", 0.3),
+            ("-2", -2.0),
+            ("+2.5", 2.5),
+            (" 0.5 ", 0.5),
+            (".25", 0.25),
+            ("3.", 3.0),
+            ("1e-1", 0.1),
+            ("1E1", 10.0),
+            ("0.0000000004", 4e-10),
+            ("1e-300", 1e-300),
+            ("10", 10.0),
+            ("-10", -10.0),
+        ],
+    )
+    def test_numbers(self, text: str, expected: float) -> None:
+        assert self.float_range().parse(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "", " ", "abc", "1,5", "0x10", "inf", "-inf", "nan", "1_0", "1__0", "--1", "+-1",
+            "1.2.3", "1e", "e1", "1e+", ".", "-", "10.0001", "-10.0001", "1e999",
+            "\u0661", "\u0663.\u0665",
+            "\uff11", "1\u0663", "1 2", "\u00bd", "1e1_0", "True", "None",
+        ],
+    )  # fmt: skip
+    def test_what_is_no_number_or_is_outside_the_range(self, text: str) -> None:
+        assert self.float_range().parse(text) is None
+
+    @pytest.mark.parametrize(
+        ("text", "expected"), [("12", 12), ("12.0", 12), ("1e1", 10), ("0", 0)]
+    )
+    def test_an_int_takes_whole_numbers(self, text: str, expected: int) -> None:
+        result = self.int_range().parse(text)
+
+        assert result == expected
+        assert type(result) is int
+
+    @pytest.mark.parametrize(
+        "text", ["2.5", "100.5", "-1", "101", "1e3", "1_0", "\u0661\u0662", "0x1"]
+    )
+    def test_an_int_refuses_the_rest(self, text: str) -> None:
+        assert self.int_range().parse(text) is None

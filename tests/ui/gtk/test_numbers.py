@@ -36,6 +36,8 @@ RANGES: dict[str, Json] = {
     "huge step": number("x", 0, minimum=0, maximum=MAX_SAFE_INT, step=MAX_SAFE_INT),
     "negative range": number("x", -5, minimum=-10, maximum=-1),
     "float, smallest step": real("x", 0.0, minimum=0.0, maximum=1.0, step=SMALLEST),
+    "float, 1e-20 wide, step 1e-22": real("x", 0.0, minimum=0.0, maximum=1e-20, step=1e-22),
+    "float, 1e-20 wide, no step": real("x", 0.0, minimum=0.0, maximum=1e-20),
     "float, tiny range and step": real("x", 1e-300, minimum=0.0, maximum=1e-290, step=SMALLEST),
     "float, fine step": real("x", 0.5, minimum=-1.0, maximum=1.0, step=1e-9),
     "float, step is the range": real("x", 0.0, minimum=0.0, maximum=3.0, step=3.0),
@@ -47,6 +49,8 @@ RANGES: dict[str, Json] = {
 
 
 SPIN_REFUSED = {  # a spin button needs a step above GTK's epsilon (1e-10); these are slider-only
+    "float, 1e-20 wide, step 1e-22",
+    "float, 1e-20 wide, no step",
     "float, tiny range and step",
     "float, smallest step",
     "float, no step, narrow",
@@ -61,6 +65,18 @@ def cases(kinds: tuple[str, ...]) -> list[tuple[str, str]]:
         for name in RANGES
         if not (kind == "spin" and name in SPIN_REFUSED)
     ]
+
+
+def numeric_step(decl: Json) -> float:
+    """The step the widget works with: the declared one, a whole number's 1, or the default."""
+    from tumbleweed.ui.spec import default_float_step
+
+    if "step" in decl:
+        return float(decl["step"])  # type: ignore[arg-type]  # JSON
+    if decl["kind"] == "int":
+        return 1.0
+    low, high = bounds(decl)
+    return default_float_step(high - low)
 
 
 def widget_spec(kind: str, decl: Json) -> "UiSpec":
@@ -129,6 +145,7 @@ class TestDrivenToTheEnds:
         seen: list[object] = []
         tool.runtime.store.subscribe(lambda change: seen.append(change.value))
 
+        step = numeric_step(decl)
         with caplog.at_level(logging.ERROR):
             for position in (high, low, high, (low + high) / 2, low):
                 widget.get_adjustment().set_value(position)
@@ -136,6 +153,12 @@ class TestDrivenToTheEnds:
                 assert isinstance(value, int | float)
                 assert math.isfinite(value)
                 assert low <= value <= high
+                # the widget and the state really are where it was driven to (within one step):
+                # a value must not collapse to 0 because it is small, nor drift because it is big
+                near = max(step, abs(position) * 1e-9)  # (a step below a double's resolution is not
+                # a distance a double can show: 2e-308 beside 5e-291)
+                assert abs(widget.get_adjustment().get_value() - position) <= near, (position, step)
+                assert abs(value - position) <= near, (position, value, step)
             widget.get_adjustment().set_value(1e300)  # beyond the range: clamped by the widget
             assert low <= float(tool.runtime.store.value(StateKey("x"))) <= high  # type: ignore[arg-type]  # a number
 

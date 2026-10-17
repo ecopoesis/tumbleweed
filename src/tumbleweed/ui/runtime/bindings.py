@@ -37,8 +37,8 @@ from tumbleweed.ui.spec.names import StateKey
 from tumbleweed.ui.spec.state import FloatState, IntState, StateDecl
 
 MAX_DIGITS: Final = 10  # decimals a number widget shows
-_MAX_GRID: Final = 15  # decimals a double keeps: snapping to more would snap to nothing
-_NOISE: Final = 1e-9  # how near, relatively, a value must be to its rounded form to be snapped
+STEP_NOISE: Final = 1e-6  # how far from whole steps (in steps) a value may be and still be stepped
+_MAX_STEPS: Final = 20  # whole steps a single move may be (a held arrow accelerates)
 _NUMBER: Final = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 
 
@@ -156,19 +156,29 @@ class NumericRange:
             return int(value) if value == int(value) else None
         return value
 
-    def snap(self, value: float, held: float | int) -> float:
-        """`value` without the noise of floating-point stepping.
+    def snap_step(self, value: float, held: float | int) -> float:
+        """`value` if it is the value held plus or minus whole steps (or pages), without the noise.
 
-        50.0 stepped by 0.01 nine times is 50.08999999999998, not 50.09. A value that lies within
-        a hair of a number with no more decimals than the step and the value held before it has
-        is that number; anything else (a typed or patched value with more digits) is kept whole.
+        Stepping adds the step to the value again and again, and floating point leaves noise: 50.0
+        in steps of 0.01 gives 50.08999999999998. This is for what a step or page *increment*
+        produced, nothing else (never typed text, which is parsed exactly, nor a patched or default
+        value): `value - held` is a few whole steps or pages, to within a millionth of one, and the
+        result is `held` plus those, added as decimals, so that no digit of `held` is lost and
+        none is invented. A value that is not such a stepped one, a dragged position or one with
+        digits of its own, is returned as it is.
         """
         if self.integer:
             return value
-        places = min(_MAX_GRID, max(_decimals(self.step), _decimals(float(held))))
-        rounded = round(value, places)
-        if abs(rounded - value) <= _NOISE * max(1.0, abs(value)):
-            return rounded
+        delta = value - held
+        for unit in (self.step, self.page):
+            if unit <= 0.0 or not math.isfinite(delta):
+                continue
+            count = round(delta / unit)
+            if count == 0 or abs(count) > _MAX_STEPS:
+                continue
+            exact = float(Decimal(repr(float(held))) + count * Decimal(repr(unit)))
+            if math.isfinite(exact) and abs(exact - value) <= unit * STEP_NOISE:
+                return exact
         return value
 
     def to_state(self, position: float) -> int | float:

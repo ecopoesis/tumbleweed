@@ -14,7 +14,7 @@ import pytest
 from tests.ui.gtk.support import of_type, spec_of
 from tests.ui.runtime.support import real, set_handler
 from tests.ui.spec.support import Json, binary, lit_int, ref
-from tumbleweed.ui.runtime import UiRuntime
+from tumbleweed.ui.runtime import Change, UiRuntime
 from tumbleweed.ui.spec.names import StateKey
 
 if TYPE_CHECKING:
@@ -341,3 +341,107 @@ def test_very_small_values_are_shown_whole_and_read_back() -> None:
 
     assert float(spin.get_text()) == 1.2345e-8
     assert tool.runtime.store.value(StateKey("x")) == 1.2345e-8
+
+
+@pytest.mark.parametrize(
+    ("typed", "step", "expected"),
+    [
+        ("0.0000000004", 0.01, 4e-10),
+        ("3000000.678", 0.01, 3000000.678),
+        ("2.0000000001", 0.1, 2.0000000001),
+        ("0.00000000000000000001", 0.01, 1e-20),
+        ("1234567.123456789", 0.5, 1234567.123456789),
+    ],
+)
+def test_a_typed_number_is_kept_exactly_whatever_the_step(
+    typed: str, step: float, expected: float
+) -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    state: list[Json] = [real("x", 2.0, minimum=0.0, maximum=4e6, step=step)]
+    tool = RenderedTool(spec_of({"kind": "spin", "bind": "x"}, state))
+    (spin,) = of_type(tool, Gtk.SpinButton)
+
+    spin.set_text(typed)
+    spin.update()
+
+    assert tool.runtime.store.value(StateKey("x")) == expected
+    assert spin.get_adjustment().get_value() == expected
+    assert float(spin.get_text()) == expected
+
+
+def hits_spec(kind: str, written: float) -> "RenderedTool":
+    from tumbleweed.ui.gtk import RenderedTool
+
+    state: list[Json] = [
+        real("x", 0.5, minimum=0.0, maximum=1.0, step=0.01),
+        {"kind": "int", "key": "hits", "default": 0},
+    ]
+    handlers: list[Json] = [
+        set_handler("h", x={"kind": "float", "value": written}),
+        set_handler("count", hits=binary("add", ref("hits"), lit_int(1))),
+    ]
+    root: Json = {"kind": kind, "bind": "x", "on_change": "h"}
+    return RenderedTool(spec_of(root, state, handlers))
+
+
+@pytest.mark.parametrize("written", [5e-324, 1e-320, 1e-300, 1e-100, 1e-9])
+@pytest.mark.parametrize("kind", ["slider", "spin"])
+@pytest.mark.timeout(30)
+def test_a_handler_that_writes_a_tiny_value_back_does_not_loop(kind: str, written: float) -> None:
+    import time
+
+    from tumbleweed.shell._gi import Gtk
+
+    tool = hits_spec(kind, written)
+    widget = tool.widget
+    assert isinstance(widget, Gtk.Scale | Gtk.SpinButton)
+    started = time.monotonic()
+
+    widget.get_adjustment().set_value(0.75)  # the user moves it: the handler answers with `written`
+
+    assert time.monotonic() - started < 5
+    assert tool.runtime.store.value(StateKey("x")) == written
+    assert widget.get_adjustment().get_value() == written
+    from tests.shell.gtk_support import pump
+
+    pump(0.2)  # whatever GTK reports late
+    assert tool.runtime.store.value(StateKey("x")) == written
+
+
+def test_a_late_report_of_the_value_the_runtime_set_is_no_edit() -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    state: list[Json] = [
+        real("x", 0.5, minimum=0.0, maximum=1.0, step=0.01),
+        {"kind": "int", "key": "hits", "default": 0},
+    ]
+    handlers: list[Json] = [set_handler("count", hits=binary("add", ref("hits"), lit_int(1)))]
+    spec = spec_of({"kind": "slider", "bind": "x", "on_change": "count"}, state, handlers)
+    tool = RenderedTool(spec)
+    (scale,) = of_type(tool, Gtk.Scale)
+
+    tool.runtime.patch_state({"x": 0.3})
+    changes: list[Change] = []
+    tool.runtime.store.subscribe(changes.append)
+    scale.emit("value-changed")  # GTK reporting it again, outside the runtime's own update
+
+    assert tool.runtime.store.value(StateKey("hits")) == 0
+    assert changes == []  # nothing was written, not even the unchanged value
+
+
+def test_a_typed_number_that_looks_like_stepping_noise_is_kept_exactly() -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    state: list[Json] = [real("x", 0.2, minimum=0.0, maximum=1.0, step=0.1)]
+    tool = RenderedTool(spec_of({"kind": "spin", "bind": "x"}, state))
+    (spin,) = of_type(tool, Gtk.SpinButton)
+
+    spin.set_text("0.30000000000000004")  # one step up from 0.2, as floating point makes it
+    spin.update()
+
+    assert tool.runtime.store.value(StateKey("x")) == 0.30000000000000004  # not "cleaned" to 0.3
+    assert float(spin.get_text()) == 0.30000000000000004
