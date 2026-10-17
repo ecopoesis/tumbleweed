@@ -10,6 +10,7 @@ from pathlib import Path
 
 from tests.history.support import history_directory, open_store, raw
 from tumbleweed.history.db import Database
+from tumbleweed.history.schema import MIGRATIONS
 from tumbleweed.history.store import HistoryStore
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -63,7 +64,7 @@ class TestTwoWritersAtOnce:
 
         assert len(set(sessions)) == 4  # nobody shared a session
         with raw(history_directory(tmp_path)) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+            assert connection.execute("PRAGMA user_version").fetchone() == (MIGRATIONS[-1].version,)
             assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
             assert connection.execute("SELECT count(*) FROM messages").fetchone() == (600,)
             for session in sessions:

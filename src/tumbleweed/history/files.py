@@ -16,17 +16,18 @@ descriptor, never through a second look at a path (CLAUDE.md, TOCTOU):
 - Files are opened relative to a directory descriptor with `O_NOFOLLOW`, created with mode 0600, and
   must be a regular file, owned by this user, with one link. A mode other than 0600 on a file of
   ours is set to exactly 0600 the same way.
-- SQLite opens the database by path itself. On Linux it is given `/proc/self/fd/<n>/chat.sqlite3`,
-  which names the directory we hold open, and it derives the `-wal`, `-shm` and `-journal` names
-  from that (measured: they land in the pinned directory), so a directory swapped for another one
-  after our checks changes nothing. Elsewhere `db` gives it the plain path and, once SQLite has
-  opened the file, `same_file` compares the exact string it was given with the descriptor opened
-  first (device and inode), `same_directory` does the same for the directory, and `check_sidecar`
-  looks at the side files; a redirected ancestor is then caught before anything is written. What
-  remains on those platforms is the instant between our check and SQLite's own open, during which
-  someone able to write inside our 0700 directory, or to rename it (this user, or root), could
-  have SQLite create its empty side files elsewhere; nothing of ours is written there, because
-  the check fails first. An ACL on a directory is not examined (#80).
+- SQLite opens the database by path itself, and a `/proc/self/fd/<n>` path would not pin
+  anything: SQLite resolves it to the plain path (`PRAGMA database_list` shows it) and opens
+  that, and derives the `-wal`, `-shm` and `-journal` names from it. So after SQLite has opened
+  the file, `same_directory` compares the directory path with the descriptor we hold (device
+  and inode), `same_file` the file in it, and `check_sidecar` looks at the side files, all
+  relative to our directory descriptor; a redirected ancestor is refused before anything is
+  written. What remains is the instant
+  between our check and SQLite's own opens: someone able to write inside our 0700 directory, or
+  to rename it or an ancestor (this user, or root), could have SQLite open, read and create its
+  empty files in another directory then. Nothing of ours is written there, because the checks
+  that follow fail first; but the attacker's file could have been read. An ACL on a directory
+  is not examined (#80).
 """
 
 import contextlib
@@ -160,6 +161,8 @@ def _check_regular(info: os.stat_result, what: str) -> None:
         raise _refused(what, "not a regular file")
     if info.st_uid != current_uid():
         raise _refused(what, "it belongs to another user")
+    if info.st_nlink == 0:  # unlinked since we opened it (another shell pruned it): just gone
+        raise HistoryRefusedError(f"The chat history {what} is gone.")
     if info.st_nlink != 1:
         raise _refused(what, "it has more than one link")
 
@@ -179,16 +182,6 @@ def same_directory(path: Path, descriptor: int) -> bool:
     """Whether `path`, looked at now, is the directory `descriptor` was opened on."""
     try:
         on_disk = path.stat()
-    except OSError:
-        return False
-    opened = os.fstat(descriptor)
-    return (on_disk.st_dev, on_disk.st_ino) == (opened.st_dev, opened.st_ino)
-
-
-def same_path(path: str, descriptor: int) -> bool:
-    """Whether the exact string `path` is, now, the file `descriptor` was opened on."""
-    try:
-        on_disk = Path(path).stat()
     except OSError:
         return False
     opened = os.fstat(descriptor)

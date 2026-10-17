@@ -6,7 +6,8 @@
 - **Concurrency.** WAL mode (readers never block the writer and the writer never blocks readers,
   so a second shell does not stall the first), `synchronous=NORMAL`, and a busy timeout of
   `BUSY_TIMEOUT`: a write waits that long for another shell's write, then fails with
-  `HistoryBusyError` instead of freezing the window. The first statements of an open (switching to
+  `HistoryBusyError` (each write waits at most about that long; the window is not held for
+  longer by any one write). The first statements of an open (switching to
   WAL, migrating) are asked again within the same time, because SQLite answers some of them with
   BUSY at once, without waiting, while another shell is setting a new file up. Every write is
   `BEGIN IMMEDIATE`, so a transaction either gets the write lock at its start or fails there,
@@ -48,7 +49,6 @@ from tumbleweed.history.files import (
     open_private_file,
     same_directory,
     same_file,
-    same_path,
 )
 from tumbleweed.history.schema import MIGRATIONS, Migration, migrate, verify
 
@@ -67,19 +67,6 @@ _BUSY: Final = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 _DAMAGED: Final = frozenset({11, 18, 20, 24, 25, 26})  # CORRUPT TOOBIG MISMATCH FORMAT RANGE NOTADB
 
 type Row = tuple[object, ...]
-
-
-def sqlite_path(directory_fd: int, directory: Path) -> tuple[str, bool]:
-    """The path string to give SQLite, and whether it is pinned to the directory we hold.
-
-    On Linux `/proc/self/fd/<n>/...` names the open directory itself, whatever happens to its
-    path afterwards (SQLite derives the side files from it: measured). Elsewhere it is the plain
-    path, which `Database.open` then checks.
-    """
-    proc = Path(f"/proc/self/fd/{directory_fd}")
-    if proc.is_dir():
-        return f"{proc}/{DATABASE_NAME}", True
-    return str(directory / DATABASE_NAME), False
 
 
 def _primary_code(error: sqlite3.Error) -> int | None:
@@ -126,7 +113,7 @@ class Database:
             file_fd = open_private_file(directory_fd, DATABASE_NAME)
             for suffix in SIDECAR_SUFFIXES:
                 check_sidecar(directory_fd, DATABASE_NAME + suffix)
-            path, pinned = sqlite_path(directory_fd, directory)
+            path = str(directory / DATABASE_NAME)
             connection = sqlite3.connect(
                 path,
                 timeout=BUSY_TIMEOUT.total_seconds(),
@@ -136,9 +123,7 @@ class Database:
             deadline = time.monotonic() + BUSY_TIMEOUT.total_seconds()
             while True:
                 try:
-                    cls._prepare(
-                        connection, (directory, directory_fd), (path, pinned, file_fd), migrations
-                    )
+                    cls._prepare(connection, (directory, directory_fd), file_fd, migrations)
                     break
                 except sqlite3.Error as exc:
                     # SQLite answers BUSY at once, without its busy handler, to some statements
@@ -161,19 +146,19 @@ class Database:
     def _prepare(
         connection: sqlite3.Connection,
         directory: tuple[Path, int],
-        opened: tuple[str, bool, int],
+        file_fd: int,
         migrations: tuple[Migration, ...],
     ) -> None:
         directory_path, directory_fd = directory
-        path, pinned, file_fd = opened
         # Reads only: a file that is not ours is refused before it is switched to WAL or written.
         verify(connection, migrations)
-        # SQLite has opened the file by now, by the string it was given: that must be the file we
-        # examined, in the directory we hold.
+        # SQLite has opened the file by now, by the path string it was given (on Linux a
+        # `/proc/self/fd/<n>` path would not help: SQLite resolves it to the plain path, and
+        # opens that). That path must still be the file we examined, in the directory we hold;
+        # a directory swapped in between is refused here, before anything is written.
         if not (
-            same_path(path, file_fd)
-            and same_file(directory_fd, DATABASE_NAME, file_fd)
-            and (pinned or same_directory(directory_path, directory_fd))
+            same_file(directory_fd, DATABASE_NAME, file_fd)
+            and same_directory(directory_path, directory_fd)
         ):
             raise HistoryRefusedError("The chat history file was replaced while opening.")
         mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()

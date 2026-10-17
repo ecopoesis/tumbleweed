@@ -167,9 +167,13 @@ class TestBadRows:
     def test_a_session_row_that_is_not_valid_is_skipped_not_fatal(self, tmp_path: Path) -> None:
         directory, good = seed(tmp_path)
         with raw(directory) as connection:
-            connection.execute("INSERT INTO sessions VALUES ('ses_junk', 1, ?)", (NOW + 10,))
             connection.execute(
-                "INSERT INTO sessions VALUES (?, -4, ?)", (str(SessionId.new()), NOW)
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES ('ses_junk', 1, ?)",
+                (NOW + 10,),
+            )
+            connection.execute(
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES (?, -4, ?)",
+                (str(SessionId.new()), NOW),
             )
             insert_session(connection, good, NOW - 5)
             insert_message(connection, good, 1, text="the good one")
@@ -233,14 +237,19 @@ class TestRowParsing:
             message_from_row(self.GOOD[:5])
 
     def test_sessions_too(self) -> None:
-        good = (str(SessionId.new()).encode(), 1, 2)
+        good = (str(SessionId.new()).encode(), 1, 2, 0)
         assert session_from_row(good).updated_at == 2
+        assert session_from_row((*good[:3], 1)).user_started is True
         for bad in (
-            (None, 1, 2),
-            (good[0], "1", 2),
-            (good[0], 1, None),
-            (b"ses_x", 1, 2),
-            (good[0], True, 2),
+            (None, 1, 2, 0),
+            (good[0], "1", 2, 0),
+            (good[0], 1, None, 0),
+            (b"ses_x", 1, 2, 0),
+            (good[0], True, 2, 0),
+            (good[0], 1, 2, 2),  # the flag is 0 or 1
+            (good[0], 1, 2, None),
+            (good[0], 1, 2, True),
+            (good[0], 1, 2),
         ):
             with pytest.raises(HistoryCorruptError):
                 session_from_row(bad)
@@ -361,7 +370,7 @@ class TestHugeFilesAreReadInBoundedTime:
         with raw(directory) as connection:
             connection.execute("BEGIN")
             connection.executemany(
-                "INSERT INTO sessions VALUES (?, 1, ?)",
+                "INSERT INTO sessions (id, created_at, updated_at) VALUES (?, 1, ?)",
                 ((str(SessionId.new()), index + 1) for index in range(200_000)),
             )
             insert_session(connection, big, 10**12)

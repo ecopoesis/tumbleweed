@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 
 from tests.history.support import assistant, history_directory, open_store, user
+from tumbleweed.core.ids import SessionId
 from tumbleweed.history import files
+from tumbleweed.history.claims import SessionClaims
 from tumbleweed.history.db import DATABASE_NAME, Database
 from tumbleweed.history.errors import HistoryRefusedError
 from tumbleweed.history.store import HistoryStore
@@ -244,6 +246,56 @@ class TestTheDescriptorFunctionsThemselves:
             os.close(descriptor)
 
         assert mode(directory / "name") == 0o600
+
+
+class TestALockFileThatIsGone:
+    def claims(self, tmp_path: Path) -> tuple[SessionClaims, int]:
+        directory = tmp_path / "dir"
+        directory.mkdir(mode=0o700)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        return SessionClaims(descriptor), descriptor
+
+    def test_a_lock_file_unlinked_since_it_was_opened_is_no_claim_and_no_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        claims, descriptor = self.claims(tmp_path)
+        real = os.fstat
+
+        def fstat(fd: int) -> os.stat_result:
+            info = real(fd)
+            if stat.S_ISREG(info.st_mode):
+                return os.stat_result(
+                    (info.st_mode, info.st_ino, info.st_dev, 0, info.st_uid, *info[5:])
+                )
+            return info
+
+        monkeypatch.setattr(os, "fstat", fstat)
+        try:
+            with caplog.at_level(logging.WARNING):
+                assert claims.try_claim(SessionId.new()) is None
+        finally:
+            claims.close()
+            os.close(descriptor)
+
+        assert caplog.text == ""  # "gone" is ordinary: nothing to warn about
+
+    def test_a_lock_file_with_a_second_link_is_still_refused_with_a_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        claims, descriptor = self.claims(tmp_path)
+        session = SessionId.new()
+        try:
+            first = claims.try_claim(session)
+            assert first is not None
+            first.release()
+            os.link(tmp_path / "dir" / "chat.locks" / f"{session}.lock", tmp_path / "second")
+            with caplog.at_level(logging.WARNING):
+                assert claims.try_claim(session) is None
+        finally:
+            claims.close()
+            os.close(descriptor)
+
+        assert "more than one link" in caplog.text
 
 
 class TestSwappedUnderUs:

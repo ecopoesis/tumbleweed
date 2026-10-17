@@ -169,8 +169,8 @@ class HistoryStore:
     def new_session(self) -> StoredSession:
         self._require_open()
         previous, claim = self._session, self._claim
-        session = self._start()  # the previous claim is held until this has worked
-        self._let_go(previous, claim)
+        session = self._start(user_started=True)  # the previous claim is held until this works
+        self._let_go(previous, claim, keep_user_started=False)
         return session
 
     def append(self, message: NewMessage) -> None:
@@ -186,26 +186,32 @@ class HistoryStore:
             return
         self._closed = True
         try:
-            self._let_go(self._session, self._claim)
+            self._let_go(self._session, self._claim, keep_user_started=True)
         finally:
             try:
                 self._claims.close()
             finally:
                 self._database.close()
 
-    def _let_go(self, session: StoredSession | None, claim: Claim | None) -> None:
-        """Give up `claim` on `session`, and delete both if the session is empty."""
+    def _let_go(
+        self, session: StoredSession | None, claim: Claim | None, *, keep_user_started: bool
+    ) -> None:
+        """Give up `claim` on `session`, and delete both if the session is empty (unless the user
+        made it with "New session" and `keep_user_started`: closing keeps that one, as the last
+        session; starting another replaces it, so only the newest one is ever kept)."""
         if claim is None:
             return
         try:
-            if session is not None and self._sessions.delete_if_empty(session.id):
+            if session is not None and self._sessions.delete_if_empty(
+                session.id, keep_user_started=keep_user_started
+            ):
                 claim.forget()
         except HistoryError:
             logger.warning("could not delete an unused chat session")
         finally:
             claim.release()
 
-    def _start(self) -> StoredSession:
+    def _start(self, *, user_started: bool = False) -> StoredSession:
         """Create a session, claim it, make it the current one, and prune the oldest.
 
         The claim comes first: nobody else knows the new ID yet, so it cannot fail for want of
@@ -216,7 +222,7 @@ class HistoryStore:
         if claim is None:
             raise HistoryRefusedError("A chat session could not be claimed.")
         try:
-            session = self._sessions.create(session_id, self._clock())
+            session = self._sessions.create(session_id, self._clock(), user_started=user_started)
         except BaseException:
             claim.forget()
             raise

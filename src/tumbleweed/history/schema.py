@@ -64,6 +64,15 @@ MIGRATIONS: Final = (
 ) STRICT""",
         ),
     ),
+    Migration(
+        2,
+        (
+            (
+                "ALTER TABLE sessions ADD COLUMN user_started INTEGER NOT NULL DEFAULT 0 "
+                "CHECK (user_started IN (0, 1))"
+            ),
+        ),
+    ),
 )
 
 type Signature = tuple[tuple[str, str, str, str], ...]

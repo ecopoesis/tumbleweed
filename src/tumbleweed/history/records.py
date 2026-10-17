@@ -122,6 +122,10 @@ class StoredSession(BaseModel):
     id: SessionId
     created_at: Millis
     updated_at: Millis
+    user_started: bool
+    """Made by the user's "New session", and so kept even while it is empty: it is the last
+    session, and restores as an empty chat. A session a shell makes by itself at start is not
+    kept while it is empty."""
 
 
 __all__ = [

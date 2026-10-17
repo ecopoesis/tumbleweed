@@ -9,10 +9,13 @@ import pytest
 from tests.history.support import (
     assistant,
     history_directory,
+    insert_message,
+    insert_session,
     open_store,
     raw,
     user,
 )
+from tumbleweed.core.ids import SessionId
 from tumbleweed.history.db import Database
 from tumbleweed.history.errors import HistoryError, HistoryRefusedError
 from tumbleweed.history.schema import (
@@ -26,14 +29,14 @@ from tumbleweed.history.schema import (
 from tumbleweed.history.store import HistoryStore
 
 ADD_PINNED = Migration(
-    2,
+    MIGRATIONS[-1].version + 1,
     (
         "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
         "CREATE INDEX sessions_by_pin ON sessions (pinned)",
     ),
 )
 FAILING = Migration(
-    2,
+    MIGRATIONS[-1].version + 1,
     ("CREATE TABLE half_made (x INTEGER) STRICT", "CREATE TABLE sessions (x INTEGER) STRICT"),
 )
 
@@ -100,11 +103,44 @@ class TestUpgrade:
         restored = upgraded.begin(limit=10)
         upgraded.close()
 
-        assert pragma(directory, "user_version") == 2
+        assert pragma(directory, "user_version") == ADD_PINNED.version
         assert restored.session.id == first.id
         assert [m.text for m in restored.messages] == ["kept", "this too"]
         with raw(directory) as connection:
             assert connection.execute("SELECT pinned FROM sessions").fetchall() == [(0,)]
+
+    def test_a_version_1_file_gets_the_user_started_column_with_every_session_not_user_started(
+        self, tmp_path: Path
+    ) -> None:
+        directory = history_directory(tmp_path)
+        Database.open(directory, migrations=MIGRATIONS[:1]).close()
+        kept = SessionId.new()
+        with raw(directory) as connection:  # what the first version wrote (no such column)
+            insert_session(connection, kept, 5)
+            insert_message(connection, kept, 1, text="from the first version")
+        assert pragma(directory, "user_version") == 1
+
+        upgraded = HistoryStore.open(directory)
+        restored = upgraded.begin(limit=10)
+        upgraded.close()
+
+        assert pragma(directory, "user_version") == MIGRATIONS[-1].version == 2
+        assert restored.session.id == kept
+        assert restored.session.user_started is False
+        assert [m.text for m in restored.messages] == ["from the first version"]
+        with raw(directory) as connection:
+            assert connection.execute("SELECT user_started FROM sessions").fetchall() == [(0,)]
+
+    def test_the_column_only_takes_0_or_1(self, tmp_path: Path) -> None:
+        directory = history_directory(tmp_path)
+        Database.open(directory).close()
+        with raw(directory) as connection:  # (checks on, unlike `raw`'s usual setting)
+            connection.execute("PRAGMA ignore_check_constraints = OFF")
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO sessions (id, created_at, updated_at, user_started) "
+                    "VALUES ('ses_x', 1, 1, 2)"
+                )
 
     def test_an_upgrade_is_atomic(self, tmp_path: Path) -> None:
         directory = history_directory(tmp_path)
@@ -113,7 +149,7 @@ class TestUpgrade:
         with pytest.raises(HistoryError):
             Database.open(directory, migrations=(*MIGRATIONS, FAILING)).close()
 
-        assert pragma(directory, "user_version") == 1
+        assert pragma(directory, "user_version") == MIGRATIONS[-1].version
         with raw(directory) as connection:
             names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
         assert "half_made" not in names  # the statement before the failing one was undone
@@ -125,7 +161,7 @@ class TestUpgrade:
         with pytest.raises(HistoryRefusedError, match="newer version"):
             Database.open(directory)
 
-        assert pragma(directory, "user_version") == 2
+        assert pragma(directory, "user_version") == ADD_PINNED.version
 
     def test_a_version_this_code_does_not_know_is_refused_not_downgraded(
         self, tmp_path: Path
@@ -217,4 +253,4 @@ class TestFilesThatAreNotOurs:
         with pytest.raises(HistoryRefusedError):
             Database.open(directory, migrations=(*MIGRATIONS, ADD_PINNED))
 
-        assert pragma(directory, "user_version") == 1  # not migrated
+        assert pragma(directory, "user_version") == MIGRATIONS[-1].version  # not migrated

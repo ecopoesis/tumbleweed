@@ -4,6 +4,7 @@ session."""
 import fcntl
 import os
 import sqlite3
+from collections.abc import Sequence
 from contextlib import AbstractContextManager
 from pathlib import Path
 
@@ -215,7 +216,8 @@ class TestBounds:
             for index in range(total):
                 session = SessionId.new()
                 connection.execute(
-                    "INSERT INTO sessions VALUES (?, 1, ?)", (str(session), index + 1)
+                    "INSERT INTO sessions (id, created_at, updated_at) VALUES (?, 1, ?)",
+                    (str(session), index + 1),
                 )
                 insert_message(connection, session, 1)
         store = open_store(tmp_path)
@@ -264,7 +266,8 @@ class TestBounds:
         with raw(directory) as connection:  # a crowd of empty sessions, newer than every chat
             for index in range(PRUNE_BATCH):
                 connection.execute(
-                    "INSERT INTO sessions VALUES (?, 1, ?)", (str(SessionId.new()), 10**12 + index)
+                    "INSERT INTO sessions (id, created_at, updated_at) VALUES (?, 1, ?)",
+                    (str(SessionId.new()), 10**12 + index),
                 )
 
         second = open_store(tmp_path)
@@ -275,11 +278,11 @@ class TestBounds:
         with raw(directory) as connection:
             kept = {row[0] for row in connection.execute("SELECT id FROM sessions")}
             empties = connection.execute(
-                "SELECT count(*) FROM sessions WHERE NOT EXISTS "
+                "SELECT count(*) FROM sessions WHERE user_started = 0 AND NOT EXISTS "
                 "(SELECT 1 FROM messages WHERE session_id = sessions.id)"
             ).fetchone()
         assert all(str(chat) in kept for chat in chats[: MAX_SESSIONS - 1])
-        assert empties == (0,)
+        assert empties == (0,)  # (an empty session the user started is kept: see the next class)
 
     def test_a_session_that_another_shell_holds_is_never_pruned(self, tmp_path: Path) -> None:
         holder = open_store(tmp_path)
@@ -394,7 +397,8 @@ class TestWhoOwnsTheLastSession:
         with raw(directory) as connection:
             for index in range(RESTORE_CANDIDATES + 2):
                 connection.execute(
-                    "INSERT INTO sessions VALUES (?, 1, ?)", (str(SessionId.new()), index + 1)
+                    "INSERT INTO sessions (id, created_at, updated_at) VALUES (?, 1, ?)",
+                    (str(SessionId.new()), index + 1),
                 )
         # Every candidate is held: the shell starts a session of its own instead of searching on.
         for _ in range(RESTORE_CANDIDATES):
@@ -416,6 +420,7 @@ class TestARaceWithPruning:
     ) -> None:
         store = open_store(tmp_path)
         gone = store.begin(limit=10).session
+        store.append(user("a real chat, so it is a candidate"))
         store.close()
         monkeypatch.setattr(SessionRepository, "get", lambda self, session_id: None)
         second = open_store(tmp_path)
@@ -603,7 +608,13 @@ class TestTheClaimsAndTheClockAndTheOrder:
         held = first.begin(limit=10).session
         first.append(user("held"))
 
-        def failing(self: SessionRepository, session_id: SessionId, now: EpochMillis) -> None:
+        def failing(
+            self: SessionRepository,
+            session_id: SessionId,
+            now: EpochMillis,
+            *,
+            user_started: bool = False,
+        ) -> None:
             raise HistoryError("disk full")
 
         monkeypatch.setattr(SessionRepository, "create", failing)
@@ -622,3 +633,155 @@ class TestTheClaimsAndTheClockAndTheOrder:
         assert MAX_SESSIONS == 20
         assert PRUNE_BATCH == 20
         assert RESTORE_CANDIDATES == 8
+
+
+class TestNewSessionByTheUser:
+    """The decision: an empty session made with "New session" is kept (it is the last session and
+    restores as an empty chat); the empty one a shell makes by itself at start is not."""
+
+    def sessions(self, tmp_path: Path) -> list[tuple[str, int]]:
+        with raw(history_directory(tmp_path)) as connection:
+            return [
+                (row[0], row[1])
+                for row in connection.execute(
+                    "SELECT id, user_started FROM sessions ORDER BY updated_at, id"
+                )
+            ]
+
+    def test_new_session_then_quit_restarts_with_an_empty_chat(self, tmp_path: Path) -> None:
+        clock = Ticks()
+        first = open_store(tmp_path, clock)
+        old = first.begin(limit=10).session
+        first.append(user("what I wanted to be rid of"))
+        cleared = first.new_session()
+        first.close()
+
+        restored = open_store(tmp_path, clock).begin(limit=10)
+
+        assert restored.session.id == cleared.id
+        assert restored.session.user_started is True
+        assert restored.messages == ()
+        assert str(old.id) in {row[0] for row in self.sessions(tmp_path)}  # it is not deleted
+
+    def test_an_accidental_second_shell_then_quit_everything_restarts_with_the_real_chat(
+        self, tmp_path: Path
+    ) -> None:
+        clock = Ticks()
+        first = open_store(tmp_path, clock)
+        real = first.begin(limit=10).session
+        first.append(user("my real chat"))
+        accident = open_store(tmp_path, clock)
+        accident.begin(limit=10)
+        accident.close()
+        first.close()
+
+        restored = open_store(tmp_path, clock).begin(limit=10)
+
+        assert restored.session.id == real.id
+        assert [m.text for m in restored.messages] == ["my real chat"]
+
+    def test_the_session_a_shell_makes_at_start_is_not_user_started(self, tmp_path: Path) -> None:
+        store = open_store(tmp_path)
+
+        assert store.begin(limit=10).session.user_started is False
+        assert store.new_session().user_started is True
+        store.close()
+
+    def test_only_the_newest_empty_session_the_user_made_is_kept(self, tmp_path: Path) -> None:
+        store = open_store(tmp_path)
+        store.begin(limit=10)
+        last = [store.new_session() for _ in range(5)][-1]
+        store.close()
+
+        assert [row[0] for row in self.sessions(tmp_path)] == [str(last.id)]
+
+    def test_a_user_started_session_that_got_messages_is_an_ordinary_one(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_store(tmp_path)
+        store.begin(limit=10)
+        used = store.new_session()
+        store.append(user("now it has a chat"))
+        later = store.new_session()
+        store.close()
+
+        assert {row[0] for row in self.sessions(tmp_path)} == {str(used.id), str(later.id)}
+
+    def test_user_started_sessions_count_towards_the_cap_when_they_hold_chats(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_store(tmp_path)
+        store.begin(limit=10)
+        for index in range(MAX_SESSIONS + 5):
+            store.new_session()
+            store.append(user(f"chat {index}"))
+        store.close()
+
+        assert len(self.sessions(tmp_path)) == MAX_SESSIONS
+
+    def test_a_shell_that_crashed_leaves_an_empty_session_that_is_reaped_not_restored(
+        self, tmp_path: Path
+    ) -> None:
+        directory = history_directory(tmp_path)
+        store = open_store(tmp_path)
+        real = store.begin(limit=10).session
+        store.append(user("real"))
+        store.close()
+        crashed = SessionId.new()
+        with raw(directory) as connection:  # what a killed shell leaves behind
+            insert_session(connection, crashed, 10**13)
+
+        second = open_store(tmp_path)
+        restored = second.begin(limit=10)
+        assert restored.session.id == real.id
+        second.new_session()
+        second.close()
+
+        assert str(crashed) not in {row[0] for row in self.sessions(tmp_path)}
+
+
+class TestPruningThatFails:
+    def test_a_delete_that_fails_leaves_the_lock_files_and_gives_the_claims_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        directory = history_directory(tmp_path)
+        store = open_store(tmp_path)
+        store.begin(limit=10)
+        for index in range(MAX_SESSIONS):
+            store.append(user(f"chat {index}"))
+            store.new_session()
+        store.close()
+        old: list[SessionId] = []
+        with raw(directory) as connection:  # kept sessions beyond the cap: pruning's candidates
+            for index in range(3):
+                session = SessionId.new()
+                insert_session(connection, session, index + 1)
+                insert_message(connection, session, 1)
+                old.append(session)
+        calls: list[int] = []
+
+        def failing(self: SessionRepository, session_ids: Sequence[SessionId]) -> None:
+            calls.append(len(session_ids))
+            raise HistoryError("disk full")
+
+        monkeypatch.setattr(SessionRepository, "delete", failing)
+        second = open_store(tmp_path)
+        second.begin(limit=10)
+        second.new_session()  # prunes: must not raise
+        monkeypatch.undo()
+
+        assert calls == [3]  # the failing branch ran, with the three candidates
+        locks = directory / "chat.locks"
+        with raw(directory) as connection:
+            still_there = {row[0] for row in connection.execute("SELECT id FROM sessions")}
+        claims = SessionClaims(second._database.directory_fd)  # noqa: SLF001
+        try:
+            for session in old:
+                assert str(session) in still_there  # nothing was deleted...
+                assert (locks / f"{session}.lock").exists()  # ...so no lock file was either
+                claim = claims.try_claim(session)
+                assert claim is not None  # and the claim was given back, not kept
+                claim.release()
+        finally:
+            claims.close()
+        second.close()

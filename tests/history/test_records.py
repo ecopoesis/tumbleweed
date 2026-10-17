@@ -151,6 +151,16 @@ class TestStoredRecords:
             self.stored(created_at=created)
 
     def test_a_session_has_validated_times(self) -> None:
-        StoredSession(id=SessionId.new(), created_at=EpochMillis(0), updated_at=EpochMillis(5))
+        StoredSession(
+            id=SessionId.new(),
+            created_at=EpochMillis(0),
+            updated_at=EpochMillis(5),
+            user_started=False,
+        )
         with pytest.raises(ValidationError):
-            StoredSession(id=SessionId.new(), created_at=EpochMillis(-1), updated_at=EpochMillis(5))
+            StoredSession(
+                id=SessionId.new(),
+                created_at=EpochMillis(-1),
+                updated_at=EpochMillis(5),
+                user_started=False,
+            )

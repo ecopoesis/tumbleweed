@@ -57,13 +57,17 @@ def _integer(value: object) -> int:
 
 
 def session_from_row(row: Row) -> StoredSession:
-    """A validated session from `(id, created_at, updated_at)`. Raises `HistoryCorruptError`."""
+    """A validated session from `_SESSION_COLUMNS`. Raises `HistoryCorruptError`."""
     try:
-        id_, created, updated = row
+        id_, created, updated, user_started = row
+        flag = _integer(user_started)
+        if flag not in (0, 1):
+            raise HistoryCorruptError(_CORRUPT)
         return StoredSession(
             id=SessionId(_text(id_)),
             created_at=EpochMillis(_integer(created)),
             updated_at=EpochMillis(_integer(updated)),
+            user_started=flag == 1,
         )
     except (ValueError, TypeError, ValidationError):
         raise HistoryCorruptError(_CORRUPT) from None
@@ -90,10 +94,12 @@ def message_from_row(row: Row) -> StoredMessage:
 
 
 SCAN_WINDOW: Final = 1000
-_NON_EMPTY: Final = (
-    "SELECT id, created_at, updated_at FROM (SELECT id, created_at, updated_at FROM sessions "
+_SESSION_COLUMNS: Final = "id, created_at, updated_at, user_started"
+# The sessions worth keeping: they have messages, or the user made them with "New session".
+_KEPT: Final = (
+    f"SELECT {_SESSION_COLUMNS} FROM (SELECT {_SESSION_COLUMNS} FROM sessions "  # noqa: S608
     "ORDER BY updated_at DESC, id DESC LIMIT ?) AS s "
-    "WHERE EXISTS (SELECT 1 FROM messages WHERE session_id = s.id) "
+    "WHERE user_started = 1 OR EXISTS (SELECT 1 FROM messages WHERE session_id = s.id) "
 )
 
 
@@ -112,18 +118,24 @@ class SessionRepository:
     def __init__(self, database: Database) -> None:
         self._database = database
 
-    def create(self, session_id: SessionId, now: EpochMillis) -> StoredSession:
-        session = StoredSession(id=session_id, created_at=now, updated_at=now)
+    def create(
+        self, session_id: SessionId, now: EpochMillis, *, user_started: bool = False
+    ) -> StoredSession:
+        session = StoredSession(
+            id=session_id, created_at=now, updated_at=now, user_started=user_started
+        )
         with self._database.write() as connection:
             connection.execute(
-                "INSERT INTO sessions (id, created_at, updated_at) VALUES (?, ?, ?)",
-                (str(session.id), session.created_at, session.updated_at),
+                "INSERT INTO sessions (id, created_at, updated_at, user_started) "
+                "VALUES (?, ?, ?, ?)",
+                (str(session.id), session.created_at, session.updated_at, int(user_started)),
             )
         return session
 
     def get(self, session_id: SessionId) -> StoredSession | None:
         rows = self._database.query(
-            "SELECT id, created_at, updated_at FROM sessions WHERE id = ?", (str(session_id),)
+            f"SELECT {_SESSION_COLUMNS} FROM sessions WHERE id = ?",  # noqa: S608
+            (str(session_id),),
         )
         return session_from_row(rows[0]) if rows else None
 
@@ -138,7 +150,7 @@ class SessionRepository:
         if not 1 <= limit <= MAX_SEQUENCE:
             raise ValueError("limit must be positive")
         rows = self._database.query(
-            _NON_EMPTY + "ORDER BY updated_at DESC, id DESC LIMIT ?", (SCAN_WINDOW, limit)
+            _KEPT + "ORDER BY updated_at DESC, id DESC LIMIT ?", (SCAN_WINDOW, limit)
         )
         sessions: list[StoredSession] = []
         for row in rows:
@@ -149,25 +161,27 @@ class SessionRepository:
         return tuple(sessions)
 
     def beyond(self, keep: int, batch: int) -> tuple[SessionId, ...]:
-        """Up to `batch` sessions with messages older than the newest `keep` of them, oldest
-        first, for deleting. Empty sessions do not count towards `keep`."""
+        """Up to `batch` kept sessions (with messages, or started by the user) older than the
+        newest `keep` of them, oldest first, for deleting. Sessions a shell made by itself and
+        that are still empty do not count towards `keep`."""
         if not (1 <= batch <= MAX_SEQUENCE and 0 <= keep <= MAX_SEQUENCE):
             raise ValueError("batch must be positive and keep not negative")
         rows = self._database.query(
-            _NON_EMPTY + "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            _KEPT + "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
             (SCAN_WINDOW, batch, keep),
         )
         return tuple(reversed(_ids(rows)))
 
     def empty(self, batch: int) -> tuple[SessionId, ...]:
-        """Up to `batch` of the oldest sessions without messages (among the newest
-        `SCAN_WINDOW`), for deleting if nobody holds them."""
+        """Up to `batch` of the oldest sessions without messages that the user did not start
+        (among the newest `SCAN_WINDOW`), for deleting if nobody holds them."""
         if not 1 <= batch <= MAX_SEQUENCE:
             raise ValueError("batch must be positive")
         rows = self._database.query(
-            "SELECT id FROM (SELECT id, updated_at FROM sessions "
+            "SELECT id FROM (SELECT id, updated_at, user_started FROM sessions "
             "ORDER BY updated_at DESC, id DESC LIMIT ?) AS s "
-            "WHERE NOT EXISTS (SELECT 1 FROM messages WHERE session_id = s.id) "
+            "WHERE user_started = 0 AND NOT EXISTS "
+            "(SELECT 1 FROM messages WHERE session_id = s.id) "
             "ORDER BY updated_at ASC, id ASC LIMIT ?",
             (SCAN_WINDOW, batch),
         )
@@ -179,13 +193,14 @@ class SessionRepository:
             for session_id in session_ids:
                 connection.execute("DELETE FROM sessions WHERE id = ?", (str(session_id),))
 
-    def delete_if_empty(self, session_id: SessionId) -> bool:
-        """Delete the session if it has no messages; whether it did."""
+    def delete_if_empty(self, session_id: SessionId, *, keep_user_started: bool) -> bool:
+        """Delete the session if it has no messages (and, with `keep_user_started`, was not made
+        by the user's "New session"); whether it did."""
         with self._database.write() as connection:
             deleted = connection.execute(
-                "DELETE FROM sessions WHERE id = ? "
+                "DELETE FROM sessions WHERE id = ? AND (? = 0 OR user_started = 0) "
                 "AND NOT EXISTS (SELECT 1 FROM messages WHERE session_id = ?)",
-                (str(session_id), str(session_id)),
+                (str(session_id), int(keep_user_started), str(session_id)),
             )
             return deleted.rowcount == 1
 

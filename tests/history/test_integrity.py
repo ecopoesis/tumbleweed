@@ -20,11 +20,9 @@ from tests.history.support import (
     insert_session,
     open_store,
     raw,
-    user,
 )
 from tumbleweed.core.ids import MessageId, SessionId
 from tumbleweed.core.types import ByteCount
-from tumbleweed.history import db as database_module
 from tumbleweed.history import files, schema
 from tumbleweed.history.db import (
     BUSY_TIMEOUT,
@@ -194,24 +192,33 @@ class TestPositionsAreUnique:
         assert self.read(repo) == 1
 
 
-@pytest.mark.linux  # `/proc/self/fd/<n>` names a directory we hold open; only Linux has it
-class TestADirectorySwappedUnderSqlitePinned:
-    def test_the_database_goes_where_we_hold_the_directory_not_where_the_path_now_leads(
+class TestADirectorySwappedInsideTheOpen:
+    def test_a_swap_between_resolving_the_path_and_opening_it_is_refused(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        shell, evil = swap_setup(tmp_path, monkeypatch)
+        """The probe's race, on any platform: the directory is swapped for a symlink to the
+        attacker's right before SQLite is asked to open the path (a `/proc/self/fd/<n>` path
+        would be resolved to this same plain path first, so it is not used)."""
+        shell = history_directory(tmp_path)
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        real_connect = sqlite3.connect
 
-        store = HistoryStore.open(shell)
-        store.begin(limit=10)
-        store.append(user("my private chat"))
-        store.close()
+        def swapping(path: str, *, timeout: float, autocommit: bool) -> sqlite3.Connection:
+            shell.rename(shell.parent / "shell.moved")
+            shell.symlink_to(evil)
+            return real_connect(path, timeout=timeout, autocommit=autocommit)
 
-        assert list(evil.iterdir()) == []
-        moved = shell.parent / "shell.moved"
-        with closing(sqlite3.connect(moved / DATABASE_NAME)) as connection:
-            assert connection.execute("SELECT text FROM messages").fetchall() == [
-                ("my private chat",)
-            ]
+        monkeypatch.setattr(sqlite3, "connect", swapping)
+
+        with pytest.raises(HistoryRefusedError, match="replaced"):
+            HistoryStore.open(shell)
+
+        assert not (evil / DATABASE_NAME).exists() or (evil / DATABASE_NAME).stat().st_size == 0
+        assert (
+            not (evil / f"{DATABASE_NAME}-wal").exists()
+            or (evil / f"{DATABASE_NAME}-wal").stat().st_size == 0
+        )  # nothing of ours was written there
 
 
 def swap_setup(
@@ -238,16 +245,11 @@ def swap_setup(
     return shell, evil
 
 
-class TestADirectorySwappedUnderSqlitePortable:
+class TestADirectorySwappedBeforeTheOpen:
     def test_the_redirected_directory_is_refused_before_a_message_is_written(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         shell, evil = swap_setup(tmp_path, monkeypatch)
-        monkeypatch.setattr(
-            database_module,
-            "sqlite_path",
-            lambda fd, directory: (str(directory / DATABASE_NAME), False),
-        )
 
         with pytest.raises(HistoryRefusedError, match="replaced"):
             HistoryStore.open(shell)
@@ -263,11 +265,6 @@ class TestADirectorySwappedUnderSqlitePortable:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         shell, _ = swap_setup(tmp_path, monkeypatch, hard_link=True)
-        monkeypatch.setattr(
-            database_module,
-            "sqlite_path",
-            lambda fd, directory: (str(directory / DATABASE_NAME), False),
-        )
 
         with pytest.raises(HistoryRefusedError, match="replaced"):
             HistoryStore.open(shell)
@@ -413,7 +410,7 @@ class TestMigrationsWhileAnotherShellMigrates:
 
         assert injected == [True]
         with raw(directory) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+            assert connection.execute("PRAGMA user_version").fetchone() == (MIGRATIONS[-1].version,)
 
     def test_a_refusal_is_believed_only_if_it_holds_under_the_write_lock(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -434,7 +431,7 @@ class TestMigrationsWhileAnotherShellMigrates:
         monkeypatch.setattr(schema, "_refuse_foreign", refuse_once)
         connection = sqlite3.connect(directory / DATABASE_NAME, autocommit=True)
         try:
-            assert schema.verify(connection) == 1
+            assert schema.verify(connection) == MIGRATIONS[-1].version
         finally:
             connection.close()
 
@@ -456,7 +453,7 @@ class TestMigrationsWhileAnotherShellMigrates:
         assert 0.3 < time.monotonic() - started < BUSY_TIMEOUT.total_seconds()
         holder.close()
         with raw(directory) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+            assert connection.execute("PRAGMA user_version").fetchone() == (MIGRATIONS[-1].version,)
 
     def test_a_write_lock_held_too_long_is_a_busy_error_never_a_half_made_schema(
         self, tmp_path: Path
