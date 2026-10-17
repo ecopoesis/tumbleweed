@@ -607,7 +607,9 @@ rule in `tests/ui/runtime/`, so that a spec means the same everywhere:
   it is **stale**, and so is every computed entry that reads a stale one, until a recomputation
   applies. The renderer shows "Out of date" in place of a stale value, never the old value as if it
   were current. Whenever a write makes the text of the state smaller, the stale entries are
-  evaluated again (and once more if that freed more room), so they catch up when room appears.
+  evaluated again, and again (up to twice more) while a pass frees more room, since an entry that
+  comes earlier in the order may fit only after a later one has shrunk. They catch up when room
+  appears.
 - Computed entries are evaluated in `computed_order()` and re-evaluated, in that order,
   whenever an entry they read changes. A `set` handler's assignments are applied together, so the
   computed entries are re-evaluated once, after all of them.
@@ -652,14 +654,18 @@ is read-only unless `editable`. All text a component shows is plain text.
 **Text on the screen is bounded (I9).** A renderer lays text out on the thread that also serves the
 trusted chrome, and laying out text takes time that grows faster than its length, so what is shown is
 bounded, though the state holds the whole value. The reference renderer shows at most 8,192
-characters of one `label`, `heading` or bound text, followed by ` (cut)`, and at most sixty-four thousand characters
-in all (text blocks, button and check box labels and the options of a `dropdown`) in a tool: a text
-that does not fit is replaced by a line saying so, an option that does not fit is left out of its
-list (which ends in a line saying that more are not shown), and a text shown is laid out at most once
-per frame, the latest value only. A `dropdown` is a list in place, never a popup. An `entry` bound to a
-`string` that is longer than 65,534 bytes (what GTK's entry can hold) shows the start of it, read-only
-and with a warning icon: the state still holds it all, and an edit would otherwise write the cut text
-over it.
+characters of one `label`, `heading`, bound text or `entry`, followed by ` (cut)` for the labels,
+and at most <!-- limit: MAX_STRING_LENGTH -->65,536<!-- /limit --> characters in all in a tool
+(`tumbleweed.ui.gtk.budget.MAX_SHOWN_PER_TOOL`, a renderer constant that happens to equal that
+limit, not a spec limit): text blocks, button and check box labels, entry texts and placeholders, and
+the options of a `dropdown` all count. A text that does not fit is replaced by a line saying so
+(and shown when room appears, which is when another text shrinks), an option that does not fit is
+left out of its list (which ends in a line saying that more are not shown, and gets them when room
+appears), and a text shown is laid out at most once per frame, the latest value only. A `dropdown`
+is a list in place, never a popup. An `entry` shows a text of up to 8,192 characters whole and
+editable; a longer text, or one the budget has no room for, is shown cut (or as a line saying so),
+read-only and with a warning icon: the state still holds it all, and an edit would otherwise write
+the cut text over it.
 
 What a widget shows or edits is an entry named by `bind`. The entry's declaration supplies range,
 options and limits, so they are written once. Which kinds of entry a component accepts:
@@ -692,6 +698,14 @@ so the step of its entry is not checked for it. A `float` entry without a `step`
 to the renderer, which uses a power of ten about a hundredth of the range, so a `slider` or `spin` bound to a float entry
 without a `step` needs a range at least as wide as the smallest normal float (a narrower one leaves no step
 that is not subnormal, and is refused).
+A `spin` also needs a step above 1e-10, declared or chosen: GTK ignores a change of that size or
+less, so a smaller step could never be taken with its arrows (a `slider` has no such limit). What a
+user types into a `spin` is taken only if it is a finite number inside the range (a whole number
+for an `int`); anything else (`abc`, `1,5`, `0x10`, `inf`, an empty field, a number outside the
+range) is dropped and the text of the value it holds comes back, and neither the state nor a handler
+is touched. A value stepped with the arrows or the keyboard is rounded to the decimals of the step
+and of the value it was stepped from, so that 50.0 in steps of 0.01 reads 50.09, not
+50.08999999999998; a typed or patched value with more digits is kept as it is, and shown whole.
 
 A component's events name a handler, or none:
 

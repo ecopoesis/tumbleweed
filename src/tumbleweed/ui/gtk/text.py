@@ -31,13 +31,20 @@ def line_label(
 ) -> Gtk.Label:
     """A wrapping label for a short line (a button, a check box, an option): plain, bounded.
 
-    With a `budget`, a line that does not fit in what the tool may show is shown as `NOT_SHOWN`.
+    With a `budget`, a line that does not fit in what the tool may show is shown as `NOT_SHOWN`,
+    until room appears.
     """
     label = plain_label("", wrap=True, css_classes=css_classes)
-    if budget is not None and not budget.fits(label, text):
-        text = NOT_SHOWN
-    label.set_text(display_text(text))
+    _show_line(label, text, budget)
     return label
+
+
+def _show_line(label: Gtk.Label, text: str, budget: TextBudget | None) -> None:
+    shown = text
+    if budget is not None and not budget.fits(label, text):
+        budget.wait_for_room(label, lambda: _show_line(label, text, budget))
+        shown = NOT_SHOWN
+    label.set_text(display_text(shown))
 
 
 @lru_cache(maxsize=16)
@@ -81,6 +88,13 @@ class TextBlock(Gtk.Box):
         """Whether `set_text` has been called."""
         return self._text is not None
 
+    def refresh(self) -> None:
+        """Show the text again, as far as the budget allows now."""
+        if self._text is not None:
+            text, stale = self._text, self._stale
+            self._text = None
+            self.set_text(text, stale=stale)
+
     def set_text(self, text: str, *, stale: bool = False) -> None:
         """Show `text` (at most `MAX_SHOWN_PER_TEXT` characters of it, and as far as the tool's
         budget allows), or, if `stale`, a mark that it is out of date instead of the old text."""
@@ -90,8 +104,12 @@ class TextBlock(Gtk.Box):
         shown = STALE_TEXT if stale else text[:MAX_SHOWN_PER_TEXT]
         if not stale and len(text) > MAX_SHOWN_PER_TEXT:
             shown += CUT_MARK
-        if self._budget is not None and not self._budget.fits(self, shown):
-            shown = NOT_SHOWN
+        if self._budget is not None:
+            if self._budget.fits(self, shown):
+                self._budget.stop_waiting(self)
+            else:
+                shown = NOT_SHOWN
+                self._budget.wait_for_room(self, self.refresh)
         chunks = chunks_of(shown)
         while len(self._labels) > len(chunks):
             self.remove(self._labels.pop())

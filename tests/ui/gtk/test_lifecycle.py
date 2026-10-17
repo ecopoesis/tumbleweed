@@ -78,3 +78,19 @@ def test_a_closed_tool_has_no_bindings_handlers_or_pending_work() -> None:
 
     assert tool.runtime.store.value("tip_percent") == 18  # type: ignore[arg-type]  # a key's text
     assert tool.widget_at("root") is None  # the widget map is dropped
+
+
+def test_closing_a_tool_stops_listening_to_the_store_and_does_so_once() -> None:
+    from tumbleweed.ui.gtk import RenderedTool
+
+    tool = RenderedTool(golden_spec("tip_calculator"))
+    other = tool.runtime.store.subscribe(lambda change: None)  # someone else's listener
+    assert tool.runtime.store.listener_count == 2
+
+    tool.close()
+    assert tool.runtime.store.listener_count == 1  # only the other one is left
+    tool.close()  # closing again takes nothing more away
+    assert tool.runtime.store.listener_count == 1
+
+    other()
+    assert tool.runtime.store.listener_count == 0

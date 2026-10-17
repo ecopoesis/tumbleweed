@@ -625,8 +625,8 @@ class TestWidgetRanges:
 
         assert mentions(refused(build(template, [entry])), "or a range at least as wide")
 
-    @pytest.mark.parametrize("component", STEPPED)
-    def test_the_narrowest_float_range_that_needs_no_step_is_accepted(self, component: str) -> None:
+    def test_the_narrowest_float_range_that_needs_no_step_is_accepted(self) -> None:
+        component = "slider"  # (a spin button needs a step above GTK's epsilon: see below)
         import sys
 
         template = BOUND[component][0]
@@ -654,7 +654,7 @@ class TestWidgetRanges:
     @pytest.mark.parametrize("component", STEPPED)
     @pytest.mark.parametrize(
         ("maximum", "step"),
-        [(1_000_000, 0.01), (1000, 1e-9), (1, 1e-300), (MAX_SAFE_INT // 2, 1e-12)],
+        [(1_000_000, 0.01), (1000, 1e-9), (1, 2e-10), (MAX_SAFE_INT // 2, 1e-9)],
     )
     def test_how_many_positions_the_step_makes_is_not_checked(
         self, component: str, maximum: float, step: float
@@ -685,7 +685,33 @@ class TestWidgetRanges:
             "needs both a minimum and a maximum",
         )
 
-    @pytest.mark.parametrize("component", NUMBER_BINDERS)
+    @pytest.mark.parametrize("step", [1e-300, 1e-12, 1e-10, 5e-11])
+    def test_a_slider_may_take_a_step_a_spin_button_could_not(self, step: float) -> None:
+        accepted(
+            build(BOUND["slider"][0], [number_entry("float", minimum=0, maximum=1, step=step)])
+        )
+
+    @pytest.mark.parametrize("step", [1e-300, 1e-12, 1e-10, 5e-11])
+    def test_a_spin_button_needs_a_step_above_gtks_epsilon(self, step: float) -> None:
+        # GTK ignores a change of 1e-10 or less, so such a step could never be taken.
+        entry = number_entry("float", minimum=0, maximum=1, step=step)
+
+        assert mentions(refused(build(BOUND["spin"][0], [entry])), "needs a step above 1e-10")
+
+    def test_a_spin_button_with_no_step_needs_a_range_that_makes_a_step_above_it(self) -> None:
+        # The renderer picks a power of ten about a hundredth of the range: 1e-9 for 1e-7 wide.
+        template = BOUND["spin"][0]
+
+        accepted(build(template, [number_entry("float", minimum=0, maximum=1e-7)]))
+        assert mentions(
+            refused(build(template, [number_entry("float", minimum=0, maximum=1e-8)])),
+            "needs a step above 1e-10",
+        )
+
+    def test_an_int_spin_button_is_not_affected(self) -> None:
+        accepted(build(BOUND["spin"][0], [number_entry("int", minimum=0, maximum=1)]))
+
+    @pytest.mark.parametrize("component", ["slider", "progress"])
     def test_the_normal_smallest_step_of_a_tiny_range_is_fine(self, component: str) -> None:
         template = BOUND[component][0]
 

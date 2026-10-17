@@ -145,6 +145,11 @@ class StateStore:
         return self._stale.get(key, False)
 
     @property
+    def listener_count(self) -> int:
+        """How many listeners are subscribed."""
+        return len(self._listeners)
+
+    @property
     def text_bytes(self) -> int:
         """The bytes of text in the whole state, as the budget counts them."""
         return self._total

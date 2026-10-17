@@ -209,6 +209,7 @@ def test_the_cursor_is_kept_in_range_when_the_answer_is_shorter() -> None:
     entry.set_position(5)
 
     tool.runtime.patch_state({"s": "ab"})
+    tool.flush()
 
     assert entry.get_text() == "ab"
     assert entry.get_position() <= 2
@@ -250,7 +251,7 @@ def test_selecting_what_is_not_an_option_changes_nothing() -> None:
     assert chosen == []
 
 
-def test_a_text_too_long_for_gtks_entry_has_a_warning_icon_while_it_is_cut() -> None:
+def test_a_text_over_the_cap_has_a_warning_icon_while_it_is_cut() -> None:
     from tumbleweed.shell._gi import Gtk
     from tumbleweed.ui.gtk import RenderedTool
 
@@ -262,8 +263,10 @@ def test_a_text_too_long_for_gtks_entry_has_a_warning_icon_while_it_is_cut() -> 
     assert entry.get_icon_name(position) is None
 
     tool.runtime.patch_state({"s": "€" * 40000})
+    tool.flush()
     assert entry.get_icon_name(position) == "dialog-warning-symbolic"
     assert entry.get_icon_activatable(position) is False
 
     tool.runtime.patch_state({"s": "ok"})
+    tool.flush()
     assert entry.get_icon_name(position) is None

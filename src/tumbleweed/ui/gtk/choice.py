@@ -40,32 +40,49 @@ class ChoiceList(Gtk.ScrolledWindow):
         self.add_css_class("frame")
         self._on_choose = on_choose
         self._current: int | None = None  # the row last chosen, which stays chosen
+        self._all = tuple(options)
+        self._budget = budget
+        self._wanted: str | None = None  # what the entry holds, shown or not (yet)
         # BROWSE: a row, once selected, cannot be deselected (Ctrl+click and Ctrl+Space would
         # leave the list showing nothing while the entry still holds an option).
         self._list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.BROWSE)
         self.rows: list[Gtk.ListBoxRow] = []
-        built: list[str] = []
-        for option in options:
-            row = Gtk.ListBoxRow()
-            if budget is not None and not budget.fits(row, option):
-                break  # the rest would not be shown: a mark says so below
-            row.set_child(line_label(option))
-            self._list.append(row)
-            self.rows.append(row)
-            built.append(option)
-        if len(built) < len(options):
-            more = Gtk.ListBoxRow(selectable=False, activatable=False)
-            more.set_child(line_label(MORE_OPTIONS))
-            self._list.append(more)
-        self.options = tuple(built)
+        self.options: tuple[str, ...] = ()
+        self._more: Gtk.ListBoxRow | None = None
         self._handler = self._list.connect("row-selected", self._on_row_selected)
         self.set_child(self._list)
+        self._grow()
+
+    def _grow(self) -> None:
+        """Build the rows that fit in the tool's budget; the rest wait for room."""
+        for option in self._all[len(self.options) :]:
+            row = Gtk.ListBoxRow()
+            if self._budget is not None and not self._budget.fits(row, option):
+                break  # the rest would not be shown: a mark says so, and they are retried
+            row.set_child(line_label(option))
+            self._list.insert(row, len(self.rows))
+            self.rows.append(row)
+            self.options = (*self.options, option)
+        if len(self.options) < len(self._all):
+            if self._more is None:
+                self._more = Gtk.ListBoxRow(selectable=False, activatable=False)
+                self._more.set_child(line_label(MORE_OPTIONS))
+                self._list.append(self._more)
+            if self._budget is not None:
+                self._budget.wait_for_room(self, self._grow)
+        elif self._more is not None:
+            self._list.remove(self._more)
+            self._more = None
+        if self._wanted is not None:
+            self.select(self._wanted)
 
     def release(self) -> None:
         """Let go of the signal handler, which refers back to this widget, and of the callback."""
         if self._handler:
             self._list.disconnect(self._handler)
             self._handler = 0
+        if self._budget is not None:
+            self._budget.stop_waiting(self)
         self._on_choose = _ignore
 
     @property
@@ -77,8 +94,9 @@ class ChoiceList(Gtk.ScrolledWindow):
         return self.options[row.get_index()]
 
     def select(self, option: str) -> None:
-        """Select the row of `option` (nothing happens for a text that is not an option, or an
-        option that was not shown)."""
+        """Select the row of `option` (nothing happens for a text that is not an option; an
+        option that is not shown yet is selected when it is)."""
+        self._wanted = option
         if option in self.options and option != self.selected:
             self._list.select_row(self.rows[self.options.index(option)])
 

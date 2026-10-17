@@ -17,13 +17,15 @@ The image, table, text view, tabs and expander components are S11's: until then 
 placeholder saying so.
 """
 
+from collections.abc import Callable
 from typing import Literal, assert_never
 
 from tumbleweed.shell._gi import Gtk
 from tumbleweed.shell.viewmodel.display import display_text
+from tumbleweed.ui.gtk.budget import MAX_SHOWN_PER_TEXT, NOT_SHOWN
 from tumbleweed.ui.gtk.choice import ChoiceList
 from tumbleweed.ui.gtk.context import BuildContext
-from tumbleweed.ui.gtk.guard import harden_text
+from tumbleweed.ui.gtk.guard import harden_text, quiet_spin_input_marshalling
 from tumbleweed.ui.gtk.text import TextBlock, line_label, placeholder
 from tumbleweed.ui.runtime import NumericRange, UiEvent, bind_of
 from tumbleweed.ui.runtime.values import number_of
@@ -59,9 +61,6 @@ from tumbleweed.ui.spec.state import (
     StringState,
 )
 
-# GTK's entry buffer holds at most this many bytes of UTF-8 (G_MAXUINT16 less a terminator): a
-# `string` entry that is longer cannot be edited in one, and is shown cut and read-only instead.
-ENTRY_CAPACITY_BYTES = 65_534
 WARNING_CLASS = "warning"
 WARNING_ICON = "dialog-warning-symbolic"
 
@@ -189,35 +188,63 @@ def _entry(component: Entry, ctx: BuildContext) -> Gtk.Widget:
     key, decl = _bound(component, ctx, StringState)
     entry = Gtk.Entry()
     entry.set_hexpand(True)
-    entry.set_max_length(min(decl.max_length, 65_535))
-    entry.set_placeholder_text(display_text(component.placeholder) or None)
+    # An entry shows (and so lets the user edit) at most what a label may show: typing past it
+    # would make the text a layout has to shape unbounded, as the labels' is not.
+    entry.set_max_length(min(decl.max_length, MAX_SHOWN_PER_TEXT))
+    placeholder = component.placeholder
+    if placeholder and ctx.budget.fits((entry, "placeholder"), placeholder):
+        entry.set_placeholder_text(display_text(placeholder))  # (a placeholder is laid out too)
     ctx.on_close(harden_text(entry))
     change = _event(component.on_change, component.kind, "change", key)
     activate = _event(component.on_activate, component.kind, "activate", key)
+    editing = False  # inside this entry's own `changed`: it shows what the user typed already
+    first = True
 
     def show(value: StateValue) -> None:
         text = _text_value(value)
-        fits = len(text) * 4 <= ENTRY_CAPACITY_BYTES or len(text.encode()) <= ENTRY_CAPACITY_BYTES
-        entry.set_editable(fits)
-        # A text GTK cannot hold is shown cut, read-only, and with a warning icon and style.
+        # Editable only while the whole text is shown: it is cut at the per-text cap and refused
+        # (with a mark) when the tool's budget of text on the screen is spent, and then an edit
+        # would write the cut text over the state's value. The state keeps all of it.
+        shown = text[:MAX_SHOWN_PER_TEXT]
+        whole = len(text) <= MAX_SHOWN_PER_TEXT
+        if ctx.budget.fits(entry, shown):
+            ctx.budget.stop_waiting(entry)
+        else:
+            shown, whole = NOT_SHOWN, False
+            ctx.budget.wait_for_room(entry, lambda: show(ctx.runtime.store.value(key)))
+        entry.set_editable(whole)
         entry.set_icon_from_icon_name(
-            Gtk.EntryIconPosition.SECONDARY, None if fits else WARNING_ICON
+            Gtk.EntryIconPosition.SECONDARY, None if whole else WARNING_ICON
         )
         entry.set_icon_activatable(Gtk.EntryIconPosition.SECONDARY, False)
-        if fits:
+        if whole:
             entry.remove_css_class(WARNING_CLASS)
         else:
             entry.add_css_class(WARNING_CLASS)
-        if entry.get_text() != text:
+        if entry.get_text() != shown:
             position = entry.get_position()
-            entry.set_text(text)  # which puts the cursor at the start
+            entry.set_text(shown)  # which puts the cursor at the start
             entry.set_position(min(position, len(entry.get_text())))
 
     def update(value: StateValue, stale: bool) -> None:
-        show(value)
+        nonlocal first
+        if editing or first:
+            first = False
+            show(value)  # the first time, and what the user is typing: at once
+        else:
+            # Anything else waits for the next idle turn, with the latest value only: a text
+            # that costs a layout to show is not laid out again for every change of a slider.
+            ctx.defer(entry, lambda: show(ctx.runtime.store.value(key)))
 
     def on_changed(_entry: object) -> None:
-        ctx.user_input(key, entry.get_text(), change)
+        nonlocal editing
+        if ctx.updating:
+            return
+        editing = True
+        try:
+            ctx.user_input(key, entry.get_text(), change)
+        finally:
+            editing = False
 
     ctx.connect(entry, "changed", on_changed)
     if activate is not None:
@@ -261,6 +288,35 @@ def _check(component: Check, ctx: BuildContext) -> Gtk.Widget:
     return check
 
 
+def _number_changed(
+    adjustment: Gtk.Adjustment,
+    numeric: NumericRange,
+    ctx: BuildContext,
+    key: StateKey,
+    change: UiEvent | None,
+) -> Callable[[object], None]:
+    """The `value-changed` handler of a slider or spin button.
+
+    Stepping adds the step to the value again and again, and floating point leaves noise (50.0 in
+    steps of 0.01 gives 50.08999999999998): the value is snapped to the decimals of the step and of
+    what the entry held, in the widget and in the state. A value with more digits than that (typed,
+    patched, a default) is not touched.
+    """
+
+    def on_changed(_widget: object) -> None:
+        if ctx.updating:
+            return
+        value = adjustment.get_value()
+        held = number_of(ctx.runtime.store.value(key))
+        snapped = numeric.snap(value, 0.0 if held is None else held)
+        if snapped != value:
+            with ctx.programmatic():
+                adjustment.set_value(snapped)
+        ctx.user_input(key, numeric.to_state(snapped), change)
+
+    return on_changed
+
+
 def _slider(component: Slider, ctx: BuildContext) -> Gtk.Widget:
     key, numeric, adjustment = _numeric(component, ctx)
     scale = Gtk.Scale.new(Gtk.Orientation.HORIZONTAL, adjustment)
@@ -272,14 +328,10 @@ def _slider(component: Slider, ctx: BuildContext) -> Gtk.Widget:
 
     def update(value: StateValue, stale: bool) -> None:
         number = number_of(value)
-        if number is not None and scale.get_value() != float(number):
-            scale.set_value(float(number))
+        if number is not None and adjustment.get_value() != float(number):
+            adjustment.set_value(float(number))
 
-    ctx.connect(
-        scale,
-        "value-changed",
-        lambda _scale: ctx.user_input(key, numeric.to_state(scale.get_value()), change),
-    )
+    ctx.connect(scale, "value-changed", _number_changed(adjustment, numeric, ctx, key, change))
     ctx.bind(key, scale, update)
     return scale
 
@@ -289,8 +341,9 @@ def _spin(component: Spin, ctx: BuildContext) -> Gtk.Widget:
     spin = Gtk.SpinButton.new(adjustment, 1.0, numeric.digits)  # climb rate: GTK's usual
     # Not numeric-only: GTK then refuses to take the text of a value with more decimals than
     # `digits`, or with an exponent (1e-300), which is how a float is shown whole. What is typed
-    # is checked when the field is left: text that is no number leaves the value as it was.
+    # is checked by `on_input` instead.
     spin.set_numeric(False)
+    quiet_spin_input_marshalling()
     ctx.on_close(harden_text(spin))
     change = _event(component.on_change, component.kind, "change", key)
 
@@ -306,6 +359,20 @@ def _spin(component: Spin, ctx: BuildContext) -> Gtk.Widget:
         show_whole()
         return True
 
+    def on_input(_spin: object, _new_value: object) -> int:
+        # What the user typed, when they leave the field or press Enter. Strictly a number, finite,
+        # within the range (a whole number for an int): a valid one is put into the adjustment
+        # here (GTK itself ignores a change of 1e-10 or less, which is how a tiny value would be
+        # lost); anything else is dropped. Either way the text is then rewritten from the
+        # adjustment, so that GTK's own parse, which follows, reads the value the widget holds
+        # and sees no change. (Returning GTK's input error instead makes GTK read a value that was
+        # never set, and write 0.)
+        parsed = numeric.parse(spin.get_text())
+        if parsed is not None:
+            adjustment.set_value(float(parsed))
+        show_whole()
+        return 0  # not handled: the default parse comes next
+
     def update(value: StateValue, stale: bool) -> None:
         number = number_of(value)
         # Through the adjustment: the spin button's own `set_value` ignores a change under 1e-10.
@@ -313,12 +380,10 @@ def _spin(component: Spin, ctx: BuildContext) -> Gtk.Widget:
             adjustment.set_value(float(number))
 
     ctx.connect(spin, "output", output)
-    ctx.connect(
-        spin,
-        "value-changed",
-        lambda _spin: ctx.user_input(key, numeric.to_state(spin.get_value()), change),
-    )
+    ctx.connect(spin, "input", on_input)
+    ctx.connect(spin, "value-changed", _number_changed(adjustment, numeric, ctx, key, change))
     ctx.bind(key, spin, update)
+    show_whole()  # the first text, whatever GTK would have written (a default off the grid)
     return spin
 
 

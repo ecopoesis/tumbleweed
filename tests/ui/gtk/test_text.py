@@ -208,43 +208,62 @@ class TestLongText:
 
 
 class TestEntries:
-    def test_a_value_the_entry_buffer_cannot_hold_is_shown_cut_and_read_only(self) -> None:
+    def test_a_value_over_the_cap_is_shown_cut_and_read_only_with_a_warning(self) -> None:
         from tumbleweed.shell._gi import Gtk
         from tumbleweed.ui.gtk import RenderedTool
+        from tumbleweed.ui.gtk.budget import MAX_SHOWN_PER_TEXT
 
         state: list[Json] = [text("s", "short", max_length=65536)]
         tool = RenderedTool(spec_of({"kind": "entry", "bind": "s"}, state))
         (entry,) = of_type(tool, Gtk.Entry)
         assert entry.get_editable() is True
 
-        tool.runtime.patch_state({"s": "€" * 40000})  # 120,000 bytes: more than GTK holds
+        tool.runtime.patch_state({"s": "\u20ac" * 40000})
+        tool.flush()
 
         assert entry.get_editable() is False  # editing would write the cut text over the value
         assert "warning" in entry.get_css_classes()
-        assert len(entry.get_text()) < 40000
-        assert tool.runtime.store.value(key("s")) == "€" * 40000  # the state keeps it all
+        assert len(entry.get_text()) == MAX_SHOWN_PER_TEXT
+        assert tool.runtime.store.value(key("s")) == "\u20ac" * 40000  # the state keeps it all
 
         tool.runtime.patch_state({"s": "back"})
+        tool.flush()
 
         assert entry.get_editable() is True
         assert "warning" not in entry.get_css_classes()
         assert entry.get_text() == "back"
 
-    def test_a_value_that_fits_is_shown_whole_and_edits_write_back(self) -> None:
+    def test_a_value_at_the_cap_is_shown_whole_and_edits_write_back(self) -> None:
         from tumbleweed.shell._gi import Gtk
         from tumbleweed.ui.gtk import RenderedTool
+        from tumbleweed.ui.gtk.budget import MAX_SHOWN_PER_TEXT
 
         state: list[Json] = [text("s", "", max_length=65536)]
         tool = RenderedTool(spec_of({"kind": "entry", "bind": "s"}, state))
         (entry,) = of_type(tool, Gtk.Entry)
-        value = "x" * 65534
+        value = "x" * MAX_SHOWN_PER_TEXT
 
         tool.runtime.patch_state({"s": value})
+        tool.flush()
 
         assert entry.get_text() == value
         assert entry.get_editable() is True
         entry.set_text("edited")
         assert tool.runtime.store.value(key("s")) == "edited"
+
+    def test_the_user_cannot_type_past_the_cap(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk import RenderedTool
+        from tumbleweed.ui.gtk.budget import MAX_SHOWN_PER_TEXT
+
+        state: list[Json] = [text("s", "", max_length=65536)]
+        tool = RenderedTool(spec_of({"kind": "entry", "bind": "s"}, state))
+        (entry,) = of_type(tool, Gtk.Entry)
+
+        entry.set_text("y" * (MAX_SHOWN_PER_TEXT + 100))
+
+        assert len(entry.get_text()) == MAX_SHOWN_PER_TEXT
+        assert len(str(tool.runtime.store.value(key("s")))) == MAX_SHOWN_PER_TEXT
 
     def test_the_entry_cannot_take_more_characters_than_the_entry_allows(self) -> None:
         from tumbleweed.shell._gi import Gtk
@@ -279,13 +298,15 @@ class TestEntries:
         measure = (Gtk.Orientation.HORIZONTAL, -1)
         empty = tool.widget.measure(*measure)[:2]
 
-        tool.runtime.patch_state({"s": "W" * 65534})
+        tool.runtime.patch_state({"s": "W" * 8192})
+        tool.flush()
         long_value = tool.widget.measure(*measure)[:2]
         tool.runtime.patch_state({"s": "\u1100\u1161\u11a8" * 20000})
+        tool.flush()
         cluster = tool.widget.measure(*measure)[:2]
 
         assert long_value == empty
-        # a text GTK cannot hold gets a warning icon (22 px) and nothing else
+        # a text over the cap gets a warning icon (22 px) and nothing else
         assert cluster[1] - empty[1] <= 30
 
 

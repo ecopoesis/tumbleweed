@@ -69,8 +69,9 @@ class BuildContext:
         self._programmatic = 0
         self.budget = TextBudget()
         self._on_close: list[Callable[[], None]] = []
-        self._pending_text: dict[TextBlock, tuple[str, bool]] = {}
+        self._pending: dict[object, Callable[[], None]] = {}
         self._idle = 0
+        self.budget.on_room = self._schedule
         self.closed = False
 
     # --- lifetime ------------------------------------------------------------------------
@@ -101,13 +102,14 @@ class BuildContext:
         self._on_close.clear()
         self._bindings.clear()
         self._by_key.clear()
-        self._pending_text.clear()
+        self._pending.clear()
+        self.budget.on_room = None
         if self._idle:
             GLib.source_remove(self._idle)
             self._idle = 0
         self.budget.clear()
 
-    # --- text shown ----------------------------------------------------------------------
+    # --- work for the next idle turn -----------------------------------------------------
 
     def show_text(self, block: TextBlock, text: str, *, stale: bool) -> None:
         """Show `text` in `block`: at once the first time, and after that on the next idle turn,
@@ -116,24 +118,33 @@ class BuildContext:
         if not block.has_text:
             block.set_text(text, stale=stale)
             return
-        self._pending_text[block] = (text, stale)
-        if not self._idle:
-            self._idle = GLib.idle_add(self._apply_text)
+        self.defer(block, lambda: block.set_text(text, stale=stale))
+
+    def defer(self, owner: object, work: Callable[[], None]) -> None:
+        """Run `work` on the next idle turn, replacing what `owner` had waiting."""
+        self._pending[owner] = work
+        self._schedule()
+
+    def _schedule(self) -> None:
+        if not self._idle and not self.closed:
+            self._idle = GLib.idle_add(self._run_idle)
 
     def flush(self) -> None:
-        """Show the texts that are waiting for an idle turn now."""
+        """Do the work that is waiting for an idle turn now."""
         if self._idle:
             GLib.source_remove(self._idle)
-        self._apply_text()
+        self._run_idle()
 
-    def _apply_text(self) -> bool:
+    def _run_idle(self) -> bool:
         self._idle = 0
-        pending, self._pending_text = self._pending_text, {}
-        for block, (text, stale) in pending.items():
-            try:
-                block.set_text(text, stale=stale)
-            except Exception:
-                logger.exception("a text could not be shown")
+        pending, self._pending = self._pending, {}
+        with self.programmatic():  # none of it is the user's doing
+            for work in pending.values():
+                try:
+                    work()
+                except Exception:
+                    logger.exception("deferred work failed")
+            self.budget.retry_waiting()  # owners refused for lack of room, now that texts changed
         return GLib.SOURCE_REMOVE
 
     @property

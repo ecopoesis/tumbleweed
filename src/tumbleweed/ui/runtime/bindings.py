@@ -8,6 +8,7 @@ be used raises `ValueError` here, for the renderer to turn into a placeholder.
 """
 
 import math
+import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from typing import Final, final
 
 from tumbleweed.ui.runtime.errors import UnresolvedBindingError
 from tumbleweed.ui.runtime.values import round_half_away
+from tumbleweed.ui.spec import default_float_step
 from tumbleweed.ui.spec.components import (
     Check,
     Component,
@@ -35,6 +37,9 @@ from tumbleweed.ui.spec.names import StateKey
 from tumbleweed.ui.spec.state import FloatState, IntState, StateDecl
 
 MAX_DIGITS: Final = 10  # decimals a number widget shows
+_MAX_GRID: Final = 15  # decimals a double keeps: snapping to more would snap to nothing
+_NOISE: Final = 1e-9  # how near, relatively, a value must be to its rounded form to be snapped
+_NUMBER: Final = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
 
 
 @final
@@ -71,9 +76,14 @@ def bind_of(component: Component, decls: Mapping[StateKey, StateDecl]) -> Bindin
     return Binding(key=key, decl=decl, two_way=two_way)
 
 
+def _decimals(number: float) -> int:
+    """The decimals the shortest text of `number` has (uncapped)."""
+    exponent = Decimal(repr(number)).normalize().as_tuple().exponent
+    return 0 if not isinstance(exponent, int) else max(0, -exponent)
+
+
 def _decimals_of(step: float) -> int:
-    exponent = Decimal(repr(step)).normalize().as_tuple().exponent
-    return 0 if not isinstance(exponent, int) else min(MAX_DIGITS, max(0, -exponent))
+    return min(MAX_DIGITS, _decimals(step))
 
 
 @final
@@ -96,10 +106,11 @@ class NumericRange:
     def of(cls, decl: StateDecl, *, stepped: bool = True) -> "NumericRange":
         """The range of `decl`; `ValueError` if it has no usable one.
 
-        A validated spec has one, with a single exception: a `float` entry with no `step` whose
-        range is narrower than the smallest normal float (5e-324 wide, say) leaves a slider or spin
-        button no step that is not subnormal, whose arithmetic underflows. `stepped=False` is for a
-        progress bar, which has no step and so needs none.
+        A validated spec always has one: `ui.spec` refuses a range the widget cannot work with
+        (no bounds, an empty or too wide range, a subnormal step, a float range narrower than the
+        smallest normal float with no step). The errors here are a backstop that the renderer turns
+        into a placeholder, not a case a spec can reach. `stepped=False` is for a progress bar,
+        which has no step and so needs none.
         """
         if not isinstance(decl, IntState | FloatState):
             raise ValueError("only an int or float entry has a numeric range")
@@ -112,7 +123,7 @@ class NumericRange:
         integer = isinstance(decl, IntState)
         if not stepped:
             return cls(minimum, maximum, width, width, 0, integer)
-        step = decl.step if decl.step is not None else _default_step(width)
+        step = decl.step if decl.step is not None else default_float_step(width)
         step = float(step)
         if not (math.isfinite(step) and step >= sys.float_info.min):
             raise ValueError("the entry's range leaves no step that is not subnormal")
@@ -126,12 +137,40 @@ class NumericRange:
         position = (value - self.minimum) / self.width
         return 0.0 if math.isnan(position) else min(1.0, max(0.0, position))
 
+    def parse(self, text: str) -> int | float | None:
+        """The number a user typed, or None if it is not one this range can take.
+
+        Strict: an optional sign, digits with an optional fraction and exponent, nothing else (not
+        `1,5`, `0x10`, `inf`, `nan`, `1_0` or `1.2.3`), a finite value inside the range, and for an
+        `int` entry a whole number.
+        """
+        if not _NUMBER.fullmatch(text.strip()):
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        if not math.isfinite(value) or not self.minimum <= value <= self.maximum:
+            return None
+        if self.integer:
+            return int(value) if value == int(value) else None
+        return value
+
+    def snap(self, value: float, held: float | int) -> float:
+        """`value` without the noise of floating-point stepping.
+
+        50.0 stepped by 0.01 nine times is 50.08999999999998, not 50.09. A value that lies within
+        a hair of a number with no more decimals than the step and the value held before it has
+        is that number; anything else (a typed or patched value with more digits) is kept whole.
+        """
+        if self.integer:
+            return value
+        places = min(_MAX_GRID, max(_decimals(self.step), _decimals(float(held))))
+        rounded = round(value, places)
+        if abs(rounded - value) <= _NOISE * max(1.0, abs(value)):
+            return rounded
+        return value
+
     def to_state(self, position: float) -> int | float:
         """The state value for a widget position: rounded half away from zero for an `int`."""
         return round_half_away(position) if self.integer else position
-
-
-def _default_step(width: float) -> float:
-    """A power of ten, a hundredth of the width or so, when a float entry declares no step."""
-    nice = 10.0 ** (math.floor(math.log10(width)) - 2)
-    return nice if sys.float_info.min <= nice <= width else width

@@ -794,3 +794,46 @@ class TestTextAccounting:
         assert store.text_bytes == MAX_STATE_TEXT_BYTES - 2 * 1
         store.write(key("t"), "y" * 32769, origin=USER)  # t fits (to the byte); c would not
         assert store.is_stale(key("c")) is True
+
+
+def chained_store() -> StateStore:
+    """Two computed copies (`c1` of `y`, `c2` of `x`, each twice as long) with `c1` before `c2`
+    in evaluation order, in a state with room for little: 15 strings of 64K four-byte characters."""
+    gclef = "\U0001d11e"
+
+    def doubled(key_: str, source: str) -> Json:
+        return {
+            "kind": "string",
+            "key": key_,
+            "default": "",
+            "max_length": 65536,
+            "computed": {"kind": "concat", "args": [ref(source), ref(source)]},
+        }
+
+    state = [text(f"a{i}", max_length=65536) for i in range(15)]
+    state += [text("x", max_length=65536), text("y", max_length=65536)]
+    state += [doubled("c1", "y"), doubled("c2", "x")]
+    store = StateStore(spec_with(state))
+    for first in range(0, 15, 7):
+        store.patch({f"a{j}": gclef * 65536 for j in range(first, min(first + 7, 15))})
+    return store
+
+
+class TestMoreThanOnePassOfRetrying:
+    def test_an_entry_that_fits_only_once_a_later_one_has_shrunk_is_served_by_the_next_pass(
+        self,
+    ) -> None:
+        gclef = "\U0001d11e"
+        store = chained_store()
+        store.write(key("x"), gclef * 20000, origin=USER)  # x 80K and c2 160K
+        store.write(key("y"), gclef * 2000, origin=USER)  # y 8K: c1 (16K) does not fit
+        assert store.is_stale(key("c1"))
+        assert not store.is_stale(key("c2"))
+
+        # x shrinks: its copy c2 shrinks too, and that frees room for c1, which is earlier in
+        # the order than the write that freed it: it is served by a second pass.
+        store.write(key("x"), gclef * 19750, origin=USER)
+
+        assert store.is_stale(key("c1")) is False
+        assert store.value(key("c1")) == gclef * 4000
+        assert store.is_stale(key("c2")) is False

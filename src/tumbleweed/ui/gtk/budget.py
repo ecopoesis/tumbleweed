@@ -13,6 +13,7 @@ The state still holds the whole value: only what is displayed is bounded. Nothin
 order: the claim is made when a widget is built or its text changes, first come first served.
 """
 
+from collections.abc import Callable
 from typing import Final, final
 
 MAX_SHOWN_PER_TEXT: Final = 8_192
@@ -24,11 +25,19 @@ MORE_OPTIONS: Final = "(more options not shown)"
 
 @final
 class TextBudget:
-    """The characters one tool has put on the screen, by owner."""
+    """The characters one tool has put on the screen, by owner.
+
+    An owner whose claim is refused can ask to be told when room appears (`wait_for_room`): it
+    shows a mark meanwhile, and shows its text once a claim shrinks or an owner lets go. The
+    tool schedules the retry (`on_room`) for its next idle turn, so refused owners are served in
+    the order they were refused.
+    """
 
     def __init__(self) -> None:
         self._claims: dict[object, int] = {}
         self._total = 0
+        self._waiting: dict[object, Callable[[], None]] = {}
+        self.on_room: Callable[[], None] | None = None
 
     @property
     def total(self) -> int:
@@ -37,21 +46,44 @@ class TextBudget:
     def claim(self, owner: object, wanted: int) -> bool:
         """Make `owner`'s claim `wanted` characters (replacing its last): False if it won't fit.
 
-        A claim that does not fit is dropped (the owner shows a mark of a few characters).
+        A claim that does not fit is dropped (the owner shows a mark of a few characters), which
+        gives back what it held.
         """
         old = self._claims.get(owner, 0)
         if self._total - old + wanted > MAX_SHOWN_PER_TOOL:
             self._total -= old
             self._claims[owner] = 0
+            if old:
+                self._room()
             return False
         self._total += wanted - old
         self._claims[owner] = wanted
+        if wanted < old:
+            self._room()
         return True
 
     def fits(self, owner: object, text: str) -> bool:
         """Claim `text` for `owner`, for good (an option, a button label)."""
         return self.claim(owner, len(text))
 
+    def wait_for_room(self, owner: object, retry: Callable[[], None]) -> None:
+        """Call `retry` (once) when room has appeared and `retry_waiting` is run."""
+        self._waiting[owner] = retry
+
+    def stop_waiting(self, owner: object) -> None:
+        self._waiting.pop(owner, None)
+
+    def retry_waiting(self) -> None:
+        """Let the owners that were refused try again, first refused first."""
+        waiting, self._waiting = self._waiting, {}
+        for retry in waiting.values():
+            retry()
+
+    def _room(self) -> None:
+        if self._waiting and self.on_room is not None:
+            self.on_room()
+
     def clear(self) -> None:
         self._claims.clear()
+        self._waiting.clear()
         self._total = 0

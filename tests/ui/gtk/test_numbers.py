@@ -46,6 +46,23 @@ RANGES: dict[str, Json] = {
 }
 
 
+SPIN_REFUSED = {  # a spin button needs a step above GTK's epsilon (1e-10); these are slider-only
+    "float, tiny range and step",
+    "float, smallest step",
+    "float, no step, narrow",
+    "float, narrowest with a default step",
+}
+
+
+def cases(kinds: tuple[str, ...]) -> list[tuple[str, str]]:
+    return [
+        (kind, name)
+        for kind in kinds
+        for name in RANGES
+        if not (kind == "spin" and name in SPIN_REFUSED)
+    ]
+
+
 def widget_spec(kind: str, decl: Json) -> "UiSpec":
     return spec_of({"kind": kind, "bind": "x"}, [decl])
 
@@ -55,8 +72,7 @@ def bounds(decl: Json) -> tuple[float, float]:
 
 
 class TestRendering:
-    @pytest.mark.parametrize("name", list(RANGES))
-    @pytest.mark.parametrize("kind", ["slider", "spin", "progress"])
+    @pytest.mark.parametrize(("kind", "name"), cases(("slider", "spin", "progress")))
     def test_every_widget_is_built_over_every_range_and_shows_the_default(
         self, kind: str, name: str, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -98,8 +114,7 @@ class TestRendering:
 
 
 class TestDrivenToTheEnds:
-    @pytest.mark.parametrize("name", list(RANGES))
-    @pytest.mark.parametrize("kind", ["slider", "spin"])
+    @pytest.mark.parametrize(("kind", "name"), cases(("slider", "spin")))
     def test_the_widget_driven_to_both_ends_writes_values_inside_the_bounds(
         self, kind: str, name: str, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -134,12 +149,13 @@ class TestDrivenToTheEnds:
         from tumbleweed.shell._gi import Gtk
 
         decl = RANGES[name]
+        spins: list[Json] = [] if name in SPIN_REFUSED else [{"kind": "spin", "bind": "x"}]
         spec = spec_of(
             {
                 "kind": "box",
                 "children": [
                     {"kind": "slider", "bind": "x"},
-                    {"kind": "spin", "bind": "x"},
+                    *spins,
                     {"kind": "progress", "bind": "x"},
                 ],
             },

@@ -24,6 +24,7 @@ The problems found are all reported (up to `MAX_REPORTED_PROBLEMS`), one per lin
 the component (`root.children[2] (slider)`), state entry or handler it is about.
 """
 
+import math
 import sys
 from collections.abc import Collection, Iterator, Mapping
 from typing import Annotated, Final, Literal, Self, assert_never, final
@@ -446,7 +447,19 @@ class UiSpec(SpecModel):
             )
 
 
-def _range_problem(decl: IntState | FloatState, *, stepped: bool) -> str | None:
+SPIN_MIN_STEP: Final = 1e-10
+"""GTK's spin button ignores a change of this size or less (its own epsilon), so a smaller step
+could never be taken with its arrows, and a spin button needs a step above it."""
+
+
+def default_float_step(width: float) -> float:
+    """The step the renderer gives a float entry that declares none: a power of ten about a
+    hundredth of the range (or the range itself when that is subnormal or wider than it)."""
+    nice = 10.0 ** (math.floor(math.log10(width)) - 2)
+    return nice if sys.float_info.min <= nice <= width else width
+
+
+def _range_problem(decl: IntState | FloatState, *, stepped: bool, spin: bool = False) -> str | None:
     """Why `decl` cannot be the range of a slider, spin button or progress bar, or None.
 
     These are rules of numeric safety, not of taste. The widget needs both bounds, finite and
@@ -455,7 +468,8 @@ def _range_problem(decl: IntState | FloatState, *, stepped: bool) -> str | None:
     the widget computes overflows or loses its integers. A slider or spin button (`stepped`)
     also needs a `step` that is a normal float (not subnormal, whose arithmetic underflows) and
     no wider than the range, or, with no `step`, a range at least as wide as the smallest normal
-    float (the renderer chooses the step then). How many positions that makes is the author's
+    float (the renderer chooses the step then). A spin button's step, declared or chosen, must also
+    be above `SPIN_MIN_STEP`. How many positions that makes is the author's
     business: a step of 0.01 over a range of a million is a fine slider. A progress bar has no
     step.
     """
@@ -477,6 +491,13 @@ def _range_problem(decl: IntState | FloatState, *, stepped: bool) -> str | None:
             return "needs a step that is not subnormal"
         if decl.step > maximum - minimum:
             return "needs a step no wider than its range"
+    if spin and isinstance(decl, FloatState):
+        step = decl.step if decl.step is not None else default_float_step(maximum - minimum)
+        if step <= SPIN_MIN_STEP:
+            return (
+                f"needs a step above {SPIN_MIN_STEP} for a spin button (GTK ignores smaller "
+                "changes), or a slider"
+            )
     return None
 
 
@@ -490,6 +511,7 @@ def _bind(
     writes: bool = False,
     bounded: bool = False,
     stepped: bool = False,
+    spin: bool = False,
 ) -> None:
     decl = decls.get(key)
     if decl is None:
@@ -503,7 +525,7 @@ def _bind(
     if writes and _computed_expr(decl) is not None:
         problems.add(f"{where}: binds {key} two-way, but it is computed and cannot be written")
     if bounded and isinstance(decl, IntState | FloatState):
-        problem = _range_problem(decl, stepped=stepped)
+        problem = _range_problem(decl, stepped=stepped, spin=spin)
         if problem is not None:
             problems.add(f"{where}: {key} {problem}")
 
@@ -531,6 +553,7 @@ def _check_component(
         writes: bool = False,
         bounded: bool = False,
         stepped: bool = False,
+        spin: bool = False,
     ) -> None:
         _bind(
             where,
@@ -541,6 +564,7 @@ def _check_component(
             writes=writes,
             bounded=bounded,
             stepped=stepped,
+            spin=spin,
         )
 
     def handler(name: HandlerName | None) -> None:
@@ -568,7 +592,15 @@ def _check_component(
             bind(component.bind, "bool", writes=True)
             handler(component.on_change)
         case Slider() | Spin():
-            bind(component.bind, "int", "float", writes=True, bounded=True, stepped=True)
+            bind(
+                component.bind,
+                "int",
+                "float",
+                writes=True,
+                bounded=True,
+                stepped=True,
+                spin=isinstance(component, Spin),
+            )
             handler(component.on_change)
         case Dropdown():
             bind(component.bind, "enum", writes=True)

@@ -20,7 +20,7 @@ Selecting and typing, and copy and paste with the shortcuts, work as before.
 from collections.abc import Callable
 from typing import Protocol
 
-from tumbleweed.shell._gi import Gdk, Gtk
+from tumbleweed.shell._gi import Gdk, GLib, Gtk
 
 
 class _Selectable(Protocol):
@@ -84,3 +84,32 @@ def harden_text(widget: Gtk.Editable) -> Callable[[], None]:
         touch.disconnect(touched)
 
     return disconnect
+
+
+_marshal_handler_installed = False
+
+
+def quiet_spin_input_marshalling() -> None:
+    """Silence the one GLib warning that connecting to a spin button's `input` signal causes.
+
+    PyGObject reads the signal's out parameter (`new_value`, a pointer) as a double, and GLib says
+    so (`g_value_get_double: assertion 'G_VALUE_HOLDS_DOUBLE (value)' failed`) on every emission.
+    Where warnings are errors (the tests) that stops the handler from running at all, and elsewhere
+    it is noise on stderr for every number typed. The handler is for that one message in GLib's
+    GObject domain; every other message goes where it went before. Done once per process.
+    """
+    global _marshal_handler_installed
+    if _marshal_handler_installed:
+        return
+    _marshal_handler_installed = True
+
+    def handler(domain: str | None, level: GLib.LogLevelFlags, message: str, _data: object) -> None:
+        if "g_value_get_double" not in message:
+            GLib.log_default_handler(domain, level, message, None)
+
+    GLib.log_set_handler(
+        "GLib-GObject",
+        GLib.LogLevelFlags.LEVEL_WARNING | GLib.LogLevelFlags.LEVEL_CRITICAL,
+        handler,
+        None,
+    )

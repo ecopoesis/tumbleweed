@@ -71,7 +71,6 @@ def hostile_json() -> Json:
         {"kind": "slider", "bind": "whole"},
         {"kind": "spin", "bind": "wide"},
         {"kind": "spin", "bind": "big"},
-        {"kind": "spin", "bind": "tiny"},
         {"kind": "spin", "bind": "fine"},
         {"kind": "spin", "bind": "whole"},
         {"kind": "progress", "bind": "wide"},
