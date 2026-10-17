@@ -65,6 +65,18 @@ class ShellWindow(Adw.ApplicationWindow):
         root.append(self.status_strip)
         self.set_content(root)
 
+        # Esc stops the reply in flight, wherever the focus is in the window. A shortcut (not a
+        # GAction, which would be exported on the session bus), in the bubble phase: whatever
+        # wants Esc first (a popover, an entry) gets it, and while no reply is streaming the key
+        # is not consumed at all.
+        escape = Gtk.ShortcutController()
+        escape.add_shortcut(
+            Gtk.Shortcut.new(
+                Gtk.ShortcutTrigger.parse_string("Escape"),
+                Gtk.CallbackAction.new(self._on_escape),
+            )
+        )
+        self.add_controller(escape)
         self._add_action("focus-input", self._focus_input)
         self._add_action("toggle-side-panel", self._toggle_side_panel)
         self.connect("close-request", self._on_close_request)
@@ -88,6 +100,12 @@ class ShellWindow(Adw.ApplicationWindow):
         if self._side.get_visible() and self.get_focus() is None:
             # Hiding the panel took the focus with it; do not leave the window with none.
             self.chat_panel.focus_input()
+
+    def _on_escape(self, _widget: Gtk.Widget, _args: object) -> bool:
+        if not self.controller.busy:
+            return False
+        self.controller.cancel()
+        return True
 
     def shutdown(self) -> None:
         """Stop the reply in flight, and stop observing it, before the widgets go away.

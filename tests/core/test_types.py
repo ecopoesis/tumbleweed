@@ -23,6 +23,7 @@ from tumbleweed.core.types import (
     ModelName,
     PatternStr,
     ProviderRequestId,
+    TokenCount,
     ToolVersion,
     WorkspaceRelPath,
 )
@@ -51,6 +52,16 @@ NOT_INTS: list[object] = [
     object(),
     complex(5),
 ]
+
+
+class TestTokenCount:
+    def test_accepts_zero_and_up_and_refuses_what_is_not_a_count(self) -> None:
+        assert TokenCount(0) == 0
+        assert TokenCount(4096) == 4096
+        with pytest.raises(InvalidValueError, match="TokenCount must be from 0"):
+            TokenCount(-1)
+        with pytest.raises(InvalidValueError, match="TokenCount must be an int"):
+            TokenCount(True)  # the point of the test: a bool is not a count
 
 
 class TestByteCount:

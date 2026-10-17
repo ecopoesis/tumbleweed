@@ -7,6 +7,15 @@ text is untrusted (model output), so it only ever goes into labels through `plai
 bounded (a huge grapheme cluster, or text with no break opportunity, would wreck the window: I5,
 I9). The transcript scrolls in both directions as needed and never passes its content's size on
 to the window.
+
+What the user takes out of a message is meant to be the message's own text, not the text as it is
+laid out (which has zero-width spaces added where a long run could not break). That holds for Copy
+(Ctrl+C, the context menu) and for dragging the selection out (a drag source of our own over the
+selected text). It does **not** hold for the primary selection (middle-click paste): GTK puts the
+laid-out text there when a label is selected, and the only way to replace it is to take the
+clipboard from the label's own provider, which makes the label drop its selection (measured: the
+selection (True, 250, 270) becomes (False, 270, 270)). The highlight matters more, so the primary
+selection stays GTK's (#63 stays open for it).
 """
 
 import logging
@@ -14,7 +23,7 @@ from typing import assert_never, final
 
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import MessageId
-from tumbleweed.shell._gi import Gdk, Gtk
+from tumbleweed.shell._gi import Gdk, Gtk, Pango
 from tumbleweed.shell._widgets import plain_label
 from tumbleweed.shell.viewmodel.chat import ChatController, describe_error
 from tumbleweed.shell.viewmodel.display import DisplayChunks, display_text
@@ -94,6 +103,10 @@ class MessageRow(Gtk.Box):
                 # Copying (Ctrl+C and the context menu both emit this) puts the message's own text
                 # on the clipboard, without the zero-width spaces that were added for display.
                 label.connect("copy-clipboard", self._on_copy, index)
+                drag = Gtk.DragSource(actions=Gdk.DragAction.COPY)
+                drag.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+                drag.connect("prepare", self._on_drag_prepare, label)
+                label.add_controller(drag)
                 self.paragraphs.append(label)
                 self._body.append(label)
             self.paragraphs[index].set_text(chunks[index])
@@ -103,6 +116,34 @@ class MessageRow(Gtk.Box):
         if selected:
             label.get_clipboard().set(self._chunks.source_text(index, start, end))
         label.stop_emission_by_name("copy-clipboard")  # the default would copy what is shown
+
+    def selected_source(self, label: Gtk.Label) -> str | None:
+        """The source text of what is selected in one of this row's labels, if anything is."""
+        selected, start, end = label.get_selection_bounds()
+        if not selected or label not in self.paragraphs:
+            return None
+        return self._chunks.source_text(self.paragraphs.index(label), start, end)
+
+    def _on_drag_prepare(
+        self, _source: Gtk.DragSource, x: float, y: float, label: Gtk.Label
+    ) -> Gdk.ContentProvider | None:
+        """A drag that starts on the selected text carries its source text; elsewhere, none of ours
+        (the label's own gestures select)."""
+        text = self.selected_source(label)
+        if text is None:
+            return None
+        selected, start, end = label.get_selection_bounds()
+        offset_x, offset_y = label.get_layout_offsets()
+        scale = Pango.SCALE
+        inside, byte_index, _trailing = label.get_layout().xy_to_index(
+            int((x - offset_x) * scale), int((y - offset_y) * scale)
+        )
+        position = len(label.get_text().encode("utf-8")[:byte_index].decode("utf-8", "ignore"))
+        # `inside` is False for a point outside the text (below the last line, beside a short
+        # one), where the index is only the nearest: not on the selection, whatever it is.
+        if not (inside and selected and start <= position < end):
+            return None
+        return Gdk.ContentProvider.new_for_value(text)
 
     def _show_state(self, message: TranscriptMessage) -> None:
         match message.state:

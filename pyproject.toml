@@ -5,9 +5,19 @@ description = "An AI-first OS shell: voice and chat in, generated tools out."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    # The official Claude SDK behind our `LlmProvider` protocol (DECISIONS D3, S03): streaming,
+    # typed errors and the client's timeout and retry configuration, so that we do not hand-roll
+    # an SSE client for the one service the agent talks to. Pure Python (pydantic, httpx2, jiter
+    # and their dependencies have wheels for every platform we lock). >=1.13 is the newest release
+    # inside the 7-day cooldown today (1.15.0 is younger); it uses httpx2, not httpx (#43).
+    "anthropic>=1.13",
+    # The SDK's HTTP library, imported directly by `agent.anthropic_provider` (a bounded transport,
+    # no redirects, no environment proxies, its exception types), so it is declared, not borrowed.
+    "httpx2>=2.13",
     "pydantic>=2.11",
     # Built from source against the system GTK (Homebrew on macOS, apt in the Linux image).
-    # >=3.50 for `gi.events` (asyncio on the GLib main loop), see DECISIONS D2.
+    # >=3.50 was chosen for `gi.events` (D2); the agent runs its own loop on a worker thread
+    # instead (D11, #47); the floor stays where it was.
     "PyGObject>=3.50",
     # Unicode grapheme-cluster segmentation (UAX 29: `\X`) for the transcript's display transform,
     # which keeps a hostile cluster from wrecking the layout. The data is upstream's, current with
@@ -259,4 +269,24 @@ forbidden_modules = [
     "anthropic",
     "openai",
     "litellm",
+]
+
+# The provider interface (`tumbleweed.agent.llm`) is what everything else uses; the SDK itself
+# stays in the one module that adapts it (DECISIONS D3), so a proxy or another vendor replaces one
+# file. Direct imports only: the shell reaches the SDK through the factory, which is the point.
+[[tool.importlinter.contracts]]
+name = "the Anthropic SDK and its HTTP library are imported only by tumbleweed.agent.anthropic_provider (D3)"
+type = "forbidden"
+source_modules = [
+    "tumbleweed.agent",
+    "tumbleweed.core",
+    "tumbleweed.ipc",
+    "tumbleweed.shell",
+    "tumbleweed.ui",
+]
+forbidden_modules = ["anthropic", "httpx2"]
+allow_indirect_imports = true
+ignore_imports = [
+    "tumbleweed.agent.anthropic_provider -> anthropic",
+    "tumbleweed.agent.anthropic_provider -> httpx2",
 ]

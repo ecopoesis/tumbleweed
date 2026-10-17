@@ -194,10 +194,12 @@ tracked chokepoint.
 - Agent loop:
   - a typed tool registry (no real tools yet);
   - per-turn iteration, token and reply-timeout limits (I9); the token limit must fit
-    `MAX_ASSISTANT_BYTES` (64 KiB per transcript message), or that cap is revisited;
+    `MAX_ASSISTANT_BYTES` (64 KiB per transcript message), or that cap is revisited (S03: a byte cap
+    in the loop guarantees the fit, since tokens do not bound bytes, and the token limit is about
+    cost and time, thinking included; `agent/limits.py`);
   - cancellation with Esc.
 - asyncio on the GLib main loop (`gi.events`). Fallback (D2): a worker-thread loop
-  marshalled through `GLib.idle_add`.
+  marshalled through `GLib.idle_add`. S03 took the fallback (D11, #47).
 - Shell behaviour:
   - the agent loop implements S02's `Responder` protocol (`tumbleweed.agent.responder`: `start`,
     the `ReplyDelta`/`ReplyFinished`/`ReplyFailed` events, `cancel`; DECISIONS D9), replacing the
