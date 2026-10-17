@@ -84,3 +84,37 @@ class PathError(BrokerError):
     def __reduce__(self) -> tuple[type["PathError"], tuple[PathFault, int | None]]:
         # The default would rebuild from the message, which is not what the constructor takes.
         return (type(self), (self.fault, self.errno_code))
+
+
+class PrivateFsError(BrokerError):
+    """The broker's own directory or one of its files is not safe to use, or cannot be opened.
+
+    Fixed text: the path is never repeated. A directory or file of the broker's that is a
+    symlink, belongs to someone else or is not what it should be is refused, never repaired
+    (a file or directory of ours with a loose mode is tightened).
+    """
+
+
+class AuditError(BrokerError):
+    """The audit log could not be written. Whatever needed the entry must not go ahead (I7)."""
+
+
+class StoreError(BrokerError):
+    """The grant store could not be read or written."""
+
+
+class StoreRefusedError(StoreError):
+    """The database file is not one the broker will use: not ours, newer, or an unexpected
+    schema. Nothing in it has been changed."""
+
+
+class StoreCorruptError(StoreError):
+    """The database holds something that cannot be real (an unparseable record)."""
+
+
+class FsTimeoutError(BrokerError):
+    """A file system operation did not finish in time (a hung network or FUSE mount)."""
+
+
+class WorkspaceError(BrokerError):
+    """A task workspace could not be created, opened or deleted."""
