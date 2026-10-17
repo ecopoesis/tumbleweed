@@ -28,7 +28,6 @@ from tests.sandbox.procs import (
 from tests.sandbox.support import PYTHON, Opened, grant, opened, policy, run_sandbox
 from tumbleweed.core.types import ByteCount
 from tumbleweed.sandbox.errors import InvalidPolicyError, SandboxLaunchError
-from tumbleweed.sandbox.limits import kernel_counts_processes_per_namespace
 from tumbleweed.sandbox.policy import GrantAccess, SandboxLimits
 from tumbleweed.sandbox.result import LimitKind, LimitsBackend, LimitsReport, Termination
 from tumbleweed.sandbox.runner import SandboxRunner
@@ -324,57 +323,7 @@ class TestCpuAndFiles:
         assert result.stdout == b"/tmp ENOSPC True\n/dev/shm ENOSPC True\n"
 
 
-class TestProcessesAndFiles:
-    FORK = (
-        "import os, time\n"
-        "kids = []\n"
-        "try:\n"
-        "    for _ in range(300):\n"
-        "        pid = os.fork()\n"
-        "        if pid == 0:\n"
-        "            time.sleep(10)\n"
-        "            os._exit(0)\n"
-        "        kids.append(pid)\n"
-        "    print('forked', len(kids))\n"
-        "except OSError as exc:\n"
-        "    print('stopped', len(kids), exc.errno)\n"
-        "for kid in kids:\n"
-        "    os.kill(kid, 9)\n"
-    )
-
-    @pytest.fixture(autouse=True)
-    def need_a_kernel_with_per_namespace_process_counts(self) -> None:
-        if not kernel_counts_processes_per_namespace(os.uname().release):
-            pytest.skip("RLIMIT_NPROC counts the user's other processes before Linux 5.14")
-
-    def test_without_a_scope_a_fork_bomb_stops_near_the_pids_limit(self, workspace: Opened) -> None:
-        limits = SandboxLimits(pids=20, wall_time=timedelta(seconds=30))
-
-        result = run_sandbox(policy(workspace, PYTHON, "-c", self.FORK, limits=limits))
-
-        word, count, errno_ = result.stdout.decode().split()
-        assert (word, errno_) == ("stopped", "11")  # EAGAIN
-        assert 20 <= int(count) < 60
-
-    def test_the_control_a_larger_limit_lets_the_same_program_fork_them_all(
-        self, workspace: Opened
-    ) -> None:
-        limits = SandboxLimits(pids=1000, wall_time=timedelta(seconds=30))
-
-        result = run_sandbox(policy(workspace, PYTHON, "-c", self.FORK, limits=limits))
-
-        assert result.stdout == b"forked 300\n"
-
-    def test_the_hosts_own_processes_are_not_counted_against_the_sandbox(
-        self, workspace: Opened
-    ) -> None:
-        # The limit is per user namespace, so a busy desktop does not stop a small sandbox.
-        limits = SandboxLimits(pids=8)
-
-        result = run_sandbox(policy(workspace, "/bin/sh", "-c", "echo a | cat", limits=limits))
-
-        assert result.stdout == b"a\n"
-
+class TestFiles:
     def test_open_files_are_limited_per_process(self, workspace: Opened) -> None:
         code = (
             "import os\n"

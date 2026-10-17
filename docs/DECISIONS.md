@@ -174,8 +174,8 @@ user manager has no delegated controllers therefore says so instead of pretendin
 `exit-code` only once the program it started has ended, by exit or by signal. A run that ends
 without an `exit-code` is a `SandboxLaunchError` carrying bwrap's message.
 **Consequences.** The probe costs one scope per runner, and one a minute while the host has none.
-The rlimit fallback has no total memory limit, no exact pids limit (an `RLIMIT_NPROC` approximation
-on kernels that count it per user namespace) and no CPU quota (reported). Unlike the rest, the scope path cannot be run in
+The rlimit fallback has no total memory limit, no pids limit (`RLIMIT_NPROC` was measured and rejected: bwrap's first fork is
+counted against all of the uid's processes) and no CPU quota (reported). Unlike the rest, the scope path cannot be run in
 the container or in CI, where there is no user manager: its command lines and the probe's decision
 are unit-tested, the wrapper is exercised with a stand-in `systemd-run`, and S27's VM test is where
 the real thing runs (#73).

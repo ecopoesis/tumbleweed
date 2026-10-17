@@ -175,10 +175,10 @@ shell, voice or `gi` (section 10).
   concurrently, each cut at `max_output_bytes`, and exceeding the cap or the wall clock `SIGKILL`s
   bwrap, which takes the sandbox's PID namespace down with it (`--die-with-parent`). CPU time, file
   size, core dumps and open files (256) are `prlimit` rlimits (soft equal to hard, so a CPU
-  overrun is an uncatchable `SIGKILL`). Without a scope, processes are bounded by `RLIMIT_NPROC`
-  (limit plus 16 for bwrap's own) where the kernel counts them per user namespace (5.14 and
-  later; before that it would count the user's other processes, so it is not set); that is an
-  approximation and `pids` is still reported as unenforced. Memory, `pids.max` and a CPU quota come from `systemd-run --user --scope` when the
+  overrun is an uncatchable `SIGKILL`). `RLIMIT_NPROC` is deliberately not
+  used for `pids`: measured in the container (kernel 6.12), bwrap's first fork is counted against
+  every process of the uid in the parent namespace, so a limit low enough to stop a fork bomb
+  also stops the sandbox from starting wherever the user has that many processes. Memory, `pids.max` and a CPU quota come from `systemd-run --user --scope` when the
   host has a systemd user manager whose controllers are delegated. The launcher proves that
   once, by starting a scope and reading the limits the kernel reports for it; a limit it did not
   see applied is not counted. Otherwise memory is `RLIMIT_AS` per process, there is no `pids`
@@ -200,7 +200,7 @@ shell, voice or `gi` (section 10).
   process without a scope, so a program that starts many processes multiplies it; `memfd` and
   SysV shared memory are not address space of the process and escape `RLIMIT_AS` (the scope's
   memory limit covers them; without one, the open-file limit and the wall clock are what bound
-  them); a fork bomb is bounded only by `RLIMIT_NPROC` and the wall clock without a scope;
+  them); a fork bomb is bounded only by the wall clock (and the memory its processes use) without a scope;
   nothing bounds the disk a program writes to its workspace beyond the per-file limit; and the
   program inherits the launcher's session keyring until S15 (#15). S17 must refuse, on the
   target, runs on a host that lacks the pids or memory-total limit; these and the other gaps are

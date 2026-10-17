@@ -21,7 +21,6 @@ the ones the policy names; bwrap closes those before it executes the program.
 """
 
 import asyncio
-import dataclasses
 import io
 import json
 import logging
@@ -46,7 +45,6 @@ from tumbleweed.sandbox.errors import (
 )
 from tumbleweed.sandbox.limits import (
     LimitsPlan,
-    kernel_counts_processes_per_namespace,
     prlimit_argv,
     probe_scope,
     scope_argv,
@@ -73,10 +71,6 @@ def _absolute(path: str) -> str:
 
 def _now() -> float:
     return time.monotonic()
-
-
-def _kernel_release() -> str:
-    return os.uname().release
 
 
 def _platform() -> str:
@@ -184,12 +178,6 @@ class SandboxRunner:
             return self._plan
 
     async def _probe(self) -> LimitsPlan:
-        plan = await self._probe_scope()
-        return dataclasses.replace(
-            plan, pids_rlimit=kernel_counts_processes_per_namespace(_kernel_release())
-        )
-
-    async def _probe_scope(self) -> LimitsPlan:
         if not self._use_scope:
             return LimitsPlan(detail="the systemd scope is switched off")
         found = self._systemd_run or shutil.which("systemd-run")

@@ -28,8 +28,6 @@ log = logging.getLogger(__name__)
 
 MAX_OPEN_FILES: Final = 256
 """Descriptors per process: bounds sockets, pipes and memfds, which `RLIMIT_AS` does not count."""
-NPROC_SLACK: Final = 16
-"""Processes of the sandbox's own (bwrap's init and helpers) on top of the program's `pids`."""
 
 _PROBE_MEMORY: Final = 256 * 1024 * 1024
 _PROBE_TASKS: Final = 64
@@ -62,8 +60,6 @@ class LimitsPlan:
     scope_cpu: bool = False
     systemd_run: str | None = None
     """The absolute path the probe ran, and the only one a scoped run may use."""
-    pids_rlimit: bool = False
-    """Also bound processes with `RLIMIT_NPROC` (counted per user namespace since Linux 5.14)."""
     detail: str | None = None
 
     @property
@@ -122,27 +118,10 @@ def prlimit_argv(plan: LimitsPlan, limits: SandboxLimits, *, prlimit: str) -> li
         "--core=0:0",
         f"--nofile={MAX_OPEN_FILES}:{MAX_OPEN_FILES}",
     ]
-    if plan.pids_rlimit and not (plan.scope and plan.scope_pids):
-        processes = limits.pids + NPROC_SLACK
-        argv.append(f"--nproc={processes}:{processes}")
     if plan.address_space:
         memory = int(limits.memory)
         argv.append(f"--as={memory}:{memory}")
     return [*argv, "--"]
-
-
-def kernel_counts_processes_per_namespace(release: str) -> bool:
-    """Whether `RLIMIT_NPROC` is counted per user namespace here (Linux 5.14 and later).
-
-    Before that it counts every process of the uid, so a limit low enough to matter would stop
-    the user's own processes (and bwrap's first fork) on a busy desktop.
-    """
-    parts = release.split(".")[:2]
-    try:
-        major, minor = (int("".join(c for c in part if c.isdigit()) or "x") for part in parts)
-    except ValueError:
-        return False
-    return (major, minor) >= (5, 14)
 
 
 def parse_probe(output: str) -> LimitsPlan:

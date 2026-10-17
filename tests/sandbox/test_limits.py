@@ -13,7 +13,6 @@ from tumbleweed.core.types import ByteCount
 from tumbleweed.sandbox.errors import SandboxUnavailable, SandboxUnsupported
 from tumbleweed.sandbox.limits import (
     LimitsPlan,
-    kernel_counts_processes_per_namespace,
     parse_probe,
     prlimit_argv,
     probe_scope,
@@ -69,40 +68,15 @@ class TestPrlimit:
     def test_the_open_file_limit_is_always_set(self) -> None:
         assert "--nofile=256:256" in prlimit_argv(LimitsPlan(), LIMITS, prlimit="prlimit")
 
-    def test_without_a_scope_processes_get_an_rlimit_on_a_modern_kernel(self) -> None:
-        plan = LimitsPlan(pids_rlimit=True)
-
-        assert "--nproc=26:26" in prlimit_argv(plan, LIMITS, prlimit="prlimit")  # 10 and 16 slack
-
-    def test_no_process_rlimit_when_the_kernel_would_count_the_users_other_processes(self) -> None:
-        assert not any(
-            arg.startswith("--nproc") for arg in prlimit_argv(LimitsPlan(), LIMITS, prlimit="p")
-        )
-
-    def test_no_process_rlimit_when_the_scope_limits_pids(self) -> None:
-        plan = dataclasses.replace(FULL, pids_rlimit=True)
-
-        assert not any(arg.startswith("--nproc") for arg in prlimit_argv(plan, LIMITS, prlimit="p"))
-
-    @pytest.mark.parametrize(
-        ("release", "per_namespace"),
-        [
-            ("5.14.0", True),
-            ("6.12.5-linuxkit", True),
-            ("6.8.0-1017-azure", True),
-            ("5.13.19", False),
-            ("4.19.0", False),
-            ("5.4.0-150-generic", False),
-            ("25.6.0", True),
-            ("garbage", False),
-            ("", False),
-            ("7", False),
-        ],
-    )
-    def test_which_kernels_count_processes_per_user_namespace(
-        self, release: str, per_namespace: bool
+    def test_there_is_no_process_rlimit_because_it_would_count_the_users_other_processes(
+        self,
     ) -> None:
-        assert kernel_counts_processes_per_namespace(release) is per_namespace
+        # Measured (S14): bwrap's first fork is counted against every process of the uid in the
+        # parent namespace, so a limit low enough to stop a fork bomb also stops the sandbox from
+        # starting on a busy desktop. Without a scope, processes are bounded by the wall clock.
+        for plan in (LimitsPlan(), FULL):
+            argv = prlimit_argv(plan, LIMITS, prlimit="prlimit")
+            assert not any("nproc" in arg for arg in argv)
 
     def test_cpu_time_is_rounded_up(self) -> None:
         limits = SandboxLimits(cpu_time=timedelta(milliseconds=1500))
