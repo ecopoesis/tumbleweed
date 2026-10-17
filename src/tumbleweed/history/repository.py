@@ -18,6 +18,7 @@ from pydantic import ValidationError
 
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.ids import MessageId, SessionId, TaskId
+from tumbleweed.core.types import ByteCount
 from tumbleweed.history.db import Database, Row
 from tumbleweed.history.errors import HistoryCorruptError, HistoryError
 from tumbleweed.history.records import (
@@ -219,7 +220,7 @@ class MessageRepository:
         return stored
 
     def newest(
-        self, session_id: SessionId, *, limit: int, max_bytes: int
+        self, session_id: SessionId, *, limit: int, max_bytes: ByteCount
     ) -> tuple[StoredMessage, ...]:
         """The newest messages of the session, oldest first: at most `limit` of them, and as many
         of those, newest first, as have text adding up to at most `max_bytes` (none if the newest

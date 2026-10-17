@@ -196,6 +196,56 @@ class TestRefusals:
         assert mode(wrong) in (0o755, 0o644)  # not "repaired" (it is not ours to chmod)
 
 
+class TestTheDescriptorFunctionsThemselves:
+    """Each defence on its own: the checks after SQLite opens the file would catch a symlink too,
+    so the store's tests alone cannot tell whether `O_NOFOLLOW` is there."""
+
+    def test_a_symlink_is_not_opened_and_what_it_points_at_is_not_touched(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "target"
+        target.write_text("not ours to change")
+        target.chmod(0o644)
+        directory = tmp_path / "dir"
+        directory.mkdir(mode=0o700)
+        (directory / "name").symlink_to(target)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+
+        try:
+            with pytest.raises(HistoryRefusedError):
+                files.open_private_file(descriptor, "name")
+        finally:
+            os.close(descriptor)
+
+        assert mode(target) == 0o644  # not "repaired" through the link
+        assert target.read_text() == "not ours to change"
+
+    def test_a_symlink_in_place_of_a_directory_is_not_opened(self, tmp_path: Path) -> None:
+        real = tmp_path / "real"
+        real.mkdir(mode=0o700)
+        link = tmp_path / "link"
+        link.symlink_to(real)
+
+        with pytest.raises(HistoryRefusedError):
+            files.open_private_directory(link)
+
+    def test_a_new_file_is_0600_and_an_existing_one_keeps_its_content(self, tmp_path: Path) -> None:
+        directory = tmp_path / "dir"
+        directory.mkdir(mode=0o700)
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            first = files.open_private_file(descriptor, "name")
+            os.write(first, b"content")
+            os.close(first)
+            second = files.open_private_file(descriptor, "name")
+            assert os.pread(second, 100, 0) == b"content"
+            os.close(second)
+        finally:
+            os.close(descriptor)
+
+        assert mode(directory / "name") == 0o600
+
+
 class TestSwappedUnderUs:
     def test_a_database_replaced_between_our_check_and_sqlite_opening_it_is_refused(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

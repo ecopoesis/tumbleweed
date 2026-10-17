@@ -5,7 +5,7 @@
 
 - **Concurrency.** WAL mode (readers never block the writer and the writer never blocks readers,
   so a second shell does not stall the first), `synchronous=NORMAL`, and a busy timeout of
-  `BUSY_TIMEOUT_SECONDS`: a write waits that long for another shell's write, then fails with
+  `BUSY_TIMEOUT`: a write waits that long for another shell's write, then fails with
   `HistoryBusyError` instead of freezing the window. The first statements of an open (switching to
   WAL, migrating) are asked again within the same time, because SQLite answers some of them with
   BUSY at once, without waiting, while another shell is setting a new file up. Every write is
@@ -28,9 +28,11 @@ import sqlite3
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Final, Self, final
 
+from tumbleweed.core.types import ByteCount
 from tumbleweed.history.errors import (
     HistoryBusyError,
     HistoryCorruptError,
@@ -50,9 +52,10 @@ from tumbleweed.history.schema import MIGRATIONS, Migration, migrate
 logger = logging.getLogger(__name__)
 
 DATABASE_NAME: Final = "chat.sqlite3"
-BUSY_TIMEOUT_SECONDS: Final = 2.0
-MAX_VALUE_BYTES: Final = 128 * 1024  # a message is at most 64 KiB; this bounds a hostile row
-MAX_SQL_BYTES: Final = 16 * 1024
+BUSY_TIMEOUT: Final = timedelta(seconds=2)
+# A message is at most 64 KiB; this bounds a hostile row.
+MAX_VALUE_BYTES: Final = ByteCount(128 * 1024)
+MAX_SQL_BYTES: Final = ByteCount(16 * 1024)
 _MINIMUM_SQLITE: Final = (3, 37, 0)  # STRICT tables
 
 # SQLite's primary result codes (https://sqlite.org/rescode.html), the low byte of an error code.
@@ -108,11 +111,11 @@ class Database:
                 check_sidecar(directory_fd, DATABASE_NAME + suffix)
             connection = sqlite3.connect(
                 str(directory / DATABASE_NAME),
-                timeout=BUSY_TIMEOUT_SECONDS,
+                timeout=BUSY_TIMEOUT.total_seconds(),
                 autocommit=True,
             )
             _configure(connection)
-            deadline = time.monotonic() + BUSY_TIMEOUT_SECONDS
+            deadline = time.monotonic() + BUSY_TIMEOUT.total_seconds()
             while True:
                 try:
                     cls._prepare(connection, directory_fd, file_fd, migrations)

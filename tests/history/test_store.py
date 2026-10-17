@@ -17,6 +17,7 @@ from tests.history.support import (
     user,
 )
 from tumbleweed.core.ids import MessageId, SessionId, TaskId
+from tumbleweed.core.types import ByteCount
 from tumbleweed.history.errors import HistoryError, HistoryRefusedError
 from tumbleweed.history.records import (
     MAX_MESSAGES_PER_SESSION,
@@ -96,7 +97,7 @@ class TestBounds:
             store.append(assistant(f"{index:02d}" + "x" * 98))  # 100 bytes each
         store.close()
 
-        restored = open_store(tmp_path).begin(limit=100, max_bytes=1000)
+        restored = open_store(tmp_path).begin(limit=100, max_bytes=ByteCount(1000))
 
         assert [m.text[:2] for m in restored.messages] == [f"{n:02d}" for n in range(20, 30)]
 
@@ -108,7 +109,7 @@ class TestBounds:
         store.append(assistant("x" * 5000))
         store.close()
 
-        restored = open_store(tmp_path).begin(limit=100, max_bytes=4999)
+        restored = open_store(tmp_path).begin(limit=100, max_bytes=ByteCount(4999))
 
         assert restored.session.id == session.id
         assert restored.messages == ()
@@ -224,6 +225,7 @@ class TestBounds:
         store = open_store(tmp_path)
         store.begin(limit=10)
         for _ in range(MAX_SESSIONS + 3):
+            store.append(user("keeps the session"))  # (an empty session is not kept)
             store.new_session()
 
         with raw(history_directory(tmp_path)) as connection:

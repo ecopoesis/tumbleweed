@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Final, Protocol, Self, final
 
 from tumbleweed.core.ids import SessionId
+from tumbleweed.core.types import ByteCount
 from tumbleweed.history.claims import LOCKS_DIRECTORY, Claim, SessionClaims
 from tumbleweed.history.db import Database
 from tumbleweed.history.errors import HistoryCorruptError, HistoryError, HistoryRefusedError
@@ -53,7 +54,7 @@ logger = logging.getLogger(__name__)
 RESTORE_CANDIDATES: Final = 8
 # What a restore reads, besides the message count: 4 MiB of text, which the window lays out in well
 # under a second (a hostile file of valid, maximal messages must not make it take longer).
-RESTORE_BYTES: Final = 4 * 1024 * 1024
+RESTORE_BYTES: Final = ByteCount(4 * 1024 * 1024)
 PRUNE_BATCH: Final = 20
 NOT_RESTORED: Final = (
     "The last chat could not be read (its stored data is damaged), so a new session was "
@@ -75,7 +76,7 @@ class RestoredSession:
 class ChatHistory(Protocol):
     """What the shell needs from the history."""
 
-    def begin(self, *, limit: int, max_bytes: int = RESTORE_BYTES) -> RestoredSession:
+    def begin(self, *, limit: int, max_bytes: ByteCount = RESTORE_BYTES) -> RestoredSession:
         """Claim and return the last session, or a new one: its newest messages, at most `limit`
         of them and `max_bytes` of text."""
         ...
@@ -137,7 +138,7 @@ class HistoryStore:
         if self._closed:
             raise HistoryRefusedError("The chat history is closed.")
 
-    def begin(self, *, limit: int, max_bytes: int = RESTORE_BYTES) -> RestoredSession:
+    def begin(self, *, limit: int, max_bytes: ByteCount = RESTORE_BYTES) -> RestoredSession:
         self._require_open()
         if self._session is not None:
             raise HistoryRefusedError("A chat session is already open.")
