@@ -534,6 +534,9 @@ audited.
   never resolved again. Opens, at decision time and at run time, can wait as long as the file
   system takes to answer (a hung network or FUSE mount); the daemon runs them on a worker it can
   abandon, with a deadline (S17, section 2 "Broker daemon").
+  The decision-time walk reads the directories on the way, and the run-time open only searches them
+  (`O_PATH`, Linux), so a directory that can be searched but not read makes what is below it
+  ungrantable: that refuses more, never less, and is kept (#71).
 - **Network.** `net.full` gives the sandbox its own network namespace connected through
   `slirp4netns --disable-host-loopback` (no host loopback, no host abstract sockets),
   never `--share-net`. The payload is held with bwrap `--block-fd` until the network is
