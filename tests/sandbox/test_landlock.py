@@ -191,6 +191,7 @@ class TestWithLandlock:
         rules: Callable[[Path, Path], list[str]],
         *,
         layered: bool = True,
+        code: str = payloads.TWO_DIRECTORIES,
     ) -> SandboxResult:
         """Two granted writable directories, `named` and `other`, and a second launcher in the
         sandbox (its source is in `named`) that restricts further with the given rules.
@@ -200,7 +201,7 @@ class TestWithLandlock:
             directory.mkdir(parents=True)
             (directory / "file").write_text(f"secret of {directory.name}")
         (named / "sandbox_exec.py").write_bytes(helper_source())
-        payload = [PYTHON, "-c", payloads.TWO_DIRECTORIES, str(named), str(other)]
+        payload = [PYTHON, "-c", code, str(named), str(other)]
         inner = [
             PYTHON,
             "-I",
@@ -295,11 +296,16 @@ class TestWithLandlock:
         def rules(named: Path, other: Path) -> list[str]:
             return ["--read", "/", "--write", "/"]
 
-        result = self.two_directories(workspace, tmp_path, rules)
+        result = self.two_directories(workspace, tmp_path, rules, code=payloads.BEYOND_THE_MOUNTS)
 
-        assert json.loads(result.stdout)["read_named"] == "ok"
-        listing = report(workspace, payloads.BEYOND_THE_MOUNTS)
-        assert listing["list_root"] == "EACCES"
+        # The second launcher allowed everything under `/`; the first's ruleset still holds.
+        assert json.loads(result.stdout) == {
+            "list_root": "EACCES",
+            "list_etc": "EACCES",
+            "write_proc": "EACCES",
+            "make_socket_file": "EACCES",
+            "read_loader_cache": "ok",
+        }
 
     def test_an_abstract_unix_socket_made_outside_is_out_of_scope_where_the_abi_has_it(
         self, tmp_path: Path
