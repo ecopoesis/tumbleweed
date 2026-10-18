@@ -528,21 +528,29 @@ generation, so what an abandoned utterance finds later is dropped.
   exported on the session bus.
 - *Bounds (I9).* A recording stops by itself at `max_utterance_seconds` (default 30, at most 120): the
   cap is in bytes, in the buffer that takes the samples (`BoundedPcm`), so a device that keeps
-  delivering cannot grow memory. A tap shorter than 300 ms is not sent. The request has a timeout for
-  each wait (connecting 5 s, a write at most 10 s, a read the request timeout) and a deadline of the
-  request timeout, checked between pieces of the upload and of the answer; the upload ends at the
-  deadline, and the answer, which the server may take the whole timeout to begin, at most one
-  timeout after that (about twice the timeout in all). It reads at most
+  delivering cannot grow memory. A tap shorter than 300 ms is not sent. `request_timeout` (default
+  30 s, at most 120) bounds the **whole exchange**: every operation of the request (name lookup,
+  connecting, the TLS handshake, each write, each read) runs through `voice.budget.BudgetBackend`,
+  which cuts it to what is left of one deadline and fails once there is none, so a server that
+  answers a byte at a time, or reads the upload slowly, is cut off at the deadline. The one thing it
+  cannot shorten is the operating system's resolver once asked (the request stops waiting for it; the
+  lookup's own thread ends with it; an IP address needs none). The user can abandon a request
+  (`AbortSignal`, set by `VoiceInput.cancel`: Esc, closing the shell), which shuts its sockets down at
+  once, so the next utterance does not queue behind it. It reads at most
   `max_response_bytes` (default 64 KiB, at most 1 MiB) counted as the bytes arrive, before decoding,
   and refuses a response with any content encoding, any status but 200, any type but JSON. Redirects
   are not followed and the environment's proxies are ignored. `Accept-Encoding: identity` is asked for.
 - *The URL* (`voice.endpoint.SttEndpoint`) is validated wherever one is made: http or https, a host
   that is a DNS name or an IP address, no credentials, query or fragment, a conservative path; only
   `scheme://host:port` is ever logged or shown. Plain `http` to a host that is not the loopback is
-  allowed (a VM reaches its host over a private network) and logged as a warning.
+  allowed (a VM reaches its host over a private network), logged as a warning, and then a transcript
+  is **never sent automatically**: `edit_before_send` is forced on (`voice.factory`), because anyone on
+  the network could rewrite what comes back.
 - *Audio is never persisted.* It exists in memory from the capture callback to the request body. No
-  voice module can write a file (`tests/voice/test_no_audio_on_disk.py` runs an utterance under an
-  audit hook and scans the sources, and the pipeline has no file sink).
+  voice module can write a file (an AST scan), the pipeline is built from fixed elements none of
+  which writes (checked by name), and an utterance run under a Python audit hook writes nothing
+  (`tests/voice/test_no_audio_on_disk.py`; an audit hook cannot see native writes, so a Linux test
+  also runs a real GStreamer capture and checks that no file appears).
 - *Failures* are fixed text shown next to the Mic button (never a server's or a library's words),
   and the shell keeps running; a bug in a backend is logged by type and place, not by message.
 
@@ -996,8 +1004,7 @@ Each invariant names where it is enforced. Reviews check every change against th
   new message.
   Voice (`tumbleweed.voice`, D20): a recording is capped in bytes where the samples arrive
   (`max_utterance_seconds`, default 30, at most 120), the speech server's answer is read to at most
-  `max_response_bytes` (default 64 KiB) with one timeout per wait and a deadline for the whole
-  request, and a transcript is at most the transcript's own 16 KiB (section 2, "Voice input").
+  `max_response_bytes` (default 64 KiB) with a deadline that bounds the whole exchange, and a transcript is at most the transcript's own 16 KiB (section 2, "Voice input").
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input. The
   microphone feeds the chat input only (S06): a transcript is typed-equivalent text, nothing reads
   it as an answer to a prompt, and the push-to-talk key and button are not `GAction`s (so no other
@@ -1163,7 +1170,10 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   import `gi`; `ui.runtime` also never imports `ui.gtk` or the shell, so it cannot reach GTK
   through them. `voice` imports it only in `voice._gst`, the pin of the GStreamer adapter, which
   only `voice.gstreamer` and `voice.factory` (lazily) import; the rest of `voice` cannot import
-  either, and `voice` never imports `shell` or `broker` (the shell depends on it).
+  either, and `voice` never imports `shell` or `broker` (the shell depends on it). The one edge
+  between `agent` and `voice` is configuration: `agent.config` holds the loader of the one file and
+  imports `voice.config` (the `[voice]` model), and `voice.factory` imports `agent.config` to read
+  it; a contract lets `agent` import nothing else of `voice`.
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
 - `history` never imports `shell` or `agent`; the shell depends on it through `ChatHistory`.
 - The Anthropic SDK is imported only by `agent.anthropic_provider`; the rest of the agent, and

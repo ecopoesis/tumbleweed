@@ -283,10 +283,11 @@ enabled = true                       # false: no Mic button and no key
 stt_url = "http://127.0.0.1:8080"    # whisper-server's address         (TUMBLEWEED_STT_URL)
 language = "auto"                    # or a code such as "en", "de"
 edit_before_send = false             # true: the words wait in the input for you to edit and send
+                                     # (always, over plain http to an address that is not local)
 
 [voice.limits]                       # ARCHITECTURE I9
 max_utterance_seconds = 30           # recording stops by itself here (up to 120)
-request_timeout_seconds = 30         # the whole request to the server (up to 120)
+request_timeout_seconds = 30         # the whole exchange with the server (up to 120)
 max_response_bytes = 65536           # the most of the server's answer that is read
 ```
 
@@ -294,11 +295,19 @@ max_response_bytes = 65536           # the most of the server's answer that is r
 `WHISPER_HOST=192.168.64.1 scripts/whisper-server`) and give the VM `stt_url = "http://192.168.64.1:8080"`.
 whisper-server has no authentication or encryption, and anyone who reaches the port can send it audio,
 use the machine's CPU and GPU and change its model, so bind it to the loopback or to a private
-interface and never to a network you share; the shell warns in its log when audio goes to a
-non-local address over plain `http`, and `https` works if you put a TLS proxy in front.
+interface and never to a network you share. Over plain `http` to an address that is not local, the
+shell logs a warning and **never sends a transcript by itself**: it waits in the input for you to read
+it (`edit_before_send` is forced on), because anyone on that network could have rewritten it on its
+way back. `https` works if you put a TLS proxy in front.
 
-**The microphone** is read through GStreamer, 16 kHz mono, only while you talk, and audio is never
-written anywhere: it lives in memory from the microphone to the HTTP request. A recording is capped at
+`request_timeout_seconds` bounds the whole exchange with the server, however slow it is (the lookup of
+its name, connecting, sending the audio and reading the answer each get what is left of it, so a
+server that answers a byte at a time is cut off at the limit); Esc abandons a request at once. Only
+the operating system's name lookup, once started, cannot be shortened (the request stops waiting for
+it); an IP address needs none.
+
+**The microphone** is read through GStreamer, 16 kHz mono, only while you talk, and the shell
+never writes audio anywhere: it lives in memory from the microphone to the HTTP request. A recording is capped at
 `max_utterance_seconds` however long the key is held. GStreamer is needed only for voice and is not
 part of the base setup: on a Mac `brew install gstreamer` (it bundles `osxaudiosrc` and the
 typelibs, and macOS asks for microphone permission the first time you talk); on Linux
