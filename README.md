@@ -10,7 +10,8 @@ together, and [`docs/handoff.md`](docs/handoff.md) for the original vision. What
 far is the typed foundation in `src/tumbleweed/core`, the build and test setup around it, and the
 GTK4 shell skeleton (`tumbleweed-shell`: a window with a canvas, a chat panel that talks to Claude,
 and a status strip; see [Running the shell](#running-the-shell) and
-[Talking to Claude](#talking-to-claude)).
+[Talking to Claude](#talking-to-claude)) and push-to-talk voice input to a local whisper.cpp
+([Voice input](#voice-input)).
 
 ## Development setup (macOS)
 
@@ -65,7 +66,8 @@ One window opens, with no desktop around it:
   answered by Claude, streamed in as they are written (with no key configured the chat says how to
   set one; `responder = "echo"` brings back the S02 placeholder that echoes). While a reply streams
   the Send button waits, and the input stays editable; **Esc** stops the reply;
-- the **status strip** (bottom) with the voice indicator, which reads "idle" until voice arrives (S06);
+- the **status strip** (bottom) with the voice indicator (idle, listening, transcribing; thinking and
+  speaking arrive with S07) and the **Mic** button ([Voice input](#voice-input));
 - a **reserved strip for trusted prompts** along the top, outside the canvas, which is empty until S18.
 
 Enter sends, Shift+Enter inserts a newline. Ctrl+L focuses the input (and shows the side panel if it
@@ -213,6 +215,78 @@ last session's data is damaged, a new session starts and the old data stays in t
 directory or file of yours that is too open is corrected, with a log line. Deferred pieces (a session
 browser, and others) are in #80.
 
+### Voice input
+
+Hold **Ctrl+Space** and speak; let go and the words are transcribed and sent as your message (or click
+**Mic** in the status strip to start, and click again to stop). The voice indicator shows
+*listening* while you talk and *transcribing* while the speech server works; **Esc** abandons the
+utterance. Speech-to-text is whisper.cpp's `whisper-server`, which the shell reaches over HTTP, so
+it can run natively on a Mac (with Metal, which a VM does not have) while the shell runs anywhere.
+Speech output and hands-free listening are later steps (S07, S08). On a Mac, Ctrl+Space may be
+taken by the system's input-source shortcut (System Settings, Keyboard, Keyboard Shortcuts, Input
+Sources); the Mic button works regardless (a configurable key is #100).
+
+**1. The speech server.** Homebrew's `whisper-cpp` does not include `whisper-server` (its formula
+turns it off), so build it from the source, at a release tag; on Apple Silicon Metal is on by default:
+
+```sh
+brew install cmake
+git clone --depth 1 --branch v1.9.5 https://github.com/ggml-org/whisper.cpp ~/whisper.cpp
+cmake -S ~/whisper.cpp -B ~/whisper.cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build ~/whisper.cpp/build -j --config Release
+scripts/whisper-model                                  # base.en, 142 MiB, checked against a pinned SHA-256
+WHISPER_SERVER_BIN=~/whisper.cpp/build/bin/whisper-server scripts/whisper-server
+```
+
+`scripts/whisper-model [tiny.en|base.en|base]` downloads over https to
+`~/.local/share/tumbleweed/whisper/` and installs the file only if its SHA-256 is the pinned one.
+`scripts/whisper-server` runs the server on `127.0.0.1:8080` with that model (`WHISPER_MODEL`,
+`WHISPER_HOST`, `WHISPER_PORT` change it). The startup log of whisper.cpp says which backend it uses
+(`ggml_metal_init` on a Mac with Metal). `base` is multilingual: set `language` below to your language.
+
+**2. The shell.** With the server on its default address nothing needs configuring. Otherwise, in
+`config.toml` (all optional) or the environment:
+
+```toml
+[voice]
+enabled = true                       # false: no Mic button and no key
+stt_url = "http://127.0.0.1:8080"    # whisper-server's address         (TUMBLEWEED_STT_URL)
+language = "auto"                    # or a code such as "en", "de"
+edit_before_send = false             # true: the words wait in the input for you to edit and send
+
+[voice.limits]                       # ARCHITECTURE I9
+max_utterance_seconds = 30           # recording stops by itself here (up to 120)
+request_timeout_seconds = 30         # the whole request to the server (up to 120)
+max_response_bytes = 65536           # the most of the server's answer that is read
+```
+
+**From a VM**, run the server on the Mac bound to the host-only address the VM sees (for example
+`WHISPER_HOST=192.168.64.1 scripts/whisper-server`) and give the VM `stt_url = "http://192.168.64.1:8080"`.
+whisper-server has no authentication or encryption, and anyone who reaches the port can send it audio,
+use the machine's CPU and GPU and change its model, so bind it to the loopback or to a private
+interface and never to a network you share; the shell warns in its log when audio goes to a
+non-local address over plain `http`, and `https` works if you put a TLS proxy in front.
+
+**The microphone** is read through GStreamer, 16 kHz mono, only while you talk, and audio is never
+written anywhere: it lives in memory from the microphone to the HTTP request. A recording is capped at
+`max_utterance_seconds` however long the key is held. GStreamer is needed only for voice and is not
+part of the base setup: on a Mac `brew install gstreamer` (it bundles `osxaudiosrc` and the
+typelibs, and macOS asks for microphone permission the first time you talk); on Linux
+`gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base` plus
+`gstreamer1.0-pipewire` or `gstreamer1.0-pulseaudio`. Without it the shell starts as usual and the
+Mic says what is missing. The server's answer is untrusted text: it is size-limited, read as strict
+UTF-8 JSON, stripped of control and direction-changing characters, and shown as plain text. It then
+enters the chat exactly as if you had typed it: it is *your* message, with no more authority than
+typing, and nothing a transcript says can approve anything (prompts take the keyboard and pointer
+only, I10). If your input already has a draft, the words are added to it and not sent.
+
+**A real server** is exercised by the `live` test (never run in CI): it has macOS's `say` speak a
+sentence, sends it to the server and checks the words that come back:
+
+```sh
+TUMBLEWEED_LIVE=1 TUMBLEWEED_STT_URL=http://127.0.0.1:8080 uv run pytest -m live tests/voice -v
+```
+
 ### Checks
 
 ```sh
@@ -244,7 +318,8 @@ checker), `anthropic` (the official Claude SDK, behind our provider interface; i
 few small pure-Python packages, all locked for the three platforms, and 1.13 is the newest release
 inside the cooldown today) and `httpx2`, the SDK's HTTP library, which is a direct dependency because
 `agent.anthropic_provider` imports it: for the transport that bounds a response, for refusing
-redirects and environment proxies, and for its exception types. A new one needs its justification in the PR and a lock for macOS and Linux.
+redirects and environment proxies, and for its exception types, and by `voice.whisper`, the speech
+server's client (one HTTP stack for the project, not two: DECISIONS D20, #43). A new one needs its justification in the PR and a lock for macOS and Linux.
 
 - To update: `uv lock --upgrade`, which re-resolves with the window as of today.
 - To take a newer release of one package before its week is up (a security fix), add

@@ -432,6 +432,49 @@ the broker imports the agent or an LLM (I2).
   S19's scope in the plan). `BrokerClient`'s heartbeat stops only when the connection ends; a ping
   that times out or is refused is logged and the next is tried.
 
+### Voice input (S06, D20)
+
+`tumbleweed.voice` turns a held key (or a toggled button) into a user message. The user holds
+Ctrl+Space, or clicks the Mic, and `VoiceInput` (GTK-free: `press`, `release`, `cancel`, observers)
+runs `IDLE -> LISTENING -> TRANSCRIBING -> IDLE`; the voice indicator shows the phase. The main thread
+never waits on audio or on the network: an *audio worker* thread opens, stops and cancels the capture
+(`AudioSource`, in production `GStreamerAudioSource`: a pipeline of fixed element names that ends in
+16 kHz mono PCM; `osxaudiosrc` on macOS, PipeWire or Pulse on Linux) and a *speech worker* thread
+makes the HTTP request (`SttBackend`, in production `WhisperServerBackend`, whisper.cpp's
+`whisper-server`, reached at a configurable URL so that a VM can use its host's Metal). Both are daemon
+threads; results come back through the injected main-thread dispatcher, tagged with the utterance's
+generation, so what an abandoned utterance finds later is dropped.
+
+- *Trust.* The microphone is open only while the user holds the key or has toggled the button.
+  The transcript is untrusted text from a server (and, behind it, from whatever the microphone
+  heard: "Ambient audio", section 8). It is made safe in one place, `stt.clean_transcript`: exactly
+  a `str`, at most the transcript's 16 KiB for a user message, strictly encodable, controls and
+  format characters (right-to-left overrides, zero-width spaces) removed, whitespace collapsed, and
+  nothing at all if it is only `[BLANK_AUDIO]` or the like. It enters the input as the **user's own
+  words** (it is not framed as untrusted data to the model, because it is what the user said, as
+  typing would be, and carries no more authority); it is shown with plain-text APIs (I4). With
+  `edit_before_send` it waits in the input to be edited, and a draft that is already there is never
+  sent by a transcript. It cannot approve anything: prompts and pickers take keyboard and pointer
+  input only (I10), and the key and button are plain widgets, never `GAction`s, which would be
+  exported on the session bus.
+- *Bounds (I9).* A recording stops by itself at `max_utterance_seconds` (default 30, at most 120): the
+  cap is in bytes, in the buffer that takes the samples (`BoundedPcm`), so a device that keeps
+  delivering cannot grow memory. A tap shorter than 300 ms is not sent. The request has one timeout
+  for connecting, writing and each read plus a deadline for the whole answer (at most twice the
+  timeout in the worst case, the piece being read when the deadline passes), reads at most
+  `max_response_bytes` (default 64 KiB, at most 1 MiB) counted as the bytes arrive, before decoding,
+  and refuses a response with any content encoding, any status but 200, any type but JSON. Redirects
+  are not followed and the environment's proxies are ignored. `Accept-Encoding: identity` is asked for.
+- *The URL* (`voice.endpoint.SttEndpoint`) is validated wherever one is made: http or https, a host
+  that is a DNS name or an IP address, no credentials, query or fragment, a conservative path; only
+  `scheme://host:port` is ever logged or shown. Plain `http` to a host that is not the loopback is
+  allowed (a VM reaches its host over a private network) and logged as a warning.
+- *Audio is never persisted.* It exists in memory from the capture callback to the request body. No
+  voice module can write a file (`tests/voice/test_no_audio_on_disk.py` runs an utterance under an
+  audit hook and scans the sources, and the pipeline has no file sink).
+- *Failures* are fixed text shown next to the Mic button (never a server's or a library's words),
+  and the shell keeps running; a bug in a backend is logged by type and place, not by message.
+
 ## 3. Request flow
 
 1. The user speaks (push-to-talk or wake word) or types. Speech goes through the STT backend;
@@ -858,7 +901,14 @@ Each invariant names where it is enforced. Reviews check every change against th
   MiB of their text, a value or row over 128 KiB fails the read, and every record is validated. What is sent to the
   model is bounded by `agent.context`: a token budget over the system prompt, the history and the
   new message.
-- **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input.
+  Voice (`tumbleweed.voice`, D20): a recording is capped in bytes where the samples arrive
+  (`max_utterance_seconds`, default 30, at most 120), the speech server's answer is read to at most
+  `max_response_bytes` (default 64 KiB) with one timeout per wait and a deadline for the whole
+  request, and a transcript is at most the transcript's own 16 KiB (section 2, "Voice input").
+- **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input. The
+  microphone feeds the chat input only (S06): a transcript is typed-equivalent text, nothing reads
+  it as an answer to a prompt, and the push-to-talk key and button are not `GAction`s (so no other
+  process can switch the microphone on through the session bus).
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps
   what it reads. Workspace references are relative and validated.
@@ -890,6 +940,8 @@ only, so it can only refuse more; and case folding is not every file system's ow
 |---|---|---|
 | Shell config (TOML), API key file (0600) | `$XDG_CONFIG_HOME/tumbleweed/` | Never |
 | Chat history (SQLite), invocation log | `$XDG_DATA_HOME/tumbleweed/shell/` | Never |
+| Speech models for `whisper-server` (fetched by `scripts/whisper-model`, hash-checked) | `$XDG_DATA_HOME/tumbleweed/whisper/` | Never |
+| Recorded audio | Nowhere: held in memory from the microphone to the request, never written (S06) | n/a |
 | Broker data: grants, tasks and the tool store's index (`broker.sqlite3`), tool packages (`tool-blobs/`), audit log (`audit.jsonl`) | `$XDG_DATA_HOME/tumbleweed/broker/` | Never |
 | Copy/reflink snapshots | `$XDG_DATA_HOME/tumbleweed/broker/snapshots/` | Never |
 | btrfs snapshots | dedicated subvolume on the same filesystem, on the deny list | Never |
@@ -1015,11 +1067,14 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   policy core, storage and audit modules never do, nor do they import the daemon layer; `ipc` never
   imports `broker`.
 - `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
-  import `gi`.
+  import `gi`. `voice` imports it only in `voice._gst`, the pin of the GStreamer adapter, which
+  only `voice.gstreamer` and `voice.factory` (lazily) import; the rest of `voice` cannot import
+  either, and `voice` never imports `shell` or `broker` (the shell depends on it).
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
 - `history` never imports `shell` or `agent`; the shell depends on it through `ChatHistory`.
 - The Anthropic SDK is imported only by `agent.anthropic_provider`; the rest of the agent, and
-  everything else, uses the `LlmProvider` interface (D3). `agent` runs its asyncio loop on its own
+  everything else, uses the `LlmProvider` interface (D3). Its HTTP library, `httpx2`, is also
+  imported by `voice.whisper`, the speech server's client, and by nothing else (D20, #43). `agent` runs its asyncio loop on its own
   worker thread and reaches the GTK main thread only through a dispatcher the shell injects (D11).
 - `shell.viewmodel` never imports `gi`, directly or through another module, so it cannot import
   the GTK adapter modules of `shell` either. `tests/test_import_contracts.py` plants each
