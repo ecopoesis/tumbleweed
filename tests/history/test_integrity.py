@@ -301,6 +301,31 @@ class TestADirectorySwappedInsideTheOpen:
         assert len(calls) >= 2
         assert not (evil / "chat.locks").exists()
 
+    def test_a_swap_after_the_migration_is_caught_by_the_last_look(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Everything passed, the side files are in our directory; then the directory is swapped
+        before the end-of-open look at the path SQLite keeps."""
+        shell = history_directory(tmp_path)
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        real_sidecar = files.require_sidecar
+        seen: list[str] = []
+
+        def sidecar_then_swap(directory: int, name: str) -> None:
+            real_sidecar(directory, name)  # passes: the files are where they should be
+            seen.append(name)
+            if len(seen) == 2:  # both checked: now swap, before the final look
+                shell.rename(shell.parent / "shell.moved")
+                shell.symlink_to(evil)
+
+        monkeypatch.setattr(database_module, "require_sidecar", sidecar_then_swap)
+
+        with pytest.raises(HistoryRefusedError, match="replaced"):
+            HistoryStore.open(shell)
+
+        assert len(seen) == 2
+
     def test_the_path_sqlite_uses_is_what_is_checked(self, tmp_path: Path) -> None:
         directory = history_directory(tmp_path)
         directory.mkdir(parents=True, mode=0o700)

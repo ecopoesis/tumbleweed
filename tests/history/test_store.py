@@ -1092,3 +1092,73 @@ class TestWhoReapsWhatOnCloseAndStart:
 
         assert not {str(s) for s in leftovers} & self.sessions(tmp_path)
         store.close()
+
+
+class TestPruningRespectsWhoHoldsAndWhatChanged:
+    def test_a_chat_another_shell_holds_is_never_pruned_however_old(self, tmp_path: Path) -> None:
+        directory = history_directory(tmp_path)
+        clock = Ticks()
+        old = open_store(tmp_path, clock)
+        old.begin(limit=10)
+        old.append(user("an old chat whose shell is still open"))
+        with raw(directory) as connection:
+            (held_id,) = connection.execute("SELECT id FROM sessions").fetchone()
+        for index in range(MAX_SESSIONS + 2):
+            shell = open_store(tmp_path, clock)
+            shell.begin(limit=10)
+            shell.new_session()
+            shell.append(user(f"chat {index}"))
+            shell.new_session()
+            shell.close()
+
+        with raw(directory) as connection:
+            assert connection.execute(
+                "SELECT count(*) FROM sessions WHERE id = ?", (held_id,)
+            ).fetchone() == (1,)
+            assert connection.execute(
+                "SELECT count(*) FROM messages WHERE session_id = ?", (held_id,)
+            ).fetchone() == (1,)
+        old.close()
+
+    def test_a_candidate_that_changed_keeps_its_lock_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        directory = history_directory(tmp_path)
+        clock = Ticks()
+        store = open_store(tmp_path, clock)
+        store.begin(limit=10)
+        for index in range(MAX_SESSIONS):
+            store.append(user(f"chat {index}"))
+            store.new_session()
+        store.close()
+        real = SessionRepository.beyond
+        listed: list[SessionId] = []
+
+        def beyond(self: SessionRepository, keep: int, batch: int) -> tuple[StoredSession, ...]:
+            found = real(self, keep, batch)
+            for chat in found:  # each gains a message after it was listed
+                listed.append(chat.id)
+                with raw(directory) as connection:
+                    connection.execute(
+                        "UPDATE sessions SET updated_at = updated_at + 1 WHERE id = ?",
+                        (str(chat.id),),
+                    )
+            return found
+
+        with raw(directory) as connection:  # one chat too many, so that one is listed
+            extra = SessionId.new()
+            insert_session(connection, extra, 1)
+            insert_message(connection, extra, 1)
+        monkeypatch.setattr(SessionRepository, "beyond", beyond)
+        second = open_store(tmp_path, clock)
+        second.begin(limit=10)
+        second.new_session()
+        monkeypatch.undo()
+
+        assert extra in listed
+        with raw(directory) as connection:
+            assert connection.execute(
+                "SELECT count(*) FROM sessions WHERE id = ?", (str(extra),)
+            ).fetchone() == (1,)  # it changed since it was listed: not deleted
+        assert (directory / "chat.locks" / f"{extra}.lock").exists()  # and its lock file stays
+        second.close()  # (a later prune, listing it afresh, may delete it: that is as it should be)
