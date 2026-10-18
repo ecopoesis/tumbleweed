@@ -639,6 +639,19 @@ class TestCoverageWhereTheFileSystemReportsNoId:
 
         assert target.below(mount) == ("a", "b")
 
+    def test_the_object_at_that_depth_must_be_the_one_that_was_granted(self) -> None:
+        """A forged chain: the identity is in it, and the name agrees, but not at that depth."""
+        mount = StoredPath(path="/syn", identity=self.ZERO_A)
+        forged = self.path("/syn/a/b", (self.ROOT, self.ZERO_B, self.ZERO_A, self.ZERO_B))
+
+        assert forged.below(mount) is None
+
+    def test_a_chain_that_ends_before_that_depth_covers_nothing(self) -> None:
+        mount = StoredPath(path="/syn/a/b", identity=self.ZERO_A)
+        short = self.path("/syn/a/b", (self.ROOT, self.ZERO_A))  # holds the identity at depth 1
+
+        assert short.below(mount) is None
+
     def test_a_name_that_only_starts_alike_is_not_covered(self) -> None:
         mount = StoredPath(path="/sy", identity=self.ZERO_A)
         target = self.path("/syn/a", (self.ROOT, self.ZERO_A, self.ZERO_B))

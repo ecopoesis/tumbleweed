@@ -24,8 +24,6 @@ def test_the_constants_are_pinned() -> None:
     assert limits.MAX_TOOL_INPUT_BYTES == 64 * 1024
     assert limits.MAX_TOOL_RESULT_BYTES == 16 * 1024
     assert limits.TOOL_TIMEOUT.total_seconds() == 30
-    assert limits.MAX_HISTORY_MESSAGES == 40
-    assert limits.MAX_HISTORY_BYTES == 256 * 1024
 
 
 def test_the_defaults_are_what_the_readme_says() -> None:

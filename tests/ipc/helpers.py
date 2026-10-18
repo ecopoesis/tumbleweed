@@ -12,7 +12,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import timedelta
-from typing import Self, assert_never
+from typing import Self
 
 from tests.ipc.creds import FixedUid
 from tumbleweed.core.types import ByteCount
@@ -99,7 +99,8 @@ class ScriptedHandler:
                 self.calls.append(request.text)
                 return await self.answer(request.text, connection)
             case _:
-                assert_never(request)
+                # The broker's requests share the union (#61): these tests never send one.
+                raise AssertionError(f"unexpected request {request.kind}")
 
     async def answer(self, text: str, connection: Connection) -> ResponseBody:
         key = text.partition(":")[2]

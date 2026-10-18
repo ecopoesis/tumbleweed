@@ -100,6 +100,7 @@ def issued(
         rules=world.rules,
         now=now,
         expires_at=expires_at,
+        grants=(),
     )
     assert isinstance(result, Issued), result
     return result.grant, result.task
@@ -233,6 +234,7 @@ class TestTheAncestorRuleWhenIssuing:
             grant_id=GrantId.new(),
             rules=world.rules,
             now=NOW,
+            grants=(),
         )
 
         reason = refusal_of(result)
@@ -264,6 +266,7 @@ class TestTheAncestorRuleWhenIssuing:
                 grant_id=GrantId.new(),
                 rules=world.rules,
                 now=NOW,
+                grants=(),
             )
         )
 
@@ -283,6 +286,7 @@ class TestTheAncestorRuleWhenIssuing:
                     grant_id=GrantId.new(),
                     rules=world.rules,
                     now=NOW,
+                    grants=(),
                 )
             )
             assert isinstance(reason, StaticDeny), ancestor
@@ -296,6 +300,7 @@ class TestTheAncestorRuleWhenIssuing:
             grant_id=GrantId.new(),
             rules=world.rules,
             now=NOW,
+            grants=(),
         )
 
         assert task.taint == frozenset()
@@ -375,6 +380,7 @@ class TestTheWriteGate:
             grant_id=GrantId.new(),
             rules=world.rules,
             now=NOW,
+            grants=(),
         )
 
         assert refusal_of(result) == WriteGateClosed()
@@ -613,6 +619,7 @@ class TestExpiry:
                 rules=world.rules,
                 now=NOW,
                 expires_at=naive,
+                grants=(),
             )
 
     @pytest.mark.parametrize("offset", [dt.timedelta(0), -MINUTE])
@@ -628,6 +635,7 @@ class TestExpiry:
             rules=world.rules,
             now=NOW,
             expires_at=NOW + offset,
+            grants=(),
         )
 
         assert refusal_of(result) == BadExpiry()
@@ -707,6 +715,7 @@ class TestTaint:
             grant_id=GrantId.new(),
             rules=world.rules,
             now=NOW,
+            grants=(),
         )
         fs_after_net = issue_grant(
             net_tainted,
@@ -716,6 +725,7 @@ class TestTaint:
             grant_id=GrantId.new(),
             rules=world.rules,
             now=NOW,
+            grants=(),
         )
 
         assert refusal_of(net_after_fs) == TaintConflict(held=TaintKind.FS, wanted=TaintKind.NET)
@@ -1063,6 +1073,7 @@ class TestToolGrants:
                 grant_id=GrantId.new(),
                 rules=world.rules,
                 now=NOW,
+                grants=(),
             )
             assert refusal_of(result) == ScopeUnavailable(scope=GrantScope.TOOL)
 
@@ -1429,6 +1440,7 @@ class TestIssuing:
             grant_id=GrantId.new(),
             rules=world.rules,
             now=NOW,
+            grants=(),
         )
 
         assert refusal_of(result) == Ungrantable()
@@ -1445,6 +1457,7 @@ class TestIssuing:
                 grant_id=GrantId.new(),
                 rules=world.rules,
                 now=NOW,
+                grants=(),
             )
             assert isinstance(refusal_of(result), TaskEnded | TaskMismatch)
 
@@ -1457,6 +1470,7 @@ class TestIssuing:
             grant_id=GrantId.new(),
             rules=world.rules,
             now=NOW,
+            grants=(),
         )
         adapter = TypeAdapter(Issuance)
 
@@ -1531,6 +1545,7 @@ class TestTheRunTimeHalf:
             grant_id=GrantId.new(),
             rules=world.rules,
             now=NOW,
+            grants=(),
         )
         assert isinstance(issuance, Issued)
         grant, task = issuance.grant, issuance.task

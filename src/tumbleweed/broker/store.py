@@ -1,0 +1,845 @@
+"""The broker's SQLite store: tasks (with their taint and workspace identity) and grants.
+
+The file is untrusted, as the audit log's directory is: it may have been replaced, edited or
+planted, so `BrokerStore.open` accepts it only after looking, and changes nothing until it has:
+
+- The directory and the file are opened through descriptors (`privatefs`): `O_NOFOLLOW`, ours,
+  0700 and 0600, one link; the `-wal`, `-shm` and `-journal` files are checked, and after SQLite
+  has opened the file by path it is compared with the descriptor.
+- The connection is configured for a file it must not trust before anything is read from it:
+  defensive mode, untrusted-schema mode, no triggers, no views, no `ATTACH`, limits on the size of
+  a value and of a statement. Text is read as bytes and decoded strictly by us.
+- **One read snapshot** decides whether the file is ours: its `application_id`, `user_version`
+  and *every* row of `sqlite_master`, the automatic `sqlite_autoindex_*` ones included, must be
+  exactly what the migrations produce (`expected_signature`, computed on a scratch database), or
+  the file must be empty (version 0, no objects). Anything else is refused (`StoreRefusedError`)
+  with the file untouched: not switched to WAL, not migrated, not written. A version newer than
+  ours is refused too; a file is never migrated down.
+- Only then is the journal mode set to WAL (and refused if the file system cannot) and the schema
+  created or migrated, in one `BEGIN IMMEDIATE`, checked again inside it.
+
+What is stored. A grant is its JSON (`Grant`, validated strictly when it is read back, so the
+unsigned 64-bit identities of a path live in text and not in SQLite's signed integers); a task row
+keeps the task's taint, when it ended, and the identity of its workspace directory as decimal text
+(`f_fsid` and `st_ino` are unsigned 64-bit). A record that cannot be read back is skipped and
+logged by ID: a grant that cannot be read grants nothing. Every `sqlite3.Error` leaves this module
+as a `StoreError` with fixed text; SQLite's own message, which can quote a name from a hostile
+schema, is only logged by its code name.
+
+The connection belongs to the thread that opened it (the broker's event loop).
+"""
+
+import logging
+import os
+import sqlite3
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Annotated, Final, Literal, Self, final
+
+from pydantic import AwareDatetime, Field, TypeAdapter, ValidationError, model_validator
+
+from tumbleweed.broker.errors import StoreCorruptError, StoreError, StoreRefusedError
+from tumbleweed.broker.grants import Grant, ToolGrant
+from tumbleweed.broker.identity import FsIdentity
+from tumbleweed.broker.model import PolicyModel
+from tumbleweed.broker.privatefs import (
+    SIDECAR_SUFFIXES,
+    check_sidecar,
+    open_private_directory,
+    open_private_file,
+    same_file,
+)
+from tumbleweed.broker.task import TaintKind
+from tumbleweed.core.errors import InvalidValueError
+from tumbleweed.core.ids import GrantId, TaskId, ToolId
+from tumbleweed.core.types import ByteCount, ContentHash, ToolVersion
+from tumbleweed.tools.limits import MAX_PACKAGE_BYTES
+from tumbleweed.tools.package import Description, Name, ToolTag
+
+_log = logging.getLogger(__name__)
+
+DATABASE_NAME: Final = "broker.sqlite3"
+APPLICATION_ID: Final = 0x54574252  # "TWBR"
+BUSY_TIMEOUT: Final = timedelta(seconds=2)
+MAX_VALUE_BYTES: Final = ByteCount(64 * 1024)
+MAX_SQL_BYTES: Final = ByteCount(16 * 1024)
+_MINIMUM_SQLITE: Final = (3, 37, 0)  # STRICT tables
+_EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
+
+_BUSY: Final = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
+_DAMAGED: Final = frozenset({11, 18, 20, 24, 25, 26})  # CORRUPT TOOBIG MISMATCH FORMAT RANGE NOTADB
+
+type Row = tuple[object, ...]
+type Signature = tuple[tuple[str, str, str, str], ...]
+
+_MILLIS = "BETWEEN 0 AND 253402300799999"
+MAX_FAILURES: Final = 1_000_000
+MAX_LIST: Final = 1000
+_U64_TEXT = "length(%s) BETWEEN 1 AND 20 AND %s NOT GLOB '*[^0-9]*'"
+
+# Append a migration to change the schema; never edit an earlier one.
+MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
+    (
+        f"""CREATE TABLE tasks (
+    id TEXT NOT NULL PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN ('live', 'ended')),
+    taint TEXT NOT NULL CHECK (taint IN ('none', 'fs', 'net')),
+    created_at INTEGER NOT NULL CHECK (created_at {_MILLIS}),
+    ended_at INTEGER CHECK (ended_at IS NULL OR ended_at {_MILLIS}),
+    workspace TEXT NOT NULL CHECK (workspace IN ('present', 'deleted')),
+    workspace_fsid TEXT NOT NULL CHECK ({_U64_TEXT % ("workspace_fsid", "workspace_fsid")}),
+    workspace_ino TEXT NOT NULL CHECK ({_U64_TEXT % ("workspace_ino", "workspace_ino")}),
+    delete_failures INTEGER NOT NULL DEFAULT 0
+        CHECK (delete_failures BETWEEN 0 AND {MAX_FAILURES}),
+    delete_after INTEGER CHECK (delete_after IS NULL OR delete_after {_MILLIS}),
+    CHECK ((state = 'live') = (ended_at IS NULL))
+) STRICT""",
+        "CREATE INDEX tasks_by_end ON tasks (state, ended_at)",
+        f"""CREATE TABLE grants (
+    id TEXT NOT NULL PRIMARY KEY,
+    task_id TEXT,
+    scope TEXT NOT NULL CHECK (scope IN ('once', 'task', 'tool')),
+    record TEXT NOT NULL CHECK (length(CAST(record AS BLOB)) <= 16384),
+    issued_at INTEGER NOT NULL CHECK (issued_at {_MILLIS}),
+    revoked_at INTEGER CHECK (revoked_at IS NULL OR revoked_at {_MILLIS})
+) STRICT""",
+        "CREATE INDEX grants_by_task ON grants (task_id, revoked_at)",
+    ),
+    # S23: the tool store's index. A package is a file (`toolblobs`); these rows say which exist,
+    # and the name, description and tags are copies of the package's own, for listing and search
+    # (a read that opens a package checks them against it). `taint` is what a decision must use: for
+    # a saved version it is the package's own, for an imported one the package's claim plus `fs`
+    # (an imported package is user-filesystem input of unknown provenance, I12); `claimed_taint` is
+    # the package's own, for display. `tool_search` indexes the newest
+    # version of each tool, under the rowid of its `tools` row.
+    (
+        """CREATE TABLE tools (
+    seq INTEGER PRIMARY KEY,
+    id TEXT NOT NULL UNIQUE CHECK (length(id) = 31 AND id GLOB 'tool_*'),
+    latest INTEGER NOT NULL CHECK (latest BETWEEN 1 AND 9223372036854775807)
+) STRICT""",
+        f"""CREATE TABLE tool_versions (
+    tool INTEGER NOT NULL,
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9223372036854775807),
+    hash TEXT NOT NULL UNIQUE CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
+    size INTEGER NOT NULL CHECK (size BETWEEN 1 AND {MAX_PACKAGE_BYTES}),
+    name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) <= 1024),
+    description TEXT NOT NULL CHECK (length(CAST(description AS BLOB)) <= 8192),
+    tags TEXT NOT NULL CHECK (length(CAST(tags AS BLOB)) <= 512),
+    taint TEXT NOT NULL CHECK (taint IN ('none', 'fs', 'net', 'both')),
+    claimed_taint TEXT NOT NULL CHECK (claimed_taint IN ('none', 'fs', 'net')),
+    origin TEXT NOT NULL CHECK (origin IN ('saved', 'imported')),
+    saved_at INTEGER NOT NULL CHECK (saved_at {_MILLIS}),
+    PRIMARY KEY (tool, version)
+) STRICT""",
+        (
+            "CREATE VIRTUAL TABLE tool_search USING fts5("
+            "name, description, tags, tokenize = 'unicode61 remove_diacritics 2')"
+        ),
+    ),
+)
+
+_GRANTS: Final[TypeAdapter[Grant]] = TypeAdapter(Grant)
+
+
+def _millis(moment: datetime) -> int:
+    return (moment - _EPOCH) // timedelta(milliseconds=1)
+
+
+def _moment(value: object) -> datetime:
+    if type(value) is not int:
+        raise StoreCorruptError("the broker's database holds a malformed time")
+    try:
+        return _EPOCH + timedelta(milliseconds=value)
+    except OverflowError:
+        raise StoreCorruptError("the broker's database holds a malformed time") from None
+
+
+def _text(value: object) -> str:
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            raise StoreCorruptError("the broker's database holds text that is not UTF-8") from None
+    if value is None:
+        return ""  # a NULL `sql` (an automatic index): it cannot match anything we wrote
+    if isinstance(value, str):
+        return value
+    raise StoreCorruptError("the broker's database holds an unexpected value")
+
+
+def _integer(value: object) -> int:
+    if type(value) is not int:
+        raise StoreCorruptError("the broker's database holds an unexpected value")
+    return value
+
+
+def _primary_code(error: sqlite3.Error) -> int | None:
+    code = getattr(error, "sqlite_errorcode", None)
+    return code & 0xFF if isinstance(code, int) else None
+
+
+def translate(error: sqlite3.Error) -> StoreError:
+    """The `StoreError` for an SQLite one; logs its name, never its message."""
+    name = getattr(error, "sqlite_errorname", None)
+    _log.warning("sqlite error in the broker's database: %s (%s)", type(error).__name__, name)
+    primary = _primary_code(error)
+    if primary in _BUSY:
+        return StoreError("the broker's database is in use")
+    if primary in _DAMAGED or isinstance(error, sqlite3.DataError):
+        return StoreRefusedError("the broker's database file is not usable")
+    return StoreError("the broker's database could not be read or written")
+
+
+# --- the schema, and the checks that guard it -------------------------------------------------
+
+
+def schema_signature(connection: sqlite3.Connection) -> Signature:
+    """Every object of the schema as (type, name, table, SQL), sorted: the automatic indexes
+    that SQLite makes for a PRIMARY KEY or UNIQUE included, and nothing left out."""
+    rows: list[Row] = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+    ).fetchall()
+    found: list[tuple[str, str, str, str]] = []
+    for row in rows:
+        if len(row) != 4:
+            raise StoreCorruptError("the broker's database could not be read")
+        found.append((_text(row[0]), _text(row[1]), _text(row[2]), _text(row[3])))
+    return tuple(found)
+
+
+def expected_signature(version: int) -> Signature:
+    """The signature of a database at `version`, made by running the migrations on a scratch one."""
+    scratch = sqlite3.connect(":memory:", autocommit=True)
+    try:
+        for statements in MIGRATIONS[:version]:
+            for statement in statements:
+                scratch.execute(statement)
+        return schema_signature(scratch)
+    finally:
+        scratch.close()
+
+
+def _pragma(connection: sqlite3.Connection, name: str) -> int:
+    row: Row | None = connection.execute(f"PRAGMA {name}").fetchone()
+    if row is None:
+        raise StoreCorruptError("the broker's database could not be read")
+    return _integer(row[0])
+
+
+def _examine(connection: sqlite3.Connection) -> int:
+    """The file's schema version, once it is known to be ours and exactly that version; or 0 for
+    an empty file. Reads in one snapshot and changes nothing. `StoreRefusedError` otherwise."""
+    connection.execute("BEGIN")
+    try:
+        version = _pragma(connection, "user_version")
+        application = _pragma(connection, "application_id")
+        signature = schema_signature(connection)
+    finally:
+        connection.execute("COMMIT")
+    if version == 0:
+        if application != 0 or signature:
+            raise StoreRefusedError("the broker's database file is not a Tumbleweed database")
+        return 0
+    if application != APPLICATION_ID:
+        raise StoreRefusedError("the broker's database file is not a Tumbleweed database")
+    if version > len(MIGRATIONS):
+        raise StoreRefusedError(
+            "the broker's database was written by a newer version and is left alone"
+        )
+    if signature != expected_signature(version):
+        raise StoreRefusedError("the broker's database has an unexpected schema")
+    return version
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    latest = len(MIGRATIONS)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        version = _examine_in_transaction(connection)
+        for number, statements in enumerate(MIGRATIONS, start=1):
+            if number > version:
+                for statement in statements:
+                    connection.execute(statement)
+                connection.execute(f"PRAGMA user_version = {number}")
+        if version == 0:
+            connection.execute(f"PRAGMA application_id = {APPLICATION_ID}")
+        if _pragma(connection, "user_version") != latest:
+            raise StoreCorruptError("the broker's database was not migrated")
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+
+
+def _examine_in_transaction(connection: sqlite3.Connection) -> int:
+    """`_examine`, inside a write transaction that is already open."""
+    version = _pragma(connection, "user_version")
+    application = _pragma(connection, "application_id")
+    signature = schema_signature(connection)
+    if version == 0:
+        if application != 0 or signature:
+            raise StoreRefusedError("the broker's database file is not a Tumbleweed database")
+        return 0
+    if application != APPLICATION_ID or signature != expected_signature(version):
+        raise StoreRefusedError("the broker's database has an unexpected schema")
+    return version
+
+
+def _configure(connection: sqlite3.Connection) -> None:
+    connection.text_factory = bytes
+    connection.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+    connection.setconfig(sqlite3.SQLITE_DBCONFIG_TRUSTED_SCHEMA, False)
+    connection.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_TRIGGER, False)
+    connection.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_VIEW, False)
+    connection.setlimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
+    connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
+    connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, MAX_SQL_BYTES)
+
+
+# --- records ----------------------------------------------------------------------------------
+
+
+@final
+class TaskRecord(PolicyModel):
+    """A task as stored: its taint, when it was made and ended, and its workspace's identity."""
+
+    task: TaskId
+    taint: frozenset[TaintKind]
+    created_at: AwareDatetime
+    ended_at: AwareDatetime | None
+    workspace_present: bool
+    workspace: FsIdentity
+    failures: int = 0  # failed attempts to delete the workspace
+
+    @property
+    def ended(self) -> bool:
+        return self.ended_at is not None
+
+
+@final
+class ToolRecord(PolicyModel):
+    """One stored version of a tool, as the index has it (the package itself is a blob).
+
+    Validated like everything read from the file: a row whose text is not a valid name,
+    description or tags, or whose number is out of range, cannot be read and is skipped.
+    """
+
+    tool: ToolId
+    version: ToolVersion
+    hash: ContentHash
+    size: ByteCount
+    name: Name
+    description: Description
+    tags: Annotated[tuple[ToolTag, ...], Field(max_length=8)]
+    taint: frozenset[TaintKind]  # effective: what open_tool and grants must use (I12)
+    claimed_taint: frozenset[TaintKind]  # what the package itself records
+    origin: Literal["saved", "imported"]
+    saved_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _claim_is_one_taint_at_most(self) -> Self:
+        if len(self.claimed_taint) > 1 or not self.claimed_taint <= self.taint:
+            raise InvalidValueError("a package's own taint is at most one, and part of the taint")
+        return self
+
+
+def _taint_text(taint: frozenset[TaintKind]) -> str:
+    if len(taint) > 1:
+        raise InvalidValueError("a task is never both fs- and net-tainted (I12)")
+    return next(iter(taint)).value if taint else "none"
+
+
+def _tool_taint_text(taint: frozenset[TaintKind]) -> str:
+    """A tool's taint, which unlike a task's can be both (an imported package that claims net)."""
+    return "both" if len(taint) > 1 else _taint_text(taint)
+
+
+def _tool_taint_of(text: str) -> frozenset[TaintKind]:
+    if text == "both":
+        return frozenset({TaintKind.FS, TaintKind.NET})
+    return _taint_of(text)
+
+
+def _taint_of(text: str) -> frozenset[TaintKind]:
+    if text == "none":
+        return frozenset()
+    try:
+        return frozenset({TaintKind(text)})
+    except ValueError:
+        raise StoreCorruptError("the broker's database holds an unknown taint") from None
+
+
+def _failures(value: object) -> int:
+    """The count of failed deletions as stored, which a hand-edited file can make anything: a
+    number out of range is a record that cannot be real (the row is skipped)."""
+    count = _integer(value)
+    if not 0 <= count <= MAX_FAILURES:
+        raise StoreCorruptError("the broker's database holds a malformed count")
+    return count
+
+
+def _limit(limit: int) -> int:
+    if type(limit) is not int or not 1 <= limit <= MAX_LIST:
+        raise StoreError("a listing is of 1 to 1000 rows")
+    return limit
+
+
+def _origin(text: str) -> Literal["saved", "imported"]:
+    match text:
+        case "saved":
+            return "saved"
+        case "imported":
+            return "imported"
+    raise StoreCorruptError("the broker's database holds an unknown origin")
+
+
+def _identity(fsid: str, ino: str) -> FsIdentity:
+    try:
+        return FsIdentity(fsid=int(fsid), ino=int(ino))
+    except (ValueError, ValidationError):
+        raise StoreCorruptError("the broker's database holds a malformed identity") from None
+
+
+@final
+class BrokerStore:
+    """The open database. Made by `BrokerStore.open`; writes go in `transaction()` blocks."""
+
+    def __init__(self, connection: sqlite3.Connection, directory_fd: int, file_fd: int) -> None:
+        self._connection = connection
+        self._directory_fd = directory_fd
+        self._file_fd = file_fd
+        self._closed = False
+
+    @classmethod
+    def open(cls, directory: Path) -> Self:
+        """Open (creating if needed) the database in `directory`.
+
+        Raises `PrivateFsError` for an unsafe directory or file, `StoreRefusedError` for a file
+        that is not ours (nothing has been changed), `StoreError` for any other failure.
+        """
+        if sqlite3.sqlite_version_info < _MINIMUM_SQLITE:
+            raise StoreRefusedError("this SQLite is too old for the broker's database")
+        directory_fd = open_private_directory(directory)
+        file_fd = -1
+        connection: sqlite3.Connection | None = None
+        try:
+            file_fd = open_private_file(directory_fd, DATABASE_NAME)
+            for suffix in SIDECAR_SUFFIXES:
+                check_sidecar(directory_fd, DATABASE_NAME + suffix)
+            connection = sqlite3.connect(
+                str(directory / DATABASE_NAME),
+                timeout=BUSY_TIMEOUT.total_seconds(),
+                autocommit=True,
+            )
+            _configure(connection)
+            _examine(connection)
+            if not same_file(directory_fd, DATABASE_NAME, file_fd):
+                raise StoreRefusedError("the broker's database file was replaced while opening")
+            for suffix in SIDECAR_SUFFIXES:
+                check_sidecar(directory_fd, DATABASE_NAME + suffix)
+            mode: Row | None = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+            if mode is None or mode[0] != b"wal":
+                raise StoreRefusedError("this file system cannot hold the broker's database")
+            connection.execute("PRAGMA synchronous = NORMAL")
+            connection.execute("PRAGMA secure_delete = ON")
+            _migrate(connection)
+        except sqlite3.Error as exc:
+            _release(connection, file_fd, directory_fd)
+            raise translate(exc) from None
+        except BaseException:
+            _release(connection, file_fd, directory_fd)
+            raise
+        return cls(connection, directory_fd, file_fd)
+
+    # --- transactions --------------------------------------------------------------------
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """A write transaction: `BEGIN IMMEDIATE`, then commit, or roll back if the block raises.
+
+        Not reentrant. The audit entry of an act is written inside the transaction of the act, so
+        that an entry that cannot be written rolls the act back.
+        """
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            raise translate(exc) from None
+        try:
+            yield
+            self._connection.execute("COMMIT")
+        except sqlite3.Error as exc:
+            self._rollback()
+            raise translate(exc) from None
+        except BaseException:
+            self._rollback()
+            raise
+
+    def _rollback(self) -> None:
+        if self._connection.in_transaction:
+            try:
+                self._connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                _log.warning("the broker's database could not roll back a transaction")
+
+    def _query(self, sql: str, parameters: Sequence[object] = ()) -> list[Row]:
+        try:
+            rows: list[Row] = self._connection.execute(sql, parameters).fetchall()
+        except sqlite3.Error as exc:
+            raise translate(exc) from None
+        return rows
+
+    def _execute(self, sql: str, parameters: Sequence[object] = ()) -> int:
+        try:
+            return self._connection.execute(sql, parameters).rowcount
+        except sqlite3.Error as exc:
+            raise translate(exc) from None
+
+    # --- tasks ---------------------------------------------------------------------------
+
+    def insert_task(self, record: TaskRecord) -> None:
+        """Add a new task (inside `transaction()`)."""
+        self._execute(
+            "INSERT INTO tasks (id, state, taint, created_at, ended_at, workspace, "
+            "workspace_fsid, workspace_ino) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(record.task),
+                "ended" if record.ended else "live",
+                _taint_text(record.taint),
+                _millis(record.created_at),
+                None if record.ended_at is None else _millis(record.ended_at),
+                "present" if record.workspace_present else "deleted",
+                str(record.workspace.fsid),
+                str(record.workspace.ino),
+            ),
+        )
+
+    def set_taint(self, task: TaskId, taint: frozenset[TaintKind]) -> None:
+        """Replace a task's taint (inside `transaction()`); the caller only ever grows it."""
+        self._execute("UPDATE tasks SET taint = ? WHERE id = ?", (_taint_text(taint), str(task)))
+
+    def end_task(self, task: TaskId, at: datetime) -> None:
+        """Mark a live task ended (inside `transaction()`)."""
+        self._execute(
+            "UPDATE tasks SET state = 'ended', ended_at = ? WHERE id = ? AND state = 'live'",
+            (_millis(at), str(task)),
+        )
+
+    def mark_workspace_deleted(self, task: TaskId) -> None:
+        self._execute("UPDATE tasks SET workspace = 'deleted' WHERE id = ?", (str(task),))
+
+    def task(self, task: TaskId) -> TaskRecord | None:
+        rows = self._query(
+            f"{_TASK_COLUMNS} FROM tasks WHERE id = ?",
+            (str(task),),
+        )
+        return self._task_row(rows[0]) if rows else None
+
+    def live_tasks(self) -> list[TaskRecord]:
+        return self._tasks(
+            f"{_TASK_COLUMNS} FROM tasks WHERE state = 'live' ORDER BY created_at, id"
+        )
+
+    def workspaces_to_delete(self, ended_before: datetime, now: datetime) -> list[TaskRecord]:
+        """Ended tasks whose workspace is still there, whose retention is over and that are not
+        waiting out a pause after a failed deletion."""
+        return self._tasks(
+            f"{_TASK_COLUMNS} FROM tasks WHERE state = 'ended' AND workspace = 'present' "
+            "AND ended_at < ? AND (delete_after IS NULL OR delete_after <= ?) "
+            "ORDER BY ended_at, id",
+            (_millis(ended_before), _millis(now)),
+        )
+
+    def delete_failed(self, task: TaskId, retry_at: datetime) -> None:
+        """Note a failed deletion and when to try again (inside `transaction()`)."""
+        self._execute(
+            "UPDATE tasks SET delete_failures = min(delete_failures + 1, 1000000), "
+            "delete_after = ? WHERE id = ?",
+            (_millis(retry_at), str(task)),
+        )
+
+    def known_tasks(self) -> frozenset[TaskId]:
+        """Every task ID in the database (for finding workspaces nobody owns)."""
+        found: set[TaskId] = set()
+        for row in self._query("SELECT id FROM tasks"):
+            try:
+                found.add(TaskId(_text(row[0])))
+            except InvalidValueError:
+                _log.warning("the broker's database holds a task ID that is not one")
+        return frozenset(found)
+
+    def _tasks(self, sql: str, parameters: Sequence[object] = ()) -> list[TaskRecord]:
+        records: list[TaskRecord] = []
+        for row in self._query(sql, parameters):
+            try:
+                records.append(self._task_row(row))
+            except (StoreCorruptError, InvalidValueError, ValidationError):
+                _log.warning("a task record of the broker's database cannot be read; skipped")
+        return records
+
+    @staticmethod
+    def _task_row(row: Row) -> TaskRecord:
+        try:
+            return TaskRecord(
+                task=TaskId(_text(row[0])),
+                taint=_taint_of(_text(row[1])),
+                created_at=_moment(row[2]),
+                ended_at=None if row[3] is None else _moment(row[3]),
+                workspace_present=_text(row[4]) == "present",
+                workspace=_identity(_text(row[5]), _text(row[6])),
+                failures=_failures(row[7]),
+            )
+        except (InvalidValueError, ValidationError):
+            raise StoreCorruptError("the broker's database holds a malformed task") from None
+
+    # --- grants --------------------------------------------------------------------------
+
+    def insert_grant(self, grant: Grant, task: TaskId | None) -> None:
+        """Add a grant of `task` (none for a tool grant), inside `transaction()`."""
+        self._execute(
+            "INSERT INTO grants (id, task_id, scope, record, issued_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                str(grant.id),
+                None if task is None else str(task),
+                grant.kind.value,
+                _GRANTS.dump_json(grant).decode("utf-8"),
+                _millis(grant.issued_at),
+            ),
+        )
+
+    def replace_grant(self, grant: Grant) -> None:
+        """Store a changed grant (a once grant, consumed), inside `transaction()`."""
+        changed = self._execute(
+            "UPDATE grants SET record = ? WHERE id = ? AND revoked_at IS NULL",
+            (_GRANTS.dump_json(grant).decode("utf-8"), str(grant.id)),
+        )
+        if changed != 1:
+            raise StoreError("the grant to update is not in the broker's database")
+
+    def revoke_grant(self, grant: GrantId, at: datetime) -> bool:
+        """Revoke one grant (inside `transaction()`); whether there was one to revoke."""
+        return (
+            self._execute(
+                "UPDATE grants SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+                (_millis(at), str(grant)),
+            )
+            == 1
+        )
+
+    def grants_of(self, task: TaskId) -> list[Grant]:
+        """The grants of `task` not revoked, in order of issue."""
+        return self._grants(
+            "SELECT id, scope, record FROM grants WHERE task_id = ? AND revoked_at IS NULL "
+            "ORDER BY issued_at, id",
+            (str(task),),
+        )
+
+    def tool_grants(self) -> list[Grant]:
+        """The tool grants not revoked (they belong to no task)."""
+        return self._grants(
+            "SELECT id, scope, record FROM grants WHERE task_id IS NULL AND revoked_at IS NULL "
+            "ORDER BY issued_at, id"
+        )
+
+    def _grants(self, sql: str, parameters: Sequence[object] = ()) -> list[Grant]:
+        grants: list[Grant] = []
+        for row in self._query(sql, parameters):
+            try:
+                identifier, scope, record = _text(row[0]), _text(row[1]), _text(row[2])
+                grant = _GRANTS.validate_json(record, strict=True)
+                if str(grant.id) != identifier or grant.kind.value != scope:
+                    raise StoreCorruptError("a grant record disagrees with its row")
+                if isinstance(grant, ToolGrant) != (scope == "tool"):
+                    raise StoreCorruptError("a grant record disagrees with its row")
+                grants.append(grant)
+            except (StoreCorruptError, ValidationError):
+                # A grant that cannot be read grants nothing. Only its ID is logged.
+                _log.warning("a grant record of the broker's database cannot be read; skipped")
+        return grants
+
+    # --- tools (S23) ---------------------------------------------------------------------
+
+    def tool_totals(self) -> tuple[int, int]:
+        """How many tools there are, and the bytes of all their packages."""
+        rows = self._query(
+            "SELECT (SELECT count(*) FROM tools), "
+            "(SELECT coalesce(sum(size), 0) FROM tool_versions)"
+        )
+        return _integer(rows[0][0]), _integer(rows[0][1])
+
+    def latest_version(self, tool: ToolId) -> ToolVersion | None:
+        """The newest version of `tool`, or None if the store has no such tool."""
+        rows = self._query("SELECT latest FROM tools WHERE id = ?", (str(tool),))
+        return self._version(rows[0][0]) if rows else None
+
+    def version_count(self, tool: ToolId) -> int:
+        """How many versions of `tool` are stored."""
+        rows = self._query(
+            "SELECT count(*) FROM tool_versions WHERE tool = (SELECT seq FROM tools WHERE id = ?)",
+            (str(tool),),
+        )
+        return _integer(rows[0][0])
+
+    def tool_record(self, tool: ToolId, version: ToolVersion | None) -> ToolRecord | None:
+        """The record of one version of `tool` (the newest if `version` is None), or None.
+        `StoreCorruptError` if the row cannot be read."""
+        if version is None:
+            rows = self._query(
+                f"{_TOOL_COLUMNS} FROM tools t JOIN tool_versions v ON v.tool = t.seq "
+                "AND v.version = t.latest WHERE t.id = ?",
+                (str(tool),),
+            )
+        else:
+            rows = self._query(
+                f"{_TOOL_COLUMNS} FROM tools t JOIN tool_versions v ON v.tool = t.seq "
+                "WHERE t.id = ? AND v.version = ?",
+                (str(tool), int(version)),
+            )
+        return self._tool_row(rows[0]) if rows else None
+
+    def insert_tool_version(self, record: ToolRecord) -> None:
+        """Add a version (inside `transaction()`). A new tool gets a row of its own; the next
+        version of a tool the store has must be exactly the one after its newest, and becomes the
+        one that is searched. Versions are never changed or removed: there is no method that does
+        either, and the primary key and the unique hash refuse a second row for one."""
+        known = self._query("SELECT seq, latest FROM tools WHERE id = ?", (str(record.tool),))
+        if not known:
+            self._execute(
+                "INSERT INTO tools (id, latest) VALUES (?, ?)",
+                (str(record.tool), int(record.version)),
+            )
+            known = self._query("SELECT seq, latest FROM tools WHERE id = ?", (str(record.tool),))
+            if not known:
+                raise StoreCorruptError("the broker's database lost a row it just wrote")
+        else:
+            if self._version(known[0][1]) + 1 != record.version:
+                raise StoreError("a version of a tool must be the one after its newest")
+            self._execute(
+                "UPDATE tools SET latest = ? WHERE id = ?", (int(record.version), str(record.tool))
+            )
+        sequence = _integer(known[0][0])
+        self._execute(
+            "INSERT INTO tool_versions (tool, version, hash, size, name, description, tags, "
+            "taint, claimed_taint, origin, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sequence,
+                int(record.version),
+                str(record.hash),
+                int(record.size),
+                record.name,
+                record.description,
+                " ".join(record.tags),
+                _tool_taint_text(record.taint),
+                _taint_text(record.claimed_taint),
+                record.origin,
+                _millis(record.saved_at),
+            ),
+        )
+        self._execute("DELETE FROM tool_search WHERE rowid = ?", (sequence,))
+        self._execute(
+            "INSERT INTO tool_search (rowid, name, description, tags) VALUES (?, ?, ?, ?)",
+            (sequence, record.name, record.description, " ".join(record.tags)),
+        )
+
+    def list_tools(self, limit: int) -> list[ToolRecord]:
+        """The newest version of each tool, the most recently saved first, at most `limit`."""
+        return self._tools(
+            f"{_TOOL_COLUMNS} FROM tools t JOIN tool_versions v ON v.tool = t.seq "
+            "AND v.version = t.latest ORDER BY v.saved_at DESC, t.id LIMIT ?",
+            (_limit(limit),),
+        )
+
+    def search_tools(self, match: str, limit: int) -> list[ToolRecord]:
+        """The tools whose newest version matches `match`, best first, at most `limit`.
+
+        `match` is an FTS5 query and must be made by `tumbleweed.tools.fts_match`, never be text
+        from outside: it is bound as a parameter (so it cannot change the SQL), but FTS5's own
+        language is the part that has syntax errors and costly forms. A name counts for more than
+        a tag, and a tag for more than a description.
+        """
+        return self._tools(
+            f"{_TOOL_COLUMNS} FROM tool_search s JOIN tools t ON t.seq = s.rowid "
+            "JOIN tool_versions v ON v.tool = t.seq AND v.version = t.latest "
+            "WHERE tool_search MATCH ? ORDER BY bm25(tool_search, 10.0, 2.0, 5.0), t.id LIMIT ?",
+            (match, _limit(limit)),
+        )
+
+    def _tools(self, sql: str, parameters: Sequence[object]) -> list[ToolRecord]:
+        records: list[ToolRecord] = []
+        for row in self._query(sql, parameters):
+            try:
+                records.append(self._tool_row(row))
+            except StoreCorruptError:
+                _log.warning("a tool record of the broker's database cannot be read; skipped")
+        return records
+
+    @staticmethod
+    def _version(value: object) -> ToolVersion:
+        try:
+            return ToolVersion(_integer(value))
+        except InvalidValueError:
+            raise StoreCorruptError("the broker's database holds a malformed version") from None
+
+    @classmethod
+    def _tool_row(cls, row: Row) -> ToolRecord:
+        try:
+            return ToolRecord(
+                tool=ToolId(_text(row[0])),
+                version=cls._version(row[1]),
+                hash=ContentHash(_text(row[2])),
+                size=ByteCount(_integer(row[3])),
+                name=_text(row[4]),
+                description=_text(row[5]),
+                tags=tuple(ToolTag(tag) for tag in _text(row[6]).split()),
+                taint=_tool_taint_of(_text(row[7])),
+                claimed_taint=_taint_of(_text(row[8])),
+                origin=_origin(_text(row[9])),
+                saved_at=_moment(row[10]),
+            )
+        except (InvalidValueError, ValidationError):
+            raise StoreCorruptError("the broker's database holds a malformed tool") from None
+
+    # --- closing -------------------------------------------------------------------------
+
+    def close(self) -> None:
+        """Close the connection and the descriptors. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        _release(self._connection, self._file_fd, self._directory_fd)
+
+
+_TOOL_COLUMNS: Final = (
+    "SELECT t.id, v.version, v.hash, v.size, v.name, v.description, v.tags, v.taint, "
+    "v.claimed_taint, v.origin, v.saved_at"
+)
+
+_TASK_COLUMNS: Final = (
+    "SELECT id, taint, created_at, ended_at, workspace, workspace_fsid, workspace_ino, "
+    "delete_failures"
+)
+
+
+def _release(connection: sqlite3.Connection | None, file_fd: int, directory_fd: int) -> None:
+    try:
+        if connection is not None:
+            connection.close()
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(directory_fd)
+
+
+__all__ = [
+    "APPLICATION_ID",
+    "DATABASE_NAME",
+    "MIGRATIONS",
+    "BrokerStore",
+    "TaskRecord",
+    "ToolRecord",
+    "expected_signature",
+    "schema_signature",
+]

@@ -171,33 +171,58 @@ class SandboxRunner:
         self._plan: LimitsPlan | None = None
         self._plan_at = 0.0
         self._plan_lock = asyncio.Lock()
+        self._reprobe: asyncio.Future[None] | None = None
         self._warned = False
 
     async def limits_plan(self) -> LimitsPlan:
         """How limits are applied on this host.
 
-        Probed on first use and remembered. A plan with a scope is kept; one without is probed
-        again after `REPROBE_SECONDS`, so that a user manager that was not up yet, or one probe
-        that failed, does not switch cgroup limits off for the life of the runner.
+        Probed on first use (a run has nothing to fall back to, and the probe is bounded) and
+        remembered. A plan with a scope is kept. One without is probed again after
+        `REPROBE_SECONDS`, so that a user manager that was not up yet, or a probe that failed,
+        does not switch cgroup limits off for the life of the runner. That probe runs in the
+        background while the old plan stays in use, so a probe that hangs for its whole timeout
+        stalls no run (#76); its answer replaces the plan when it arrives.
         """
-        async with self._plan_lock:
-            stale = (
-                self._plan is not None
-                and not self._plan.scope
-                and self._use_scope
-                and _now() - self._plan_at >= REPROBE_SECONDS
+        if self._plan is None:
+            async with self._plan_lock:
+                if self._plan is None:
+                    self._adopt(await self._probe(), previous=None)
+        plan = self._plan
+        assert plan is not None  # noqa: S101  (the branch above set it)
+        stale = not plan.scope and self._use_scope and _now() - self._plan_at >= REPROBE_SECONDS
+        if stale and (self._reprobe is None or self._reprobe.done()):
+            self._plan_at = _now()  # one probe per interval, whether or not this one succeeds
+            self._reprobe = asyncio.ensure_future(self._reprobe_in_background(plan))
+        return plan
+
+    async def wait_for_probe(self) -> None:
+        """Wait for a probe running in the background, if there is one (tests, shutdown)."""
+        if self._reprobe is not None:
+            await asyncio.gather(self._reprobe, return_exceptions=True)
+
+    async def aclose(self) -> None:
+        """Stop a probe running in the background. The runner stays usable."""
+        if self._reprobe is not None and not self._reprobe.done():
+            self._reprobe.cancel()
+        await self.wait_for_probe()
+
+    def _adopt(self, plan: LimitsPlan, *, previous: LimitsPlan | None) -> None:
+        self._plan = plan
+        self._plan_at = _now()
+        if plan.unenforced and (previous is None or previous.scope):
+            log.warning(
+                "sandbox limits not enforced on this host: %s (%s)",
+                ", ".join(plan.unenforced),
+                plan.detail or "the systemd scope lacks them",
             )
-            if self._plan is None or stale:
-                previous = self._plan
-                self._plan = await self._probe()
-                self._plan_at = _now()
-                if self._plan.unenforced and (previous is None or previous.scope):
-                    log.warning(
-                        "sandbox limits not enforced on this host: %s (%s)",
-                        ", ".join(self._plan.unenforced),
-                        self._plan.detail or "the systemd scope lacks them",
-                    )
-            return self._plan
+
+    async def _reprobe_in_background(self, previous: LimitsPlan) -> None:
+        try:
+            self._adopt(await self._probe(), previous=previous)
+        except Exception:
+            # The old plan stays and the next interval asks again.
+            log.exception("re-probing the systemd scope failed unexpectedly")
 
     async def _probe(self) -> LimitsPlan:
         if not self._use_scope:

@@ -288,6 +288,7 @@ class TestEscapeAttemptsAgainstTheDenyRules:
             grant_id=GrantId.new(),
             rules=attack.rules,
             now=NOW,
+            grants=(),
         )
 
         # What does not need a file system to say: the canonical path and a protected place agree
@@ -330,6 +331,7 @@ class TestEscapeAttemptsAgainstTheDenyRules:
             grant_id=GrantId.new(),
             rules=attack.rules,
             now=NOW,
+            grants=(),
         )
         assert isinstance(granted, Issued)
 
@@ -597,6 +599,7 @@ class TestTaintProperties:
                     rules=world.rules,
                     now=now,
                     expires_at=now + dt.timedelta(seconds=30),
+                    grants=(),
                 )
                 if isinstance(result, Issued):
                     task = result.task

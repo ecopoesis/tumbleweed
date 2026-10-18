@@ -285,18 +285,200 @@ launcher reports on a pipe it passes as a number and closes at its `exec`, as JS
 with strict models; it writes to stderr, which the program shares, only for a command line it
 cannot parse, which only a bug in the runner can produce. It runs with an empty environment and
 is given the program's variables as arguments, applied at the `exec`, so that `LD_PRELOAD` in a
-policy cannot run code in it before Landlock; the policy refuses loader variables as well. It reads its
-environment from `/proc/self/environ`, because Python adds `LC_CTYPE` to its own. (4) The Landlock
-ruleset is computed from the policy's mounts by a pure function and given as arguments, so the
-mounts and the ruleset are one fact. `require_landlock` is a policy field that defaults to true, and
+policy cannot run code in it before Landlock; the policy refuses loader variables as well. It
+reads its environment from `/proc/self/environ`, because Python adds `LC_CTYPE` to its own. (4) The
+Landlock ruleset is computed from the policy's mounts by a pure function and given as arguments,
+so the mounts and the ruleset are one fact. `require_landlock` is a policy field that defaults to true, and
 a missing Landlock is `SandboxUnavailable` before the program starts; false records "unavailable"
 in every result. (5) Tests prove each denial against a control run in the namespaces alone, since
 the sandbox has no capabilities and many denials would otherwise look the same.
 (6) A grant may not be or sit inside `/tmp`: Landlock rights add up down a path, so it would
 inherit the write rule of the sandbox's own tmpfs.
 **Consequences.** Every sandbox run costs a Python start (about 20 ms). A kernel without Landlock
-needs `require_landlock=False`, and the broker (S17) must decide where that is allowed. The filter
+needs `require_landlock=False`, and the broker decides where that is allowed (D17). The filter
 is a deny list; a new dangerous syscall is allowed until it is added, and `DENIED_SYSCALLS` is
 where to add it. Landlock's scope covers abstract unix sockets only; pathname sockets rest on
 seccomp and the mounts. The 32-bit ARM check cannot be run on Apple silicon or in CI, so it is
 proved on the exported program (`tests/sandbox/bpf.py`) rather than on a live AArch32 call.
+
+## D16 — Chat history: SQLite in WAL, one owner per session by `flock`, the model's context taken from the transcript (2026-10-17, accepted)
+
+**Context.** S04 keeps the chat across restarts. Shells are non-unique (S02), so two can have the store open;
+the file is the user's to edit, so it is untrusted; the S03 `Conversation` trimmed by message count and bytes
+and lived in the agent.
+**Decision.** (1) *Store.* SQLite in WAL mode (`$XDG_DATA_HOME/tumbleweed/shell/chat.sqlite3`), typed
+repositories over validated records, versioned atomic migrations, and a schema that must equal what the
+migrations produce, exactly. (2) *Who owns the last session.* A session has one owner: a shell claims it with an
+exclusive `flock` on a file named after it and holds it until it moves on or exits; the last session is the newest
+by activity among the kept ones that nobody holds, a kept session being one with messages or one the user
+made empty with "New session" (`user_started`, schema v2): "New session", quit, start gives an empty chat; the
+empty session a shell makes by itself is deleted when it closes or moves on (or reaped if its shell was
+killed), so an accidental second shell cannot hide the real chat; only the newest user-started empty session is
+kept (starting one, or closing a shell that keeps one, deletes the others nobody holds, in any shell),
+and empty sessions never count towards the cap of 20 chats. Only the newest 1000 sessions are looked at (`SCAN_WINDOW`), so a file of millions of rows costs what a
+small one does. (3) *Bad files.* Refuse what is not ours (a symlink, another owner,
+not a regular file, a foreign or newer database) and run without history; repair the mode of what is ours;
+if the newest session's rows are invalid, do not restore it and start a fresh one, leaving the data in place. Never
+delete a file on suspicion. (4) *Context.* The responder keeps no history: the request carries the transcript's
+finished exchanges and `agent.context` keeps the system prompt, the new message and the newest turns that fit
+at most 120,000 estimated tokens (less when the configuration allows a longer reply: the window minus the reply and a reserve), where a text's tokens are estimated as its UTF-8 bytes plus 16 per message.
+**Alternatives rejected.** Sharing a session between shells (two transcripts that cannot see each other's
+messages would interleave writes and each model would see half the conversation). A heartbeat column for liveness
+(a wall-clock timeout is a guess, and the window between a crash and expiry restores nothing). POSIX byte-range
+locks on one file (they belong to the process, so closing any descriptor to the file drops them, and two claims in
+one process do not conflict). A tokenizer, or characters divided by four (a new dependency per model; and neither is an upper bound,
+which would turn an under-count into a failed reply). A `Conversation` in the agent seeded by the shell (a second
+source of truth that "new session" and restore would both have to keep in step). Refusing a file or directory of ours whose mode is too open (that would
+lose the user's history over a stray `chmod`, so the mode is set and logged; the API key file is refused instead,
+because it is a secret).
+**Consequences.** The request carries the chat's `SessionId`, and the invocation log records it, so a model call
+can be traced to the conversation it belonged to. **S19 must carry `TaskId` through `TranscriptMessage` and
+`ContextTurn`** (messages are stored with it, always `None` today, but the transcript and the requests do not
+have it yet), so that task-scoped context and the I12 taint filter can apply to restored history. The estimate overcounts ordinary English by three to four times, so the model sees about 30,000
+real tokens of history, not the window's worth; the budget is `history_budget` in `agent.context`: the 200,000-token window less the longest reply the
+configuration allows and a reserve, never more than 120,000. A crash in the middle of
+a reply loses that reply. A session claimed by a shell that hangs stays claimed until it ends. The oldest sessions
+are deleted (20 kept, 1000 messages each). There is no way yet to browse older sessions: S04 restores the last one only. What is deferred is in #80.
+
+## D17 — The broker is layers over one service; a decision is audited in the transaction that records it (2026-10-17, accepted)
+
+**Context.** S17 turns S16's pure decisions into a service: tasks and workspaces, a grant store,
+reads and listings, sandbox runs, an audit log. Several choices were open, and several earlier steps
+left a duty to it: where `require_landlock=False` is allowed (D15), what to do about hosts that
+cannot enforce `pids` and total memory (#74), who owns the sandbox environment (#74), the sandbox's
+refusal of grants in `/tmp` (#79), what S16 asked of the daemon (#71), and S13's heartbeat and
+per-request deadline (#59, #60, #61). **Decision.** (1) *Layers.* The policy core, the storage
+(`audit`, `store`, `workspaces`) and `config`/`compose` know nothing of the transport. `service` is
+what a request does, `daemon` the server and `client` the shell's side; only those import
+`tumbleweed.ipc`, which imports nothing of the broker, and import-linter keeps it so (a module below
+`service` importing `service` would reach `ipc` through it, so a second contract forbids that, and a
+test checks the contract names every module). The broker's messages live in
+`tumbleweed.ipc.broker_messages` and name IDs and plain text, never broker types. (2) *One
+transaction, one audit.* A decision, the consumption of a once grant, the new taint and the audit
+entries are one synchronous block: the entries are written just before the database commits, so an
+entry that cannot be written rolls the act back and the request is refused, and there is no `await`
+between deciding and recording, which makes a lock unnecessary (two requests racing for a once grant
+cannot both win). A run has two entries, `sandbox_run` before it starts and `sandbox_run_result`
+after, because a crash in between must not leave a run that started unrecorded. If the commit fails
+after the entries were written, a `rolled_back` entry follows them. Every refusal once the task is
+known is recorded too (a refused run is a `sandbox_run` entry with outcome `refused`), the taint a
+new task inherits is read where it is recorded, and what a request reserves (a place under a cap, a
+`RunId`) is reserved before its first `await`. (3) *Owners.* A task belongs to the connection that
+made it and ends with it; a broker that starts ends what a dead one left (grants revoked, workspaces
+kept 7 days, taint kept for the task that replaces it). The daemon, not the caller, owns taint. (4)
+*The two host requirements are the daemon's settings, on by default, never a request's.*
+`--no-landlock` and `--allow-unenforced-limits` are for a development host (Docker Desktop's kernel
+has no Landlock; the container and CI have no systemd user manager); the audit log's start entry
+records them, and every result says what was not enforced. Where required, a run on a host whose
+runner reports `pids` or total memory as unenforced is refused before anything is opened. (5) *The
+sandbox's own paths are deny entries.* `/tmp`, `/workspace`, `/inputs`, the launcher's file and the
+runtime's paths are added to the deny list, so a grant the sandbox would refuse is refused when it
+is asked for (a prompt is never shown for what cannot run), instead of remapped: a remap would show
+the user a different path from the one that is granted. The directory of `$SSH_AUTH_SOCK` joins them
+(#71). (6) *The broker owns the environment* of a run: five fixed variables, and a request may add
+only `LANG`, `LC_ALL` and `TZ`; any other name is refused, not dropped. (7) *Filesystem calls can be
+abandoned.* Anything that walks or opens a path runs on a four-thread pool of its own with a
+deadline, because a hung mount blocks a thread for as long as it likes; a late result is discarded
+and a descriptor it opened is closed. (8) *The prompt is an interface the broker asks, with
+`AutoDeny` until S18.* Its answer is checked against the scopes offered and re-checked by
+`issue_grant`; a timeout, an exception and a malformed answer are denials. (9) *Heartbeat, not
+deadlines.* `BrokerClient` pings every 30 s and the daemon closes a connection that is silent for 90
+s while nothing is in progress (#59). The per-request deadline and cancel frame (#60) and
+per-direction unions (#61) are not done here: nothing in S17 needs them (a run ends at its own limit
+and the connection ending cancels it), and S18's prompts do. (10) *The store is accepted only after
+one read snapshot shows it is exactly ours*, including the automatic index rows of `sqlite_master`,
+and is not touched before (not even switched to WAL). **Deviations from the plan.** The broker's IPC
+handler timeout is 170 s (the longest run, its setup and 30 s), not the connection default of 25 s.
+`read_file`, `list_dir` and `request_grant` take the `RunId` from the caller instead of the broker
+allocating one for non-run operations (S16's note): a once grant binds to a run the caller names,
+and a caller that names a fresh one gets nothing from a once grant. The wire has no tool binding or
+trigger yet, so tool grants are modelled and stored but never apply (S24 adds them). The
+start-on-demand connector is in `tumbleweed.broker.client`, not wired into the shell (S19). Reads of
+a task's own workspace are not audited (they are not decisions). **Consequences.** Every request
+does at least one path walk on a worker and rebuilds the deny rules (about a hundred walks: 15 ms on
+a Mac, 8 ms in the container, measured), and the rules must be fresh at each decision (S16). The
+audit log is neither fsynced, rotated nor tamper evident (#82). A tree nested more than 128 levels
+cannot be deleted by the retention sweep; it is reported and retried after a pause that doubles with
+each failure, so that it does not hold up the rest (#84). S18 must extend the prompt interface (a
+`PromptId`, the picker, the requesting tool) and the wire for broker-to-shell requests.
+
+## D19 — The tool store: one canonical package, an index in the broker's database, blobs named by their hash (2026-10-18, accepted)
+
+**Context.** S23 gives the broker durable, versioned tool packages (ARCHITECTURE section 5). The
+plan fixed the shape (manifest, UI spec, code, RFC 8785 plus NFC and LF, a content hash, SQLite
+and a content-addressed blob store, immutable versions, FTS5, bundles, IPC and a CLI); it left open
+where the package model lives, what the hash covers, how an import may touch an existing tool, how
+the CLI reaches the store, what is audited, and what #62 (iterative `jcs`) and #23 (int against
+float) ask. **Decision.** (1) *The package is pure and lives in `tumbleweed.tools`*, not in the
+broker: the shell builds drafts in S24 and needs the model, and a model that imports no broker, no
+transport and no GTK can be tested and bounded on its own (an import contract keeps it so). The
+normalised bytes and the hash are in `core.canonical` on top of `core.jcs`, the one canonicaliser;
+`ui.spec.text.canonical_text` now calls the same normaliser. (2) *The hash covers the whole
+package*, not only the code: manifest, spec, modules and taint. A tool grant binds to the hash, so a
+change of what a tool declares, or of what it may embed, needs a new grant. The taint is inside the
+package for the same reason: it cannot be edited out of a stored version without breaking the hash.
+(3) *Normalise, then validate.* Every string and key is normalised before the bytes are made, and the
+normalised package is parsed by the strict models; NFC can lengthen a text, so a draft that is valid
+as written and not as stored is refused. A draft from outside (`parse_draft`) is normalised before it
+is validated, so it is judged by the length it is stored with. Text with a code point Unicode 15.0
+had not assigned is refused (`core.unicode15`): NFC changes between Unicode versions (U+105D2
+U+0307 composes in 16.0), so Python 3.12 and 3.14 would otherwise hash one text two ways. A bundle must *already* be in normal form and is
+refused, not repaired, when it is not: otherwise the hash it states would not be the hash stored; and
+the file is exactly canonical JSON, so that the bytes hashed are the bytes in the file.
+(4) *No archive.* A bundle is one canonical JSON document around the package's own bytes, so there
+is no member, path or expansion to attack; it is parsed by the same closed models as a stored
+package, which is how nothing but the declared fields (no grant, no state) can travel (I8). (5)
+*The index is in `broker.sqlite3`, the packages are files.* One database means one hardened open,
+one exact-signature check (the FTS5 shadow tables included) and one transaction for a change and
+its audit entry; a separate file would have duplicated all three. Packages are files named by their
+hash in `tool-blobs/`, opened through a directory descriptor with `O_NOFOLLOW`, verified on every
+read and never replaced (written to a temporary name and linked, which cannot overwrite); the index
+keeps copies of name, description, tags, taint and size for listing and search, and `open` refuses a
+package that disagrees with them, so editing either one is detected. (6) *Versions are immutable
+by having no operation that changes them,* and by a primary key, a unique hash and a link that
+fails if the name exists. A refinement is a save of a tool that exists: the version is the newest
+plus one, assigned where it is stored. (7) *An import never touches a lineage it does not own.* It adds a tool whose ID the store
+does not have; the same version byte for byte changes nothing; any other bundle for a known ID is
+a `conflict`. A bundle that could be the "next version" of a tool the user has would show a stranger's
+code in the place of the user's, and the alternative (renaming the ID) changes the hash the bundle
+states. Updating from a bundle is a flow of S24. (8) *An import is `fs`-tainted whatever it claims.* The first version of this decision kept a
+bundle's claimed taint, on the premise that a bundle holds none of this user's data; that was
+false, because a bundle is file input that a task which could read files and write one may have
+made, with their content in it, claiming none (I12). The index now keeps two fields: `taint`, what
+open and grant decisions must read (S24), is the claim plus `fs` for an import and the task's own
+for a save; `claimed_taint` is the package's own, for display. The package is not rewritten, so
+its hash is the bundle's and export and import are hash-stable (the alternative, rewriting the
+taint and recomputing the hash, would make a re-export a different tool). The origin is the
+index's to say, because a package cannot record how it came without changing its hash; editing the
+database is out of scope (section 8). Lowering an import's taint is a user's decision in a trusted
+prompt (S18, S24; #98). A refinement never cleans a lineage either: the newest version is the one
+that is opened, so a refined version's taint is its task's plus the effective taint of the version it
+refines, and a save that would make that both is refused. (9) *Saving takes the taint from the task, inside the block that stores it.*
+`BrokerService.save_tool` reads the broker's record of the task and stores the version in one synchronous section with its
+audit entry, so a grant that arrived a moment ago is in it (I12). It has no IPC request: the model's
+`save_tool` is S24's. (10) *Audit:* a saved or imported version, an export and a refused import
+have entries, written before the act in its transaction; listing, showing and searching do not (they
+are reads of the broker's own store), and importing a version the store already has changes
+nothing and has none. An export is audited because a bundle is content that leaves the broker's
+custody. (11) *The CLI is a client of the broker.* `tumbleweed-tools` talks to the running broker
+over IPC and opens no store: one writer, one audit log, one place for the checks. It does not start a
+broker, and its only waits are bounded. (12) *Search is words.* The text a user or model types is
+reduced to at most eight quoted prefix terms before FTS5 sees it, so no syntax (and no syntax error
+or costly form) is reachable; the number of tools is bounded, so is the cost of a query. (13) *Limits:*
+400 KiB a package, 256 KiB its spec, 16 modules of 48 KiB (96 KiB in all), 500 tools, 100 versions of
+one, 256 MiB in all; the biggest package and its bundle fit one IPC frame with room to spare.
+(14) *Version numbers* stop at 2**53 (the largest integer a JSON double holds exactly), so a version
+survives canonicalisation; a tool at the last one cannot be refined, and says so.
+(15) *#62 and #23.* `jcs.canonicalize` walks iteratively with a budget of values and bytes (a
+hostile value costs a bounded amount and cannot reach the recursion limit), and only validated
+values are canonicalised here. Inside a `json` value an int and a float of one value are one value
+once canonicalised; the bytes and the hash are stable, and consumers must not depend on the
+difference (stated in `jcs`, `canonical` and ARCHITECTURE section 5). **Deviations from the plan.**
+No archive format; list and search are one request (`list_tools` with a query); `save` exists in the
+service and the store but has no IPC request or model tool (S24). **Consequences.** A tool is as big
+as its package: 400 KiB at most, and the broker canonicalises a few times per import
+(about 10 ms for the largest, on the event loop: #96). A stored version can never be corrected, only superseded. An import of a newer
+version of a tool the user has needs S24's flow (#95). Blobs are never garbage-collected, and nothing
+removes a tool (an orphan from a failed transaction stays and the next save of the same bytes finds
+it): #94, with the audit log's rotation (#82). A module named like a
+standard library module is a valid name; the sandbox loader keeps it from shadowing (#56).

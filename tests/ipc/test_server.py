@@ -610,6 +610,29 @@ class TestKeepingTheSocketYoung:
 
         run(scenario)
 
+    def test_a_wall_clock_set_back_does_not_delay_the_touch_by_the_size_of_the_jump(
+        self, sock_path: SocketPath, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wall = [1_000_000.0]
+        monkeypatch.setattr(server_module, "_wall_clock", lambda: wall[0])
+        monkeypatch.setattr(server_module, "_WAKE_INTERVAL", timedelta(seconds=0.05))
+
+        async def scenario() -> None:
+            async with serving(sock_path, refresh_interval=timedelta(hours=6)):
+                long_ago = time.time() - 4 * 24 * 3600
+                files = (sock_path.path, sock_path.lock_path, sock_path.path.parent)
+                for path in files:
+                    os.utime(path, (long_ago, long_ago))
+
+                await asyncio.sleep(0.3)  # the refresher has started, and several wake-ups pass
+                assert all(path.stat().st_mtime < long_ago + 3600 for path in files)
+
+                wall[0] -= 24 * 3600  # the clock was set back a day: "now" is before the last touch
+                while any(path.stat().st_mtime < long_ago + 3600 for path in files):  # noqa: ASYNC110
+                    await asyncio.sleep(0.05)
+
+        run(scenario)
+
     @pytest.mark.parametrize("loss", ["socket removed", "socket replaced", "lock replaced"])
     def test_a_server_that_lost_its_files_closes_itself_so_that_a_supervisor_can_restart_it(
         self, sock_path: SocketPath, caplog: pytest.LogCaptureFixture, loss: str

@@ -200,7 +200,10 @@ def describe(reason: Refusal) -> str:
         case TaskMismatch():
             return "refused: the request is for another task"
         case Ungrantable():
-            return "refused: only an existing regular file or directory can be granted"
+            return (
+                "refused: only an existing regular file or directory that this user can open "
+                "can be granted (it may not exist, or be unreadable or of another kind)"
+            )
         case ScopeUnavailable(scope=scope):
             return f"refused: the {scope.value} scope is not available for this request"
         case BadExpiry():
@@ -575,8 +578,8 @@ def issue_grant(
     grant_id: GrantId,
     rules: DenyRules,
     now: datetime,
+    grants: Sequence[Grant],
     expires_at: datetime | None = None,
-    grants: Sequence[Grant] = (),
 ) -> Issuance:
     """Make the grant the user decided on, or refuse.
 
@@ -590,9 +593,10 @@ def issue_grant(
     returned task has the new grant's taint, whether or not the grant is ever used (I12), and
     the grant is bound to `request.run` (once) or to its tool and content hash (tool).
 
-    `grants` are the grants the caller holds that could apply to the run, as for `decide`: the
-    taint check counts the ones that apply, so a task whose store disagrees with its state cannot
-    be made both fs- and net-tainted by issuing.
+    `grants` (required, so that the check cannot be skipped by leaving it out) are the grants the
+    caller holds that could apply to the run, as for `decide`: the taint check counts the ones
+    that apply, so a task whose store disagrees with its state cannot be made both fs- and
+    net-tainted by issuing.
     """
     _require_aware(now, "now")
     if expires_at is not None:

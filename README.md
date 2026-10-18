@@ -176,6 +176,45 @@ invocation log and that the key is not in it:
 TUMBLEWEED_LIVE=1 ANTHROPIC_API_KEY="$(cat path/to/key)" uv run pytest -m live tests/agent -v
 ```
 
+### Chat history
+
+The chat is kept between runs. `tumbleweed-shell` restores the last session when it starts (its newest
+messages, at most 998 and 4 MiB of text; the chat then has room for more) and saves each message as it
+goes: yours when you send it, the reply when it ends. **New session** (the button above the chat) stops
+the reply in flight, starts an empty session and keeps the old one in the file; it is also what to press
+when the chat says it is full (1000 messages). The model is told about the restored conversation, the
+newest exchanges that fit a budget of at most 120,000 estimated tokens (a text counts as its UTF-8
+bytes, which overcounts ordinary English several times over, on purpose; ARCHITECTURE section 9 and
+D16).
+
+It lives in `$XDG_DATA_HOME/tumbleweed/shell/chat.sqlite3` (default `~/.local/share/...`), in directories of
+mode 0700 and files of mode 0600, and holds only what the chat shows: no API key, no configuration (what you
+type is stored as you typed it, so do not paste a secret into the chat). To forget everything, quit the shell
+and delete `chat.sqlite3*` and `chat.locks/` there. A `tumbleweed/` or `shell/` directory that is a symlink is
+refused (the shell then runs without history, and says so). It keeps the newest 20 sessions that have
+messages, of at most 1000 messages each. Each write waits at most about 2 seconds for another shell's, then
+fails and is reported (opening, restoring and starting a session are a few writes each), so no one write
+holds the window for longer than that.
+
+**New session and quitting.** An empty session you made with the **New session** button is kept: it is the
+last session, so after you quit and start again the chat is empty (your old chat is still in the file, but is
+not shown: there is no session browser yet, #80). Only the one newest such session is kept (starting another, in any shell, deletes the
+empty ones nobody is using), and one that got messages is an ordinary session. The empty session a shell makes by itself when it starts is not kept: it is
+deleted when that shell closes or starts another session, and one left by a shell that was killed is deleted
+by the next shell that starts a session.
+
+Two shells can run at once, and each owns its own session: a session a running shell holds is never taken by
+another. A shell started while another runs gets the newest session that has messages (or that you started
+empty) and that nobody holds, which is an older chat if there is one, or else an empty chat. An accidental
+second shell therefore leaves nothing behind: its empty session is deleted when it closes, and the next start
+restores the real chat. If a message cannot be saved (the disk is full, another shell held the file for too
+long) the chat says so above the messages and the rest of that session is not saved; **New session** tries
+the history again. If the file cannot be used (not a database, a symlink, another user's, written by a newer
+version) the shell starts anyway, says so above the chat, and does not save; it leaves the file alone. If the
+last session's data is damaged, a new session starts and the old data stays in the file. The mode of a
+directory or file of yours that is too open is corrected, with a log line. Deferred pieces (a session
+browser, and others) are in #80.
+
 ### Checks
 
 ```sh
@@ -259,7 +298,7 @@ is covered with a fake credentials provider.
 
 `tumbleweed.sandbox` ([ARCHITECTURE: Sandbox launcher](docs/ARCHITECTURE.md)) runs one argv list in
 bubblewrap: no network, only its workspace and what it was granted, hard limits. It is a library
-for the broker (S17) and has no command of its own yet. Its policy and bubblewrap argument builder
+for the broker (below) and has no command of its own. Its policy and bubblewrap argument builder
 are tested on every OS; running a sandbox needs Linux, so on a Mac use the container:
 
 ```sh
@@ -300,13 +339,78 @@ The first lines of a pytest run say whether the `TUMBLEWEED_CI` guard is active.
 ### Broker policy core
 
 `src/tumbleweed/broker` is the decision logic behind every grant (ARCHITECTURE section 7), as
-pure code with no daemon, IPC or storage yet (S17 builds those on it): capabilities, grant
+pure code with no daemon, IPC or storage (the daemon, below, is built on it): capabilities, grant
 scopes, the static deny rules with the ancestor rule, sticky taint, the write gate, and the
 path handling (`ResolvedPath` when deciding, `StoredPath` and a component-by-component open
 that follows no symlink when running). Its tests include property tests (hypothesis) that
 generate escape attempts. A few tests need a case-insensitive volume, which a Mac has and the
 Linux container does not (they skip there, with the reason), and the `openat2` ones need Linux
 (marked `linux`, run by `scripts/test-linux`); between them both ways of opening are covered.
+
+### Broker daemon
+
+`tumbleweed-broker` (`src/tumbleweed/broker`, [ARCHITECTURE: Broker daemon](docs/ARCHITECTURE.md),
+D17) serves tasks, grants, file access and sandbox runs over the IPC above. Nothing in the shell
+starts it yet (S19 wires it in); to try it by hand, in one terminal:
+
+```sh
+uv run tumbleweed-broker --no-landlock --allow-unenforced-limits   # a development host
+```
+
+and from Python, a `BrokerClient` that starts the daemon if nobody is there:
+
+```python
+from tumbleweed.broker.client import BrokerClient, BrokerConnector, spawn_broker_process
+from tumbleweed.ipc.sockdir import SocketPath
+
+
+async def connect(socket_path: SocketPath) -> BrokerClient:
+    connector = BrokerConnector(
+        socket_path,
+        spawn=lambda: spawn_broker_process(
+            extra_args=("--no-landlock", "--allow-unenforced-limits")
+        ),
+    )
+    return await connector.connect()
+```
+
+Until S18 there is nobody to ask, so every
+`request_grant` is denied and nothing can be granted: the tests give the daemon a scripted user.
+`--no-landlock` and `--allow-unenforced-limits` are for a development host only (Docker Desktop's
+kernel has no Landlock; the container and CI have no systemd user manager). Without them the daemon
+refuses runs on a host that cannot apply Landlock, the process limit and the total-memory limit,
+which is what the target needs, and it writes the setting to its audit log
+(`$XDG_DATA_HOME/tumbleweed/broker/audit.jsonl`, one JSON entry per decision, run and revocation).
+The tests that run a real sandbox through the daemon are marked `linux` (`scripts/test-linux`);
+the rest use a fake sandbox and run everywhere.
+
+### Tool store
+
+The broker keeps saved tools (`src/tumbleweed/tools`, `src/tumbleweed/broker/toolstore.py`,
+[ARCHITECTURE section 5](docs/ARCHITECTURE.md), D19): versioned, immutable, hashed packages (manifest
+with typed ports, UI spec with state defaults, code modules, the taint of the task they were saved
+from) in `$XDG_DATA_HOME/tumbleweed/broker/`, an index with full-text search in `broker.sqlite3` and
+the packages themselves in `tool-blobs/`, each file named by its SHA-256 and checked on every read.
+Nothing saves a tool from a conversation until S24; what works today is the store, bundle import and
+export, and the `tumbleweed-tools` command, which talks to the running broker (it opens no store of
+its own, and does not start the broker):
+
+```sh
+uv run tumbleweed-broker --no-landlock --allow-unenforced-limits &   # a development host
+uv run tumbleweed-tools list                      # newest version of each tool
+uv run tumbleweed-tools list "csv viewer"         # search name, description and tags
+uv run tumbleweed-tools show tool_01j... [--version 2] [--json]
+uv run tumbleweed-tools export tool_01j... csv.tool.json   # a new file, mode 0600; `-` is stdout
+uv run tumbleweed-tools import csv.tool.json      # `-` is stdin; no grant or state comes with it
+```
+
+A bundle is one canonical JSON file; an import refuses anything that is not exactly what an export
+writes (unknown fields, a wrong hash, pretty-printed or escaped JSON, text that is not NFC with LF
+line endings, too big) and never changes a tool the store already has. An imported tool is
+tainted as if it had read files (`fs`) whatever the bundle says; `import` prints both what the
+package claims and what is kept. `export TOOL -` refuses to print on a terminal; use a file or a
+pipe. `uv run pytest tests/tools tests/broker/test_toolstore.py
+tests/broker/test_daemon_tools.py` are the tests that matter most here.
 
 ### UI spec
 

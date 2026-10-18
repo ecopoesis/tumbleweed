@@ -84,3 +84,79 @@ class PathError(BrokerError):
     def __reduce__(self) -> tuple[type["PathError"], tuple[PathFault, int | None]]:
         # The default would rebuild from the message, which is not what the constructor takes.
         return (type(self), (self.fault, self.errno_code))
+
+
+class PrivateFsError(BrokerError):
+    """The broker's own directory or one of its files is not safe to use, or cannot be opened.
+
+    Fixed text: the path is never repeated. A directory or file of the broker's that is a
+    symlink, belongs to someone else or is not what it should be is refused, never repaired
+    (a file or directory of ours with a loose mode is tightened).
+    """
+
+
+class AuditError(BrokerError):
+    """The audit log could not be written. Whatever needed the entry must not go ahead (I7)."""
+
+
+class StoreError(BrokerError):
+    """The grant store could not be read or written."""
+
+
+class StoreRefusedError(StoreError):
+    """The database file is not one the broker will use: not ours, newer, or an unexpected
+    schema. Nothing in it has been changed."""
+
+
+class StoreCorruptError(StoreError):
+    """The database holds something that cannot be real (an unparseable record)."""
+
+
+class FsTimeoutError(BrokerError):
+    """A file system operation did not finish in time (a hung network or FUSE mount)."""
+
+
+class WorkspaceError(BrokerError):
+    """A task workspace could not be created, opened or deleted."""
+
+
+class UnknownTaskError(BrokerError):
+    """A task that is not live and owned by the caller was named, by a call that is not a request
+    (`BrokerService.save_tool`); a request about one is answered `unknown_task`."""
+
+
+class ToolStoreError(BrokerError):
+    """The tool store refused or could not do something. The subclasses say what; messages are
+    fixed text that never repeats a name, a hash or any other input."""
+
+
+class ToolNotFoundError(ToolStoreError):
+    """No such tool, or no such version of it."""
+
+
+class ToolConflictError(ToolStoreError):
+    """The ToolId is taken: imported a tool whose ID the store has, with other content. A version
+    is never replaced (versions are immutable) and a lineage is never extended by an import."""
+
+
+class ToolStoreFullError(ToolStoreError):
+    """The store is at one of its limits (tools, versions of a tool, bytes)."""
+
+
+class ToolTaintConflictError(ToolStoreError):
+    """A refinement would give a tool both fs and net taint (I12): the task it is saved from and
+    the version it refines cannot be combined."""
+
+
+class ToolBlobWriteError(ToolStoreError):
+    """A package could not be written to the store (the disk is full, the directory unwritable, the
+    bytes are not what their name says): not a sign that anything stored was tampered with."""
+
+
+class ToolVersionExhaustedError(ToolStoreError):
+    """A tool has no version number left (`ToolVersion` ends at 2**53)."""
+
+
+class ToolBlobError(ToolStoreError):
+    """A stored package is missing or is not what its hash says (tampered, truncated, replaced by
+    a symlink or another kind of file). It is refused, never repaired or deleted."""

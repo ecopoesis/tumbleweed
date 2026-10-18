@@ -28,6 +28,7 @@ class Recorder:
     def __init__(self) -> None:
         self.added: list[TranscriptMessage] = []
         self.changed: list[TranscriptMessage] = []
+        self.replaced: list[tuple[TranscriptMessage, ...]] = []
         self.streaming_seen: list[MessageId | None] = []
         self.transcript: Transcript | None = None
 
@@ -38,6 +39,9 @@ class Recorder:
     def message_changed(self, message: TranscriptMessage) -> None:
         self.changed.append(message)
         self._note()
+
+    def messages_replaced(self, messages: tuple[TranscriptMessage, ...]) -> None:
+        self.replaced.append(messages)
 
     def _note(self) -> None:
         if self.transcript is not None:
@@ -540,6 +544,9 @@ class TestObservers:
 
             def message_changed(self, message: TranscriptMessage) -> None:
                 raise RuntimeError("boom")
+
+            def messages_replaced(self, messages: tuple[TranscriptMessage, ...]) -> None:
+                return
 
         transcript = Transcript()
         transcript.subscribe(Failing())

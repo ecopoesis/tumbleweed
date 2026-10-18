@@ -158,10 +158,13 @@ shell, voice or `gi` (section 10).
   mount *sources*; a mount point's parents are another matter, below). bwrap closes the
   descriptors before the program runs. A grant may be, contain or be inside none of `/proc`,
   `/dev`, `/sys`, `/workspace`, `/inputs`, `/tmp`, another grant or a runtime path (a grant inside
-  `/tmp` would inherit Landlock's write rule for it). No nesting, because bwrap makes the mount point of an inner grant by walking the live
-  directory of the outer one, which the program can write to: a symlink planted there
+  `/tmp` would inherit Landlock's write rule for it; the broker refuses such a request when it is
+  made, section 7). No nesting, because bwrap makes the mount point of an inner grant by walking
+  the live directory of the outer one, which the program can write to: a symlink planted there
   (`/oldroot`, which bwrap itself uses to reach the host while it builds the sandbox) would send
-  that `mkdir` to the host, outside every grant. The broker keeps its grants apart (S17).
+  that `mkdir` to the host, outside every grant. The broker keeps its grants apart (S17): of two
+  grants where one is the other or inside it, only the outer is mounted
+  (`tumbleweed.broker.compose.disjoint_mounts`).
 - **Flags.** `--unshare-all --unshare-user --disable-userns --die-with-parent --new-session
   --clearenv --cap-drop ALL`, plus a hostname of its own. There is no network option until S22:
   the sandbox's `lo` is its own, and no host interface, host loopback or host abstract socket is
@@ -169,8 +172,10 @@ shell, voice or `gi` (section 10).
 - **Environment.** Empty, plus the variables the policy lists, each of which must be on the
   policy's allowlist (otherwise the policy is refused, not trimmed). A name that looks like a
   secret (`key`, `token`, `secret`, `passw`, `credential`, `auth`, `anthropic`) is refused even on
-  the allowlist (I6). bwrap adds `PWD`. The fixed allowlist of a real run is S17's (the launcher
-  only enforces the one it is given).
+  the allowlist (I6). bwrap adds `PWD`. The environment of a real run is the broker's (S17,
+  `tumbleweed.broker.compose`; the launcher only enforces the allowlist it is given): `PATH`,
+  `HOME` (`/workspace`), `TMPDIR`, `LANG` and `PYTHONDONTWRITEBYTECODE`, to which a request may add
+  only `LANG`, `LC_ALL` and `TZ`. Any other name is refused, not dropped.
 - **Limits (I9).** Wall time and output are the launcher's: stdout and stderr are read
   concurrently, each cut at `max_output_bytes`, and exceeding the cap or the wall clock `SIGKILL`s
   bwrap, which takes the sandbox's PID namespace down with it (`--die-with-parent`). CPU time, file
@@ -187,7 +192,8 @@ shell, voice or `gi` (section 10).
   in `detail`). The container and CI have no user manager, so they run the rlimit path; the scope
   path is tested against a stand-in for `systemd-run` there (it cannot show a kernel enforcing the
   limits), and on the target (S27) the scope is expected; its real verification is #73. The probe
-  is repeated every 60 s while the plan has no scope, and the scope is run by the absolute path
+  is repeated every 60 s while the plan has no scope, in the background while the old plan stays in
+  use so that a probe that hangs stalls no run, and the scope is run by the absolute path
   of the `systemd-run` the probe ran (a bare name is looked up on `PATH`, never in the current
   directory).
 - **Seccomp (S15).** bwrap loads a filter built with libseccomp through ctypes
@@ -219,9 +225,11 @@ shell, voice or `gi` (section 10).
   through a stream socketpair). **Integer arguments are compared masked to 32 bits**: the kernel
   truncates an `int`, a filter sees the whole register, so `(1 << 32) | AF_UNIX` was `AF_UNIX` to
   the kernel and a different number to a 64-bit compare (the first round's live escape). Every
-  rule on an `int` uses `MASKED_EQ` with `0xFFFFFFFF`, and a family with any high bit, or at or
-  above the kernel's `AF_MAX`, is refused whole. `personality` is allowed only as `PER_LINUX`
-  (0), and `kcmp`, `memfd_secret` and `process_madvise` are denied.
+  equality rule on an `int` uses `MASKED_EQ` with `0xFFFFFFFF`; the range rules (the family limit
+  and `personality`) compare the whole register on purpose, because a high bit only makes the
+  value larger. A family with any high bit, or at or above the kernel's `AF_MAX`, is refused
+  whole. `personality` is allowed only as `PER_LINUX` (0), and `kcmp`, `memfd_secret` and
+  `process_madvise` are denied.
   The filter is a deny list, so what it does not name is allowed; that is not an escape because the
   program also has no capabilities, no nested user namespaces, a read-only root and Landlock.
 - **The in-sandbox launcher and Landlock (S15).** The first process in the sandbox is
@@ -256,11 +264,15 @@ shell, voice or `gi` (section 10).
   needs. With it true, a kernel that has no usable Landlock (`ENOSYS`, `EOPNOTSUPP`, or `EPERM`,
   which is an outer seccomp filter refusing the call; any other answer is a refusal, not "no
   Landlock") makes the run raise `SandboxUnavailable` before the program starts, and so does a
-  report that does not say Landlock was applied (the runner checks it, it does not trust it), so a weaker sandbox is never what runs
-  by accident. A dev kernel without it (Docker Desktop's, #44) sets it false, and then every
+  report that does not say Landlock was applied (the runner checks it, it does not trust it), so a
+  weaker sandbox is never what runs by accident. A dev kernel without it (Docker Desktop's, #44)
+  sets it false, and then every
   result says so: `SandboxResult.hardening.landlock` is `unavailable`, with the kernel's answer in
   `detail`. Where Landlock is there it is always applied, whatever the flag says. Any other failure
   of the launcher (a missing mount path, `no_new_privs` unset, a filter not loaded) refuses too.
+  The broker decides where it may be false (S17, D17): only by the daemon's own setting
+  (`tumbleweed-broker --no-landlock`, for a development host), never by anything a request says;
+  the setting is on by default and is written to the audit log when the daemon starts.
 - **Failure.** A program that fails is a result. A sandbox that could not be set up (a mount
   source gone, a program that does not exist, user namespaces refused, a scope that cannot be
   started, a launcher that refused) raises `SandboxLaunchError` with the message of whoever
@@ -273,8 +285,152 @@ shell, voice or `gi` (section 10).
   `RLIMIT_AS` (the scope's memory limit covers them; without one, the open-file limit and the wall
   clock are what bound them); a fork bomb is bounded only by the wall clock (and the memory its
   processes use) without a scope; and nothing bounds the disk a program writes to its workspace
-  beyond the per-file limit. S17 must refuse, on the target, runs on a host that lacks the pids or
-  memory-total limit; these and the other gaps are tracked in #74.
+  beyond the per-file limit. The broker refuses, unless told otherwise
+  (`--allow-unenforced-limits`, for a development host), a run on a host whose runner reports the
+  pids or memory-total limit as unenforced (S17); these and the other gaps are tracked in #74.
+
+### Broker daemon
+
+`tumbleweed-broker` (`tumbleweed.broker.daemon`, S17, D17) serves the broker over the IPC of this
+section. It is built in layers that the import contracts keep apart: the policy core of section 7
+and the storage (`audit`, `store`, `workspaces`, `privatefs`) know nothing of the transport;
+`service` is what each request does, `daemon` is the server and `client` is the shell's side
+(`BrokerClient`, typed calls), and only those three, and `toolscli` (the `tumbleweed-tools` command,
+a client of the broker), import `tumbleweed.ipc`, which imports nothing of the broker. Nothing in
+the broker imports the agent or an LLM (I2).
+
+- **Requests and answers.** `start_task`, `end_task`, `request_grant`, `revoke_grant`,
+  `read_workspace_file`, `list_workspace`, `read_file`, `list_dir` and `run_in_sandbox`
+  (`tumbleweed.ipc.broker_messages`), and the tool store's `list_tools`, `show_tool`, `export_tool`
+  and `import_tool` (`tumbleweed.ipc.tool_messages`, section 5). Every body is a strict model with
+  bounded fields before the service sees it, so a request the schema refuses ends the connection
+  like any malformed frame. A request the broker declines is *answered* with `Refused`: a closed
+  reason (`unknown_task`, `invalid_request`, `denied`, `not_granted`, `not_found`, `unsafe`,
+  `too_large`, `busy`, `unavailable`, `timeout`, `failed`, `conflict`) and fixed text that never
+  repeats a path, a command, a name from a tool or the model's reason. A denied grant is an ordinary answer (`GrantOutcome(granted=false)`).
+- **Tasks.** `start_task(previous, fresh_context)` ends `previous` and makes the new task, with a
+  private workspace (`<workspaces>/<TaskId>`, mode 0700), copying `previous`'s taint unless
+  `fresh_context`: the broker owns taint and the caller only says whether the model's context
+  carries over (I12). A task belongs to the connection that made it: any other connection is
+  answered `unknown_task`. When a connection ends its tasks end, and a broker that starts ends
+  whatever a stopped one left live (their once and task grants are revoked, their workspaces are
+  kept and their taint stays on record). At most 16 tasks are live, counted (with the ones being
+  made) before the workspace is, so tasks started together cannot all pass the cap. The taint a
+  new task inherits is read where the new task is recorded, after the workspace exists, with no
+  `await` in between: a grant or read on the task it replaces that completed while the workspace
+  was being made is inherited, as is the taint of one that ended meanwhile (I12).
+- **Grants and prompts.** `request_grant` canonicalises the path once, decides with
+  `policy.decide`, and only when no grant covers it and policy allows one asks a
+  `PromptInterface`. Until S18 that is `AutoDeny`, so nothing can be granted without a user. A
+  prompt gets the structured capability, the scopes it may offer (`once`, `task`: `tool` needs
+  S24's saved tools) and the model's reason as text to be quoted. Its answer is checked against
+  what was offered; a timeout (60 s), an exception, a scope not offered and an answer that is not
+  one of the two kinds are all a denial. The grant is issued by `policy.issue_grant` after the
+  deny rules are rebuilt, against the path as it was resolved *before* the prompt, so what the user
+  saw is what is recorded. Beyond S16's rules the broker refuses, at decision time and without
+  asking, what the sandbox would refuse to mount (section 7). A once grant that has been used up is
+  dropped at that moment (and marked revoked in the database), so the grants a task holds, at most
+  64, are the ones that can still be used; an audit entry that lists grant IDs holds the first 64
+  and says how many there were, so that no task is too big to end.
+- **Files.** `read_file` and `list_dir` take an absolute path and a `RunId`; they never prompt. The
+  decision (`decide`), the consumption of a once grant, the task's taint and the audit entry are
+  one transaction, written before anything is opened; then the grant is opened with
+  `open_granted` and the part below it with `open_below(expect=<what the decision saw>)`, so a
+  swap after the decision refuses instead of redirecting (I11). A read is at most 512 KiB and
+  refused, not cut, beyond the limit; a listing has at most 1000 entries, reports a symlink as a
+  symlink and leaves out names with control or format characters (and says how many). The same
+  without a decision, for the task's own workspace, with `read_workspace_file` and
+  `list_workspace`; those are not audited (they are not decisions). A read or listing that the
+  decision allowed (and recorded as `allowed`) but that opening refused (a swapped file, a
+  vanished one, a hung mount) gets a second `file_access` entry, `refused`, with the reason.
+- **Runs.** `run_in_sandbox(task, run, command, env, wall/cpu seconds, output limit)` is composed
+  from the task's grants as `select_grants` selects them for that run: every applicable `fs.read`
+  grant is opened by `open_granted` (any failure, a swapped or vanished path, refuses the whole
+  run), kept disjoint, and bound read-only at its host path by descriptor, with the task's
+  workspace read-write at `/workspace`. Writes are not offered (S16's gate), and a `net.full`
+  grant is held but gives no network until S22. The once grants the run uses are consumed, the
+  task's taint raised and a `sandbox_run` audit entry written in one transaction *before* the
+  program starts; `sandbox_run_result` follows when it ends. A `RunId` can be used once, and
+  it and the run's place under the task's cap are reserved before the first `await`, so requests
+  that arrive together cannot all pass; at most 4 runs are in progress (a fifth is refused, not
+  queued) and 1000 per task. Every refusal once the task is known (a forbidden variable, a reused
+  ID, a cap, a granted path that was swapped, grants that changed while the run was set up, a
+  timeout, the host's limits; except when the audit log or the database itself fails) is recorded
+  as a `sandbox_run` entry with outcome `refused` and a reason; a run cancelled before it was
+  authorised is recorded the same way. The limits a request may set are bounded (at most 120 s of
+  wall clock, 256 KiB of output per stream) and the rest are the broker's. **The host must be able
+  to enforce what I3 requires:** unless the daemon was told otherwise (`--allow-unenforced-limits`)
+  a run is refused, before anything is opened, when the runner reports the `pids` or total-memory
+  limit as unenforced; and Landlock is required unless `--no-landlock` (above). Both settings are
+  the daemon's and are written to the audit log at start. Ending a task, or its connection ending,
+  cancels its runs: the sandbox is killed and the run's result entry says `cancelled`.
+- **The audit log (I7).** `<broker>/audit.jsonl`: append-only JSONL, one typed entry
+  (`tumbleweed.broker.audit`, a pydantic model with a `kind` and a format version `v`) per daemon
+  start, task start and end, grant decision (covered, granted, denied, with the model's reason
+  quoted and cut; a grant the user allowed but the broker then refused, because the task ended,
+  the grant cap was reached or the file system hung, is a denied entry with that reason, and the
+  cap is checked before the user is asked), read or listing under a grant (allowed, refused, or
+  allowed and then refused at the open), revocation, run (authorised or refused, then its
+  result), workspace deletion, and the tool store's changes and hand-outs (`tool_saved`, for a
+  saved or an imported version; `tool_exported`; `tool_import_refused`, with a closed reason and
+  nothing of the bundle: section 5). It is opened `O_APPEND |
+  O_NOFOLLOW` as a regular file of ours, mode 0600, in a 0700 directory; an entry goes out in one
+  write and a failed one is cut back, so the file never holds half a line. The whole file is
+  ASCII (non-ASCII text is `\u` escaped), so that no character a reader might take for a line
+  break (U+0085, U+2028, U+2029 included) can start a second entry. An entry is written before
+  the act it records, inside the act's database transaction; if it cannot be written the act does
+  not happen and the request is answered `unavailable`. If the commit itself fails after the
+  entries were written, a `rolled_back` entry follows them, naming their kinds: the log never
+  keeps saying that something happened which did not. It is not fsynced (it survives a
+  crash of the broker, not a loss of power), not tamper evident and not rotated: anything running
+  as the user can edit it, which section 8 puts out of scope, and rotation is a follow-up (#82).
+  Later steps add fields with defaults or kinds of entry; only the tool store's entries name
+  content, by the hash of a package.
+- **The store.** `<broker>/broker.sqlite3` holds tasks (taint, when they ended, the identity of
+  their workspace) and grants (their JSON, validated strictly when read back; a record that
+  cannot be read grants nothing and is skipped). It is accepted only after one read snapshot shows
+  it is exactly ours (`application_id`, `user_version` and every row of `sqlite_master`, the
+  automatic indexes included, compared with what the migrations produce); anything else, a newer
+  version too, is refused with the file untouched, not even switched to WAL. Directory and file
+  are opened through descriptors with `O_NOFOLLOW`; `FsIdentity` is kept as text because SQLite's
+  integers are signed. From schema version 2 the file also holds the tool store's index (section 5),
+  FTS5 search table and its shadow tables included in that exact comparison, which is why the tool
+  store shares this file: one hardened open, one signature, and one transaction with the audit entry
+  of each change.
+- **Workspaces and retention.** A workspace is opened by the identity recorded when it was made
+  (`StoredPath.open`), never by name. Seven days after its task ended (`BrokerConfig.retention`,
+  checked in the background as soon as the broker has started, and every hour) it is deleted
+  through descriptors only: nothing a symlink in it
+  points at is touched, a directory the program made unreadable is given a mode first, and a tree
+  nested deeper than 128 levels is left in place and reported as failed. A workspace that cannot
+  be deleted is tried again after a pause that doubles with every failure (an hour, up to a day;
+  the count and the time are in the database), so that a few undeletable ones do not hold up the
+  rest of the queue. A directory in the workspaces directory named like a task that the database
+  does not know (a crash between making it and recording it) is removed in the same first sweep;
+  one whose task is being made is not an orphan, and any other name is left alone. A workspace
+  whose creation was abandoned (the request was cancelled or timed out) is removed when the
+  creation finally returns.
+- **The file system can hang.** Every decision-time and run-time open, walk, read and deletion
+  runs on a pool of four threads of its own (`FsWorker`) with a deadline (5 s; 60 s to delete); on
+  timeout the request is answered `timeout`, whatever the abandoned call finally returns is
+  discarded and a descriptor it opened is closed. If every thread is stuck the requests that need
+  the file system time out and the others are still answered.
+- **Connections (#59, #60, #61).** The daemon serves at most 8 connections. A request may take as
+  long as the longest run plus its setup (`handler_timeout` 170 s). A connection that receives
+  nothing for 90 s while nothing is in progress is closed, and `BrokerClient` pings every 30 s,
+  so a quiet shell is not idle and a dead one does not keep its slot. What S17 does *not* do: the
+  caller's deadline does not travel with a request and a caller that gives up cannot cancel it
+  (#60: a run ends at its own limit, and the connection ending cancels it; S18's prompts need
+  this); and request bodies still share one union for both directions (#61: S18 adds the first
+  broker-to-shell requests). `BrokerClient` gives the typed request-to-response pairing at the API
+  a caller uses.
+- **Development.** `BrokerConnector` connects and, if nobody is there, starts `python -I -m
+  tumbleweed.broker.daemon` detached, from `/`, with a minimal environment of its own (never the
+  shell's: the API key is not passed on, I6; `-I` and the working directory keep a module planted
+  where the shell runs from out of the broker) and retries with backoff for at most 30 s; on the
+  target a systemd user service starts the daemon (S27). The shell wires it in S19 (#89, and
+  S19's scope in the plan). `BrokerClient`'s heartbeat stops only when the connection ends; a ping
+  that times out or is refused is logged and the next is tried.
 
 ## 3. Request flow
 
@@ -346,12 +502,152 @@ image, table, text view, tabs or expander renders as a placeholder.
 
 A **tool package** is a manifest (ToolId, name, description, tags, version, declared
 capabilities, typed ports), a UI spec (with state *defaults* only, never the user's current
-state values), and code modules. Its content hash is SHA-256 over a canonical serialization
-(defined in S23). Normalisation is applied when the tool is saved, so the stored bytes are
-the normalised bytes and the hash covers exactly what the sandbox executes. Packages are immutable; refining a tool creates a new version. The broker
-owns the tool store so it can verify that the code it runs for a saved tool is exactly the
-stored version (I8). Retrieval in v1 is SQLite FTS5 plus model re-ranking; embeddings arrive
-with file search, post-v1.
+state values), code modules and the taint of the task it was saved from. Its content hash is
+SHA-256 over a canonical serialization. Normalisation is applied when the tool is saved, so the
+stored bytes are the normalised bytes and the hash covers exactly what the sandbox executes.
+Packages are immutable; refining a tool creates a new version. The broker owns the tool store so
+it can verify that the code it runs for a saved tool is exactly the stored version (I8).
+Retrieval in v1 is SQLite FTS5 plus model re-ranking; embeddings arrive with file search,
+post-v1. S23 (D19) built the store; the model's `save_tool`, `find_tools` and `open_tool` and the
+tool grants are S24's.
+
+**The package** (`tumbleweed.tools.package`, pure, no I/O; the broker and the shell both use it).
+Every model is closed (`extra="forbid"`, strict, frozen), so a grant, a task or a current state
+value has nowhere to go (I8). A `ToolVersion` is 1 to 2**53 (the largest integer a JSON double
+holds exactly, so it survives canonicalisation); a tool at the last one cannot be refined.
+- *Manifest.* `ToolId`, name (1 to 64 characters), description (at most 1000), at most 8 tags
+  (lowercase ASCII words, sorted, distinct), `ToolVersion`, the spec version (`tumbleweed.ui/1`),
+  the declared capabilities (kinds only, `fs.read`, `fs.write`, `net.full`: a path is the user's to
+  grant, never the tool's), and the typed ports. A **port** is a state entry of the spec (`name`)
+  with one of the S09 value types (`text`, `json`, `table`, `image`, `file`); it must be an entry
+  whose kind carries that type (`port_type_of`), an input cannot be a computed entry, and a port is
+  named once per direction (at most 16 inputs and 16 outputs).
+- *UI spec.* A `UiSpec`, validated whole, at most 256 KiB as canonical JSON (the size limit
+  `parse_ui_spec` puts on text, applied to what is stored).
+- *Code modules.* At most 16, each named like the `module` of a `sandbox` handler (`ModuleName`:
+  lowercase snake_case, never a path or a dotted name) with its source as text (at most 48 KiB;
+  96 KiB in all). Every `sandbox` handler must name a module that exists. A module is a value in the
+  JSON document, never a file in the store, so no name ever becomes a path; the sandbox loader (S20)
+  imports modules by name under a private package (#56).
+- *Taint.* `[]`, `["fs"]` or `["net"]`, never both: what the package records, part of it and so of
+  its hash. For a saved version it is the broker's own record of the task the tool was saved from
+  (I12). For an imported package it is only the exporter's *claim*, kept as written so that export
+  and import are hash-stable; the taint that decisions use is a separate field of the index (see
+  "Taint of an import" below).
+- *Size.* The canonical package is at most 400 KiB. A bundle is at most 401 KiB, and a JSON string
+  that holds a JSON document is at most twice its size, so the largest package, its bundle and the
+  answers that carry them each fit the 1 MiB frame (a test sends them over a real connection).
+
+**Canonical form and hash.** `canonical_package` takes a package and normalises every string and
+every object key (Unicode NFC; a line feed for `\r\n` and `\r`), refuses text that holds a code
+point Unicode 15.0 had not assigned (NFC changes between Unicode versions, so Python 3.12 and 3.14
+would hash such text apart: `core.unicode15` pins the table), validates the *normalised* package
+again (NFC can lengthen a text and can make two names one, so a draft that does not survive is
+refused, not stored; `parse_draft`, the entry for a draft from outside, normalises *before* it
+validates, so a name of forty accented letters written as eighty characters is a name of forty),
+writes it as RFC 8785 JSON with `tumbleweed.core.jcs.canonicalize` and takes
+the SHA-256 of those UTF-8 bytes: the `ContentHash`. The package it returns was parsed back from
+those bytes. Inside a `json` value an int and a float of one value are one value (`5.0` is `5`):
+the bytes are stable, and a consumer must not depend on which it had. `jcs.canonicalize` is
+iterative and has a budget (a million values, 16 MiB of output), and only validated values are
+canonicalised here (#62). The hash covers the manifest, the spec, the code and the taint, so any
+change to any of them is a new hash and, for a tool grant, a new grant.
+
+**The store** (`tumbleweed.broker.toolstore`). Two parts that must agree:
+- the **index**, in `broker.sqlite3` (schema version 2): `tools` (one row per ToolId and its newest
+  version), `tool_versions` (one row per stored version: its hash, size, a copy of name,
+  description and tags, the package's own taint and the taint a decision uses, how it came, when) and `tool_search`, an FTS5 table over name,
+  description and tags of each tool's *newest* version (`unicode61`, case and accents ignored,
+  every word a prefix, name over tag over description by `bm25`). The primary key
+  `(tool, version)` and the unique hash refuse a second row for a version;
+- the **blobs**, in `<broker>/tool-blobs/` (0700, files 0600): the canonical bytes of each version in
+  a file named by their hash. The name is the only input to a path, and a `ContentHash` is 64
+  lowercase hex digits and nothing else. The directory is opened once through a descriptor with
+  `O_NOFOLLOW`, every file relative to it with `O_NOFOLLOW`. **A read verifies**: a regular file
+  of ours with one link, at most 400 KiB, read under that bound, whose SHA-256 is its name; a
+  missing, replaced, truncated, extended, symlinked or special file is refused and nothing is
+  returned. **A write cannot replace**: the bytes go to a temporary name and are *linked* to the
+  final one, which fails if it exists; an existing blob must verify, and one that does not is left
+  as it is and the write refused. Nothing deletes a blob, and a blob left by a transaction that
+  failed is harmless and found again by the next save of the same bytes.
+
+`open` (what S24's `open_tool` and the sandbox run will use) reads the blob, parses it with the
+strict models, and checks that the index row is a faithful copy of it (id, version, name,
+description, tags, the package's taint, the taint its origin gives, size): a package whose blob or
+row was edited is refused, so the taint of a saved version cannot be lowered by editing the
+database either (for an import, see "Taint of an import"). Listing and searching show the
+index (the copies); showing, exporting and opening read the package. At most 500 tools, 100
+versions of one and 256 MiB of packages are kept; beyond that a save or import is refused (`busy`),
+never evicted. A search is words only: `fts_match` drops the syntax of FTS5 (operators, quotes,
+column filters, brackets), keeps at most 8 words of at most 64 characters from the first 200
+characters, and quotes each as a prefix term; the string is a bound parameter, never part of the
+SQL, and a query without a word finds nothing. At most 50 results.
+
+**Versions are immutable.** The store has no operation that changes or removes a version. `save`
+(S24's `save_tool` calls it through `BrokerService.save_tool`, which has no IPC request yet) adds
+the first version of a new tool or the next of one that exists, assigning the version where it is
+stored and taking the taint from the task, read in the same synchronous block (I12). `import_`
+adds a tool the store does not have.
+
+**Bundles** (`tumbleweed.tools.bundle`). One canonical JSON document, not an archive, so there is
+no path, no nesting and no expansion to attack: `{"format": "tumbleweed.tool-bundle/1", "hash":
+"<sha-256>", "package": {...}}`, the package embedded exactly as stored. `import_tool` accepts
+a bundle only if it is at most 401 KiB, UTF-8 JSON with no repeated key and exactly those three
+members, the package passes every check of a stored one **and is already in normal form** (NFC, LF,
+every field written, canonical bytes: a bundle that is not is refused, not repaired, so that the
+hash it states is the hash that is stored), the stated hash is the hash of those bytes, and the
+whole file is exactly canonical JSON (RFC 8785), so that the bytes that are hashed are the bytes of
+the package as they lie in the file: a pretty-printed or `\u`-escaped bundle is refused. A
+bundle cannot carry what a package cannot: no grant, no state, no task, no unknown field anywhere
+(I8); an imported tool is granted again like any other version. It adds a tool whose `ToolId` the
+store does not know; the very same version again, byte for byte, changes no row (and verifies the
+blob, writing it again if it was lost, so importing repairs a store); any other bundle for a known
+`ToolId` is refused as a `conflict`, so an import can neither replace a version nor appear as the
+next version of a tool the user has.
+
+**A refinement never cleans a lineage (I12).** The newest version is the one that is opened, so a
+version saved from a task that read nothing, as a refinement of one that carried `fs`, would drop
+what the first carried. So a refined version's effective taint is its task's taint **plus the
+effective taint of the version it refines**; if that would combine `fs` and `net` the save is
+refused (`ToolTaintConflictError`, answered `denied`). The package still records its task's taint
+as its claim. `open` checks a refinement's taint against its predecessor's.
+
+**Taint of an import (I12).** A bundle is input from the user's file system or from elsewhere: a task
+that could read files and write one could have made it, with their content in it, under any claim.
+So **an imported package is `fs`-tainted whatever it claims**. The index keeps two fields:
+`taint`, what open and grant decisions **must read** (S24's `open_tool`, tool grants): for a saved
+version the task's taint, for an imported one the claim plus `fs` (so a claim of `net` makes `fs`
+and `net`, which no task can hold and which opens nowhere); and `claimed_taint`, what the package
+says, for display (`tumbleweed-tools` shows both). The package itself is not rewritten, so the
+hash is the bundle's. `open` refuses a version whose `taint` is not what its origin and package
+give. The origin lives in the index (a package cannot record how it came without changing the hash
+it is exported with), so rewriting both fields of an index row is not detected: editing the broker's
+database is out of scope (section 8), as for the grants beside it. Editing a bundle's claim and its
+hash gains nothing: it is another package, and an import is `fs`-tainted anyway. Lowering the taint
+of an import later is a user's decision in a trusted prompt (S18, S24; #98).
+
+**Audit.** A saved or imported version (`tool_saved`: tool, version, hash, size, the effective
+taint and the package's claim, origin, and the task for a save), an export (`tool_exported`: written before the bundle is returned, the
+effective taint included, because a bundle is content that leaves the broker's custody) and a
+refused import (`tool_import_refused`: `invalid`, `too_large`, `conflict`, `full`, `integrity` for a
+stored package that failed its check while the import looked at it, `error` for any other failure
+of the store or the disk; nothing of the bundle) are written before the act, in its transaction (a
+refusal that is itself a failure of the store is recorded if the log can take it). Listing, showing and searching are reads of the broker's own store and are not
+decisions; an import that finds the very same version stored changes nothing and has no entry.
+
+**`tumbleweed-tools`** (`tumbleweed.broker.toolscli`: `list [QUERY]`, `show TOOL [--version N]
+[--json]`, `export TOOL FILE [--version N]`, `import FILE`; `-` is standard output or input) is a
+client of the running broker and opens no database and no blob: one process writes the store, so two
+writers cannot corrupt it, every export and import is audited, and the checks are made in one
+place. It does not start the broker, waits at most 5 s to connect and 60 s in all, escapes every
+character of tool text that is not printable, reads a bundle file as a regular file (never a
+symlink) of at most 401 KiB, and creates an export 0600 and never over an existing file. An export
+to `-` is refused when standard output is a terminal (a bundle is raw text, and a terminal obeys
+controls that `printable` would have escaped), and is the canonical bytes to a pipe or a file;
+`show --json` is the canonical bytes to a pipe and, on a terminal, the same JSON value with every
+non-printable character escaped as JSON. `import` prints the taint the package claims and the taint
+kept. A write failure (a full disk) is answered `unavailable`, apart from `unsafe`, which means a
+stored package failed its check.
 
 ## 6. Composition
 
@@ -373,8 +669,9 @@ audited.
 - **Capabilities** (v1): `fs.read(path)`, `fs.write(path)` (implies read), `net.full`.
   Host-scoped egress needs a filtering proxy and is post-v1.
 - **Grant scopes**:
-  - `once`: bound to the specific pending run (or handler call) whose request caused the
-    prompt, and consumed by it. No other run can use it.
+  - `once`: bound to the one run (or handler call) whose `RunId` the request named (the caller
+    chooses it: `request_grant`, `read_file`, `list_dir` and `run_in_sandbox` all carry one), and
+    consumed by it. No other run can use it.
   - `task`: lasts until the task ends.
   - `tool`: persisted, bound to a ToolId **and** the exact version content hash. A new
     version must be granted again. Tool grants apply **only** to sandbox handler runs
@@ -397,7 +694,15 @@ audited.
   sockets of the user's desktop and shell under `/tmp` (`.X11-unix`, `.ICE-unix`, `tmux-<uid>`,
   `$TMUX_TMPDIR`) are entries, which makes `/tmp` ungrantable by the ancestor rule, and so is
   `/var/tmp`: a read-only bind still lets a sandbox `connect()` to a socket. Any directory that
-  is world-writable and sticky is refused as a grant target too.
+  is world-writable and sticky is refused as a grant target too. The daemon adds what only it
+  knows (`BrokerConfig.deny_context`): its own data, workspaces and socket directories wherever
+  they are; the paths the sandbox builds itself, `/tmp` (so nothing at or inside `/tmp` can be
+  granted: the sandbox refuses it, because a grant there would inherit Landlock's write rule for
+  the sandbox's own tmpfs, and refusing at decision time means the user is never prompted for
+  what cannot run), `/workspace`, `/inputs` and the launcher's file; the runtime's own paths; and
+  the directory of `$SSH_AUTH_SOCK` when the daemon's environment has one. A systemd user service
+  does not have `TMUX_TMPDIR` or `SSH_AUTH_SOCK` from the user's login shell, so there the
+  defaults are what protects (`/tmp/tmux-<uid>` and anything under `/tmp`, `$XDG_RUNTIME_DIR`).
 - **Path handling.** At decision time the broker canonicalises the path once (absolute,
   `..` and symlinks resolved), checks it against the deny rules, and stores the canonical
   path together with its identity `(statfs f_fsid, st_ino)` (`st_dev` is not stable across
@@ -411,18 +716,25 @@ audited.
   the identity of each directory on the way and of the target), and `StoredPath`, what a grant
   keeps (canonical text and the target's identity), which is opened by `StoredPath.open` and
   never resolved again. Opens, at decision time and at run time, can wait as long as the file
-  system takes to answer (a hung network or FUSE mount); the daemon decides on a worker it can
-  abandon (S17).
+  system takes to answer (a hung network or FUSE mount); the daemon runs them on a worker it can
+  abandon, with a deadline (S17, section 2 "Broker daemon").
+  The decision-time walk reads the directories on the way, and the run-time open only searches them
+  (`O_PATH`, Linux), so a directory that can be searched but not read makes what is below it
+  ungrantable: that refuses more, never less, and is kept (#71).
 - **Network.** `net.full` gives the sandbox its own network namespace connected through
   `slirp4netns --disable-host-loopback` (no host loopback, no host abstract sockets),
   never `--share-net`. The payload is held with bwrap `--block-fd` until the network is
   configured.
 - **Exfiltration rule (I12).** Each task has a sticky taint set. It becomes `fs`-tainted the
   moment it is issued any fs grant outside its workspace (any scope, used or not, picker
-  included) or opens a saved tool whose package is fs-tainted, and `net`-tainted the moment
-  it is issued `net.full`. The broker refuses any grant that would make a task both, and
-  refuses `open_tool` of an fs-tainted package in a net-tainted task (the model is told to
-  call `start_task(..., fresh_context=true)`). Applying a tool grant to a run counts as issuing it to the task for
+  included) or opens a saved tool whose stored version is fs-tainted, and `net`-tainted the
+  moment it is issued `net.full`. "Tainted" for a stored version is **the index's
+  `ToolRecord.taint`**: the task's taint plus that of the version it refines, for a save; the
+  package's claim plus `fs`, for an import (section 5); never the package's own `taint`, which is
+  only a claim. The broker refuses any grant that would make a task both, refuses `open_tool` of
+  an fs-tainted version in a net-tainted task (the model is told to call
+  `start_task(..., fresh_context=true)`), and refuses `open_tool` of a version whose taint is both
+  `fs` and `net` (an import that claimed `net`) in every task. Applying a tool grant to a run counts as issuing it to the task for
   taint purposes; a tool grant that would conflict with the task's taint is withheld from
   that run. Tool grants are applied oldest first, so of two conflicting ones the older applies
   and the newer is withheld: the older is the one the user made first, and the result then does
@@ -431,7 +743,8 @@ audited.
   `start_task` passes `fresh_context` to the broker, which copies the ended task's taint to
   the new task unless it is true. The broker's taint state is authoritative. A tool
   package records the taint of the task it was saved from, because its code and defaults
-  may embed what that task saw. Data reaches a net-tainted task from an fs-tainted one only
+  may embed what that task saw; an imported package may embed anything, so it is `fs`-tainted
+  whatever it says, and a refinement keeps the taint of what it refines. Data reaches a net-tainted task from an fs-tainted one only
   through a cross-task connection the user approved in a trusted prompt; the model context
   of a net-tainted task excludes every turn of fs-tainted tasks (§2).
 - **Writes are off until undo exists.** Until snapshots ship (S21), policy refuses every
@@ -477,9 +790,10 @@ Each invariant names where it is enforced. Reviews check every change against th
   explicit grants, no host sockets (Wayland, X11, D-Bus, PipeWire, broker, shell, host
   loopback), user namespace with nested userns disabled, `no_new_privs`, all capabilities
   dropped, a seccomp filter (architecture-checked, non-native ABIs killed; no keyring calls and
-  no unix sockets or families beyond inet), a Landlock ruleset and a pids limit (both required on the target; on dev/CI
-  hosts without them the run reports their absence), CPU/memory/time/output limits, killed with
-  its parent.
+  no unix sockets or families beyond inet), a Landlock ruleset and a pids limit (both required on
+  the target: the broker refuses a run without them unless a development host's daemon was started
+  with `--no-landlock` or `--allow-unenforced-limits`, and every result and the audit log's start
+  entry say so), CPU/memory/time/output limits, killed with its parent.
 - **I4 — Generated UI is inert data.** The renderer accepts only the schema. No Pango markup
   from model text (plain text only; the shell puts untrusted text into labels through
   `tumbleweed.shell._widgets.plain_label`, and `tests/shell/test_markup_lint.py` rejects the GTK
@@ -519,11 +833,19 @@ Each invariant names where it is enforced. Reviews check every change against th
   provider's own words are never displayed or logged. The SDK's DEBUG and INFO logging, which would
   hold prompts and error text, is turned down to WARNING.
 - **I7 — Everything privileged is audited.** Every grant decision, sandbox run, snapshot,
-  restore and revocation is appended to the broker's audit log.
+  restore and revocation is appended to the broker's audit log (S17: `audit.jsonl`, section 2
+  "Broker daemon"), before the act it records, so an act whose entry cannot be written does not
+  happen (if a commit fails after its entries were written, a `rolled_back` entry follows them).
+  Refusals are logged too: a refused run, a refused read or listing, a grant the user allowed and
+  the broker then refused. Also logged: starts and ends of tasks and deleted workspaces, tool
+  versions saved or imported, tool bundles exported and imports refused (section 5). Reads of a
+  task's own workspace and listing or showing tools are not decisions and are not logged.
 - **I8 — Tools don't carry privilege.** Tool packages never contain grants or user state.
   Tool-scoped grants bind to (ToolId, content hash) and apply only to user-triggered runs
   (§7). Imported or modified tools must be granted again. For saved tools the broker runs
-  code from its own store, never code supplied by the shell.
+  code from its own store, never code supplied by the shell. A package and a bundle are parsed by
+  closed models, so neither can carry a grant or a state value; a stored version is immutable and
+  every read of its blob verifies its hash (section 5).
 - **I9 — Bounded resources.** Limits on spec size, IPC frame size, file reads, sandbox
   CPU/memory/pids/time/output, agent loop iterations and tokens per turn. At most one
   sandbox handler run per tool instance in flight; slider-driven handlers are debounced. In the
@@ -550,12 +872,18 @@ Each invariant names where it is enforced. Reviews check every change against th
   stream, 64 KiB of an error body), after asking for `Accept-Encoding: identity` and refusing any
   response that is encoded anyway, because the HTTP library decompresses above the transport and
   the count would no longer be ours. Tool inputs, results and runtime are bounded by `agent.tools`.
+  The chat history (`tumbleweed.history`, D16) bounds what it keeps (20 sessions, 1000 messages
+  per session) and what a read can return: at most the newest `limit` rows of one session and 4
+  MiB of their text, a value or row over 128 KiB fails the read, and every record is validated. What is sent to the
+  model is bounded by `agent.context`: a token budget over the system prompt, the history and the
+  new message.
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input.
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps
   what it reads. Workspace references are relative and validated.
 - **I12 — No exfiltration combos.** No task is ever both fs-tainted and net-tainted (sticky,
-  from grant issuance, including picker grants and fs-tainted tool packages). A net-tainted
+  from grant issuance, including picker grants and fs-tainted stored tool versions, imports
+  always among them). A net-tainted
   task's model context contains no turns from fs-tainted tasks. Data crosses that line only
   through a user-approved cross-task connection (§6, §7).
 - **I13 — No write without undo.** A run with write grants starts only after a snapshot of
@@ -568,6 +896,12 @@ caps); the broker shares the shell's uid; full network grants are coarse; assist
 can carry injected content across tasks (but never into a net-tainted task from an
 fs-tainted one); prompt injection can still mislead the model
 within the grants a task already holds (which is why grants are narrow and snapshots exist).
+The deny rules (section 7) have documented limits, accepted for v1 (#66): a hard link, placed
+inside a granted directory, to a file inside a protected directory is not recognised (only the
+same uid can make one, and a sandbox sees none of the protected directories); a bind mount of a
+protected directory below a granted one would be exposed by bwrap's recursive bind (making one
+needs root, which is out of scope); the run-time re-check of a stored grant compares folded text
+only, so it can only refuse more; and case folding is not every file system's own equality.
 
 ## 9. Persistence layout
 
@@ -575,10 +909,10 @@ within the grants a task already holds (which is why grants are narrow and snaps
 |---|---|---|
 | Shell config (TOML), API key file (0600) | `$XDG_CONFIG_HOME/tumbleweed/` | Never |
 | Chat history (SQLite), invocation log | `$XDG_DATA_HOME/tumbleweed/shell/` | Never |
-| Broker data: grants, tool store, audit log | `$XDG_DATA_HOME/tumbleweed/broker/` | Never |
+| Broker data: grants, tasks and the tool store's index (`broker.sqlite3`), tool packages (`tool-blobs/`), audit log (`audit.jsonl`) | `$XDG_DATA_HOME/tumbleweed/broker/` | Never |
 | Copy/reflink snapshots | `$XDG_DATA_HOME/tumbleweed/broker/snapshots/` | Never |
 | btrfs snapshots | dedicated subvolume on the same filesystem, on the deny list | Never |
-| Workspaces | `$XDG_DATA_HOME/tumbleweed/workspaces/<TaskId>/` | Only their own, at `/workspace` |
+| Workspaces (kept 7 days after their task ends) | `$XDG_DATA_HOME/tumbleweed/workspaces/<TaskId>/` | Only their own, at `/workspace` |
 | Sockets | `$XDG_RUNTIME_DIR/tumbleweed/` (mode 0700) | Never |
 
 **Sockets.** `$XDG_RUNTIME_DIR/tumbleweed/` is created with mode 0700 and owned by the user. An
@@ -601,11 +935,79 @@ server dies; a socket file found at its path is then removed only if it is a soc
 user, and any other file (a regular file, a directory, a symlink, another user's socket) is left
 alone and refused. A second server on a live path is refused and the first is not disturbed.
 
+**Chat history** (`tumbleweed.history`, D16). `$XDG_DATA_HOME/tumbleweed/shell/chat.sqlite3`, with
+`chat.locks/` beside it, in directories of mode 0700 (the files 0600), created by the shell.
+
+- *Schema.* Versioned migrations (`PRAGMA user_version`; the file is marked with an
+  `application_id`), each atomic, run under `BEGIN IMMEDIATE` so that shells starting together
+  migrate once. A file is used only if its schema is exactly what the migrations make (no extra
+  trigger, view or column), and never migrated down: a newer version is refused and left alone.
+- *Concurrency.* Shells are non-unique, so several may have the file open. WAL mode, a 2 s busy
+  timeout (each write that waits longer fails and the chat says so; each write waits at most about
+  2 s), every write `BEGIN IMMEDIATE`. **A session has one owner at a
+  time.** A shell claims the session it restores or creates with an exclusive `flock` on
+  `chat.locks/<SessionId>.lock`, held until it starts another session or exits (the kernel drops it
+  if the shell dies). "The last session" is the one with the newest activity (its latest message;
+  ties go to the newer `SessionId`) *that is kept* (it has messages, or was made empty by the
+  user's "New session": `sessions.user_started`, schema v2) and that no running shell holds, among
+  the newest eight such sessions; a second shell therefore gets an older chat, or else an empty one,
+  while the first runs. The empty session a shell makes by itself at start is not kept: it is deleted
+  when that shell closes or starts another session, and one a killed shell left is deleted by the next
+  shell's pruning; so an accidental second shell leaves nothing that could hide the real chat. An
+  empty session the user made *is* kept (it restores as an empty chat: "New session", quit, start
+  gives an empty chat), but only the newest one: starting another session (in any shell) deletes the empty user-started
+  ones that nobody holds. Starting a
+  session deletes (in one write) up to 20 sessions with messages beyond the newest 20 of them (empty
+  sessions never count towards the cap, so New session cannot push a chat out), and up to 20
+  auto-created empty ones, never one a shell holds. Closing a shell whose user-started session is still empty
+  (so it is kept) also deletes the other shells' unheld ones. Only the newest 1000 sessions are looked at
+  (`SCAN_WINDOW`).
+- *What is stored.* Exactly what the transcript shows: message ID, role, text, whether a reply
+  completed or failed (and its one-line reason), the `TaskId` (`None` until S19) and the time. A
+  reply is saved when it ends, so a crash mid-reply loses that reply and keeps the question. No
+  key, configuration, provider metadata or tool result is ever stored (I6); text the user types is
+  stored as typed, so a secret the user pastes into the chat is stored like any other message.
+- *The file is untrusted input* (the user can edit it, and so can anything that wrote it). The
+  chain `tumbleweed/`, `shell/`, `chat.locks/` is opened component by component with
+  `O_NOFOLLOW` and examined through each descriptor, and the files relative to them: a symlink,
+  another owner, a non-regular file or a second hard link is **refused**; a mode other than
+  0700/0600 on something of ours is **repaired** and logged. SQLite opens the file by path itself, resolves any symlink in it then and keeps the resolved
+  path (a `/proc/self/fd/<n>` path would only be resolved to the plain one). Straight after it
+  connects, and before anything is read or written, the shell reads that path (`PRAGMA
+  database_list`) and requires the file and directory there to be the ones it holds descriptors
+  for; the directory path and the file in it are compared too. SQLite's own moved-check guards
+  writes to the database file, not to the write-ahead log, which holds every message until it is
+  checkpointed; so at the end of the open, before any message is saved, `-wal` and `-shm` must
+  exist in the directory the shell holds and the resolved path is checked again. These checks
+  refuse an accidental redirection (a symlinked or moved directory, a file that is not ours) and
+  a swap still in place at a check. They do not stop someone who can rename the directory or its
+  ancestors (this user, or root, who can read the history anyway) from swapping in and out
+  around the open's reads and sending `-wal`/`-shm` elsewhere; that is outside the threat model
+  (`history.files` has the detail, #80 the possible hardening). A file that is not ours is
+  checked, read-only, before it is switched to WAL or written to. SQLite runs in defensive mode
+  with `ATTACH` off and limits on a value, a statement and an expression's depth; text is read as
+  bytes and decoded strictly; every row is validated into a typed record, and a read refuses
+  duplicate positions and returns exactly what was measured. A file that cannot be used at all
+  (not a database, not ours, a newer schema, unsafe) is **refused**: the shell starts without
+  history, says so, and leaves the file as it is. A usable file whose newest session holds
+  anything invalid is **not restored**: a fresh session starts, with a notice, and the old data
+  is left in place. If a message cannot be saved, the rest of that session is not saved and the
+  chat says so; "New session" tries the history again.
+- *Restore.* The newest messages of the session, at most 998 (`MAX_MESSAGES` minus room for one
+  exchange, so a restored chat can always go on) and at most 4 MiB of text (so that a file of
+  maximal valid messages cannot make the window slow to open), become the transcript. "New session" cancels the reply in
+  flight, starts a fresh session and empties the transcript, which is also the way out of a full one.
+- *The model's context.* The agent keeps no history: each request carries the transcript's finished
+  exchanges, and `agent.context` keeps the system prompt, the new message and the newest turns that
+  fit a token budget. Tokens are estimated as UTF-8 bytes plus a per-message overhead, an upper
+  bound for any text (D16).
+
 ## 10. Code layout and layering
 
 ```
 src/tumbleweed/
-  core/       typed IDs, domain primitives, JSON types, errors, config, logging
+  core/       typed IDs, domain primitives, JSON types, errors, config, logging, RFC 8785
+              canonical JSON (`jcs`) and the normalised bytes and hash of the tool store (`canonical`)
   ipc/        framing, typed messages, async client/server
   ui/spec/    UI spec schema, expression AST and value types (no GTK)
   ui/runtime/ state store, expression interpreter, bindings, handler dispatch (no GTK)
@@ -616,18 +1018,26 @@ src/tumbleweed/
               the `Responder` interface the shell is built against (`agent/responder.py`)
   voice/      audio capture, STT, TTS, VAD, wake word
   history/    chat persistence
-  broker/     daemon, policy, grants, paths, tasks, workspaces, tool store, snapshots, audit
+  broker/     daemon, service, client, policy, grants, paths, tasks, workspaces, store, audit,
+              tool store (`toolstore`, `toolblobs`, `toolscli`) and snapshots (later steps)
+  tools/      the tool package model, its canonical bytes and hash, bundles, search text (no I/O)
   sandbox/    sandbox policy, bwrap argv builder, seccomp filter, runner, sandbox-exec
 ```
 
 Layering rules, enforced by import-linter contracts in `pyproject.toml`:
 
+- `tools` never imports `broker`, `ipc`, `agent`, `shell`, `voice`, `ui.gtk` or `gi`: the package
+  model is data, used by the broker that stores it and the shell that builds drafts.
 - `broker` and `sandbox` never import `agent`, `shell`, `voice`, `ui.gtk` or any LLM SDK.
 - `sandbox` never imports `broker`.
+- `broker` imports `ipc` only in its daemon layer (`service`, `daemon`, `client`, `toolscli`); the
+  policy core, storage and audit modules never do, nor do they import the daemon layer; `ipc` never
+  imports `broker`.
 - `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
   import `gi`; `ui.runtime` also never imports `ui.gtk` or the shell, so it cannot reach GTK
   through them.
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
+- `history` never imports `shell` or `agent`; the shell depends on it through `ChatHistory`.
 - The Anthropic SDK is imported only by `agent.anthropic_provider`; the rest of the agent, and
   everything else, uses the `LlmProvider` interface (D3). `agent` runs its asyncio loop on its own
   worker thread and reaches the GTK main thread only through a dispatcher the shell injects (D11).

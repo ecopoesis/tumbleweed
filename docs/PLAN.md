@@ -691,6 +691,11 @@ audit.
   - `list_dir(path)` for granted directories;
   - `read_file`.
 - The broker-backed `ImageRef` resolver replaces the S11 fake.
+- The shell connects to the broker through `tumbleweed.broker.client.BrokerConnector`, which
+  starts `tumbleweed-broker` on demand in development and reconnects with backoff (S17 built and
+  tested it, and left the wiring to this step); on the target a systemd user service starts the
+  broker (S27). Every shell request goes through one `BrokerClient`, which pings so that the
+  broker does not close a quiet connection.
 
 **Acceptance.**
 - Fake-provider tests:
@@ -750,6 +755,9 @@ and writes its output into the workspace, and the image renders. Negative tests:
   - undo snapshots first, so it can itself be undone.
 - Retention: 7 days or 100 snapshots, whichever comes first; configurable.
 - Everything is audited.
+- The snapshot subvolume joins the broker's deny entries (`BrokerConfig.deny_context`, #66 and
+  S17's `ExtraDeny` list), and a write grant is kept disjoint from the read grants of a run
+  (`broker.compose.disjoint_mounts` today handles read grants only: #74).
 
 **Acceptance.**
 - Copy-backend tests everywhere: write then undo restores contents, including deleted and
@@ -829,9 +837,12 @@ access.
 - Retrieval before generation: matching saved tools are offered to the model (top-k FTS
   plus model re-ranking).
 - Saved tools run code from the broker's store (I8).
-- Opening an fs-tainted package taints the current task (I12); `open_tool` of an
-  fs-tainted package in a net-tainted task is refused, and the model is told to call
-  `start_task(..., fresh_context=true)`.
+- Opening a saved tool whose stored version is fs-tainted taints the current task (I12);
+  `open_tool` of an fs-tainted version in a net-tainted task is refused, and the model is told to
+  call `start_task(..., fresh_context=true)`. "Tainted" is the index's `ToolRecord.taint` (S23,
+  D19), never the package's own claim: an imported version is fs-tainted whatever its bundle says,
+  a refined version carries the taint of what it refines, and a version that is both fs and net
+  is refused by `open_tool` in every task.
 - Tool grants:
   - prompts gain "allow for this tool";
   - tool-scoped grants bind to (ToolId, hash) and apply only to user-triggered handler runs

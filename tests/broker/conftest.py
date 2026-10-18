@@ -6,6 +6,10 @@ import pytest
 
 from tests.broker.support import World, make_world
 
+# Autouse, and shared with the IPC tests: an error that asyncio had to report because nobody
+# handled it fails the test that caused it (the daemon is asyncio all the way down).
+from tests.ipc.conftest import no_error_is_lost_to_the_event_loop  # noqa: F401
+
 
 @pytest.fixture
 def world(tmp_path: Path) -> World:
