@@ -693,13 +693,16 @@ def test_the_window_module_uses_a_shortcut_controller_not_a_key_controller() -> 
 # which sees every key the window gets, the terminal's included. It is pinned to what it does: it
 # reads the key value and the modifiers of a press or release, passes nothing on, and does nothing
 # at all (returns False, the event goes on to the terminal) while the focus is in the terminal pane.
+# Since S07 its Esc also takes "a reply is being spoken" (it reads the speech output's phase, never
+# the event), so the handler names include `speech`.
 PUSH_TO_TALK_MODULE = "shell/voice_controls.py"
 OTHER_KEY_CONTROLLER_MODULES = ["shell/chat_panel.py"]
 PUSH_TO_TALK_HANDLER_NAMES = frozenset(
     {
         "Gdk", "Gtk", "keyval", "state", "in_terminal", "held", "voice", "_RELEASE_KEYS",
         "KEY_space", "accelerator_get_default_mod_mask", "ModifierType", "CONTROL_MASK",
-        "KEY_Escape", "phase", "VoicePhase", "IDLE",
+        "KEY_Escape", "phase", "VoicePhase", "IDLE", "speech", "SpeechPhase", "SPEAKING",
+        "listening", "speaking",
     }
 )  # fmt: skip
 
@@ -743,5 +746,5 @@ def test_the_push_to_talk_controller_reads_nothing_but_the_key_and_the_modifiers
             for node in ast.walk(statement)
             if isinstance(node, ast.Name | ast.Attribute)
             and not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
-        } - {"press", "release", "cancel"}
+        } - {"press", "release", "cancel", "stop"}
         assert loaded <= PUSH_TO_TALK_HANDLER_NAMES, (handler, loaded - PUSH_TO_TALK_HANDLER_NAMES)

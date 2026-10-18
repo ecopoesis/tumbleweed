@@ -1,4 +1,5 @@
-"""The status strip along the bottom of the window: the voice indicator and the terminal button."""
+"""The status strip along the bottom of the window: the voice indicator, the voice buttons (Mic and
+Mute, added by the window) and the terminal button."""
 
 import enum
 from typing import assert_never, final
@@ -9,8 +10,8 @@ from tumbleweed.shell._widgets import plain_label
 
 
 class VoiceState(enum.StrEnum):
-    """What the voice side is doing. Push-to-talk sets IDLE, LISTENING and TRANSCRIBING (S06);
-    nothing sets THINKING or SPEAKING yet (S07)."""
+    """What the voice side is doing. Push-to-talk sets IDLE, LISTENING and TRANSCRIBING (S06) and
+    speech output sets SPEAKING (S07); nothing sets THINKING yet (S08's state machine does)."""
 
     IDLE = "idle"
     LISTENING = "listening"

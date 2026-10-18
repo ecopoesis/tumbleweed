@@ -23,6 +23,7 @@ from tumbleweed.shell._gi import Adw, Gio, Gtk
 from tumbleweed.shell.canvas import CanvasView
 from tumbleweed.shell.chat_panel import ChatPanel
 from tumbleweed.shell.chrome import ChromeRegion
+from tumbleweed.shell.speech_feed import SpeechFeed
 from tumbleweed.shell.status_strip import StatusStrip
 from tumbleweed.shell.terminal_pane import TerminalPane, default_settings
 from tumbleweed.shell.viewmodel.chat import ChatController
@@ -69,17 +70,24 @@ class ShellWindow(Adw.ApplicationWindow):
             terminal if terminal is not None else default_settings(),
             self._focus_input_unless_closing,
         )
-        # Push-to-talk (S06): a mic button in the strip and Ctrl+Space; none if voice is off.
+        # Push-to-talk (S06): a mic button in the strip and Ctrl+Space; none if voice is off. Speech
+        # output (S07) adds a mute button beside it and speaks the replies the transcript streams.
         self.voice_controls: VoiceControls | None = None
+        self._speech_feed: SpeechFeed | None = None
         if voice is not None:
             self.voice_controls = VoiceControls(
                 voice.input,
                 self.status_strip.voice,
                 self.chat_panel,
                 edit_before_send=voice.edit_before_send,
+                speech=voice.speech,
+                notice=voice.notice,
             )
             self.status_strip.insert_child_after(self.voice_controls, self.status_strip.voice)
             self.voice_controls.install_keys(self, self._terminal_has_focus)
+            if voice.speech is not None:
+                self._speech_feed = SpeechFeed(voice.speech)
+                self.transcript.subscribe(self._speech_feed)
 
         # The separator and the panel hide together.
         self._side = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -100,10 +108,10 @@ class ShellWindow(Adw.ApplicationWindow):
         root.append(self.status_strip)
         self.set_content(root)
 
-        # Esc abandons an utterance being recorded, or else stops the reply in flight, wherever the
-        # focus is in the window. A shortcut (not a GAction, which would be exported on the session
-        # bus), in the bubble phase: whatever wants Esc first (a popover, an entry) gets it, and
-        # while nothing is recorded or streaming the key is not consumed at all.
+        # Esc abandons an utterance being recorded, stops speech, or else stops the reply in flight,
+        # wherever the focus is in the window. A shortcut (not a GAction, which would be exported
+        # on the session bus), in the bubble phase: whatever wants Esc first (a popover, an entry)
+        # gets it, and while nothing is recorded, spoken or streaming the key is not consumed.
         escape = Gtk.ShortcutController()
         escape.add_shortcut(
             Gtk.Shortcut.new(
@@ -196,14 +204,17 @@ class ShellWindow(Adw.ApplicationWindow):
         return True
 
     def shutdown(self) -> None:
-        """Stop the utterance being recorded, and the reply in flight, and stop observing it, before
-        the widgets go away; then save what it left (the failed reply) and release the chat history.
+        """Stop the utterance being recorded, the speech and the reply in flight, and stop observing
+        them, before the widgets go away; then save what it left (the failed reply) and release
+        the chat history.
 
         A window that is destroyed outright gets no `close-request`, so whoever ends the window
         calls this: the `close-request` handler does, and so does the application when it quits.
         """
         self._closing = True
         try:
+            if self._speech_feed is not None:
+                self.transcript.unsubscribe(self._speech_feed)
             if self.voice_controls is not None:
                 self.voice_controls.shutdown()
         finally:
