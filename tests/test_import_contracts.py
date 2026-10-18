@@ -18,6 +18,7 @@ LINT = "from importlinter.cli import lint_imports_command; lint_imports_command(
 BROKER_IPC = "the broker imports ipc only in its daemon layer"
 BROKER_LAYER = "the broker's policy core, store and audit log never import its daemon layer"
 IPC_BROKER = "ipc never imports the broker"
+TOOLS = "tools never imports broker, ipc, gi, agent, shell, voice or ui.gtk"
 SANDBOX = "sandbox never imports broker, agent, shell, voice, ui.gtk, gi or an LLM SDK"
 
 # (file to append to, the import to plant, the contract that must report BROKEN, and modules that
@@ -99,6 +100,30 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         "ipc/wire.py",
         "import tumbleweed.broker.errors",
         IPC_BROKER,
+        (),
+    ),
+    "the tool package model imports the broker (S23)": (
+        "tools/package.py",
+        "import tumbleweed.broker.errors",
+        TOOLS,
+        (),
+    ),
+    "the tool package model imports the transport (S23)": (
+        "tools/bundle.py",
+        "import tumbleweed.ipc.wire",
+        TOOLS,
+        (),
+    ),
+    "the tool package model imports gi (S23)": (
+        "tools/query.py",
+        "import gi",
+        TOOLS,
+        (),
+    ),
+    "the tool package model imports the agent (S23)": (
+        "tools/limits.py",
+        "import tumbleweed.agent.responder",
+        TOOLS,
         (),
     ),
     "the broker's service imports the agent (I2)": (

@@ -382,6 +382,34 @@ which is what the target needs, and it writes the setting to its audit log
 The tests that run a real sandbox through the daemon are marked `linux` (`scripts/test-linux`);
 the rest use a fake sandbox and run everywhere.
 
+### Tool store
+
+The broker keeps saved tools (`src/tumbleweed/tools`, `src/tumbleweed/broker/toolstore.py`,
+[ARCHITECTURE section 5](docs/ARCHITECTURE.md), D19): versioned, immutable, hashed packages (manifest
+with typed ports, UI spec with state defaults, code modules, the taint of the task they were saved
+from) in `$XDG_DATA_HOME/tumbleweed/broker/`, an index with full-text search in `broker.sqlite3` and
+the packages themselves in `tool-blobs/`, each file named by its SHA-256 and checked on every read.
+Nothing saves a tool from a conversation until S24; what works today is the store, bundle import and
+export, and the `tumbleweed-tools` command, which talks to the running broker (it opens no store of
+its own, and does not start the broker):
+
+```sh
+uv run tumbleweed-broker --no-landlock --allow-unenforced-limits &   # a development host
+uv run tumbleweed-tools list                      # newest version of each tool
+uv run tumbleweed-tools list "csv viewer"         # search name, description and tags
+uv run tumbleweed-tools show tool_01j... [--version 2] [--json]
+uv run tumbleweed-tools export tool_01j... csv.tool.json   # a new file, mode 0600; `-` is stdout
+uv run tumbleweed-tools import csv.tool.json      # `-` is stdin; no grant or state comes with it
+```
+
+A bundle is one canonical JSON file; an import refuses anything that is not exactly what an export
+writes (unknown fields, a wrong hash, pretty-printed or escaped JSON, text that is not NFC with LF
+line endings, too big) and never changes a tool the store already has. An imported tool is
+tainted as if it had read files (`fs`) whatever the bundle says; `import` prints both what the
+package claims and what is kept. `export TOOL -` refuses to print on a terminal; use a file or a
+pipe. `uv run pytest tests/tools tests/broker/test_toolstore.py
+tests/broker/test_daemon_tools.py` are the tests that matter most here.
+
 ### UI spec
 
 The contract between the model and the renderer, `tumbleweed.ui/1`, is documented in

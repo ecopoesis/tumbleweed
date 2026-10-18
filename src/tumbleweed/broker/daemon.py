@@ -37,6 +37,8 @@ from tumbleweed.broker.fsworker import FsWorker
 from tumbleweed.broker.prompts import AutoDeny, PromptInterface
 from tumbleweed.broker.service import BrokerService, Owner, Sandbox, utc_now
 from tumbleweed.broker.store import BrokerStore
+from tumbleweed.broker.toolblobs import ToolBlobs
+from tumbleweed.broker.toolstore import ToolStore
 from tumbleweed.broker.workspaces import Workspaces
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.ipc.broker_messages import MAX_WALL_SECONDS
@@ -155,14 +157,17 @@ async def start_broker(
     store = BrokerStore.open(config.broker_directory)
     audit_log: AuditLog | None = None
     workspaces: Workspaces | None = None
+    tools: ToolStore | None = None
     fs = FsWorker(timeout=config.fs_timeout)
     service: BrokerService | None = None
     try:
         audit_log = AuditLog.open(config.broker_directory)
         workspaces = Workspaces.open(config.workspaces_directory)
+        tools = ToolStore(store, ToolBlobs.open(config.broker_directory))
         service = BrokerService(
             config=config,
             store=store,
+            tools=tools,
             audit_log=audit_log,
             workspaces=workspaces,
             fs=fs,
@@ -186,7 +191,7 @@ async def start_broker(
             await service.close()
         else:
             fs.close()
-            for resource in (workspaces, audit_log):
+            for resource in (workspaces, audit_log, tools):
                 if resource is not None:
                     resource.close()
             store.close()

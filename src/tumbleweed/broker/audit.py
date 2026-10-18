@@ -4,7 +4,8 @@ Every grant decision, sandbox run and revocation is a line of `audit.jsonl` in t
 directory. A line is the JSON of one `AuditEntry`: a pydantic model with a `kind` discriminator
 and a format version `v`. The entries are closed (`extra="forbid"`) for the readers of this
 version; a later step adds a field with a default (a content hash, say) or a new kind, and
-reads old lines unchanged. Nothing here hashes content: provenance is not S17's.
+reads old lines unchanged. The entries of the tool store (S23) name a package by its content hash;
+nothing else here hashes content.
 
 What the file guarantees, and what it does not:
 
@@ -35,7 +36,8 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, V
 
 from tumbleweed.broker.errors import AuditError
 from tumbleweed.broker.privatefs import open_private_directory, open_private_file
-from tumbleweed.core.ids import GrantId, RunId, TaskId
+from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId
+from tumbleweed.core.types import ContentHash, ToolVersion
 
 _log = logging.getLogger(__name__)
 
@@ -209,6 +211,43 @@ class WorkspaceDeleted(_AuditModel):
     reason: Text | None
 
 
+class ToolSaved(_AuditModel):
+    """A version of a tool was stored: saved from `task` (the task whose taint it records), or
+    imported from a bundle (no task; `taint` is what the bundle claims). Written before the version
+    is committed. A bundle that holds a version the store already has changes nothing and has no
+    entry."""
+
+    kind: Literal["tool_saved"] = "tool_saved"
+    tool: ToolId
+    version: ToolVersion
+    hash: ContentHash
+    size: Annotated[int, Field(ge=0)]
+    taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=2)]  # effective (I12)
+    origin: Literal["saved", "imported"]
+    task: TaskId | None
+    claimed_taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=1)] = ()
+
+
+class ToolExported(_AuditModel):
+    """A bundle of a stored version was handed out. Written before it is, so that a bundle that
+    left the broker has an entry. Its taint is recorded: it is what the package may embed."""
+
+    kind: Literal["tool_exported"] = "tool_exported"
+    tool: ToolId
+    version: ToolVersion
+    hash: ContentHash
+    taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=2)]  # effective (I12)
+
+
+class ToolImportRefused(_AuditModel):
+    """A bundle was refused, with a closed reason; nothing of it is kept (it is hostile input).
+    `integrity` is a stored package that failed its check while the import looked at it, `error`
+    any other failure of the store or the disk."""
+
+    kind: Literal["tool_import_refused"] = "tool_import_refused"
+    reason: Literal["invalid", "too_large", "conflict", "full", "integrity", "error"]
+
+
 type AuditEntry = Annotated[
     DaemonStart
     | TaskStarted
@@ -219,6 +258,9 @@ type AuditEntry = Annotated[
     | SandboxRun
     | SandboxRunResult
     | WorkspaceDeleted
+    | ToolSaved
+    | ToolExported
+    | ToolImportRefused
     | RolledBack,
     Field(discriminator="kind"),
 ]

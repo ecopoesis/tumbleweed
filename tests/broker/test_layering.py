@@ -27,7 +27,12 @@ FORBIDDEN_FOR_EVER = [
     "openai",
     "litellm",
 ]
-DAEMON_LAYER = ("service", "daemon", "client")  # the modules that may import tumbleweed.ipc
+DAEMON_LAYER = (
+    "service",
+    "daemon",
+    "client",
+    "toolscli",
+)  # the modules that may import tumbleweed.ipc
 LINT_IMPORTS = "from importlinter.cli import lint_imports_command; lint_imports_command()"
 
 
@@ -202,5 +207,10 @@ def test_the_daemon_layer_contract_names_every_module_below_it() -> None:
         if str(contract["name"]).startswith("the broker's policy core, store and audit log")
     ]
 
-    modules = {path.stem for path in BROKER_DIR.glob("*.py")} - {"__init__", "daemon", "client"}
+    modules = {path.stem for path in BROKER_DIR.glob("*.py")} - {
+        "__init__",
+        "daemon",
+        "client",
+        "toolscli",
+    }
     assert {name.removeprefix("tumbleweed.broker.") for name in listed} == modules

@@ -18,6 +18,7 @@ from tumbleweed.ipc.broker_messages import (
 )
 from tumbleweed.ipc.messages import IpcMessage, Request, RequestBody, Response, ResponseBody
 from tumbleweed.ipc.schema import SCHEMA_FILE_NAME, SCHEMA_TITLE, build_schema, render_schema
+from tumbleweed.ipc.tool_messages import ToolSummary
 from tumbleweed.ipc.wire import PROTOCOL_VERSION, ErrorFrame, Hello, RequestFrame, ResponseFrame
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -52,7 +53,14 @@ ALL_MESSAGES: tuple[type[IpcMessage], ...] = (
 
 
 # Models that are parts of a message, not messages themselves (nested under one).
-PARTS: tuple[type[IpcMessage], ...] = (ReadAccess, WriteAccess, NetworkAccess, DirEntry, EnvPair)
+PARTS: tuple[type[IpcMessage], ...] = (
+    ReadAccess,
+    WriteAccess,
+    NetworkAccess,
+    DirEntry,
+    EnvPair,
+    ToolSummary,
+)
 
 
 def definition(name: str) -> dict[str, JsonValue]:

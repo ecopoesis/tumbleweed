@@ -118,3 +118,45 @@ class FsTimeoutError(BrokerError):
 
 class WorkspaceError(BrokerError):
     """A task workspace could not be created, opened or deleted."""
+
+
+class UnknownTaskError(BrokerError):
+    """A task that is not live and owned by the caller was named, by a call that is not a request
+    (`BrokerService.save_tool`); a request about one is answered `unknown_task`."""
+
+
+class ToolStoreError(BrokerError):
+    """The tool store refused or could not do something. The subclasses say what; messages are
+    fixed text that never repeats a name, a hash or any other input."""
+
+
+class ToolNotFoundError(ToolStoreError):
+    """No such tool, or no such version of it."""
+
+
+class ToolConflictError(ToolStoreError):
+    """The ToolId is taken: imported a tool whose ID the store has, with other content. A version
+    is never replaced (versions are immutable) and a lineage is never extended by an import."""
+
+
+class ToolStoreFullError(ToolStoreError):
+    """The store is at one of its limits (tools, versions of a tool, bytes)."""
+
+
+class ToolTaintConflictError(ToolStoreError):
+    """A refinement would give a tool both fs and net taint (I12): the task it is saved from and
+    the version it refines cannot be combined."""
+
+
+class ToolBlobWriteError(ToolStoreError):
+    """A package could not be written to the store (the disk is full, the directory unwritable, the
+    bytes are not what their name says): not a sign that anything stored was tampered with."""
+
+
+class ToolVersionExhaustedError(ToolStoreError):
+    """A tool has no version number left (`ToolVersion` ends at 2**53)."""
+
+
+class ToolBlobError(ToolStoreError):
+    """A stored package is missing or is not what its hash says (tampered, truncated, replaced by
+    a symlink or another kind of file). It is refused, never repaired or deleted."""

@@ -107,11 +107,11 @@ class TestByteCount:
 
 
 class TestToolVersion:
-    @pytest.mark.parametrize("value", [1, 2, 10**9, INT64_MAX])
-    def test_accepts_positive_up_to_int64(self, value: int) -> None:
+    @pytest.mark.parametrize("value", [1, 2, 10**9, 2**53])
+    def test_accepts_positive_up_to_the_largest_exact_json_integer(self, value: int) -> None:
         assert ToolVersion(value) == value
 
-    @pytest.mark.parametrize("value", [0, -1, INT64_MAX + 1, 10**30])
+    @pytest.mark.parametrize("value", [0, -1, 2**53 + 1, INT64_MAX, 10**30])
     def test_rejects_zero_negative_and_too_big(self, value: int) -> None:
         with pytest.raises(InvalidValueError, match="ToolVersion must be from 1 to"):
             ToolVersion(value)
@@ -787,7 +787,7 @@ class TestPydantic:
             "type": "integer",
         }
         assert properties["version"]["minimum"] == 1
-        assert properties["version"]["maximum"] == INT64_MAX
+        assert properties["version"]["maximum"] == 2**53
         assert properties["digest"]["pattern"] == "^(?:[0-9a-f]{64})$"
         assert properties["model"]["pattern"].startswith("^(?:[A-Za-z0-9]")
         assert properties["path"]["minLength"] == 1
