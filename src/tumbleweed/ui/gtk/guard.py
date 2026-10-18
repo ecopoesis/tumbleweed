@@ -52,10 +52,19 @@ def on_touch(gesture: _Claimable, text: _Focusable) -> None:
     text.grab_focus()
 
 
-def harden_text(widget: Gtk.Editable) -> Callable[[], None]:
+type SignalHandler = (
+    Callable[[object], object]
+    | Callable[[object, object], object]
+    | Callable[[object, object, object, object], object]
+)  # what a GTK signal handler of the tool takes: the emitter, then the signal's arguments
+type _Connect = Callable[[Gtk.GestureClick, str, SignalHandler], None]
+
+
+def harden_text(widget: Gtk.Editable, connect: _Connect) -> None:
     """Apply the measures above to the `Gtk.Text` inside an entry or spin button.
 
-    Returns the function that disconnects the handlers, which refer back to the widget.
+    The handlers refer back to the widget, so they are connected with `connect` (the tool's
+    `BuildContext.connect`), which disconnects them on close and keeps what they raise from GTK.
     """
     delegate = widget.get_delegate()  # the Gtk.Text inside an entry or a spin button
     if not isinstance(delegate, Gtk.Text):
@@ -69,23 +78,21 @@ def harden_text(widget: Gtk.Editable) -> Callable[[], None]:
             delegate.remove_controller(controller)
     click = Gtk.GestureClick(button=0)  # every button
     click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-    pressed = click.connect(
-        "pressed",
-        lambda gesture, _presses, _x, _y: on_press(gesture.get_current_button(), gesture, widget),
-    )
+
+    def pressed(gesture: object, _presses: object, _x: object, _y: object) -> None:
+        if isinstance(gesture, Gtk.GestureClick):
+            on_press(gesture.get_current_button(), gesture, widget)
+
+    def touched(gesture: object, _presses: object, _x: object, _y: object) -> None:
+        if isinstance(gesture, Gtk.GestureClick):
+            on_touch(gesture, delegate)
+
+    connect(click, "pressed", pressed)
     touch = Gtk.GestureClick(touch_only=True)
     touch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-    touched = touch.connect(
-        "pressed", lambda gesture, _presses, _x, _y: on_touch(gesture, delegate)
-    )
+    connect(touch, "pressed", touched)
     delegate.add_controller(click)
     delegate.add_controller(touch)
-
-    def disconnect() -> None:
-        click.disconnect(pressed)
-        touch.disconnect(touched)
-
-    return disconnect
 
 
 _SPIN_INPUT_WARNING = "g_value_get_double: assertion 'G_VALUE_HOLDS_DOUBLE (value)' failed"

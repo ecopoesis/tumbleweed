@@ -171,6 +171,7 @@ class NumericRange:
             return value
         delta = value - held
         for unit in (self.step, self.page):
+            # (`of` never makes a step or page that is not above zero; a hand-built range might)
             if unit <= 0.0 or not math.isfinite(delta):
                 continue
             if abs(delta) > (_MAX_STEPS + 0.5) * unit:
@@ -179,6 +180,8 @@ class NumericRange:
             if count == 0 or abs(count) > _MAX_STEPS:
                 continue
             exact = float(Decimal(repr(float(held))) + count * Decimal(repr(unit)))
+            if not self.minimum <= exact <= self.maximum:
+                continue  # noise in `value` can leave the sum a hair outside: no step is made
             if math.isfinite(exact) and abs(exact - value) <= unit * STEP_NOISE:
                 return exact
         return value

@@ -666,10 +666,11 @@ is a list in place, never a popup. An `entry` shows a text of up to 8,192 charac
 editable; a longer text, or one the budget has no room for, is shown cut (or as a line saying so),
 read-only and with a warning icon: the state still holds it all, and an edit would otherwise write
 the cut text over it.
-The entry the user is typing in keeps its text whatever the budget says, so that it does not turn
-into a mark under their fingers: for as long as it is being typed in (and for the next idle turn,
-or until the focus leaves) the tool may show up to 8,192 characters more than the budget, in that
-one entry; then it claims like any other.
+The entry the user is in (the one that has the keyboard focus, or is being edited this moment)
+keeps its text whatever the budget says, so that it does not turn into a mark under their fingers:
+for as long as it has the focus the tool may show up to 8,192 characters more than the budget, in
+that one entry; once the focus leaves (or, for an edit made without focus, at the next idle turn)
+it claims like any other.
 
 What a widget shows or edits is an entry named by `bind`. The entry's declaration supplies range,
 options and limits, so they are written once. Which kinds of entry a component accepts:
@@ -712,9 +713,10 @@ keyboard, the scroll wheel) is the value held plus whole steps, added as decimal
 within a millionth of a step of that: so 50.0 in steps of 0.01 reads 50.09, not 50.08999999999998.
 That is the widget's doing, a transform of stepped values and no part of evaluation: a typed
 number (parsed exactly), a patched value and a default are never changed. A dragged slider position
-is not special either way: it is snapped if, and only if, it happens to lie within a millionth of a
-step of whole steps (or pages) from the value held, and otherwise it is kept exactly, whatever its
-magnitude.
+is not special either way: it is snapped if, and only if, it lies within a millionth of a step of
+1 to 20 whole steps (or pages) from the value held, and the snapped value is within the range;
+otherwise (a move of more steps, however far, or one that is not on whole steps) it is kept exactly,
+whatever its magnitude.
 
 A component's events name a handler, or none:
 

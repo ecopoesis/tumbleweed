@@ -12,6 +12,7 @@ from typing import Final, final
 
 from tumbleweed.shell._gi import Gtk
 from tumbleweed.ui.gtk.budget import MORE_OPTIONS, TextBudget
+from tumbleweed.ui.gtk.guard import SignalHandler
 from tumbleweed.ui.gtk.text import line_label
 
 MAX_HEIGHT: Final = 180  # pixels the list shows before it scrolls
@@ -30,6 +31,7 @@ class ChoiceList(Gtk.ScrolledWindow):
         options: Sequence[str],
         on_choose: Callable[[str], None],
         budget: TextBudget | None = None,
+        connect: Callable[[Gtk.ListBox, str, SignalHandler], None] | None = None,
     ) -> None:
         super().__init__(
             hscrollbar_policy=Gtk.PolicyType.NEVER,
@@ -49,7 +51,13 @@ class ChoiceList(Gtk.ScrolledWindow):
         self.rows: list[Gtk.ListBoxRow] = []
         self.options: tuple[str, ...] = ()
         self._more: Gtk.ListBoxRow | None = None
-        self._handler = self._list.connect("row-selected", self._on_row_selected)
+        # `connect` is the tool's guarded one (it undoes the connection on close, and no
+        # exception of the handler reaches GTK); alone, the list connects as plain GTK does.
+        self._handler = 0
+        if connect is not None:
+            connect(self._list, "row-selected", self._on_row_selected)
+        else:
+            self._handler = self._list.connect("row-selected", self._on_row_selected)
         self.set_child(self._list)
         self._grow()
 
@@ -100,12 +108,14 @@ class ChoiceList(Gtk.ScrolledWindow):
         if option in self.options and option != self.selected:
             self._list.select_row(self.rows[self.options.index(option)])
 
-    def _on_row_selected(self, _list: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
+    def _on_row_selected(self, _list: object, row: object) -> None:
         if row is None:
             # BROWSE keeps a row selected, but not every route to "none" is closed (a select-all
             # action, a keyboard shortcut): the entry still holds its option, so put the row back.
             if self._current is not None:
                 self._list.select_row(self.rows[self._current])
+            return
+        if not isinstance(row, Gtk.ListBoxRow):
             return
         if row.get_index() < len(self.options):
             self._current = row.get_index()

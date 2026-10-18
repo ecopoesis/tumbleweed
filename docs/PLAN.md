@@ -457,7 +457,8 @@ and `set` handlers.
   untrusted data.
 - The system prompt section documenting the spec is generated from the schema and docs,
   not hand-copied.
-- `sandbox` handlers render disabled with an explanatory tooltip until S20.
+- `sandbox` handlers render disabled with an explanation shown inline in the tool (never a
+  tooltip: D14) until S20.
 - The spec `title` is shown only on the canvas, never in chrome (I5).
 
 **Acceptance.** Fake-provider end-to-end tests:

@@ -858,8 +858,8 @@ Each invariant names where it is enforced. Reviews check every change against th
   The renderer bounds the total as well (`tumbleweed.ui.gtk.budget`): a label shows at most 8,192
   characters then ` (cut)`, a tool at most 65,536 characters in all (`MAX_SHOWN_PER_TOOL`, a renderer
   constant, not a spec limit; labels, buttons, options and entries all count), what does not fit is
-  replaced by a mark or left out until room appears (the one entry being typed in may pass the
-  total by its own cap, 8,192 characters, until the focus leaves), and text updates are applied once per frame
+  replaced by a mark or left out until room appears (the one entry that has the focus, or is
+  being edited, may pass the total by its own cap, 8,192 characters, until the focus leaves), and text updates are applied once per frame
   with the latest value (an 80 KB spec of 441 labels bound to one 64K string used to take minutes
   to lay out, with the chrome frozen; a test holds it to seconds).
   The agent's limits are enforced in three places: `agent.limits` holds the values and refuses

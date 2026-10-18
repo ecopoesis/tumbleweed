@@ -194,7 +194,7 @@ def _entry(component: Entry, ctx: BuildContext) -> Gtk.Widget:
     placeholder = component.placeholder
     if placeholder and ctx.budget.fits((entry, "placeholder"), placeholder):
         entry.set_placeholder_text(display_text(placeholder))  # (a placeholder is laid out too)
-    ctx.on_close(harden_text(entry))
+    harden_text(entry, ctx.connect)
     change = _event(component.on_change, component.kind, "change", key)
     activate = _event(component.on_activate, component.kind, "activate", key)
     editing = False  # inside this entry's own `changed`: it shows what the user typed already
@@ -382,7 +382,7 @@ def _spin(component: Spin, ctx: BuildContext) -> Gtk.Widget:
     spin.set_numeric(False)
     ctx.on_close(quiet_spin_input_marshalling())
     memory = _Memory()
-    ctx.on_close(harden_text(spin))
+    harden_text(spin, ctx.connect)
     change = _event(component.on_change, component.kind, "change", key)
 
     def show_whole() -> None:
@@ -405,14 +405,18 @@ def _spin(component: Spin, ctx: BuildContext) -> Gtk.Widget:
         # adjustment, so that GTK's own parse, which follows, reads the value the widget holds
         # and sees no change. (Returning GTK's input error instead makes GTK read a value that was
         # never set, and write 0.)
-        parsed = numeric.parse(spin.get_text())
-        if parsed is not None:
-            memory.typed = True
-            try:
-                adjustment.set_value(float(parsed))
-            finally:
-                memory.typed = False
-        show_whole()
+        try:
+            parsed = numeric.parse(spin.get_text())
+            if parsed is not None:
+                memory.typed = True
+                try:
+                    adjustment.set_value(float(parsed))
+                finally:
+                    memory.typed = False
+        finally:
+            # Even if the above raised: GTK's own parse follows, and would read the raw text
+            # ("abc" as 0, "0x10" as 10) as an edit by the user.
+            show_whole()
         return 0  # not handled: the default parse comes next
 
     def update(value: StateValue, stale: bool) -> None:
@@ -440,7 +444,7 @@ def _dropdown(component: Dropdown, ctx: BuildContext) -> Gtk.Widget:
     def choose(option: str) -> None:
         ctx.user_input(key, option, change)
 
-    choices = ChoiceList(decl.options, choose, ctx.budget)
+    choices = ChoiceList(decl.options, choose, ctx.budget, ctx.connect)
     ctx.on_close(choices.release)
 
     def update(value: StateValue, stale: bool) -> None:

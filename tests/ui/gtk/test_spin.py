@@ -529,3 +529,28 @@ def test_a_slider_over_the_smallest_step_can_be_dragged_anywhere() -> None:
 
     assert tool.runtime.store.value(StateKey("x")) == 5.0
     assert scale.get_value() == 5.0
+
+
+def test_a_parse_that_raises_does_not_let_gtk_read_the_raw_text_as_an_edit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from unittest import mock
+
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.runtime import NumericRange
+
+    tool, sink = tool_with(0.5)
+    (spin,) = of_type(tool, Gtk.SpinButton)
+
+    with (
+        caplog.at_level("ERROR"),
+        mock.patch.object(NumericRange, "parse", side_effect=RuntimeError("boom")),
+    ):
+        for typed in ("abc", "inf", "0x10"):
+            spin.set_text(typed)
+            spin.update()  # GTK parses what was typed: our `input` handler runs first and raises
+            assert tool.runtime.store.value(StateKey("x")) == 0.5
+            assert float(spin.get_text()) == 0.5  # the text was rewritten from the adjustment
+
+    assert tool.runtime.store.value(StateKey("hits")) == 0
+    assert sink.calls == 0

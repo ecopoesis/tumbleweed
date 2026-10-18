@@ -223,12 +223,6 @@ rejected: bwrap's first fork is counted against all of the uid's processes) and 
 no user manager: its command lines and the probe's decision are unit-tested, the wrapper is
 exercised with a stand-in `systemd-run`, and S27's VM test is where the real thing runs (#73).
 
-The rlimit fallback has no total memory limit, no pids limit (`RLIMIT_NPROC` was measured and rejected: bwrap's first fork is
-counted against all of the uid's processes) and no CPU quota (reported). Unlike the rest, the scope path cannot be run in
-the container or in CI, where there is no user manager: its command lines and the probe's decision
-are unit-tested, the wrapper is exercised with a stand-in `systemd-run`, and S27's VM test is where
-the real thing runs (#73).
-
 ## D14 — Spec content never creates a surface of its own: dropdowns are lists in place (2026-10-16, accepted)
 
 **Context.** Clipping the canvas contains what is drawn in the window's own surface (I5), and

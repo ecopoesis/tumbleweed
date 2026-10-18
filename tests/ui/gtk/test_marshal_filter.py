@@ -150,6 +150,7 @@ def test_a_message_that_merely_starts_like_ours_is_not_ignored() -> None:
     assert pattern is not None
     assert pattern.match(_SPIN_INPUT_WARNING)
     assert not pattern.match(_SPIN_INPUT_WARNING + " EXTRA")
+    assert not pattern.match(_SPIN_INPUT_WARNING + "\n")  # `\Z`, not `$`, which allows a newline
     tool.close()
 
 
@@ -164,6 +165,8 @@ def test_with_the_filter_in_force_the_message_plus_a_suffix_still_raises() -> No
     warnings.warn(_SPIN_INPUT_WARNING, GObject.Warning, stacklevel=1)  # ignored: no exception
     with pytest.raises(GObject.Warning):
         warnings.warn(_SPIN_INPUT_WARNING + " EXTRA", GObject.Warning, stacklevel=1)
+    with pytest.raises(GObject.Warning):
+        warnings.warn(_SPIN_INPUT_WARNING + "\n", GObject.Warning, stacklevel=1)
     tool.close()
 
 

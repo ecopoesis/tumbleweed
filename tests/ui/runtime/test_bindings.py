@@ -290,7 +290,8 @@ class TestSnapStep:
     def test_a_page_increment_is_recognised_too(self) -> None:
         numeric = self.numeric(0.01, maximum=100.0)  # a page is a tenth of the range: 10.0
 
-        assert numeric.snap_step(0.07 + 10.0, 0.07) == 10.07
+        assert 5.13 + 10.0 == 15.129999999999999  # the page's own noise, which is what is removed
+        assert numeric.snap_step(5.13 + 10.0, 5.13) == 15.13
 
     def test_the_digits_of_the_held_value_are_kept_and_none_is_invented(self) -> None:
         numeric = self.numeric(0.1)
@@ -404,6 +405,18 @@ class TestParse:
 
 
 class TestSnapStepEdges:
+    def test_a_step_never_lands_outside_the_range(self) -> None:
+        numeric = NumericRange(0.0, 1.0, 0.3, 0.3, 1, False)
+        held = 0.1000000001  # three steps from it would be 1.0000000001: a hair over the maximum
+
+        assert numeric.snap_step(1.0, held) == 1.0
+
+    def test_a_step_may_land_on_the_bounds(self) -> None:
+        numeric = NumericRange(0.0, 1.0, 0.1, 0.1, 1, False)
+
+        assert numeric.snap_step(0.9 + 0.1, 0.9) == 1.0
+        assert numeric.snap_step(0.1 - 0.1, 0.1) == 0.0
+
     def test_a_huge_ratio_of_move_to_step_is_not_an_overflow(self) -> None:
         # [0, 10] with the smallest normal step is a valid slider; dragging to 5.0 is 2e307 steps.
         numeric = range_of(real("x", 0.0, minimum=0.0, maximum=10.0, step=sys.float_info.min))

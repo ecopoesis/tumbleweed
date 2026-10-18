@@ -20,6 +20,7 @@ from typing import Protocol, final
 
 from tumbleweed.shell._gi import GLib, Gtk
 from tumbleweed.ui.gtk.budget import TextBudget
+from tumbleweed.ui.gtk.guard import SignalHandler
 from tumbleweed.ui.gtk.text import TextBlock
 from tumbleweed.ui.runtime import Change, Dispatch, UiEvent, UiRuntime, Value
 from tumbleweed.ui.spec.components import Component
@@ -31,11 +32,8 @@ logger = logging.getLogger(__name__)
 ERROR_CLASS = "error"
 
 
-type _Handler = Callable[[object], object] | Callable[[object, object], object]
-
-
 class _Connectable(Protocol):
-    def connect(self, detailed_signal: str, handler: _Handler, /) -> int: ...
+    def connect(self, detailed_signal: str, handler: SignalHandler, /) -> int: ...
     def disconnect(self, handler_id: int, /) -> None: ...
 
 
@@ -76,7 +74,7 @@ class BuildContext:
 
     # --- lifetime ------------------------------------------------------------------------
 
-    def connect(self, widget: _Connectable, signal: str, handler: _Handler) -> None:
+    def connect(self, widget: _Connectable, signal: str, handler: SignalHandler) -> None:
         """`widget.connect`, remembered so that `close` can undo it.
 
         A handler refers to its widget and to this context, and a signal connection is a
