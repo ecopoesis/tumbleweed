@@ -7,6 +7,7 @@ absolute path). It holds no secret: a key in it is refused. Environment variable
     TUMBLEWEED_MODEL       the model of the `chat` role
     TUMBLEWEED_BASE_URL    where the API is (a proxy such as LiteLLM, later)
     TUMBLEWEED_KEY_FILE    absolute path of the key file
+    TUMBLEWEED_STT_URL     where whisper-server is (`[voice]`, S06)
 
 The API key comes from `ANTHROPIC_API_KEY`, or else from a key file (by default
 `$XDG_CONFIG_HOME/tumbleweed/api-key`). Both are read with care:
@@ -43,6 +44,7 @@ from tumbleweed.agent.errors import ConfigError, MissingKeyError
 from tumbleweed.agent.limits import AgentLimits
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.types import ByteCount, ModelName
+from tumbleweed.voice.config import VoiceConfig
 
 DEFAULT_MODEL: Final = ModelName("claude-sonnet-5-5")
 DEFAULT_BASE_URL: Final = "https://api.anthropic.com"
@@ -135,6 +137,7 @@ class TumbleweedConfig(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     agent: AgentConfig = AgentConfig()
+    voice: VoiceConfig = VoiceConfig()
 
 
 @final
@@ -275,6 +278,11 @@ def parse_config(text: str, environ: Mapping[str, str], *, source: str) -> Tumbl
             raise ConfigError(f"In {source}: [agent] must be a table.")
         for key, value in _env_overrides(environ).items():
             agent[key] = value
+        if stt_url := environ.get("TUMBLEWEED_STT_URL"):
+            voice = data.setdefault("voice", {})
+            if not isinstance(voice, dict):
+                raise ConfigError(f"In {source}: [voice] must be a table.")
+            voice["stt_url"] = stt_url
         return TumbleweedConfig.model_validate_json(json.dumps(data))
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{source} is not valid TOML: {str(exc)[:200]}") from None
