@@ -27,7 +27,7 @@ def config_for(world: World, **changes: object) -> BrokerConfig:
         "socket_directory": world.base / "sockets",
         "deny": world.context,
     }
-    return BrokerConfig(**(base | changes))  # type: ignore[arg-type]
+    return BrokerConfig(**(base | changes))  # type: ignore[arg-type]  # the dataclass validates what it is given
 
 
 def rules_for(world: World, environ: dict[str, str] | None = None) -> DenyRules:

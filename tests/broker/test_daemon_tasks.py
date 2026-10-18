@@ -1,12 +1,11 @@
 """Tasks over IPC: made, ended, owned by their connection, and carrying taint (I12, D7)."""
 
-import dataclasses
 import stat
 from pathlib import Path
 
 import pytest
 
-from tests.broker.rig import START, running, until
+from tests.broker.rig import START, replace_config, running, until
 from tests.ipc.bounded import run
 from tumbleweed.broker.audit import GrantRevoked, TaskEnded, TaskEndReason, TaskStarted
 from tumbleweed.broker.capabilities import NetFull
@@ -56,7 +55,7 @@ class TestStarting:
 
     def test_the_number_of_live_tasks_is_bounded(self) -> None:
         async def scenario() -> None:
-            async with running(config=lambda c: _with(c, max_live_tasks=2)) as rig:
+            async with running(config=lambda c: replace_config(c, max_live_tasks=2)) as rig:
                 client = await rig.client()
                 await client.start_task()
                 await client.start_task()
@@ -71,7 +70,7 @@ class TestStarting:
 
     def test_starting_a_task_in_place_of_one_does_not_count_the_one_it_replaces(self) -> None:
         async def scenario() -> None:
-            async with running(config=lambda c: _with(c, max_live_tasks=1)) as rig:
+            async with running(config=lambda c: replace_config(c, max_live_tasks=1)) as rig:
                 client = await rig.client()
                 first = await client.start_task()
 
@@ -380,12 +379,8 @@ class TestAStoppedBroker:
 
         async def scenario() -> None:
             async with running(before_start=plant) as rig:
-                names = {p.name for p in rig.workspaces.iterdir()}
-                assert str(orphan) not in names
-                assert names == set(kept)
+                # Removed in the background, so that starting does not wait for it.
+                await until(lambda: str(orphan) not in {p.name for p in rig.workspaces.iterdir()})
+                assert {p.name for p in rig.workspaces.iterdir()} == set(kept)
 
         run(scenario)
-
-
-def _with(config: BrokerConfig, **changes: object) -> BrokerConfig:
-    return dataclasses.replace(config, **changes)  # type: ignore[arg-type]

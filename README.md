@@ -316,8 +316,24 @@ starts it yet (S19 wires it in); to try it by hand, in one terminal:
 uv run tumbleweed-broker --no-landlock --allow-unenforced-limits   # a development host
 ```
 
-and from Python, `BrokerConnector(socket_path, spawn=spawn_broker_process).connect()` returns a
-`BrokerClient` (starting the daemon if nobody is there). Until S18 there is nobody to ask, so every
+and from Python, a `BrokerClient` that starts the daemon if nobody is there:
+
+```python
+from tumbleweed.broker.client import BrokerClient, BrokerConnector, spawn_broker_process
+from tumbleweed.ipc.sockdir import SocketPath
+
+
+async def connect(socket_path: SocketPath) -> BrokerClient:
+    connector = BrokerConnector(
+        socket_path,
+        spawn=lambda: spawn_broker_process(
+            extra_args=("--no-landlock", "--allow-unenforced-limits")
+        ),
+    )
+    return await connector.connect()
+```
+
+Until S18 there is nobody to ask, so every
 `request_grant` is denied and nothing can be granted: the tests give the daemon a scripted user.
 `--no-landlock` and `--allow-unenforced-limits` are for a development host only (Docker Desktop's
 kernel has no Landlock; the container and CI have no systemd user manager). Without them the daemon

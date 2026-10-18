@@ -1,6 +1,5 @@
 """Grants over IPC: requested, decided by the user, covered, refused, revoked (I2, I12)."""
 
-import dataclasses
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -9,11 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.broker.rig import Rig, running
+from tests.broker.rig import Rig, replace_config, running
 from tests.ipc.bounded import run
 from tumbleweed.broker.audit import AuditLog, GrantDecision, GrantRevoked
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
-from tumbleweed.broker.config import BrokerConfig
 from tumbleweed.broker.errors import AuditError
 from tumbleweed.broker.grants import GrantScope
 from tumbleweed.broker.prompts import Allowed, Denied
@@ -72,7 +70,7 @@ class TestAskingTheUser:
 
                 (prompt,) = rig.prompts.asked
                 assert prompt.capability.kind.value == "fs.read"
-                assert prompt.capability.path.path == read_path(rig)  # type: ignore[union-attr]
+                assert prompt.capability.path.path == read_path(rig)  # type: ignore[union-attr]  # the prompt asked for a read: FsRead has a path
                 assert prompt.scopes == {GrantScope.ONCE, GrantScope.TASK}  # no tool in S17
 
         run(scenario)
@@ -131,7 +129,7 @@ class TestAskingTheUser:
                 await client.request_read(task, RunId.new(), str(link), "x")
 
                 (prompt,) = rig.prompts.asked
-                assert prompt.capability.path.path == read_path(rig)  # type: ignore[union-attr]
+                assert prompt.capability.path.path == read_path(rig)  # type: ignore[union-attr]  # the prompt asked for a read: FsRead has a path
 
         run(scenario)
 
@@ -365,7 +363,7 @@ class TestTheAnswerIsChecked:
     def test_a_prompt_that_never_answers_is_a_denial_when_the_time_is_up(self) -> None:
         async def scenario() -> None:
             async with running(
-                config=lambda c: _replace(c, prompt_timeout=timedelta(milliseconds=200))
+                config=lambda c: replace_config(c, prompt_timeout=timedelta(milliseconds=200))
             ) as rig:
                 client = await rig.client()
                 task = await task_of(client)
@@ -410,7 +408,7 @@ class TestTheAnswerIsChecked:
             async with running() as rig:
                 client = await rig.client()
                 task = await task_of(client)
-                rig.prompts.answers.append("yes please")  # type: ignore[arg-type]
+                rig.prompts.answers.append("yes please")  # type: ignore[arg-type]  # a prompt answering with a non-answer, on purpose
 
                 outcome = await client.request_read(task, RunId.new(), read_path(rig), "x")
 
@@ -574,7 +572,7 @@ class TestTheAuditLogIsFailClosed:
                 def refuse(self: AuditLog, entry: object) -> None:
                     if isinstance(entry, GrantDecision):
                         raise AuditError("the audit log cannot be written")
-                    real(self, entry)  # type: ignore[arg-type]
+                    real(self, entry)  # type: ignore[arg-type]  # the wrapper takes object, as any stand-in  # a prompt answering with a non-answer, on purpose
 
                 monkeypatch.setattr(AuditLog, "append", refuse)
 
@@ -632,7 +630,3 @@ class TestTheAuditLogIsFailClosed:
                 await client.end_task(task)  # the task was still live: this time it works
 
         run(scenario)
-
-
-def _replace(config: BrokerConfig, **changes: object) -> BrokerConfig:
-    return dataclasses.replace(config, **changes)  # type: ignore[arg-type]

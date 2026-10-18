@@ -287,7 +287,11 @@ entries are one synchronous block: the entries are written just before the datab
 entry that cannot be written rolls the act back and the request is refused, and there is no `await`
 between deciding and recording, which makes a lock unnecessary (two requests racing for a once grant
 cannot both win). A run has two entries, `sandbox_run` before it starts and `sandbox_run_result`
-after, because a crash in between must not leave a run that started unrecorded. (3) *Owners.* A task
+after, because a crash in between must not leave a run that started unrecorded. If the commit fails
+after the entries were written, a `rolled_back` entry follows them. Every refusal once the task is
+known is recorded too (a refused run is a `sandbox_run` entry with outcome `refused`), the taint a
+new task inherits is read where it is recorded, and what a request reserves (a place under a cap, a
+`RunId`) is reserved before its first `await`. (3) *Owners.* A task
 belongs to the connection that made it and ends with it; a broker that starts ends what a dead one
 left (grants revoked, workspaces kept 7 days, taint kept for the task that replaces it). The daemon,
 not the caller, owns taint. (4) *The two host requirements are the daemon's settings, on by default,
@@ -312,7 +316,8 @@ frame (#60) and per-direction unions (#61) are not done here: nothing in S17 nee
 at its own limit and the connection ending cancels it), and S18's prompts do. (10) *The store is
 accepted only after one read snapshot shows it is exactly ours*, including the automatic index rows
 of `sqlite_master`, and is not touched before (not even switched to WAL). **Deviations from the
-plan.** `read_file`, `list_dir` and `request_grant` take the `RunId` from the caller instead of the
+plan.** The broker's IPC handler timeout is 170 s (the longest run, its setup and 30 s), not the
+connection default of 25 s. `read_file`, `list_dir` and `request_grant` take the `RunId` from the caller instead of the
 broker allocating one for non-run operations (S16's note): a once grant binds to a run the caller
 names, and a caller that names a fresh one gets nothing from a once grant. The wire has no tool
 binding or trigger yet, so tool grants are modelled and stored but never apply (S24 adds them). The
@@ -321,6 +326,7 @@ a task's own workspace are not audited (they are not decisions). **Consequences.
 does at least one path walk on a worker and rebuilds the deny rules (about a hundred walks: 15 ms on
 a Mac, 8 ms in the container, measured), and the rules must be fresh at each decision (S16). The
 audit log is neither fsynced, rotated nor tamper evident (#82). A tree nested more than 128 levels
-cannot be deleted by the retention sweep and is reported each time (#84). S18 must extend the
+cannot be deleted by the retention sweep; it is reported and retried after a pause that doubles with
+each failure, so that it does not hold up the rest (#84). S18 must extend the
 prompt interface (a `PromptId`, the picker, the requesting tool) and the wire for broker-to-shell
 requests.

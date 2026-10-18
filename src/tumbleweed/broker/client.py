@@ -54,9 +54,14 @@ from tumbleweed.ipc.broker_messages import (
 )
 from tumbleweed.ipc.client import connect
 from tumbleweed.ipc.connection import Connection
-from tumbleweed.ipc.errors import IpcConnectError, IpcError, UnexpectedResponseError
+from tumbleweed.ipc.errors import (
+    ConnectionClosedError,
+    IpcConnectError,
+    IpcError,
+    UnexpectedResponseError,
+)
 from tumbleweed.ipc.limits import IpcLimits
-from tumbleweed.ipc.messages import Ping, Pong, Request, RequestBody, Response
+from tumbleweed.ipc.messages import Ping, Pong, RequestBody, Response
 from tumbleweed.ipc.peercred import PeerCredentialsProvider
 from tumbleweed.ipc.sockdir import SocketPath
 
@@ -108,6 +113,11 @@ class BrokerClient:
         return self._connection
 
     @property
+    def heartbeat_stopped(self) -> bool:
+        """Whether the heartbeat has ended (it does when the connection does)."""
+        return self._heartbeat.done()
+
+    @property
     def is_closed(self) -> bool:
         return self._connection.is_closed
 
@@ -128,12 +138,19 @@ class BrokerClient:
         await self.close()
 
     async def _ping_forever(self, interval: timedelta) -> None:
-        try:
-            while True:
-                await asyncio.sleep(interval.total_seconds())
+        """Ping while the connection lives. Only the end of the connection stops it: a ping that
+        times out or is refused is logged and the next one is tried, since a broker that is busy
+        is not a dead one (and a heartbeat that gave up would let the broker's idle timeout
+        close a connection that is fine)."""
+        while True:
+            await asyncio.sleep(interval.total_seconds())
+            try:
                 await self._connection.call(Ping(kind="ping"), Pong, request_timeout=_PING_TIMEOUT)
-        except IpcError:
-            _log.debug("the broker connection ended; the heartbeat stops")
+            except ConnectionClosedError:
+                _log.debug("the broker connection ended; the heartbeat stops")
+                return
+            except IpcError as error:
+                _log.warning("a heartbeat ping to the broker failed: %s", type(error).__name__)
 
     async def _ask[R: Response](
         self, request: RequestBody, expect: type[R], *, wait: timedelta | None = None
@@ -236,14 +253,8 @@ class BrokerClient:
         wait = timedelta(seconds=wall_seconds) + _RUN_SETUP
         return await self._ask(request, RunResult, wait=wait)
 
-    async def call(self, request: Request) -> Response:
-        """Any request, for callers (and tests) that handle `Refused` themselves."""
-        if not isinstance(request, Request):  # pragma: no cover  (typed)
-            raise TypeError("not a request")
-        return await self._connection.call(request, Response)  # type: ignore[arg-type]
 
-
-type Spawn = Callable[[], Awaitable[None]]
+type Spawn = Callable[[], Awaitable[object]]
 
 _ENVIRONMENT: Final = (
     "HOME",
@@ -271,12 +282,14 @@ async def spawn_broker_process(
     env = {name: source[name] for name in _ENVIRONMENT if name in source}
     return await asyncio.create_subprocess_exec(
         sys.executable,
+        "-I",  # isolated: no PYTHON* variables, no user site, and not the working directory
         "-m",
         "tumbleweed.broker.daemon",
         *extra_args,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.DEVNULL,
         env=env,
+        cwd="/",  # a module planted in the shell's directory cannot be loaded into the broker
         start_new_session=True,  # the broker outlives a shell that is restarted
     )
 

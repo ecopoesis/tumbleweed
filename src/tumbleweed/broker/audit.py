@@ -21,7 +21,8 @@ What the file guarantees, and what it does not:
   same-uid processes out of scope), and nothing rotates it (#82).
 - Bounded: an entry is at most `MAX_ENTRY_BYTES`, because every field is bounded. Text that
   came from outside (a model's reason, a path) is cut to its field's limit; the file is JSONL, so
-  a newline in it is written as an escape and cannot start a second entry.
+  the whole line is ASCII (`ensure_ascii`), so that no character that a reader
+  might take for a line break (a newline, U+0085, U+2028, U+2029) can start a second entry.
 """
 
 import logging
@@ -178,6 +179,14 @@ class SandboxRunResult(_AuditModel):
     landlock: Literal["applied", "unavailable", "unknown"] | None
 
 
+class RolledBack(_AuditModel):
+    """The act the entries just before this one recorded did not happen: its transaction could
+    not be committed after they were written. `entries` are their kinds, in order."""
+
+    kind: Literal["rolled_back"] = "rolled_back"
+    entries: Annotated[tuple[Annotated[str, Field(max_length=32)], ...], Field(max_length=130)]
+
+
 class WorkspaceDeleted(_AuditModel):
     """Retention: a task's workspace was deleted after its retention period."""
 
@@ -196,7 +205,8 @@ type AuditEntry = Annotated[
     | GrantRevoked
     | SandboxRun
     | SandboxRunResult
-    | WorkspaceDeleted,
+    | WorkspaceDeleted
+    | RolledBack,
     Field(discriminator="kind"),
 ]
 
@@ -238,7 +248,7 @@ class AuditLog:
     def append(self, entry: AuditEntry) -> None:
         """Write one entry. `AuditError` if it cannot be written whole (nothing is left of it)."""
         try:
-            line = _ENTRIES.dump_json(entry, warnings="error") + b"\n"
+            line = _ENTRIES.dump_json(entry, warnings="error", ensure_ascii=True) + b"\n"
         except (ValidationError, ValueError, TypeError):
             raise AuditError("an audit entry could not be encoded") from None
         if len(line) > MAX_ENTRY_BYTES:

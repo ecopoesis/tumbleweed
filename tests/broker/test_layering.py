@@ -41,7 +41,7 @@ def test_the_contracts_are_in_pyproject() -> None:
     contracts = broker_contracts()
 
     assert all(contract["type"] == "forbidden" for contract in contracts)
-    listed = sorted(sorted(str(m) for m in c["forbidden_modules"]) for c in contracts)  # type: ignore[attr-defined]
+    listed = sorted(sorted(str(m) for m in c["forbidden_modules"]) for c in contracts)  # type: ignore[attr-defined]  # parsed from TOML: untyped
     assert listed == sorted([sorted(FORBIDDEN_FOR_EVER), ["tumbleweed.ipc"]])
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert config["tool"]["importlinter"]["include_external_packages"] is True
@@ -50,7 +50,7 @@ def test_the_contracts_are_in_pyproject() -> None:
 def test_only_the_daemon_layer_is_exempt_from_the_ipc_contract() -> None:
     (contract,) = [c for c in broker_contracts() if c["forbidden_modules"] == ["tumbleweed.ipc"]]
 
-    assert sorted(contract["ignore_imports"]) == sorted(  # type: ignore[call-overload]
+    assert sorted(contract["ignore_imports"]) == sorted(  # type: ignore[call-overload]  # parsed from TOML: untyped
         f"tumbleweed.broker.{module} -> tumbleweed.ipc.**" for module in DAEMON_LAYER
     )
 

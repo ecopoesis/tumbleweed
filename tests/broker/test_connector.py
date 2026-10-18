@@ -156,9 +156,9 @@ class TestTheHeartbeat:
                 async def counting(*args: object, **kwargs: object) -> object:
                     nonlocal pings
                     pings += 1
-                    return await real_call(*args, **kwargs)  # type: ignore[arg-type]
+                    return await real_call(*args, **kwargs)  # type: ignore[arg-type]  # forwards its arguments
 
-                client.connection.call = counting  # type: ignore[method-assign,assignment]
+                client.connection.call = counting  # type: ignore[method-assign,assignment]  # a seam to count
 
                 await asyncio.sleep(0.4)
 
@@ -217,6 +217,7 @@ class TestWhatTheBrokerIsStartedWith:
 
         assert recorded["argv"] == (
             sys.executable,
+            "-I",
             "-m",
             "tumbleweed.broker.daemon",
             "--no-landlock",
@@ -227,6 +228,7 @@ class TestWhatTheBrokerIsStartedWith:
             "XDG_RUNTIME_DIR": "/run/user/1",
             "SSH_AUTH_SOCK": "/tmp/ssh-x/agent.1",
         }
+        assert recorded["cwd"] == "/"  # not where a module could have been planted for it
         assert recorded["start_new_session"] is True  # it outlives a shell that restarts
         assert "shell" not in recorded  # an argv list, never a shell line
 

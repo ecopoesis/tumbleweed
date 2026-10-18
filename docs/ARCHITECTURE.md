@@ -312,7 +312,11 @@ of the broker. Nothing in the broker imports the agent or an LLM (I2).
   carries over (I12). A task belongs to the connection that made it: any other connection is
   answered `unknown_task`. When a connection ends its tasks end, and a broker that starts ends
   whatever a stopped one left live (their once and task grants are revoked, their workspaces are
-  kept and their taint stays on record). At most 16 tasks are live.
+  kept and their taint stays on record). At most 16 tasks are live, counted (with the ones being
+  made) before the workspace is, so tasks started together cannot all pass the cap. The taint a
+  new task inherits is read where the new task is recorded, after the workspace exists, with no
+  `await` in between: a grant or read on the task it replaces that completed while the workspace
+  was being made is inherited, as is the taint of one that ended meanwhile (I12).
 - **Grants and prompts.** `request_grant` canonicalises the path once, decides with
   `policy.decide`, and only when no grant covers it and policy allows one asks a
   `PromptInterface`. Until S18 that is `AutoDeny`, so nothing can be granted without a user. A
@@ -331,7 +335,9 @@ of the broker. Nothing in the broker imports the agent or an LLM (I2).
   refused, not cut, beyond the limit; a listing has at most 1000 entries, reports a symlink as a
   symlink and leaves out names with control or format characters (and says how many). The same
   without a decision, for the task's own workspace, with `read_workspace_file` and
-  `list_workspace`; those are not audited (they are not decisions).
+  `list_workspace`; those are not audited (they are not decisions). A read or listing that the
+  decision allowed (and recorded as `allowed`) but that opening refused (a swapped file, a
+  vanished one, a hung mount) gets a second `file_access` entry, `refused`, with the reason.
 - **Runs.** `run_in_sandbox(task, run, command, env, wall/cpu seconds, output limit)` is composed
   from the task's grants as `select_grants` selects them for that run: every applicable `fs.read`
   grant is opened by `open_granted` (any failure, a swapped or vanished path, refuses the whole
@@ -339,8 +345,13 @@ of the broker. Nothing in the broker imports the agent or an LLM (I2).
   workspace read-write at `/workspace`. Writes are not offered (S16's gate), and a `net.full`
   grant is held but gives no network until S22. The once grants the run uses are consumed, the
   task's taint raised and a `sandbox_run` audit entry written in one transaction *before* the
-  program starts; `sandbox_run_result` follows when it ends. A `RunId` can be used once; at most
-  4 runs are in progress (a fifth is refused, not queued) and 1000 per task. The limits a request
+  program starts; `sandbox_run_result` follows when it ends. A `RunId` can be used once, and
+  it and the run's place under the task's cap are reserved before the first `await`, so requests
+  that arrive together cannot all pass; at most 4 runs are in progress (a fifth is refused, not
+  queued) and 1000 per task. Every refusal once the task is known (a forbidden variable, a reused
+  ID, a cap, a granted path that was swapped, grants that changed while the run was set up, a
+  timeout, the host's limits) is recorded as a `sandbox_run` entry with outcome `refused` and a
+  reason; a run cancelled before it was authorised is recorded the same way. The limits a request
   may set are bounded (at most 120 s of wall clock, 256 KiB of output per stream) and the rest are
   the broker's. **The host must be able to enforce what I3 requires:** unless the daemon was told
   otherwise (`--allow-unenforced-limits`) a run is refused, before anything is opened, when the
@@ -351,12 +362,19 @@ of the broker. Nothing in the broker imports the agent or an LLM (I2).
 - **The audit log (I7).** `<broker>/audit.jsonl`: append-only JSONL, one typed entry
   (`tumbleweed.broker.audit`, a pydantic model with a `kind` and a format version `v`) per daemon
   start, task start and end, grant decision (covered, granted, denied, with the model's reason
-  quoted and cut), read or listing under a grant (allowed or refused), revocation, run
-  (authorised or refused, then its result) and workspace deletion. It is opened `O_APPEND |
+  quoted and cut; a grant the user allowed but the broker then refused, because the task ended,
+  the grant cap was reached or the file system hung, is a denied entry with that reason, and the
+  cap is checked before the user is asked), read or listing under a grant (allowed, refused, or
+  allowed and then refused at the open), revocation, run (authorised or refused, then its
+  result) and workspace deletion. It is opened `O_APPEND |
   O_NOFOLLOW` as a regular file of ours, mode 0600, in a 0700 directory; an entry goes out in one
-  write and a failed one is cut back, so the file never holds half a line. An entry is written
-  before the act it records, inside the act's database transaction; if it cannot be written the
-  act does not happen and the request is answered `unavailable`. It is not fsynced (it survives a
+  write and a failed one is cut back, so the file never holds half a line. The whole file is
+  ASCII (non-ASCII text is `\u` escaped), so that no character a reader might take for a line
+  break (U+0085, U+2028, U+2029 included) can start a second entry. An entry is written before
+  the act it records, inside the act's database transaction; if it cannot be written the act does
+  not happen and the request is answered `unavailable`. If the commit itself fails after the
+  entries were written, a `rolled_back` entry follows them, naming their kinds: the log never
+  keeps saying that something happened which did not. It is not fsynced (it survives a
   crash of the broker, not a loss of power), not tamper evident and not rotated: anything running
   as the user can edit it, which section 8 puts out of scope, and rotation is a follow-up (#82). Later
   steps add fields with defaults or kinds of entry; this step hashes no content.
@@ -370,11 +388,16 @@ of the broker. Nothing in the broker imports the agent or an LLM (I2).
   integers are signed.
 - **Workspaces and retention.** A workspace is opened by the identity recorded when it was made
   (`StoredPath.open`), never by name. Seven days after its task ended (`BrokerConfig.retention`,
-  checked at start and every hour) it is deleted through descriptors only: nothing a symlink in it
+  checked in the background as soon as the broker has started, and every hour) it is deleted through descriptors only: nothing a symlink in it
   points at is touched, a directory the program made unreadable is given a mode first, and a tree
-  nested deeper than 128 levels is left in place and reported as failed. A directory in the
-  workspaces directory named like a task that the database does not know (a crash between making
-  it and recording it) is removed at start; any other name is left alone.
+  nested deeper than 128 levels is left in place and reported as failed. A workspace that cannot
+  be deleted is tried again after a pause that doubles with every failure (an hour, up to a day;
+  the count and the time are in the database), so that a few undeletable ones do not hold up the
+  rest of the queue. A directory in the workspaces directory named like a task that the database
+  does not know (a crash between making it and recording it) is removed in the same first sweep;
+  one whose task is being made is not an orphan, and any other name is left alone. A workspace
+  whose creation was abandoned (the request was cancelled or timed out) is removed when the
+  creation finally returns.
 - **The file system can hang.** Every decision-time and run-time open, walk, read and deletion
   runs on a pool of four threads of its own (`FsWorker`) with a deadline (5 s; 60 s to delete); on
   timeout the request is answered `timeout`, whatever the abandoned call finally returns is
@@ -389,10 +412,13 @@ of the broker. Nothing in the broker imports the agent or an LLM (I2).
   this); and request bodies still share one union for both directions (#61: S18 adds the first
   broker-to-shell requests). `BrokerClient` gives the typed request-to-response pairing at the API
   a caller uses.
-- **Development.** `BrokerConnector` connects and, if nobody is there, starts `python -m
-  tumbleweed.broker.daemon` detached with a minimal environment of its own (never the shell's: the
-  API key is not passed on, I6) and retries with backoff for at most 30 s; on the target a systemd
-  user service starts the daemon (S27). The shell wires it in S19.
+- **Development.** `BrokerConnector` connects and, if nobody is there, starts `python -I -m
+  tumbleweed.broker.daemon` detached, from `/`, with a minimal environment of its own (never the
+  shell's: the API key is not passed on, I6; `-I` and the working directory keep a module planted
+  where the shell runs from out of the broker) and retries with backoff for at most 30 s; on the
+  target a systemd user service starts the daemon (S27). The shell wires it in S19 (#89, and
+  S19's scope in the plan). `BrokerClient`'s heartbeat stops only when the connection ends; a ping
+  that times out or is refused is logged and the next is tried.
 
 ## 3. Request flow
 
@@ -486,8 +512,9 @@ audited.
 - **Capabilities** (v1): `fs.read(path)`, `fs.write(path)` (implies read), `net.full`.
   Host-scoped egress needs a filtering proxy and is post-v1.
 - **Grant scopes**:
-  - `once`: bound to the specific pending run (or handler call) whose request caused the
-    prompt, and consumed by it. No other run can use it.
+  - `once`: bound to the one run (or handler call) whose `RunId` the request named (the caller
+    chooses it: `request_grant`, `read_file`, `list_dir` and `run_in_sandbox` all carry one), and
+    consumed by it. No other run can use it.
   - `task`: lasts until the task ends.
   - `tool`: persisted, bound to a ToolId **and** the exact version content hash. A new
     version must be granted again. Tool grants apply **only** to sandbox handler runs
@@ -639,8 +666,10 @@ Each invariant names where it is enforced. Reviews check every change against th
 - **I7 — Everything privileged is audited.** Every grant decision, sandbox run, snapshot,
   restore and revocation is appended to the broker's audit log (S17: `audit.jsonl`, section 2
   "Broker daemon"), before the act it records, so an act whose entry cannot be written does not
-  happen. Also logged: starts and ends of tasks, reads and listings under a grant, and deleted
-  workspaces. Reads of a task's own workspace are not decisions and are not logged.
+  happen (if a commit fails after its entries were written, a `rolled_back` entry follows them).
+  Refusals are logged too: a refused run, a refused read or listing, a grant the user allowed and
+  the broker then refused. Also logged: starts and ends of tasks and deleted workspaces. Reads of
+  a task's own workspace are not decisions and are not logged.
 - **I8 — Tools don't carry privilege.** Tool packages never contain grants or user state.
   Tool-scoped grants bind to (ToolId, content hash) and apply only to user-triggered runs
   (§7). Imported or modified tools must be granted again. For saved tools the broker runs

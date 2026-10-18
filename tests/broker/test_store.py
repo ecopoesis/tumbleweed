@@ -14,9 +14,12 @@ from tumbleweed.broker.errors import PrivateFsError, StoreError, StoreRefusedErr
 from tumbleweed.broker.grants import GrantOrigin, OnceGrant, TaskGrant, ToolGrant
 from tumbleweed.broker.identity import FsIdentity
 from tumbleweed.broker.paths import StoredPath
+from tumbleweed.broker.privatefs import check_sidecar
 from tumbleweed.broker.store import (
     APPLICATION_ID,
     DATABASE_NAME,
+    MAX_SQL_BYTES,
+    MAX_VALUE_BYTES,
     MIGRATIONS,
     BrokerStore,
     TaskRecord,
@@ -75,6 +78,12 @@ def store(directory: Path) -> BrokerStore:
     return yield_
 
 
+INSERT_TASK = (
+    "INSERT INTO tasks (id, state, taint, created_at, ended_at, workspace, workspace_fsid, "
+    "workspace_ino) VALUES "
+)
+
+
 class TestTasks:
     def test_a_task_round_trips_with_identities_over_the_signed_range(
         self, store: BrokerStore
@@ -85,7 +94,7 @@ class TestTasks:
             store.insert_task(made)
 
         assert store.task(made.task) == made
-        assert store.task(made.task).workspace == BIG  # type: ignore[union-attr]
+        assert store.task(made.task).workspace == BIG  # type: ignore[union-attr]  # the task was stored just above
         store.close()
 
     def test_an_unknown_task_is_none(self, store: BrokerStore) -> None:
@@ -114,10 +123,10 @@ class TestTasks:
             store.insert_task(made)
             store.set_taint(made.task, frozenset({TaintKind.NET}))
 
-        assert store.task(made.task).taint == frozenset({TaintKind.NET})  # type: ignore[union-attr]
+        assert store.task(made.task).taint == frozenset({TaintKind.NET})  # type: ignore[union-attr]  # the task was stored just above
         with pytest.raises(ValueError, match="never both"), store.transaction():
             store.set_taint(made.task, frozenset({TaintKind.NET, TaintKind.FS}))
-        assert store.task(made.task).taint == frozenset({TaintKind.NET})  # type: ignore[union-attr]
+        assert store.task(made.task).taint == frozenset({TaintKind.NET})  # type: ignore[union-attr]  # the task was stored just above
         store.close()
 
     def test_workspaces_to_delete_are_ended_tasks_past_the_cutoff_with_a_workspace(
@@ -132,7 +141,7 @@ class TestTasks:
             store.end_task(gone.task, NOW)
             store.mark_workspace_deleted(gone.task)
 
-        found = store.workspaces_to_delete(NOW + timedelta(days=1))
+        found = store.workspaces_to_delete(NOW + timedelta(days=1), NOW + timedelta(days=9))
 
         assert [each.task for each in found] == [old.task]
         store.close()
@@ -144,17 +153,11 @@ class TestTasks:
         raw = sqlite3.connect(directory / DATABASE_NAME)
 
         with pytest.raises(sqlite3.IntegrityError):
-            raw.execute(
-                "INSERT INTO tasks VALUES ('tsk_x', 'live', 'none', 1, 2, 'present', '1', '1')"
-            )
+            raw.execute(INSERT_TASK + "('tsk_x', 'live', 'none', 1, 2, 'present', '1', '1')")
         with pytest.raises(sqlite3.IntegrityError):
-            raw.execute(
-                "INSERT INTO tasks VALUES ('tsk_y', 'live', 'both', 1, NULL, 'present', '1', '1')"
-            )
+            raw.execute(INSERT_TASK + "('tsk_y', 'live', 'both', 1, NULL, 'present', '1', '1')")
         with pytest.raises(sqlite3.IntegrityError):
-            raw.execute(
-                "INSERT INTO tasks VALUES ('tsk_z', 'live', 'none', 1, NULL, 'present', '-1', '1')"
-            )
+            raw.execute(INSERT_TASK + "('tsk_z', 'live', 'none', 1, NULL, 'present', '-1', '1')")
         raw.close()
 
 
@@ -535,3 +538,92 @@ class TestAHostileFile:
 def test_the_clock_the_tests_use_is_aware() -> None:
     assert NOW.tzinfo is UTC
     assert isinstance(NOW, datetime)
+
+
+class TestTheConnectionIsConfiguredForAFileItDoesNotTrust:
+    """Each of these is read back from the open connection, because a setting that is gone is
+    not seen by anything else (the file looks the same): `_connection` is the subject here."""
+
+    def test_the_schema_cannot_be_written_even_when_a_statement_asks(
+        self, store: BrokerStore
+    ) -> None:
+        connection = store._connection  # noqa: SLF001
+
+        connection.execute("PRAGMA writable_schema = ON")
+        with pytest.raises(sqlite3.Error):
+            connection.execute("UPDATE sqlite_master SET sql = sql WHERE name = 'tasks'")
+        store.close()
+
+    def test_no_other_database_can_be_attached(self, store: BrokerStore, tmp_path: Path) -> None:
+        connection = store._connection  # noqa: SLF001
+
+        with pytest.raises(sqlite3.Error):
+            connection.execute(f"ATTACH DATABASE '{tmp_path / 'other.db'}' AS other")
+        assert not (tmp_path / "other.db").exists()
+        store.close()
+
+    def test_a_value_over_the_limit_is_refused_not_loaded(self, store: BrokerStore) -> None:
+        connection = store._connection  # noqa: SLF001
+        big = "x" * (int(MAX_VALUE_BYTES) + 1)
+
+        with pytest.raises(sqlite3.Error):
+            connection.execute("SELECT ?", (big,)).fetchall()
+        with pytest.raises(sqlite3.Error):
+            connection.execute("SELECT '" + "y" * (int(MAX_SQL_BYTES) + 1) + "'")
+        store.close()
+
+    def test_deleted_data_is_overwritten_and_writes_are_synchronous_enough(
+        self, store: BrokerStore
+    ) -> None:
+        connection = store._connection  # noqa: SLF001
+
+        assert connection.execute("PRAGMA secure_delete").fetchone() == (1,)
+        assert connection.execute("PRAGMA synchronous").fetchone() == (1,)  # NORMAL
+        store.close()
+
+    def test_text_comes_back_as_bytes_for_us_to_decode_strictly(self, store: BrokerStore) -> None:
+        connection = store._connection  # noqa: SLF001
+
+        assert connection.execute("SELECT 'text'").fetchone() == (b"text",)
+        store.close()
+
+
+class TestSideFiles:
+    def test_the_side_files_are_looked_at_before_and_after_sqlite_opens_the_file(
+        self, directory: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: list[str] = []
+        real = check_sidecar
+
+        def recording(directory_fd: int, name: str) -> None:
+            seen.append(name)
+            real(directory_fd, name)
+
+        monkeypatch.setattr("tumbleweed.broker.store.check_sidecar", recording)
+
+        BrokerStore.open(directory).close()
+
+        names = [DATABASE_NAME + suffix for suffix in ("-wal", "-shm", "-journal")]
+        assert seen == names + names  # before SQLite opens the file, and after
+
+    def test_a_side_file_that_is_a_symlink_is_refused_even_when_nothing_else_is_wrong(
+        self, tmp_path: Path
+    ) -> None:
+        directory = tmp_path / "d"
+        directory.mkdir(mode=0o700)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            check_sidecar(fd, "absent")  # a side file that is not there is fine
+            (directory / "side").symlink_to(tmp_path)
+            with pytest.raises(PrivateFsError):
+                check_sidecar(fd, "side")
+            (directory / "linked").write_text("x")
+            os.link(directory / "linked", directory / "linked2")
+            with pytest.raises(PrivateFsError):
+                check_sidecar(fd, "linked")  # two links
+            (directory / "fifo").unlink(missing_ok=True)
+            os.mkfifo(directory / "fifo")
+            with pytest.raises(PrivateFsError):
+                check_sidecar(fd, "fifo")
+        finally:
+            os.close(fd)

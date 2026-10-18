@@ -7,10 +7,12 @@ data and its sockets live elsewhere (a short path, for the socket address).
 """
 
 import asyncio
+import dataclasses
 import os
 import shutil
+import sqlite3
 import tempfile
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -92,7 +94,8 @@ class ScriptedPrompts:
         self.asked: list[GrantPrompt] = []
         self.hang = False
         self.explode = False
-        self.while_asking: Callable[[], None] | None = None  # the user takes their time
+        # The user takes their time; what happens meanwhile (sync, or a coroutine function).
+        self.while_asking: Callable[[], Awaitable[None] | None] | None = None
 
     def allow(self, scope: str = "task") -> None:
         from tumbleweed.broker.grants import GrantScope
@@ -107,8 +110,15 @@ class ScriptedPrompts:
         if self.hang:
             await asyncio.Event().wait()
         if self.while_asking is not None:
-            self.while_asking()
+            outcome = self.while_asking()
+            if outcome is not None:
+                await outcome
         return self.answers.pop(0) if self.answers else Denied(reason="user_denied")
+
+
+def replace_config(config: BrokerConfig, **changes: object) -> BrokerConfig:
+    """`config` with some settings changed (they are validated again, by the dataclass)."""
+    return dataclasses.replace(config, **changes)  # type: ignore[arg-type]  # validated at runtime
 
 
 def canned_result(
@@ -215,6 +225,16 @@ class Rig:
     @property
     def home(self) -> Path:
         return self.world.home
+
+    def rows(self, sql: str) -> list[tuple[object, ...]]:
+        """What the database holds right now, read through another connection (read only)."""
+        database = sqlite3.connect(
+            f"file:{self.config.broker_directory / 'broker.sqlite3'}?mode=ro", uri=True
+        )
+        try:
+            return [tuple(row) for row in database.execute(sql).fetchall()]
+        finally:
+            database.close()
 
     @property
     def workspaces(self) -> Path:

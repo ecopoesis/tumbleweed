@@ -100,6 +100,18 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
 ) STRICT""",
         "CREATE INDEX grants_by_task ON grants (task_id, revoked_at)",
     ),
+    (
+        # Retention backs off from a workspace it cannot delete (how many times it failed, and
+        # when to try again), so that undeletable ones do not hold up the queue.
+        (
+            "ALTER TABLE tasks ADD COLUMN delete_failures INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (delete_failures BETWEEN 0 AND 1000000)"
+        ),
+        (
+            "ALTER TABLE tasks ADD COLUMN delete_after INTEGER "
+            f"CHECK (delete_after IS NULL OR delete_after {_MILLIS})"
+        ),
+    ),
 )
 
 _GRANTS: Final[TypeAdapter[Grant]] = TypeAdapter(Grant)
@@ -274,6 +286,7 @@ class TaskRecord(PolicyModel):
     ended_at: AwareDatetime | None
     workspace_present: bool
     workspace: FsIdentity
+    failures: int = 0  # failed attempts to delete the workspace
 
     @property
     def ended(self) -> bool:
@@ -441,12 +454,22 @@ class BrokerStore:
             f"{_TASK_COLUMNS} FROM tasks WHERE state = 'live' ORDER BY created_at, id"
         )
 
-    def workspaces_to_delete(self, ended_before: datetime) -> list[TaskRecord]:
-        """Ended tasks whose workspace is still there and whose retention is over."""
+    def workspaces_to_delete(self, ended_before: datetime, now: datetime) -> list[TaskRecord]:
+        """Ended tasks whose workspace is still there, whose retention is over and that are not
+        waiting out a pause after a failed deletion."""
         return self._tasks(
             f"{_TASK_COLUMNS} FROM tasks WHERE state = 'ended' AND workspace = 'present' "
-            "AND ended_at < ? ORDER BY ended_at, id",
-            (_millis(ended_before),),
+            "AND ended_at < ? AND (delete_after IS NULL OR delete_after <= ?) "
+            "ORDER BY ended_at, id",
+            (_millis(ended_before), _millis(now)),
+        )
+
+    def delete_failed(self, task: TaskId, retry_at: datetime) -> None:
+        """Note a failed deletion and when to try again (inside `transaction()`)."""
+        self._execute(
+            "UPDATE tasks SET delete_failures = min(delete_failures + 1, 1000000), "
+            "delete_after = ? WHERE id = ?",
+            (_millis(retry_at), str(task)),
         )
 
     def known_tasks(self) -> frozenset[TaskId]:
@@ -478,6 +501,7 @@ class BrokerStore:
                 ended_at=None if row[3] is None else _moment(row[3]),
                 workspace_present=_text(row[4]) == "present",
                 workspace=_identity(_text(row[5]), _text(row[6])),
+                failures=_integer(row[7]),
             )
         except (InvalidValueError, ValidationError):
             raise StoreCorruptError("the broker's database holds a malformed task") from None
@@ -558,7 +582,8 @@ class BrokerStore:
 
 
 _TASK_COLUMNS: Final = (
-    "SELECT id, taint, created_at, ended_at, workspace, workspace_fsid, workspace_ino"
+    "SELECT id, taint, created_at, ended_at, workspace, workspace_fsid, workspace_ino, "
+    "delete_failures"
 )
 
 

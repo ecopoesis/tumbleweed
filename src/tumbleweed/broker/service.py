@@ -52,6 +52,7 @@ from tumbleweed.broker.audit import (
     FileAccess,
     GrantDecision,
     GrantRevoked,
+    RolledBack,
     SandboxRun,
     SandboxRunResult,
     TaskEndReason,
@@ -192,10 +193,11 @@ class Sandbox(Protocol):
 class _Refuse(Exception):  # noqa: N818  (it is an answer, not a failure)
     """Internal: stop the request and answer `Refused(reason, message)`. Never leaves the module."""
 
-    def __init__(self, reason: RefusalReason, message: str) -> None:
+    def __init__(self, reason: RefusalReason, message: str, code: str | None = None) -> None:
         super().__init__(message)
         self.reason = reason
         self.message = message
+        self.code = code or reason  # what the audit log says: more exact than the reason
 
 
 @dataclass(slots=True)
@@ -207,6 +209,7 @@ class _Live:
     workspace: FsIdentity
     grants: list[Grant] = field(default_factory=list)
     runs: set[RunId] = field(default_factory=set)
+    pending_runs: set[RunId] = field(default_factory=set)  # reserved, not yet authorised
     running: set["asyncio.Future[ResponseBody]"] = field(default_factory=set)
 
 
@@ -230,6 +233,11 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _retry_after(failures: int) -> timedelta:
+    """How long to leave a workspace that could not be deleted: an hour, doubling, up to a day."""
+    return min(timedelta(hours=1) * (1 << min(failures, 8)), timedelta(days=1))
+
+
 def _taint_names(taint: frozenset[TaintKind]) -> tuple[Taint, ...]:
     names: list[Taint] = []
     for kind in sorted(taint, key=lambda item: item.value):
@@ -241,6 +249,17 @@ def _taint_names(taint: frozenset[TaintKind]) -> tuple[Taint, ...]:
             case _ as unreachable:
                 assert_never(unreachable)
     return tuple(names)
+
+
+def _why(error: Exception) -> str:
+    """A short fixed code for why a request was refused, for the audit log."""
+    if isinstance(error, _Refuse):
+        return error.code
+    if isinstance(error, PathError):
+        return error.fault.value
+    if isinstance(error, FsTimeoutError):
+        return "timeout"
+    return "invalid_request"
 
 
 def _wire_scope(grant: Grant) -> Scope | None:
@@ -356,6 +375,8 @@ class BrokerService:
         self._live: dict[TaskId, _Live] = {}
         self._slots = asyncio.Semaphore(config.max_concurrent_runs)
         self._sweeper: asyncio.Task[None] | None = None
+        self._starting = 0  # tasks being made: counted against the cap before the first await
+        self._creating: set[TaskId] = set()  # their workspaces, which are not orphans
 
     # --- life cycle ----------------------------------------------------------------------------
 
@@ -373,8 +394,7 @@ class BrokerService:
         )
         for record in self._store.live_tasks():
             self._end_stale(record, now)
-        await self._remove_orphans()
-        await self.sweep()
+        # Orphans and the first sweep can take as long as deleting takes: not before serving.
         self._sweeper = asyncio.get_running_loop().create_task(
             self._sweep_forever(), name="broker-retention-sweep"
         )
@@ -415,11 +435,13 @@ class BrokerService:
 
     async def sweep(self) -> int:
         """Delete the workspaces of tasks that ended more than the retention period ago. Returns
-        how many were deleted. A workspace that cannot be deleted is audited and tried again at
-        the next sweep."""
-        cutoff = self._now() - self._config.retention
+        how many were deleted. A workspace that cannot be deleted is audited and tried again later,
+        after a pause that doubles with every failure (an hour, up to a day), so that a few
+        undeletable ones cannot hold up the rest."""
+        now = self._now()
+        cutoff = now - self._config.retention
         deleted = 0
-        for record in self._store.workspaces_to_delete(cutoff)[:_SWEEP_BATCH]:
+        for record in self._store.workspaces_to_delete(cutoff, now)[:_SWEEP_BATCH]:
             outcome: Literal["deleted", "missing", "failed"]
             reason: str | None = None
             try:
@@ -435,6 +457,8 @@ class BrokerService:
             with self._atomic() as entries:
                 if outcome != "failed":
                     self._store.mark_workspace_deleted(record.task)
+                else:
+                    self._store.delete_failed(record.task, now + _retry_after(record.failures))
                 entries.append(
                     WorkspaceDeleted(
                         at=self._now(), task=record.task, outcome=outcome, reason=reason
@@ -451,7 +475,9 @@ class BrokerService:
                 task = TaskId(name)
             except InvalidValueError:
                 continue
-            if task in known:
+            # Judged now, not when the names were listed: a task being made has its workspace
+            # before it has a record, and that is not an orphan.
+            if task in known or task in self._creating or self._store.task(task) is not None:
                 continue
             with contextlib.suppress(WorkspaceError, FsTimeoutError):
                 await self._fs.call(
@@ -459,12 +485,18 @@ class BrokerService:
                 )
 
     async def _sweep_forever(self) -> None:
+        """Remove orphans and sweep at once (in the background, so that `start` is not held up by
+        deleting), then every `sweep_interval`."""
+        first = True
         while True:
-            await asyncio.sleep(self._config.sweep_interval.total_seconds())
             try:
+                if first:
+                    await self._remove_orphans()
                 await self.sweep()
             except (AuditError, StoreError, FsTimeoutError):
                 _log.exception("the retention sweep failed; it is tried again at the next one")
+            first = False
+            await asyncio.sleep(self._config.sweep_interval.total_seconds())
 
     # --- one request ---------------------------------------------------------------------------
 
@@ -550,13 +582,26 @@ class BrokerService:
         """A database transaction whose audit entries are written just before it commits.
 
         Append the entries to the list the block is given. If one cannot be written, the
-        transaction is rolled back and `AuditError` propagates: the act did not happen.
+        transaction is rolled back and `AuditError` propagates: the act did not happen. If the
+        commit itself fails after the entries were written, they would say something that did not
+        happen: a `rolled_back` entry follows them, naming their kinds (best effort: if it cannot
+        be written either, that is logged).
         """
         entries: list[AuditEntry] = []
-        with self._store.transaction():
-            yield entries
-            for entry in entries:
-                self._audit.append(entry)
+        written: list[str] = []
+        try:
+            with self._store.transaction():
+                yield entries
+                for entry in entries:
+                    self._audit.append(entry)
+                    written.append(entry.kind)
+        except BaseException:
+            if written:
+                try:
+                    self._audit.append(RolledBack(at=self._now(), entries=tuple(written)))
+                except (AuditError, InvalidValueError):
+                    _log.error("entries were written for an act that was rolled back")
+            raise
 
     def _end_stored(
         self, live: _Live, reason: TaskEndReason, now: datetime, entries: list[AuditEntry]
@@ -590,62 +635,90 @@ class BrokerService:
 
     # --- tasks ---------------------------------------------------------------------------------
 
+    def _previous_state(
+        self, owner: Owner, previous: TaskId | None
+    ) -> tuple[_Live | None, TaskState | None]:
+        """The task that `start_task` replaces, as it is *now*: live and the owner's (its state is
+        read here, so what a request on it did a moment ago is in it), or an ended one's record.
+        `unknown_task` for any other. Synchronous: callers read it where they record."""
+        if previous is None:
+            return None, None
+        live = self._live.get(previous)
+        if live is not None:
+            if live.owner != owner:
+                raise _Refuse("unknown_task", "no such task")
+            return live, live.state
+        record = self._store.task(previous)
+        if record is None:
+            raise _Refuse("unknown_task", "no such task")
+        return None, TaskState(task=record.task, taint=record.taint, ended=True)
+
     async def _start_task(self, owner: Owner, request: StartTask) -> ResponseBody:
-        previous_live: _Live | None = None
-        previous: TaskState | None = None
-        if request.previous is not None:
-            previous_live = self._live.get(request.previous)
-            if previous_live is not None:
-                if previous_live.owner != owner:
-                    raise _Refuse("unknown_task", "no such task")
-                previous = previous_live.state
-            else:
-                record = self._store.task(request.previous)
-                if record is None:
-                    raise _Refuse("unknown_task", "no such task")
-                previous = TaskState(task=record.task, taint=record.taint, ended=True)
-        if len(self._live) - (previous_live is not None) >= self._config.max_live_tasks:
+        replaced, _ = self._previous_state(owner, request.previous)
+        if len(self._live) + self._starting - (replaced is not None) >= self._config.max_live_tasks:
             raise _Refuse("busy", "too many tasks are live")
         task = TaskId.new()
+        # Counted against the cap before the first await, so that tasks started together cannot
+        # all pass the check; the workspace is not an orphan while it is being made.
+        self._starting += 1
+        self._creating.add(task)
+        try:
+            # If this request is cancelled, or gives up, while the directory is being made, the
+            # directory is removed when the call finally returns.
+            def remove(_identity: FsIdentity) -> None:
+                with contextlib.suppress(WorkspaceError):
+                    self._workspaces.delete(task)
+
+            identity: FsIdentity = await self._fs.call(
+                partial(self._workspaces.create, task), discard=remove
+            )
+            try:
+                return self._record_new_task(owner, request, task, identity)
+            except BaseException:
+                await self._discard_workspace(task)
+                raise
+        finally:
+            self._starting -= 1
+            self._creating.discard(task)
+
+    def _record_new_task(
+        self, owner: Owner, request: StartTask, task: TaskId, identity: FsIdentity
+    ) -> ResponseBody:
+        """Record a task whose workspace exists. There is no `await` from reading the state of
+        the task it replaces to recording the new one, so the taint inherited is the taint at the
+        moment of recording: a grant that completed while the workspace was being made counts
+        (I12)."""
+        replaced, previous = self._previous_state(owner, request.previous)
+        if len(self._live) - (replaced is not None) >= self._config.max_live_tasks:
+            raise _Refuse("busy", "too many tasks are live")
         state = (
             TaskState(task=task)
             if previous is None
             else previous.successor(task, fresh_context=request.fresh_context)
         )
-        identity = await self._fs.call(partial(self._workspaces.create, task))
-        try:
-            now = self._now()
-            replaced = (
-                previous_live
-                if previous_live is not None
-                and self._live.get(previous_live.state.task) is previous_live
-                else None
+        now = self._now()
+        with self._atomic() as entries:
+            if replaced is not None:
+                self._end_stored(replaced, TaskEndReason.REPLACED, now, entries)
+            self._store.insert_task(
+                TaskRecord(
+                    task=task,
+                    taint=state.taint,
+                    created_at=now,
+                    ended_at=None,
+                    workspace_present=True,
+                    workspace=identity,
+                )
             )
-            with self._atomic() as entries:
-                if replaced is not None:
-                    self._end_stored(replaced, TaskEndReason.REPLACED, now, entries)
-                self._store.insert_task(
-                    TaskRecord(
-                        task=task,
-                        taint=state.taint,
-                        created_at=now,
-                        ended_at=None,
-                        workspace_present=True,
-                        workspace=identity,
-                    )
+            entries.append(
+                TaskStartedEntry(
+                    at=now,
+                    task=task,
+                    previous=request.previous,
+                    fresh_context=request.fresh_context,
+                    taint=_taint_names(state.taint),
                 )
-                entries.append(
-                    TaskStartedEntry(
-                        at=now,
-                        task=task,
-                        previous=request.previous,
-                        fresh_context=request.fresh_context,
-                        taint=_taint_names(state.taint),
-                    )
-                )
-        except BaseException:
-            await self._discard_workspace(task)
-            raise
+            )
         if replaced is not None:
             self._apply_ended(replaced)
         self._live[task] = _Live(owner=owner, state=state, workspace=identity)
@@ -734,14 +807,33 @@ class BrokerService:
                 )
             case _:
                 assert_never(decision)
+        if self._held(live) >= MAX_GRANTS_PER_TASK:  # before asking: nobody is asked in vain
+            self._audit_denied(request, capability, path_text, "grant_cap")
+            raise _Refuse("busy", "the task holds as many grants as it may")
         answer = await self._ask(prompt)
         if isinstance(answer, Denied):
             return self._denied(
                 request, capability, path_text, answer.reason, "the user did not allow it"
             )
+        try:
+            return await self._issue_after_prompt(owner, request, asked, answer, path_text)
+        except (_Refuse, PathError, FsTimeoutError, InvalidValueError) as error:
+            # Whoever asked is told why, and the log says that the user's yes was not acted on.
+            self._audit_denied(request, capability, path_text, _why(error))
+            raise
+
+    async def _issue_after_prompt(
+        self,
+        owner: Owner,
+        request: RequestGrant,
+        asked: AccessRequest,
+        answer: Allowed,
+        path_text: str | None,
+    ) -> ResponseBody:
+        capability = asked.capability
         rules = await self._rules()  # rebuilt at issuance (S16): the list may have grown
         live = self._owned(owner, request.task)
-        if len(live.grants) >= MAX_GRANTS_PER_TASK:
+        if self._held(live) >= MAX_GRANTS_PER_TASK:
             raise _Refuse("busy", "the task holds as many grants as it may")
         issuance = issue_grant(
             live.state,
@@ -822,10 +914,10 @@ class BrokerService:
         if isinstance(answer, Denied):
             return answer
         # A prompt written wrong can answer anything: only the two answers count.
-        return Denied(reason="prompt_failed")  # type: ignore[unreachable]
+        return Denied(reason="prompt_failed")  # type: ignore[unreachable]  # the declared type is closed; a prompt may not be
 
-    @staticmethod
     def _decision(
+        self,
         request: RequestGrant,
         capability: CapabilityKind,
         path: str | None,
@@ -837,7 +929,7 @@ class BrokerService:
         expires_at: datetime | None = None,
     ) -> GrantDecision:
         return GrantDecision(
-            at=utc_now(),
+            at=self._now(),
             task=request.task,
             run=request.run,
             capability=capability.value,
@@ -849,6 +941,25 @@ class BrokerService:
             model_reason=cut(request.reason),
             expires_at=expires_at,
         )
+
+    def _audit_denied(
+        self, request: RequestGrant, capability: CapabilityKind, path: str | None, why: str
+    ) -> None:
+        """Record a denial that is about to be answered with a refusal. The refusal stands if the
+        entry cannot be written."""
+        try:
+            self._audit.append(
+                self._decision(
+                    request, capability, path, "denied", grant=None, scope=None, reason=why
+                )
+            )
+        except AuditError:
+            _log.error("a denied grant could not be audited")
+
+    @staticmethod
+    def _held(live: _Live) -> int:
+        """The grants a task holds against its cap: not the once grants that are used up."""
+        return sum(1 for g in live.grants if not (isinstance(g, OnceGrant) and g.consumed_by))
 
     def _denied(
         self,
@@ -905,12 +1016,16 @@ class BrokerService:
     # --- files under a grant -------------------------------------------------------------------
 
     async def _read_file(self, owner: Owner, request: ReadFile) -> ResponseBody:
-        allow, stored, rules = await self._authorise_file(
+        allow, stored, rules, resolved = await self._authorise_file(
             owner, request.task, request.run, request.path, "read_file"
         )
-        data: bytes = await self._fs.call(
-            partial(self._read_granted, stored, rules, allow, request.max_bytes)
-        )
+        try:
+            data: bytes = await self._fs.call(
+                partial(self._read_granted, stored, rules, allow, request.max_bytes)
+            )
+        except (PathError, FsTimeoutError) as error:
+            self._audit_file_refused(request.task, request.run, "read_file", resolved, allow, error)
+            raise
         return FileContent(kind="file_content", size=len(data), data=_encode(data))
 
     @staticmethod
@@ -924,11 +1039,37 @@ class BrokerService:
             )
 
     async def _list_dir(self, owner: Owner, request: ListDir) -> ResponseBody:
-        allow, stored, rules = await self._authorise_file(
+        allow, stored, rules, resolved = await self._authorise_file(
             owner, request.task, request.run, request.path, "list_dir"
         )
-        listing: Listing = await self._fs.call(partial(self._list_granted, stored, rules, allow))
+        try:
+            listing: Listing = await self._fs.call(
+                partial(self._list_granted, stored, rules, allow)
+            )
+        except (PathError, FsTimeoutError) as error:
+            self._audit_file_refused(request.task, request.run, "list_dir", resolved, allow, error)
+            raise
         return _listing(listing)
+
+    def _audit_file_refused(
+        self,
+        task: TaskId,
+        run: RunId,
+        operation: Literal["read_file", "list_dir"],
+        resolved: ResolvedPath,
+        allow: Allow,
+        error: Exception,
+    ) -> None:
+        """The decision allowed it (and said so) but opening what was granted refused: a swapped
+        file, a vanished one, a hung mount. The entry that follows says what became of it."""
+        try:
+            self._audit.append(
+                self._file_entry(
+                    task, run, operation, resolved, "refused", allow.grant, False, _why(error)
+                )
+            )
+        except AuditError:
+            _log.error("a refused read could not be audited")
 
     @staticmethod
     def _list_granted(stored: StoredPath, rules: DenyRules, allow: Allow) -> Listing:
@@ -947,7 +1088,7 @@ class BrokerService:
         run: RunId,
         text: str,
         operation: Literal["read_file", "list_dir"],
-    ) -> tuple[Allow, StoredPath, DenyRules]:
+    ) -> tuple[Allow, StoredPath, DenyRules, ResolvedPath]:
         """Decide a read or listing under a grant. On success, the consumption of a once grant,
         the task's taint and the audit entry are recorded, and the grant to open is returned."""
         self._owned(owner, task)
@@ -963,7 +1104,7 @@ class BrokerService:
         match decision:
             case Allow() as allow:
                 stored = self._record_allowed(live, run, resolved, allow, operation, now)
-                return allow, stored, rules
+                return allow, stored, rules, resolved
             case Deny(reason=refusal):
                 self._audit.append(
                     self._file_entry(
@@ -981,8 +1122,8 @@ class BrokerService:
             case _:
                 assert_never(decision)
 
-    @staticmethod
     def _file_entry(
+        self,
         task: TaskId,
         run: RunId,
         operation: Literal["read_file", "list_dir"],
@@ -993,7 +1134,7 @@ class BrokerService:
         reason: str | None,
     ) -> FileAccess:
         return FileAccess(
-            at=utc_now(),
+            at=self._now(),
             task=task,
             run=run,
             operation=operation,
@@ -1065,17 +1206,51 @@ class BrokerService:
             )
 
     async def _run_flow(self, owner: Owner, request: RunInSandbox) -> ResponseBody:
+        """A run, from the checks to the result. Once the task is known every refusal before the
+        run is authorised is recorded as a `sandbox_run` entry with outcome `refused`: a swapped
+        grant that is refused is exactly what the log is for."""
+        live = self._owned(owner, request.task)  # an unknown task is not a task to record against
+        authorised = [False]
+        try:
+            return await self._run_checked(owner, request, live, authorised)
+        except asyncio.CancelledError:
+            if not authorised[0]:
+                self._audit_refused_run(request, "cancelled")
+            raise
+        except (_Refuse, PathError, FsTimeoutError, InvalidRunError, InvalidValueError) as error:
+            if not authorised[0]:  # after that, the result entry says how it ended
+                self._audit_refused_run(request, _why(error))
+            raise
+
+    async def _run_checked(
+        self, owner: Owner, request: RunInSandbox, live: _Live, authorised: list[bool]
+    ) -> ResponseBody:
         config = self._config
         variables, allowlist = sandbox_environment(
             [(pair.name, pair.value) for pair in request.env], path=config.sandbox_path
         )
-        live = self._owned(owner, request.task)
-        if request.run in live.runs:
-            raise _Refuse("invalid_request", "that run ID was already used")
-        if len(live.runs) >= config.max_runs_per_task:
-            raise _Refuse("busy", "the task has used all the runs it may")
+        # Reserved before the first await: requests that arrive together cannot all pass these
+        # checks (a run ID is used once, a task has so many runs).
+        if request.run in live.runs or request.run in live.pending_runs:
+            raise _Refuse("invalid_request", "that run ID was already used", "run_id_reused")
+        if len(live.runs) + len(live.pending_runs) >= config.max_runs_per_task:
+            raise _Refuse("busy", "the task has used all the runs it may", "run_cap")
         if self._slots.locked():
-            raise _Refuse("busy", "too many runs are in progress")
+            raise _Refuse("busy", "too many runs are in progress", "run_slots")
+        live.pending_runs.add(request.run)
+        try:
+            return await self._run_reserved(owner, request, variables, allowlist, authorised)
+        finally:
+            live.pending_runs.discard(request.run)
+
+    async def _run_reserved(
+        self,
+        owner: Owner,
+        request: RunInSandbox,
+        variables: tuple[EnvVar, ...],
+        allowlist: frozenset[EnvName],
+        authorised: list[bool],
+    ) -> ResponseBody:
         async with self._slots:
             await self._require_limits(request)
             rules = await self._rules()
@@ -1100,6 +1275,7 @@ class BrokerService:
             try:
                 policy, limits = self._policy(request, paths, mounts, variables, allowlist)
                 self._authorise_run(request, live, context, selection, mounts, rules)
+                authorised[0] = True
             except BaseException:
                 paths.close()
                 raise
@@ -1113,35 +1289,41 @@ class BrokerService:
             async with asyncio.timeout(_PROBE_WAIT.total_seconds()):
                 plan = await self._sandbox.limits_plan()
         except TimeoutError:
-            self._audit_refused_run(request, "limits_probe_timeout")
-            raise _Refuse("timeout", "the host's limits could not be checked in time") from None
+            raise _Refuse(
+                "timeout", "the host's limits could not be checked in time", "limits_probe_timeout"
+            ) from None
         missing = [
             kind for kind in plan.unenforced if kind in (LimitKind.PIDS, LimitKind.MEMORY_TOTAL)
         ]
         if missing:
-            self._audit_refused_run(request, "limits_unenforced")
             raise _Refuse(
                 "unavailable",
                 "this host cannot enforce the sandbox's process and memory limits",
+                "limits_unenforced",
             )
 
     def _audit_refused_run(self, request: RunInSandbox, reason: str) -> None:
-        self._audit.append(
-            SandboxRun(
-                at=self._now(),
-                task=request.task,
-                run=request.run,
-                outcome="refused",
-                reason=cut(reason),
-                program=cut(request.command[0]),
-                arguments=len(request.command) - 1,
-                env_names=tuple(pair.name for pair in request.env),
-                mounted=(),
-                consumed=(),
-                wall_seconds=request.wall_seconds,
-                require_landlock=self._config.require_landlock,
+        """Record that a run was refused before it was authorised. The refusal stands, and is
+        answered, if the entry cannot be written."""
+        try:
+            self._audit.append(
+                SandboxRun(
+                    at=self._now(),
+                    task=request.task,
+                    run=request.run,
+                    outcome="refused",
+                    reason=cut(reason),
+                    program=cut(request.command[0]),
+                    arguments=len(request.command) - 1,
+                    env_names=tuple(pair.name for pair in request.env),
+                    mounted=(),
+                    consumed=(),
+                    wall_seconds=request.wall_seconds,
+                    require_landlock=self._config.require_landlock,
+                )
             )
-        )
+        except AuditError:
+            _log.error("a refused run could not be audited")
 
     def _open_run_paths(
         self,
@@ -1200,8 +1382,9 @@ class BrokerService:
             )
             policy.check_descriptors()
         except InvalidValueError:  # InvalidPolicyError is one
-            self._audit_refused_run(request, "policy_refused")
-            raise _Refuse("invalid_request", "the sandbox policy was refused") from None
+            raise _Refuse(
+                "invalid_request", "the sandbox policy was refused", "policy_refused"
+            ) from None
         return policy, limits
 
     def _authorise_run(
@@ -1218,12 +1401,20 @@ class BrokerService:
         entry is written, in one transaction (S16: persist before acting)."""
         if self._live.get(live.state.task) is not live:
             raise _Refuse("unknown_task", "the task ended")
+        if request.run in live.runs:  # reserved at the start, and re-checked where it is recorded
+            raise _Refuse("invalid_request", "that run ID was already used", "run_id_reused")
+        if len(live.runs) >= self._config.max_runs_per_task:
+            raise _Refuse("busy", "the task has used all the runs it may", "run_cap")
         now = self._now()
         again = select_grants(live.state, context, self._grants_for(live), rules=rules, now=now)
         if [g.id for g in again.applicable] != [g.id for g in selection.applicable] or (
             again.task_taint != selection.task_taint
         ):
-            raise _Refuse("busy", "the grants changed while the run was being set up: try again")
+            raise _Refuse(
+                "busy",
+                "the grants changed while the run was being set up: try again",
+                "grants_changed",
+            )
         once = [grant for grant in selection.applicable if isinstance(grant, OnceGrant)]
         spent = [grant.consume(request.run) for grant in once]
         with self._atomic() as entries:

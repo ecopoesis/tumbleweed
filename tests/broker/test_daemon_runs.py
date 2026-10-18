@@ -2,16 +2,14 @@
 
 import asyncio
 import base64
-import dataclasses
 from datetime import timedelta
 
 import pytest
 
-from tests.broker.rig import FakeSandbox, Rig, canned_result, running
+from tests.broker.rig import FakeSandbox, Rig, canned_result, replace_config, running
 from tests.ipc.bounded import run
 from tumbleweed.broker.audit import GrantDecision, SandboxRun, SandboxRunResult
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
-from tumbleweed.broker.config import BrokerConfig
 from tumbleweed.core.ids import RunId, TaskId
 from tumbleweed.ipc.broker_messages import EnvPair
 from tumbleweed.sandbox.errors import (
@@ -26,10 +24,6 @@ from tumbleweed.sandbox.policy import GrantAccess
 from tumbleweed.sandbox.result import LandlockState, LimitKind
 
 COMMAND = ("/usr/bin/python3", "-c", "print(1)")
-
-
-def replace(config: BrokerConfig, **changes: object) -> BrokerConfig:
-    return dataclasses.replace(config, **changes)  # type: ignore[arg-type]
 
 
 async def with_grants(
@@ -150,7 +144,8 @@ class TestWhatTheBrokerComposes:
 
                 assert caught.value.reason == "invalid_request"
                 assert rig.sandbox.policies == []
-                assert rig.audit_of(SandboxRun) == []
+                (refused,) = rig.audit_of(SandboxRun)
+                assert (refused.outcome, refused.reason) == ("refused", "invalid_request")
 
         run(scenario)
 
@@ -197,7 +192,7 @@ class TestWhatTheBrokerComposes:
 
     def test_landlock_is_required_by_the_daemon_never_by_a_request(self) -> None:
         async def scenario() -> None:
-            async with running(config=lambda c: replace(c, require_landlock=True)) as rig:
+            async with running(config=lambda c: replace_config(c, require_landlock=True)) as rig:
                 client = await rig.client()
                 task = (await client.start_task()).task
 
@@ -446,7 +441,10 @@ class TestWhenTheGrantsAreNoLongerWhatWasGranted:
 
                 assert caught.value.reason == "unsafe"
                 assert rig.sandbox.policies == []
-                assert rig.audit_of(SandboxRun) == []  # not authorised, so not recorded as such
+                # Refused, and the log says so, and says why: a swapped grant is what it is for.
+                (refused,) = rig.audit_of(SandboxRun)
+                assert (refused.outcome, refused.reason) == ("refused", "symlink")
+                assert refused.mounted == ()
 
         run(scenario)
 
@@ -508,7 +506,7 @@ class TestBounds:
             sandbox = FakeSandbox()
             sandbox.hang = True
             async with running(
-                sandbox=sandbox, config=lambda c: replace(c, max_concurrent_runs=1)
+                sandbox=sandbox, config=lambda c: replace_config(c, max_concurrent_runs=1)
             ) as rig:
                 client = await rig.client()
                 task = (await client.start_task()).task
@@ -526,7 +524,7 @@ class TestBounds:
 
     def test_the_runs_of_one_task_are_bounded(self) -> None:
         async def scenario() -> None:
-            async with running(config=lambda c: replace(c, max_runs_per_task=2)) as rig:
+            async with running(config=lambda c: replace_config(c, max_runs_per_task=2)) as rig:
                 client = await rig.client()
                 task = (await client.start_task()).task
                 await client.run_in_sandbox(task, RunId.new(), COMMAND)
@@ -544,7 +542,8 @@ class TestBounds:
             sandbox = FakeSandbox()
             sandbox.hang = True
             async with running(
-                sandbox=sandbox, config=lambda c: replace(c, run_grace=timedelta(milliseconds=1))
+                sandbox=sandbox,
+                config=lambda c: replace_config(c, run_grace=timedelta(milliseconds=1)),
             ) as rig:
                 client = await rig.client()
                 task = (await client.start_task()).task
