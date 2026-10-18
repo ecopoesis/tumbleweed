@@ -53,12 +53,13 @@ RefusalReason = Literal[
     "denied",  # the static rules, the write gate or the taint rule refuse it
     "not_granted",  # no grant covers it; request access first
     "not_found",
-    "unsafe",  # a symlink, a special file, or not the object that was granted
+    "unsafe",  # a symlink, a special file, not the object that was granted, a tampered package
     "too_large",
     "busy",  # the broker is at one of its limits
     "unavailable",  # this host cannot do it safely
     "timeout",  # the file system took too long
     "failed",  # the sandbox could not be set up
+    "conflict",  # the tool store already has a tool with that ID, and it is not this one (S23)
 ]
 
 

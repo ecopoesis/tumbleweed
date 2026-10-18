@@ -219,6 +219,42 @@
       "title": "ErrorFrame",
       "type": "object"
     },
+    "ExportTool": {
+      "additionalProperties": false,
+      "description": "The bundle of one stored version. The broker records that it was handed out.",
+      "properties": {
+        "kind": {
+          "const": "export_tool",
+          "title": "Kind",
+          "type": "string"
+        },
+        "tool": {
+          "pattern": "^tool_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Tool",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "required": [
+        "kind",
+        "tool"
+      ],
+      "title": "ExportTool",
+      "type": "object"
+    },
     "FileContent": {
       "additionalProperties": false,
       "description": "What was read: `size` bytes, as base64 text in `data`.",
@@ -327,6 +363,28 @@
       "title": "Hello",
       "type": "object"
     },
+    "ImportTool": {
+      "additionalProperties": false,
+      "description": "Add the tool in `bundle` to the store, if the bundle is acceptable and the tool is new. It\nbrings no grant and no state (I8): the tool is granted again like any other.",
+      "properties": {
+        "bundle": {
+          "maxLength": 410624,
+          "title": "Bundle",
+          "type": "string"
+        },
+        "kind": {
+          "const": "import_tool",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "bundle"
+      ],
+      "title": "ImportTool",
+      "type": "object"
+    },
     "ListDir": {
       "additionalProperties": false,
       "description": "List a directory under a grant of the task, named by its absolute path.",
@@ -360,6 +418,42 @@
         "path"
       ],
       "title": "ListDir",
+      "type": "object"
+    },
+    "ListTools": {
+      "additionalProperties": false,
+      "description": "The newest version of each tool, most recently saved first; or, with `query`, the tools\nthat match it in name, description or tags, best first. The query is words, not a syntax:\npunctuation is dropped, at most eight words count, each matches as a prefix.",
+      "properties": {
+        "kind": {
+          "const": "list_tools",
+          "title": "Kind",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "maximum": 50,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "query": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Query"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "ListTools",
       "type": "object"
     },
     "ListWorkspace": {
@@ -573,7 +667,8 @@
             "busy",
             "unavailable",
             "timeout",
-            "failed"
+            "failed",
+            "conflict"
           ],
           "title": "Reason",
           "type": "string"
@@ -596,7 +691,10 @@
             "mapping": {
               "echo": "#/$defs/Echo",
               "end_task": "#/$defs/EndTask",
+              "export_tool": "#/$defs/ExportTool",
+              "import_tool": "#/$defs/ImportTool",
               "list_dir": "#/$defs/ListDir",
+              "list_tools": "#/$defs/ListTools",
               "list_workspace": "#/$defs/ListWorkspace",
               "ping": "#/$defs/Ping",
               "read_file": "#/$defs/ReadFile",
@@ -604,6 +702,7 @@
               "request_grant": "#/$defs/RequestGrant",
               "revoke_grant": "#/$defs/RevokeGrant",
               "run_in_sandbox": "#/$defs/RunInSandbox",
+              "show_tool": "#/$defs/ShowTool",
               "start_task": "#/$defs/StartTask"
             },
             "propertyName": "kind"
@@ -641,6 +740,18 @@
             },
             {
               "$ref": "#/$defs/RunInSandbox"
+            },
+            {
+              "$ref": "#/$defs/ListTools"
+            },
+            {
+              "$ref": "#/$defs/ShowTool"
+            },
+            {
+              "$ref": "#/$defs/ExportTool"
+            },
+            {
+              "$ref": "#/$defs/ImportTool"
             }
           ],
           "title": "Body"
@@ -737,7 +848,11 @@
               "revoked": "#/$defs/Revoked",
               "run_result": "#/$defs/RunResult",
               "task_ended": "#/$defs/TaskEnded",
-              "task_started": "#/$defs/TaskStarted"
+              "task_started": "#/$defs/TaskStarted",
+              "tool_bundle": "#/$defs/ToolBundle",
+              "tool_imported": "#/$defs/ToolImported",
+              "tool_list": "#/$defs/ToolList",
+              "tool_shown": "#/$defs/ToolShown"
             },
             "propertyName": "kind"
           },
@@ -768,6 +883,18 @@
             },
             {
               "$ref": "#/$defs/RunResult"
+            },
+            {
+              "$ref": "#/$defs/ToolList"
+            },
+            {
+              "$ref": "#/$defs/ToolShown"
+            },
+            {
+              "$ref": "#/$defs/ToolBundle"
+            },
+            {
+              "$ref": "#/$defs/ToolImported"
             },
             {
               "$ref": "#/$defs/Refused"
@@ -1002,6 +1129,42 @@
       "title": "RunResult",
       "type": "object"
     },
+    "ShowTool": {
+      "additionalProperties": false,
+      "description": "One stored version of a tool (the newest if `version` is null), read from its package.",
+      "properties": {
+        "kind": {
+          "const": "show_tool",
+          "title": "Kind",
+          "type": "string"
+        },
+        "tool": {
+          "pattern": "^tool_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Tool",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "maximum": 9223372036854775807,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "required": [
+        "kind",
+        "tool"
+      ],
+      "title": "ShowTool",
+      "type": "object"
+    },
     "StartTask": {
       "additionalProperties": false,
       "description": "End `previous` (if it is a live task of this connection) and start a new task.\n\nThe new task starts with the taint of `previous`, unless `fresh_context` (I12): the broker\nowns taint, the caller only says whether the model's context carries over.",
@@ -1090,6 +1253,187 @@
         "taint"
       ],
       "title": "TaskStarted",
+      "type": "object"
+    },
+    "ToolBundle": {
+      "additionalProperties": false,
+      "properties": {
+        "bundle": {
+          "maxLength": 410624,
+          "title": "Bundle",
+          "type": "string"
+        },
+        "kind": {
+          "const": "tool_bundle",
+          "title": "Kind",
+          "type": "string"
+        },
+        "summary": {
+          "$ref": "#/$defs/ToolSummary"
+        }
+      },
+      "required": [
+        "kind",
+        "summary",
+        "bundle"
+      ],
+      "title": "ToolBundle",
+      "type": "object"
+    },
+    "ToolImported": {
+      "additionalProperties": false,
+      "description": "`created` is false if the store already held this very version (nothing changed).",
+      "properties": {
+        "created": {
+          "title": "Created",
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "tool_imported",
+          "title": "Kind",
+          "type": "string"
+        },
+        "summary": {
+          "$ref": "#/$defs/ToolSummary"
+        }
+      },
+      "required": [
+        "kind",
+        "summary",
+        "created"
+      ],
+      "title": "ToolImported",
+      "type": "object"
+    },
+    "ToolList": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "tool_list",
+          "title": "Kind",
+          "type": "string"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ToolSummary"
+          },
+          "maxItems": 50,
+          "title": "Tools",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "tools"
+      ],
+      "title": "ToolList",
+      "type": "object"
+    },
+    "ToolShown": {
+      "additionalProperties": false,
+      "description": "The version and its package as canonical JSON text: untrusted data, parsed by whoever\nreads it with `tumbleweed.tools.parse_package`.",
+      "properties": {
+        "document": {
+          "maxLength": 409600,
+          "title": "Document",
+          "type": "string"
+        },
+        "kind": {
+          "const": "tool_shown",
+          "title": "Kind",
+          "type": "string"
+        },
+        "summary": {
+          "$ref": "#/$defs/ToolSummary"
+        }
+      },
+      "required": [
+        "kind",
+        "summary",
+        "document"
+      ],
+      "title": "ToolShown",
+      "type": "object"
+    },
+    "ToolSummary": {
+      "additionalProperties": false,
+      "description": "One stored version of a tool, as the index lists it. `name`, `description` and `tags` are\nthe author's text (the model's, usually): bounded, and not to be shown as the broker's own.\n`taint` is what the package records of the task it was saved from.",
+      "properties": {
+        "description": {
+          "maxLength": 1000,
+          "title": "Description",
+          "type": "string"
+        },
+        "hash": {
+          "pattern": "^(?:[0-9a-f]{64})$",
+          "title": "Hash",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "origin": {
+          "enum": [
+            "saved",
+            "imported"
+          ],
+          "title": "Origin",
+          "type": "string"
+        },
+        "saved_at": {
+          "format": "date-time",
+          "title": "Saved At",
+          "type": "string"
+        },
+        "tags": {
+          "items": {
+            "maxLength": 32,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 8,
+          "title": "Tags",
+          "type": "array"
+        },
+        "taint": {
+          "items": {
+            "enum": [
+              "fs",
+              "net"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Taint",
+          "type": "array"
+        },
+        "tool": {
+          "pattern": "^tool_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Tool",
+          "type": "string"
+        },
+        "version": {
+          "maximum": 9223372036854775807,
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "tool",
+        "version",
+        "hash",
+        "name",
+        "description",
+        "tags",
+        "taint",
+        "origin",
+        "saved_at"
+      ],
+      "title": "ToolSummary",
       "type": "object"
     },
     "WriteAccess": {

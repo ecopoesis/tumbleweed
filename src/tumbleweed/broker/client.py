@@ -25,8 +25,8 @@ from types import TracebackType
 from typing import Final, Self, final
 
 from tumbleweed.core.errors import TumbleweedError
-from tumbleweed.core.ids import GrantId, RunId, TaskId
-from tumbleweed.core.types import WorkspaceRelPath
+from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId
+from tumbleweed.core.types import ToolVersion, WorkspaceRelPath
 from tumbleweed.ipc.broker_messages import (
     DirListing,
     EndTask,
@@ -64,6 +64,16 @@ from tumbleweed.ipc.limits import IpcLimits
 from tumbleweed.ipc.messages import Ping, Pong, RequestBody, Response
 from tumbleweed.ipc.peercred import PeerCredentialsProvider
 from tumbleweed.ipc.sockdir import SocketPath
+from tumbleweed.ipc.tool_messages import (
+    ExportTool,
+    ImportTool,
+    ListTools,
+    ShowTool,
+    ToolBundle,
+    ToolImported,
+    ToolList,
+    ToolShown,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -252,6 +262,26 @@ class BrokerClient:
         )
         wait = timedelta(seconds=wall_seconds) + _RUN_SETUP
         return await self._ask(request, RunResult, wait=wait)
+
+    async def list_tools(self, query: str | None = None, *, limit: int | None = None) -> ToolList:
+        """The newest version of each stored tool, or those matching `query` (words, not a
+        syntax), at most `limit`."""
+        if limit is None:
+            return await self._ask(ListTools(kind="list_tools", query=query), ToolList)
+        return await self._ask(ListTools(kind="list_tools", query=query, limit=limit), ToolList)
+
+    async def show_tool(self, tool: ToolId, version: ToolVersion | None = None) -> ToolShown:
+        return await self._ask(ShowTool(kind="show_tool", tool=tool, version=version), ToolShown)
+
+    async def export_tool(self, tool: ToolId, version: ToolVersion | None = None) -> ToolBundle:
+        """The bundle of a stored version. The broker records that it was exported."""
+        return await self._ask(
+            ExportTool(kind="export_tool", tool=tool, version=version), ToolBundle
+        )
+
+    async def import_tool(self, bundle: str) -> ToolImported:
+        """Add the tool in `bundle` (the text of a bundle file) to the store."""
+        return await self._ask(ImportTool(kind="import_tool", bundle=bundle), ToolImported)
 
 
 type Spawn = Callable[[], Awaitable[object]]

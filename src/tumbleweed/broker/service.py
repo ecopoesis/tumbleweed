@@ -27,6 +27,15 @@ are not audited.
 **The file system can hang.** Decision-time and run-time opens, walks, reads and deletions go
 through `FsWorker`, which abandons a call after a deadline; the request then fails with `timeout`.
 
+**The tool store (S23).** `list_tools`, `show_tool`, `export_tool` and `import_tool` are answered
+here from `ToolStore`; none of them belongs to a task. Each is one synchronous block, so a version
+that is opened is the one that is audited and returned, and a store that changes meanwhile cannot
+make the two differ. An export is audited before the bundle is returned and an import before it
+commits (inside `_atomic`, like every act that changes state); listing, showing and searching are
+reads of the broker's own store and are not decisions. `save_tool` is the same block for a tool
+saved from a task, whose taint is the broker's own record of it (I12); it has no IPC request until
+S24 gives the model a `save_tool`.
+
 **Refusals never carry input.** A `Refused` message is fixed text: paths, commands and the
 model's reason are never repeated in a response, a log line or an exception message, and no
 `ValidationError` text ever leaves this module.
@@ -59,11 +68,14 @@ from tumbleweed.broker.audit import (
     SandboxRun,
     SandboxRunResult,
     TaskEndReason,
+    ToolImportRefused,
+    ToolSaved,
     WorkspaceDeleted,
     cut,
 )
 from tumbleweed.broker.audit import TaskEnded as TaskEndedEntry
 from tumbleweed.broker.audit import TaskStarted as TaskStartedEntry
+from tumbleweed.broker.audit import ToolExported as ToolExportedEntry
 from tumbleweed.broker.capabilities import CapabilityKind, FsRead
 from tumbleweed.broker.compose import InvalidRunError, Mount, disjoint_mounts, sandbox_environment
 from tumbleweed.broker.config import BrokerConfig
@@ -74,6 +86,11 @@ from tumbleweed.broker.errors import (
     PathError,
     PathFault,
     StoreError,
+    ToolBlobError,
+    ToolConflictError,
+    ToolNotFoundError,
+    ToolStoreFullError,
+    UnknownTaskError,
     WorkspaceError,
     describe_fault,
 )
@@ -113,12 +130,13 @@ from tumbleweed.broker.policy import (
     select_grants,
 )
 from tumbleweed.broker.prompts import Allowed, Denied, GrantPrompt, PromptAnswer, PromptInterface
-from tumbleweed.broker.store import BrokerStore, TaskRecord
+from tumbleweed.broker.store import BrokerStore, TaskRecord, ToolRecord
 from tumbleweed.broker.task import TaintKind, TaskState
+from tumbleweed.broker.toolstore import StoredTool, ToolStore, taint_names
 from tumbleweed.broker.workspace import open_in_workspace, read_workspace_file
 from tumbleweed.broker.workspaces import Listing, Workspaces, list_directory
 from tumbleweed.core.errors import InvalidValueError
-from tumbleweed.core.ids import GrantId, RunId, TaskId
+from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId
 from tumbleweed.core.types import ByteCount, WorkspaceRelPath
 from tumbleweed.ipc.broker_messages import (
     DirEntry,
@@ -148,6 +166,17 @@ from tumbleweed.ipc.broker_messages import (
 from tumbleweed.ipc.broker_messages import TaskEnded as TaskEndedReply
 from tumbleweed.ipc.errors import ErrorCode, RequestRefused
 from tumbleweed.ipc.messages import Echo, Ping, RequestBody, ResponseBody
+from tumbleweed.ipc.tool_messages import (
+    ExportTool,
+    ImportTool,
+    ListTools,
+    ShowTool,
+    ToolBundle,
+    ToolImported,
+    ToolList,
+    ToolShown,
+    ToolSummary,
+)
 from tumbleweed.sandbox.errors import (
     InvalidPolicyError,
     SandboxLaunchError,
@@ -170,6 +199,13 @@ from tumbleweed.sandbox.result import (
     LimitKind,
     SandboxResult,
     Termination,
+)
+from tumbleweed.tools import (
+    ToolDraft,
+    ToolPackageError,
+    ToolTooLargeError,
+    export_bundle,
+    parse_bundle,
 )
 
 _log = logging.getLogger(__name__)
@@ -364,6 +400,7 @@ class BrokerService:
         *,
         config: BrokerConfig,
         store: BrokerStore,
+        tools: ToolStore,
         audit_log: AuditLog,
         workspaces: Workspaces,
         fs: FsWorker,
@@ -374,6 +411,7 @@ class BrokerService:
     ) -> None:
         self._config = config
         self._store = store
+        self._tools = tools
         self._audit = audit_log
         self._workspaces = workspaces
         self._fs = fs
@@ -426,6 +464,7 @@ class BrokerService:
         self._fs.close()
         self._workspaces.close()
         self._audit.close()
+        self._tools.close()
         self._store.close()
 
     def _now(self) -> datetime:
@@ -542,6 +581,26 @@ class BrokerService:
             return Refused(
                 kind="refused", reason="unavailable", message="the workspace is unavailable"
             )
+        except ToolNotFoundError:
+            return Refused(kind="refused", reason="not_found", message="no such tool or version")
+        except ToolConflictError:
+            return Refused(
+                kind="refused", reason="conflict", message="a tool with that ID is already stored"
+            )
+        except ToolStoreFullError:
+            return Refused(kind="refused", reason="busy", message="the tool store is full")
+        except ToolBlobError:
+            return Refused(
+                kind="refused",
+                reason="unsafe",
+                message="the stored tool failed its integrity check and is not used",
+            )
+        except ToolPackageError:
+            return Refused(
+                kind="refused",
+                reason="invalid_request",
+                message="the tool package is not acceptable",
+            )
         except InvalidRunError as error:
             return Refused(kind="refused", reason="invalid_request", message=str(error))
         except InvalidValueError:
@@ -572,6 +631,14 @@ class BrokerService:
                 return await self._list_dir(owner, request)
             case RunInSandbox():
                 return await self._run_in_sandbox(owner, request)
+            case ListTools():
+                return self._list_tools(request)
+            case ShowTool():
+                return self._show_tool(request)
+            case ExportTool():
+                return self._export_tool(request)
+            case ImportTool():
+                return self._import_tool(request)
             case Ping() | Echo():
                 raise RequestRefused(ErrorCode.UNSUPPORTED_REQUEST, "not a broker request")
             case _:
@@ -589,6 +656,98 @@ class BrokerService:
                 _log.exception("a task of a closed connection could not be ended on record")
             finally:
                 self._apply_ended(live)
+
+    # --- the tool store ------------------------------------------------------------------------
+
+    def _list_tools(self, request: ListTools) -> ResponseBody:
+        records = self._tools.find(request.query, request.limit)
+        return ToolList(kind="tool_list", tools=tuple(_tool_summary(record) for record in records))
+
+    def _show_tool(self, request: ShowTool) -> ResponseBody:
+        opened = self._tools.open(request.tool, request.version)
+        return ToolShown(
+            kind="tool_shown",
+            summary=_tool_summary(opened.record),
+            document=opened.canonical.data.decode("utf-8"),
+        )
+
+    def _export_tool(self, request: ExportTool) -> ResponseBody:
+        """Hand out the bundle of a verified version, once the export is on record: the entry is
+        written first, so a bundle that left the broker always has one."""
+        opened = self._tools.open(request.tool, request.version)
+        bundle = export_bundle(opened.canonical)
+        record = opened.record
+        with self._atomic() as entries:
+            entries.append(
+                ToolExportedEntry(
+                    at=self._now(),
+                    tool=record.tool,
+                    version=record.version,
+                    hash=record.hash,
+                    taint=taint_names(record.taint),
+                )
+            )
+        return ToolBundle(
+            kind="tool_bundle", summary=_tool_summary(record), bundle=bundle.decode("utf-8")
+        )
+
+    def _import_tool(self, request: ImportTool) -> ResponseBody:
+        """Add the tool in a bundle (hostile input) to the store. A bundle that is refused is
+        recorded with a closed reason and nothing of its content; one the store already holds,
+        byte for byte, changes nothing and is not recorded."""
+        try:
+            canonical = parse_bundle(request.bundle.encode("utf-8"))
+        except UnicodeEncodeError:  # a lone surrogate: not text, so not a bundle
+            self._audit_import_refused("invalid")
+            raise _Refuse("invalid_request", "the bundle is not acceptable") from None
+        except ToolTooLargeError:
+            self._audit_import_refused("too_large")
+            raise _Refuse("too_large", "the bundle is too large") from None
+        except ToolPackageError:
+            self._audit_import_refused("invalid")
+            raise _Refuse("invalid_request", "the bundle is not acceptable") from None
+        now = self._now()
+        try:
+            with self._atomic() as entries:
+                stored = self._tools.import_(canonical, now)
+                if stored.created:
+                    entries.append(_saved_entry(stored, now, task=None))
+        except ToolConflictError:
+            self._audit_import_refused("conflict")
+            raise
+        except ToolStoreFullError:
+            self._audit_import_refused("full")
+            raise
+        return ToolImported(
+            kind="tool_imported", summary=_tool_summary(stored.record), created=stored.created
+        )
+
+    def _audit_import_refused(
+        self, reason: Literal["invalid", "too_large", "conflict", "full"]
+    ) -> None:
+        with self._atomic() as entries:
+            entries.append(ToolImportRefused(at=self._now(), reason=reason))
+
+    def save_tool(
+        self, owner: Owner, task: TaskId, draft: ToolDraft, *, tool: ToolId | None = None
+    ) -> StoredTool:
+        """Store `draft` as a new tool, or as the next version of `tool`, saved from `task`.
+
+        The package records the task's taint as the broker has it, read in the same block that
+        stores the version (I12), so a grant that arrived a moment ago is in it. Raises
+        `UnknownTaskError` if `task` is not a live task of `owner`, `ToolNotFoundError`,
+        `ToolStoreFullError`, `ToolPackageError`, `AuditError` and `StoreError` as the store and
+        the audit log do. There is no IPC request for it yet: S24's `save_tool` is the caller.
+        """
+        try:
+            live = self._owned(owner, task)
+        except _Refuse:
+            raise UnknownTaskError("no such task") from None
+        now = self._now()
+        with self._atomic() as entries:
+            stored = self._tools.save(draft, tool=tool, taint=live.state.taint, at=now)
+            entries.append(_saved_entry(stored, now, task=task))
+        return stored
 
     # --- atomic sections and the end of a task -------------------------------------------------
 
@@ -1554,6 +1713,34 @@ class BrokerService:
             )
         except AuditError:
             _log.error("the result of a sandbox run could not be audited")
+
+
+def _tool_summary(record: ToolRecord) -> ToolSummary:
+    return ToolSummary(
+        tool=record.tool,
+        version=record.version,
+        hash=record.hash,
+        name=record.name,
+        description=record.description,
+        tags=tuple(str(tag) for tag in record.tags),
+        taint=taint_names(record.taint),
+        origin=record.origin,
+        saved_at=record.saved_at,
+    )
+
+
+def _saved_entry(stored: StoredTool, at: datetime, *, task: TaskId | None) -> ToolSaved:
+    record = stored.record
+    return ToolSaved(
+        at=at,
+        tool=record.tool,
+        version=record.version,
+        hash=record.hash,
+        size=int(record.size),
+        taint=taint_names(record.taint),
+        origin=record.origin,
+        task=task,
+    )
 
 
 def _listing(listing: Listing) -> DirListing:

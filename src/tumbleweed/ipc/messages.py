@@ -48,6 +48,16 @@ from tumbleweed.ipc.broker_messages import (
     TaskEnded,
     TaskStarted,
 )
+from tumbleweed.ipc.tool_messages import (
+    ExportTool,
+    ImportTool,
+    ListTools,
+    ShowTool,
+    ToolBundle,
+    ToolImported,
+    ToolList,
+    ToolShown,
+)
 
 ECHO_MAX_CHARS = 1024
 
@@ -93,7 +103,11 @@ RequestBody = Annotated[
     | ReadFile
     | ListWorkspace
     | ListDir
-    | RunInSandbox,
+    | RunInSandbox
+    | ListTools
+    | ShowTool
+    | ExportTool
+    | ImportTool,
     Field(discriminator="kind"),
 ]
 """Every request a peer may send. The closed union to extend (see the module docstring)."""
@@ -108,6 +122,10 @@ ResponseBody = Annotated[
     | FileContent
     | DirListing
     | RunResult
+    | ToolList
+    | ToolShown
+    | ToolBundle
+    | ToolImported
     | Refused,
     Field(discriminator="kind"),
 ]
