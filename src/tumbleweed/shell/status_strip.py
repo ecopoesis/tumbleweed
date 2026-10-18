@@ -1,4 +1,4 @@
-"""The status strip along the bottom of the window, with the voice indicator."""
+"""The status strip along the bottom of the window: the voice indicator and the terminal button."""
 
 import enum
 from typing import assert_never, final
@@ -70,3 +70,18 @@ class StatusStrip(Gtk.Box):
         self.set_margin_bottom(4)
         self.voice = VoiceIndicator()
         self.append(self.voice)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        self.append(spacer)
+        # A widget, not a GAction: actions are exported on the session bus (test_session_bus.py),
+        # and starting a shell is not something another process should be able to ask for.
+        self.terminal_button = Gtk.Button(label="Terminal (F12)")
+        self.terminal_button.set_has_frame(False)
+        # Not in the tab order and no focus from a click: F12 is the keyboard way, and a button
+        # that took the focus would get it when the side panel hides, and start a terminal on a
+        # stray Space or Enter.
+        self.terminal_button.set_focusable(False)
+        self.terminal_button.set_focus_on_click(False)
+        self.terminal_button.add_css_class("caption")
+        # No tooltip: a tooltip is a surface of its own, and none is allowed in the window (#53).
+        self.append(self.terminal_button)
