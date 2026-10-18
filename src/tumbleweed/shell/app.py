@@ -16,6 +16,7 @@ from tumbleweed.shell._gi import Adw, Gdk, Gio, GLib, GLibUnix
 from tumbleweed.shell.dispatch import GlibDispatcher
 from tumbleweed.shell.viewmodel.session import HistoryOpener
 from tumbleweed.shell.window import ShellWindow
+from tumbleweed.voice.factory import VoiceSetup, build_voice
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +52,12 @@ class ShellApplication(Adw.Application):
         *,
         flags: Gio.ApplicationFlags = Gio.ApplicationFlags.NON_UNIQUE,
         open_history: HistoryOpener | None = None,
+        voice: VoiceSetup | None = None,
     ) -> None:
         super().__init__(application_id=APPLICATION_ID, flags=flags)
         self._responder = responder
         self._open_history = open_history
+        self._voice = voice
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
@@ -67,7 +70,7 @@ class ShellApplication(Adw.Application):
     def do_activate(self) -> None:
         window = self.get_active_window()
         if window is None:
-            window = ShellWindow(self, self._responder, self._open_history)
+            window = ShellWindow(self, self._responder, self._open_history, self._voice)
             logger.info("shell window created")
         window.present()
 
@@ -123,7 +126,8 @@ def run(argv: Sequence[str] = (PROGRAM,)) -> int:
     The responder is the agent (a model) or the echo placeholder, per the configuration
     (`tumbleweed.agent.config`); the API key is taken out of the process environment on the way.
     The chat is kept in `$XDG_DATA_HOME/tumbleweed/shell/` (`tumbleweed.history`) and the last
-    session is restored on start.
+    session is restored on start. Push-to-talk (`tumbleweed.voice`) is on unless the `[voice]`
+    configuration turns it off; audio is never kept.
 
     Without a display it says so in one line and returns 1: GTK would otherwise print criticals
     and fail inside `do_activate` with a traceback, then exit 0.
@@ -134,11 +138,14 @@ def run(argv: Sequence[str] = (PROGRAM,)) -> int:
             "pointing at a running compositor or X server)."
         )
         return 1
-    agent = build_agent(os.environ, GlibDispatcher())
+    dispatcher = GlibDispatcher()
+    agent = build_agent(os.environ, dispatcher)
+    voice = build_voice(os.environ, dispatcher)
     # The history is opened when the window is made (and may refuse: the shell then runs without).
     app = ShellApplication(
         agent.responder,
         open_history=functools.partial(HistoryStore.open, shell_data_dir(os.environ)),
+        voice=voice,
     )
     try:
         with quit_on_signals(app):

@@ -9,10 +9,12 @@ from tumbleweed.shell._widgets import plain_label
 
 
 class VoiceState(enum.StrEnum):
-    """What the voice side is doing. Nothing sets it yet: S06 and S07 wire it up."""
+    """What the voice side is doing. Push-to-talk sets IDLE, LISTENING and TRANSCRIBING (S06);
+    nothing sets THINKING or SPEAKING yet (S07)."""
 
     IDLE = "idle"
     LISTENING = "listening"
+    TRANSCRIBING = "transcribing"
     THINKING = "thinking"
     SPEAKING = "speaking"
 
@@ -23,6 +25,8 @@ def _describe(state: VoiceState) -> str:
             return "Voice: idle"
         case VoiceState.LISTENING:
             return "Voice: listening"
+        case VoiceState.TRANSCRIBING:
+            return "Voice: transcribing"
         case VoiceState.THINKING:
             return "Voice: thinking"
         case VoiceState.SPEAKING:

@@ -626,6 +626,7 @@ class TestVoiceIndicator:
         [
             ("IDLE", "Voice: idle"),
             ("LISTENING", "Voice: listening"),
+            ("TRANSCRIBING", "Voice: transcribing"),
             ("THINKING", "Voice: thinking"),
             ("SPEAKING", "Voice: speaking"),
         ],
@@ -639,12 +640,13 @@ class TestVoiceIndicator:
 
         assert (voice.state, voice.text) == (VoiceState[name], text)
 
-    def test_the_states_are_the_four_of_the_plan(self) -> None:
+    def test_the_states_are_those_of_the_plan(self) -> None:
         from tumbleweed.shell.status_strip import VoiceState
 
         assert [state.value for state in VoiceState] == [
             "idle",
             "listening",
+            "transcribing",
             "thinking",
             "speaking",
         ]
