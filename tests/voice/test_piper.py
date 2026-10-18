@@ -335,10 +335,11 @@ class TestBargeIn:
 
     def test_no_zombie_is_left_after_any_outcome(self, tmp_path: Path) -> None:
         backend, _model = backend_for(tmp_path, synthesis_timeout_seconds=1)
+        before = set(zombie_children())  # other tests of a whole run may have left some
         for text in ("hello there", "FAIL", "EMPTY", "HANG", "FLOOD"):
             _swallow(functools.partial(backend.synthesize, text, AbortSignal()), TtsError)
 
-        assert zombie_children() == []
+        assert set(zombie_children()) - before == set()
 
     def test_a_late_abort_after_the_call_signals_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
