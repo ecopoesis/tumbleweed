@@ -36,9 +36,9 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final, Self, final
+from typing import Annotated, Final, Literal, Self, final
 
-from pydantic import AwareDatetime, TypeAdapter, ValidationError
+from pydantic import AwareDatetime, Field, TypeAdapter, ValidationError
 
 from tumbleweed.broker.errors import StoreCorruptError, StoreError, StoreRefusedError
 from tumbleweed.broker.grants import Grant, ToolGrant
@@ -53,8 +53,10 @@ from tumbleweed.broker.privatefs import (
 )
 from tumbleweed.broker.task import TaintKind
 from tumbleweed.core.errors import InvalidValueError
-from tumbleweed.core.ids import GrantId, TaskId
-from tumbleweed.core.types import ByteCount
+from tumbleweed.core.ids import GrantId, TaskId, ToolId
+from tumbleweed.core.types import ByteCount, ContentHash, ToolVersion
+from tumbleweed.tools.limits import MAX_PACKAGE_BYTES
+from tumbleweed.tools.package import Description, Name, ToolTag
 
 _log = logging.getLogger(__name__)
 
@@ -74,6 +76,7 @@ type Signature = tuple[tuple[str, str, str, str], ...]
 
 _MILLIS = "BETWEEN 0 AND 253402300799999"
 MAX_FAILURES: Final = 1_000_000
+MAX_LIST: Final = 1000
 _U64_TEXT = "length(%s) BETWEEN 1 AND 20 AND %s NOT GLOB '*[^0-9]*'"
 
 # Append a migration to change the schema; never edit an earlier one.
@@ -103,6 +106,34 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     revoked_at INTEGER CHECK (revoked_at IS NULL OR revoked_at {_MILLIS})
 ) STRICT""",
         "CREATE INDEX grants_by_task ON grants (task_id, revoked_at)",
+    ),
+    # S23: the tool store's index. A package is a file (`toolblobs`); these rows say which exist,
+    # and the name, description and tags are copies of the package's own, for listing and search
+    # (a read that opens a package checks them against it). `tool_search` indexes the newest
+    # version of each tool, under the rowid of its `tools` row.
+    (
+        """CREATE TABLE tools (
+    seq INTEGER PRIMARY KEY,
+    id TEXT NOT NULL UNIQUE CHECK (length(id) = 31 AND id GLOB 'tool_*'),
+    latest INTEGER NOT NULL CHECK (latest BETWEEN 1 AND 9223372036854775807)
+) STRICT""",
+        f"""CREATE TABLE tool_versions (
+    tool INTEGER NOT NULL,
+    version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9223372036854775807),
+    hash TEXT NOT NULL UNIQUE CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
+    size INTEGER NOT NULL CHECK (size BETWEEN 1 AND {MAX_PACKAGE_BYTES}),
+    name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) <= 1024),
+    description TEXT NOT NULL CHECK (length(CAST(description AS BLOB)) <= 8192),
+    tags TEXT NOT NULL CHECK (length(CAST(tags AS BLOB)) <= 512),
+    taint TEXT NOT NULL CHECK (taint IN ('none', 'fs', 'net')),
+    origin TEXT NOT NULL CHECK (origin IN ('saved', 'imported')),
+    saved_at INTEGER NOT NULL CHECK (saved_at {_MILLIS}),
+    PRIMARY KEY (tool, version)
+) STRICT""",
+        (
+            "CREATE VIRTUAL TABLE tool_search USING fts5("
+            "name, description, tags, tokenize = 'unicode61 remove_diacritics 2')"
+        ),
     ),
 )
 
@@ -285,6 +316,26 @@ class TaskRecord(PolicyModel):
         return self.ended_at is not None
 
 
+@final
+class ToolRecord(PolicyModel):
+    """One stored version of a tool, as the index has it (the package itself is a blob).
+
+    Validated like everything read from the file: a row whose text is not a valid name,
+    description or tags, or whose number is out of range, cannot be read and is skipped.
+    """
+
+    tool: ToolId
+    version: ToolVersion
+    hash: ContentHash
+    size: ByteCount
+    name: Name
+    description: Description
+    tags: Annotated[tuple[ToolTag, ...], Field(max_length=8)]
+    taint: frozenset[TaintKind]
+    origin: Literal["saved", "imported"]
+    saved_at: AwareDatetime
+
+
 def _taint_text(taint: frozenset[TaintKind]) -> str:
     if len(taint) > 1:
         raise InvalidValueError("a task is never both fs- and net-tainted (I12)")
@@ -307,6 +358,21 @@ def _failures(value: object) -> int:
     if not 0 <= count <= MAX_FAILURES:
         raise StoreCorruptError("the broker's database holds a malformed count")
     return count
+
+
+def _limit(limit: int) -> int:
+    if type(limit) is not int or not 1 <= limit <= MAX_LIST:
+        raise StoreError("a listing is of 1 to 1000 rows")
+    return limit
+
+
+def _origin(text: str) -> Literal["saved", "imported"]:
+    match text:
+        case "saved":
+            return "saved"
+        case "imported":
+            return "imported"
+    raise StoreCorruptError("the broker's database holds an unknown origin")
 
 
 def _identity(fsid: str, ino: str) -> FsIdentity:
@@ -572,6 +638,146 @@ class BrokerStore:
                 _log.warning("a grant record of the broker's database cannot be read; skipped")
         return grants
 
+    # --- tools (S23) ---------------------------------------------------------------------
+
+    def tool_totals(self) -> tuple[int, int]:
+        """How many tools there are, and the bytes of all their packages."""
+        rows = self._query(
+            "SELECT (SELECT count(*) FROM tools), "
+            "(SELECT coalesce(sum(size), 0) FROM tool_versions)"
+        )
+        return _integer(rows[0][0]), _integer(rows[0][1])
+
+    def latest_version(self, tool: ToolId) -> ToolVersion | None:
+        """The newest version of `tool`, or None if the store has no such tool."""
+        rows = self._query("SELECT latest FROM tools WHERE id = ?", (str(tool),))
+        return self._version(rows[0][0]) if rows else None
+
+    def version_count(self, tool: ToolId) -> int:
+        """How many versions of `tool` are stored."""
+        rows = self._query(
+            "SELECT count(*) FROM tool_versions WHERE tool = (SELECT seq FROM tools WHERE id = ?)",
+            (str(tool),),
+        )
+        return _integer(rows[0][0])
+
+    def tool_record(self, tool: ToolId, version: ToolVersion | None) -> ToolRecord | None:
+        """The record of one version of `tool` (the newest if `version` is None), or None.
+        `StoreCorruptError` if the row cannot be read."""
+        if version is None:
+            rows = self._query(
+                f"{_TOOL_COLUMNS} FROM tools t JOIN tool_versions v ON v.tool = t.seq "
+                "AND v.version = t.latest WHERE t.id = ?",
+                (str(tool),),
+            )
+        else:
+            rows = self._query(
+                f"{_TOOL_COLUMNS} FROM tools t JOIN tool_versions v ON v.tool = t.seq "
+                "WHERE t.id = ? AND v.version = ?",
+                (str(tool), int(version)),
+            )
+        return self._tool_row(rows[0]) if rows else None
+
+    def insert_tool_version(self, record: ToolRecord) -> None:
+        """Add a version (inside `transaction()`). A new tool gets a row of its own; the next
+        version of a tool the store has must be exactly the one after its newest, and becomes the
+        one that is searched. Versions are never changed or removed: there is no method that does
+        either, and the primary key and the unique hash refuse a second row for one."""
+        known = self._query("SELECT seq, latest FROM tools WHERE id = ?", (str(record.tool),))
+        if not known:
+            self._execute(
+                "INSERT INTO tools (id, latest) VALUES (?, ?)",
+                (str(record.tool), int(record.version)),
+            )
+            known = self._query("SELECT seq, latest FROM tools WHERE id = ?", (str(record.tool),))
+            if not known:
+                raise StoreCorruptError("the broker's database lost a row it just wrote")
+        else:
+            if self._version(known[0][1]) + 1 != record.version:
+                raise StoreError("a version of a tool must be the one after its newest")
+            self._execute(
+                "UPDATE tools SET latest = ? WHERE id = ?", (int(record.version), str(record.tool))
+            )
+        sequence = _integer(known[0][0])
+        self._execute(
+            "INSERT INTO tool_versions (tool, version, hash, size, name, description, tags, "
+            "taint, origin, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sequence,
+                int(record.version),
+                str(record.hash),
+                int(record.size),
+                record.name,
+                record.description,
+                " ".join(record.tags),
+                _taint_text(record.taint),
+                record.origin,
+                _millis(record.saved_at),
+            ),
+        )
+        self._execute("DELETE FROM tool_search WHERE rowid = ?", (sequence,))
+        self._execute(
+            "INSERT INTO tool_search (rowid, name, description, tags) VALUES (?, ?, ?, ?)",
+            (sequence, record.name, record.description, " ".join(record.tags)),
+        )
+
+    def list_tools(self, limit: int) -> list[ToolRecord]:
+        """The newest version of each tool, the most recently saved first, at most `limit`."""
+        return self._tools(
+            f"{_TOOL_COLUMNS} FROM tools t JOIN tool_versions v ON v.tool = t.seq "
+            "AND v.version = t.latest ORDER BY v.saved_at DESC, t.id LIMIT ?",
+            (_limit(limit),),
+        )
+
+    def search_tools(self, match: str, limit: int) -> list[ToolRecord]:
+        """The tools whose newest version matches `match`, best first, at most `limit`.
+
+        `match` is an FTS5 query and must be made by `tumbleweed.tools.fts_match`, never be text
+        from outside: it is bound as a parameter (so it cannot change the SQL), but FTS5's own
+        language is the part that has syntax errors and costly forms. A name counts for more than
+        a tag, and a tag for more than a description.
+        """
+        return self._tools(
+            f"{_TOOL_COLUMNS} FROM tool_search s JOIN tools t ON t.seq = s.rowid "
+            "JOIN tool_versions v ON v.tool = t.seq AND v.version = t.latest "
+            "WHERE tool_search MATCH ? ORDER BY bm25(tool_search, 10.0, 2.0, 5.0), t.id LIMIT ?",
+            (match, _limit(limit)),
+        )
+
+    def _tools(self, sql: str, parameters: Sequence[object]) -> list[ToolRecord]:
+        records: list[ToolRecord] = []
+        for row in self._query(sql, parameters):
+            try:
+                records.append(self._tool_row(row))
+            except StoreCorruptError:
+                _log.warning("a tool record of the broker's database cannot be read; skipped")
+        return records
+
+    @staticmethod
+    def _version(value: object) -> ToolVersion:
+        try:
+            return ToolVersion(_integer(value))
+        except InvalidValueError:
+            raise StoreCorruptError("the broker's database holds a malformed version") from None
+
+    @classmethod
+    def _tool_row(cls, row: Row) -> ToolRecord:
+        try:
+            return ToolRecord(
+                tool=ToolId(_text(row[0])),
+                version=cls._version(row[1]),
+                hash=ContentHash(_text(row[2])),
+                size=ByteCount(_integer(row[3])),
+                name=_text(row[4]),
+                description=_text(row[5]),
+                tags=tuple(ToolTag(tag) for tag in _text(row[6]).split()),
+                taint=_taint_of(_text(row[7])),
+                origin=_origin(_text(row[8])),
+                saved_at=_moment(row[9]),
+            )
+        except (InvalidValueError, ValidationError):
+            raise StoreCorruptError("the broker's database holds a malformed tool") from None
+
     # --- closing -------------------------------------------------------------------------
 
     def close(self) -> None:
@@ -581,6 +787,11 @@ class BrokerStore:
         self._closed = True
         _release(self._connection, self._file_fd, self._directory_fd)
 
+
+_TOOL_COLUMNS: Final = (
+    "SELECT t.id, v.version, v.hash, v.size, v.name, v.description, v.tags, v.taint, v.origin, "
+    "v.saved_at"
+)
 
 _TASK_COLUMNS: Final = (
     "SELECT id, taint, created_at, ended_at, workspace, workspace_fsid, workspace_ino, "
@@ -604,6 +815,7 @@ __all__ = [
     "MIGRATIONS",
     "BrokerStore",
     "TaskRecord",
+    "ToolRecord",
     "expected_signature",
     "schema_signature",
 ]

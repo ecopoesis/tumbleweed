@@ -1,0 +1,566 @@
+"""The tool store: versions, search, immutability, import, and a tampered store (S23)."""
+
+import sqlite3
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from tests.tools.support import draft, module, package
+from tumbleweed.broker import toolstore
+from tumbleweed.broker.errors import (
+    StoreError,
+    ToolBlobError,
+    ToolConflictError,
+    ToolNotFoundError,
+    ToolStoreFullError,
+)
+from tumbleweed.broker.store import DATABASE_NAME, BrokerStore
+from tumbleweed.broker.task import TaintKind
+from tumbleweed.broker.toolblobs import BLOB_DIRECTORY, ToolBlobs
+from tumbleweed.broker.toolstore import ToolStore
+from tumbleweed.core.ids import ToolId
+from tumbleweed.core.types import ToolVersion
+from tumbleweed.tools import ToolPackageError, export_bundle, parse_bundle
+from tumbleweed.tools.limits import MAX_RESULTS
+
+NOW = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
+NFD = "e\N{COMBINING ACUTE ACCENT}"
+NFC = "\N{LATIN SMALL LETTER E WITH ACUTE}"
+
+
+class Rig:
+    """A store over a temporary broker directory, with the helpers the tests share."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.store = BrokerStore.open(directory)
+        self.tools = ToolStore(self.store, ToolBlobs.open(directory))
+        self.clock = NOW
+
+    def close(self) -> None:
+        self.tools.close()
+        self.store.close()
+
+    def save(
+        self,
+        source: object = None,
+        *,
+        tool: ToolId | None = None,
+        taint: frozenset[TaintKind] = frozenset(),
+    ) -> toolstore.StoredTool:
+        self.clock += timedelta(minutes=1)
+        with self.store.transaction():
+            return self.tools.save(
+                source or draft(),  # type: ignore[arg-type]  # a ToolDraft
+                tool=tool,
+                taint=taint,
+                at=self.clock,
+            )
+
+    def blobs(self) -> dict[str, bytes]:
+        return {p.name: p.read_bytes() for p in (self.directory / BLOB_DIRECTORY).iterdir()}
+
+    def sql(self, statement: str, *parameters: object) -> list[tuple[object, ...]]:
+        """The database as another process sees it (and can change it)."""
+        database = sqlite3.connect(self.directory / DATABASE_NAME)
+        try:
+            rows = [tuple(row) for row in database.execute(statement, parameters).fetchall()]
+            database.commit()
+            return rows
+        finally:
+            database.close()
+
+
+@pytest.fixture
+def rig(tmp_path: Path) -> Iterator[Rig]:
+    made = Rig(tmp_path / "broker")
+    yield made
+    made.close()
+
+
+def tamper(path: Path) -> None:
+    """Change one byte of a stored blob (and prove that something changed)."""
+    original = path.read_bytes()
+    changed = original.replace(b"status", b"statuz")
+    assert changed != original
+    path.write_bytes(changed)
+
+
+def named(name: str, description: str = "", tags: tuple[str, ...] = ()) -> object:
+    return draft(name=name, description=description, tags=tags)
+
+
+class TestSavingAndRefining:
+    def test_a_new_tool_is_version_one(self, rig: Rig) -> None:
+        saved = rig.save()
+
+        assert saved.created
+        assert saved.record.version == 1
+        assert saved.record.origin == "saved"
+        assert saved.record.name == "CSV viewer"
+        assert saved.record.tags == ("csv", "table")
+        assert saved.record.saved_at == rig.clock
+
+    def test_refining_a_tool_is_the_next_version_of_the_same_tool(self, rig: Rig) -> None:
+        first = rig.save()
+        second = rig.save(draft(description="Better."), tool=first.record.tool)
+        third = rig.save(draft(description="Best."), tool=first.record.tool)
+
+        assert (second.record.version, third.record.version) == (2, 3)
+        assert {first.record.tool} == {second.record.tool} == {third.record.tool}
+        assert len({first.record.hash, second.record.hash, third.record.hash}) == 3
+
+    def test_two_new_tools_are_two_tools(self, rig: Rig) -> None:
+        assert rig.save().record.tool != rig.save().record.tool
+
+    def test_a_tool_that_is_not_there_cannot_be_refined(self, rig: Rig) -> None:
+        with pytest.raises(ToolNotFoundError):
+            rig.save(tool=ToolId.new())
+
+        assert rig.blobs() == {}
+
+    def test_the_stored_bytes_are_the_normalised_bytes_and_hash_to_the_name(self, rig: Rig) -> None:
+        import hashlib
+
+        source = draft(modules=(module("csv_view", f"x = '{NFD}'\r\ny = 1\r\n"),))
+
+        saved = rig.save(source)
+
+        blob = rig.blobs()[str(saved.record.hash)]
+        assert hashlib.sha256(blob).hexdigest() == saved.record.hash
+        assert b"\\r" not in blob
+        assert NFD.encode() not in blob
+        assert len(blob) == saved.record.size
+
+    def test_a_draft_that_does_not_survive_normalising_stores_nothing(
+        self, rig: Rig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def refuse(_package: object) -> object:
+            raise ToolPackageError(["not valid once normalised"])
+
+        monkeypatch.setattr(toolstore, "canonical_package", refuse)
+
+        with pytest.raises(ToolPackageError):
+            rig.save()
+
+        assert rig.blobs() == {}
+        assert rig.sql("SELECT * FROM tools") == []
+
+
+class TestTaint:
+    def test_the_package_and_the_index_record_the_tasks_taint(self, rig: Rig) -> None:
+        for kind in (frozenset(), frozenset({TaintKind.FS}), frozenset({TaintKind.NET})):
+            saved = rig.save(taint=kind)
+
+            opened = rig.tools.open(saved.record.tool)
+
+            assert saved.record.taint == kind == opened.record.taint
+            assert toolstore.taint_kinds(opened.canonical.package.taint) == kind
+
+    def test_a_task_that_is_both_cannot_save(self, rig: Rig) -> None:
+        with pytest.raises(ToolPackageError):
+            rig.save(taint=frozenset({TaintKind.FS, TaintKind.NET}))
+
+    def test_a_refined_version_has_the_taint_of_the_task_it_was_saved_from(self, rig: Rig) -> None:
+        first = rig.save(taint=frozenset({TaintKind.FS}))
+        second = rig.save(tool=first.record.tool, taint=frozenset())
+
+        assert first.record.taint == {TaintKind.FS}
+        assert second.record.taint == frozenset()
+        assert rig.tools.open(first.record.tool, ToolVersion(1)).record.taint == {TaintKind.FS}
+
+    def test_the_taint_cannot_be_lowered_by_editing_the_index(self, rig: Rig) -> None:
+        saved = rig.save(taint=frozenset({TaintKind.FS}))
+        rig.sql("UPDATE tool_versions SET taint = 'none'")
+
+        with pytest.raises(ToolBlobError, match="does not match its index"):
+            rig.tools.open(saved.record.tool)
+
+
+class TestImmutableVersions:
+    def test_a_stored_version_never_changes_when_another_is_saved(self, rig: Rig) -> None:
+        first = rig.save()
+        before = (rig.blobs()[str(first.record.hash)], rig.tools.open(first.record.tool).record)
+
+        rig.save(draft(description="Better."), tool=first.record.tool)
+        rig.save(draft(description="Best."), tool=first.record.tool)
+
+        opened = rig.tools.open(first.record.tool, ToolVersion(1))
+        assert rig.blobs()[str(first.record.hash)] == before[0]
+        assert opened.record == before[1]
+        assert opened.canonical.data == before[0]
+
+    def test_the_store_has_no_way_to_change_or_remove_a_version(self) -> None:
+        verbs = ("update", "delete", "remove", "replace", "overwrite", "set_", "drop", "edit")
+        for owner in (ToolStore, BrokerStore, ToolBlobs):
+            for name in dir(owner):
+                if name.startswith("_") or ("tool" not in name and owner is BrokerStore):
+                    continue
+                assert not name.startswith(verbs), f"{owner.__name__}.{name}"
+
+    def test_the_database_refuses_a_second_row_for_a_version(self, rig: Rig) -> None:
+        saved = rig.save()
+        record = saved.record
+
+        with pytest.raises(StoreError), rig.store.transaction():
+            rig.store.insert_tool_version(record)
+
+        assert len(rig.sql("SELECT * FROM tool_versions")) == 1
+
+    def test_the_database_refuses_a_version_that_is_not_the_next(self, rig: Rig) -> None:
+        saved = rig.save()
+        skipping = saved.record.model_validate(
+            {**saved.record.model_dump(), "version": ToolVersion(5), "hash": "1" * 64}
+        )
+
+        with pytest.raises(StoreError, match="after its newest"), rig.store.transaction():
+            rig.store.insert_tool_version(skipping)
+
+        assert rig.store.latest_version(saved.record.tool) == 1
+
+    def test_the_database_refuses_two_versions_with_one_hash(self, rig: Rig) -> None:
+        first = rig.save()
+        second = rig.save(tool=first.record.tool)
+        same_hash = second.record.model_validate(
+            {**second.record.model_dump(), "version": ToolVersion(3), "hash": first.record.hash}
+        )
+
+        with pytest.raises(StoreError), rig.store.transaction():
+            rig.store.insert_tool_version(same_hash)
+
+    def test_a_blob_is_never_overwritten_by_a_later_save(self, rig: Rig) -> None:
+        first = rig.save()
+        before = rig.blobs()
+
+        rig.save(tool=first.record.tool)
+
+        for name, data in before.items():
+            assert rig.blobs()[name] == data
+
+
+class TestOpeningVerifies:
+    def test_a_tampered_blob_is_detected_and_refused(self, rig: Rig) -> None:
+        saved = rig.save()
+        path = rig.directory / BLOB_DIRECTORY / str(saved.record.hash)
+        tamper(path)
+
+        with pytest.raises(ToolBlobError):
+            rig.tools.open(saved.record.tool)
+
+    def test_a_tampered_blob_of_an_old_version_is_refused_and_the_new_one_still_opens(
+        self, rig: Rig
+    ) -> None:
+        first = rig.save()
+        second = rig.save(tool=first.record.tool)
+        path = rig.directory / BLOB_DIRECTORY / str(first.record.hash)
+        path.write_bytes(b"{}")
+
+        with pytest.raises(ToolBlobError):
+            rig.tools.open(first.record.tool, ToolVersion(1))
+        assert rig.tools.open(first.record.tool).record == second.record
+
+    def test_a_removed_blob_is_refused(self, rig: Rig) -> None:
+        saved = rig.save()
+        (rig.directory / BLOB_DIRECTORY / str(saved.record.hash)).unlink()
+
+        with pytest.raises(ToolBlobError):
+            rig.tools.open(saved.record.tool)
+
+    def test_a_blob_swapped_for_another_valid_package_is_refused(self, rig: Rig) -> None:
+        # Another tool's blob, under this tool's hash: its bytes do not hash to the name.
+        one, other = rig.save(), rig.save(draft(name="Other"))
+        blobs = rig.directory / BLOB_DIRECTORY
+        (blobs / str(one.record.hash)).write_bytes((blobs / str(other.record.hash)).read_bytes())
+
+        with pytest.raises(ToolBlobError):
+            rig.tools.open(one.record.tool)
+
+    @pytest.mark.parametrize(
+        ("update", "restore"),
+        [
+            ("UPDATE tool_versions SET name = 'Renamed'", "SET name = 'CSV viewer'"),
+            ("UPDATE tool_versions SET description = 'Lies'", "SET description = ''"),
+            ("UPDATE tool_versions SET tags = 'evil'", "SET tags = 'csv table'"),
+        ],
+        ids=["name", "description", "tags"],
+    )
+    def test_a_row_that_disagrees_with_its_blob_is_refused(
+        self, rig: Rig, update: str, restore: str
+    ) -> None:
+        saved = rig.save(draft(description=""))
+        rig.sql(update)
+
+        with pytest.raises(ToolBlobError, match="does not match its index"):
+            rig.tools.open(saved.record.tool)
+
+        rig.sql(f"UPDATE tool_versions {restore}")
+        assert rig.tools.open(saved.record.tool).record == saved.record  # restored: it opens
+
+    def test_a_row_of_another_size_is_refused(self, rig: Rig) -> None:
+        saved = rig.save()
+        rig.sql("UPDATE tool_versions SET size = size + 1")
+
+        with pytest.raises(ToolBlobError):
+            rig.tools.open(saved.record.tool)
+
+    def test_a_row_that_is_not_a_valid_record_is_not_listed_and_cannot_be_opened(
+        self, rig: Rig
+    ) -> None:
+        good, bad = rig.save(draft(name="Good")), rig.save(draft(name="Bad"))
+        rig.sql("UPDATE tool_versions SET name = '' WHERE hash = ?", str(bad.record.hash))
+
+        assert [r.tool for r in rig.tools.find(None)] == [good.record.tool]
+        with pytest.raises(StoreError):
+            rig.tools.open(bad.record.tool)
+
+    def test_unknown_tool_and_version(self, rig: Rig) -> None:
+        saved = rig.save()
+
+        with pytest.raises(ToolNotFoundError):
+            rig.tools.open(ToolId.new())
+        with pytest.raises(ToolNotFoundError):
+            rig.tools.open(saved.record.tool, ToolVersion(2))
+
+
+class TestListingAndSearch:
+    def test_listing_gives_each_tool_once_at_its_newest_version_newest_saved_first(
+        self, rig: Rig
+    ) -> None:
+        one = rig.save(draft(name="One"))
+        two = rig.save(draft(name="Two"))
+        rig.save(draft(name="One v2"), tool=one.record.tool)
+
+        listed = rig.tools.find(None)
+
+        assert [(r.tool, r.version, r.name) for r in listed] == [
+            (one.record.tool, 2, "One v2"),
+            (two.record.tool, 1, "Two"),
+        ]
+
+    def test_search_finds_by_name_description_and_tag(self, rig: Rig) -> None:
+        by_name = rig.save(named("Unit converter"))
+        by_description = rig.save(named("Calculator", "Converts between currencies"))
+        by_tag = rig.save(named("Misc", "nothing here", ("converter",)))
+        rig.save(named("Unrelated", "something else", ("other",)))
+
+        found = {r.tool for r in rig.tools.find("convert")}
+
+        assert found == {by_name.record.tool, by_description.record.tool, by_tag.record.tool}
+
+    def test_a_name_counts_for_more_than_a_tag_and_a_tag_for_more_than_a_description(
+        self, rig: Rig
+    ) -> None:
+        in_description = rig.save(named("Alpha", "a graph plotter"))
+        in_tag = rig.save(named("Beta", "x", ("graph",)))
+        in_name = rig.save(named("Graph", "x"))
+
+        order = [r.tool for r in rig.tools.find("graph")]
+
+        assert order == [in_name.record.tool, in_tag.record.tool, in_description.record.tool]
+
+    def test_search_is_case_insensitive_and_ignores_accents_and_matches_prefixes(
+        self, rig: Rig
+    ) -> None:
+        saved = rig.save(named(f"Caf{NFC} timer"))
+
+        for query in ("CAFE", "cafe", f"caf{NFD}", "tim", "caf tim"):
+            assert [r.tool for r in rig.tools.find(query)] == [saved.record.tool], query
+        assert rig.tools.find("timer cafe espresso") == []  # every word must match
+
+    def test_only_the_newest_version_is_searched(self, rig: Rig) -> None:
+        first = rig.save(named("Old name"))
+        rig.save(named("Fresh name"), tool=first.record.tool)
+
+        assert rig.tools.find("old") == []
+        assert [r.version for r in rig.tools.find("fresh")] == [2]
+
+    def test_a_query_with_no_word_finds_nothing_and_no_query_lists_everything(
+        self, rig: Rig
+    ) -> None:
+        rig.save()
+
+        assert rig.tools.find("") == []
+        assert rig.tools.find("!!! ???") == []
+        assert len(rig.tools.find(None)) == 1
+
+    @pytest.mark.parametrize(
+        "query",
+        ['"', "a OR", "NEAR(", "name:csv", "*", "csv AND NOT table", "(((", "-csv", "^csv", "\x00"],
+    )
+    def test_the_syntax_of_fts5_is_not_available_and_never_raises(
+        self, rig: Rig, query: str
+    ) -> None:
+        rig.save()
+
+        rig.tools.find(query)  # no exception: only words reach MATCH
+
+    def test_an_injection_attempt_is_just_words(self, rig: Rig) -> None:
+        rig.save()
+
+        assert rig.tools.find("x'); DROP TABLE tools; --") == []
+        assert len(rig.sql("SELECT * FROM tools")) == 1
+
+    def test_the_number_of_results_is_bounded(
+        self, rig: Rig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(toolstore, "MAX_TOOLS", 1000)
+        for number in range(7):
+            rig.save(named(f"Tool {number}", "shared words"))
+
+        assert len(rig.tools.find("shared", limit=3)) == 3
+        assert len(rig.tools.find(None, limit=3)) == 3
+        assert len(rig.tools.find("shared", limit=10_000)) == 7
+        assert MAX_RESULTS == 50
+
+
+class TestImport:
+    def second(self, tmp_path: Path) -> Iterator[Rig]:
+        made = Rig(tmp_path / "other")
+        yield made
+        made.close()
+
+    def test_a_tool_exported_from_one_store_imports_into_another_unchanged(
+        self, rig: Rig, tmp_path: Path
+    ) -> None:
+        saved = rig.save(taint=frozenset({TaintKind.FS}))
+        bundle = export_bundle(rig.tools.open(saved.record.tool).canonical)
+        other = Rig(tmp_path / "other")
+        try:
+            with other.store.transaction():
+                imported = other.tools.import_(parse_bundle(bundle), NOW)
+
+            assert imported.created
+            assert imported.record.origin == "imported"
+            assert imported.record.hash == saved.record.hash
+            assert imported.record.tool == saved.record.tool
+            assert imported.record.taint == {TaintKind.FS}  # the exporter's claim, kept
+            opened = other.tools.open(saved.record.tool)
+            assert opened.canonical.data == rig.tools.open(saved.record.tool).canonical.data
+            assert [r.tool for r in other.tools.find("csv")] == [saved.record.tool]
+        finally:
+            other.close()
+
+    def test_a_version_the_store_already_has_changes_nothing(self, rig: Rig) -> None:
+        saved = rig.save()
+        bundle = parse_bundle(export_bundle(rig.tools.open(saved.record.tool).canonical))
+        blobs, rows = rig.blobs(), rig.sql("SELECT * FROM tool_versions")
+
+        with rig.store.transaction():
+            again = rig.tools.import_(bundle, NOW + timedelta(days=1))
+
+        assert not again.created
+        assert again.record == saved.record
+        assert (rig.blobs(), rig.sql("SELECT * FROM tool_versions")) == (blobs, rows)
+
+    def test_the_id_of_a_tool_the_store_has_cannot_be_taken_over(self, rig: Rig) -> None:
+        saved = rig.save()
+        hostile = package(tool=saved.record.tool, version=1, source=draft(description="Evil."))
+        blobs, rows = rig.blobs(), rig.sql("SELECT * FROM tool_versions")
+
+        with pytest.raises(ToolConflictError), rig.store.transaction():
+            rig.tools.import_(hostile, NOW)
+
+        assert (rig.blobs(), rig.sql("SELECT * FROM tool_versions")) == (blobs, rows)
+        assert rig.tools.open(saved.record.tool).record == saved.record
+
+    def test_a_bundle_cannot_appear_as_the_next_version_of_a_tool_the_store_has(
+        self, rig: Rig
+    ) -> None:
+        saved = rig.save()
+        newer = package(tool=saved.record.tool, version=2)
+        blobs = rig.blobs()
+
+        with pytest.raises(ToolConflictError), rig.store.transaction():
+            rig.tools.import_(newer, NOW)
+
+        assert rig.blobs() == blobs
+        assert rig.tools.open(saved.record.tool).record.version == 1
+
+    def test_an_imported_tool_can_be_refined_like_any_other(self, rig: Rig) -> None:
+        imported = package(tool=ToolId.new(), version=4)
+        with rig.store.transaction():
+            rig.tools.import_(imported, NOW)
+
+        refined = rig.save(draft(description="Mine."), tool=imported.package.manifest.id)
+
+        assert refined.record.version == 5
+
+    def test_the_blob_of_a_transaction_that_failed_is_found_again(self, rig: Rig) -> None:
+        bundle = package()
+
+        def import_then_fail() -> None:
+            with rig.store.transaction():
+                rig.tools.import_(bundle, NOW)
+                raise RuntimeError("the audit log could not be written")
+
+        with pytest.raises(RuntimeError):
+            import_then_fail()
+        assert rig.sql("SELECT * FROM tool_versions") == []
+        assert str(bundle.hash) in rig.blobs()  # harmless: nothing names it
+
+        with rig.store.transaction():
+            rig.tools.import_(bundle, NOW)
+
+        assert rig.tools.open(bundle.package.manifest.id).record.hash == bundle.hash
+
+    def test_a_planted_blob_under_the_hash_of_a_new_import_refuses_it(self, rig: Rig) -> None:
+        bundle = package()
+        (rig.directory / BLOB_DIRECTORY / str(bundle.hash)).write_bytes(b"planted")
+
+        with pytest.raises(ToolBlobError), rig.store.transaction():
+            rig.tools.import_(bundle, NOW)
+
+        assert rig.sql("SELECT * FROM tool_versions") == []
+        assert rig.blobs() == {str(bundle.hash): b"planted"}
+
+
+class TestLimits:
+    def test_the_number_of_tools(self, rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(toolstore, "MAX_TOOLS", 2)
+        first = rig.save()
+        rig.save()
+
+        with pytest.raises(ToolStoreFullError):
+            rig.save()
+        rig.save(tool=first.record.tool)  # a new version is not a new tool
+
+        assert len(rig.sql("SELECT * FROM tools")) == 2
+
+    def test_a_refused_save_leaves_no_blob(self, rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(toolstore, "MAX_TOOLS", 1)
+        rig.save()
+        blobs = rig.blobs()
+
+        with pytest.raises(ToolStoreFullError):
+            rig.save()
+
+        assert rig.blobs() == blobs
+
+    def test_the_number_of_versions_of_a_tool(
+        self, rig: Rig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(toolstore, "MAX_VERSIONS_PER_TOOL", 2)
+        first = rig.save()
+        rig.save(tool=first.record.tool)
+
+        with pytest.raises(ToolStoreFullError):
+            rig.save(tool=first.record.tool)
+
+        assert rig.store.version_count(first.record.tool) == 2
+
+    def test_the_bytes_of_all_packages(self, rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+        size = rig.save().record.size
+        monkeypatch.setattr(toolstore, "MAX_STORE_BYTES", int(size) * 2 + 10)
+        rig.save(draft(name="Second"))
+
+        with pytest.raises(ToolStoreFullError):
+            rig.save(draft(name="Third"))
+
+    def test_import_is_bounded_too(self, rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(toolstore, "MAX_TOOLS", 1)
+        rig.save()
+
+        with pytest.raises(ToolStoreFullError), rig.store.transaction():
+            rig.tools.import_(package(), NOW)

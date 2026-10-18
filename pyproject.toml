@@ -31,6 +31,7 @@ dependencies = [
 tumbleweed-shell = "tumbleweed.shell.launch:main"
 tumbleweed-sandbox-exec = "tumbleweed.sandbox.sandbox_exec:main"
 tumbleweed-broker = "tumbleweed.broker.daemon:main"
+tumbleweed-tools = "tumbleweed.broker.toolscli:main"
 
 [dependency-groups]
 dev = [
@@ -211,10 +212,11 @@ forbidden_modules = [
 ]
 
 # The policy core, the store and the audit log know nothing of the transport (S16, S17). Only the
-# daemon layer does: `service` (which answers IPC requests), `daemon` (the server) and `client`
-# (the shell's side). Indirect imports count, so nothing else may reach `ipc` through them either.
+# daemon layer does: `service` (which answers IPC requests), `daemon` (the server), `client`
+# (the shell's side) and `toolscli` (`tumbleweed-tools`, a client of the broker). Indirect imports
+# count, so nothing else may reach `ipc` through them either.
 [[tool.importlinter.contracts]]
-name = "the broker imports ipc only in its daemon layer: service, daemon and client (S17)"
+name = "the broker imports ipc only in its daemon layer: service, daemon, client and toolscli (S17, S23)"
 type = "forbidden"
 source_modules = ["tumbleweed.broker"]
 forbidden_modules = ["tumbleweed.ipc"]
@@ -222,6 +224,7 @@ ignore_imports = [
     "tumbleweed.broker.service -> tumbleweed.ipc.**",
     "tumbleweed.broker.daemon -> tumbleweed.ipc.**",
     "tumbleweed.broker.client -> tumbleweed.ipc.**",
+    "tumbleweed.broker.toolscli -> tumbleweed.ipc.**",
 ]
 
 # `service` is exempt from the contract above, so something below it importing `service` would
@@ -249,6 +252,8 @@ source_modules = [
     "tumbleweed.broker.service",
     "tumbleweed.broker.store",
     "tumbleweed.broker.task",
+    "tumbleweed.broker.toolblobs",
+    "tumbleweed.broker.toolstore",
     "tumbleweed.broker.workspace",
     "tumbleweed.broker.workspaces",
 ]
@@ -265,6 +270,22 @@ name = "ipc never imports the broker (S17)"
 type = "forbidden"
 source_modules = ["tumbleweed.ipc"]
 forbidden_modules = ["tumbleweed.broker"]
+
+# The tool package model is pure data and canonical bytes, shared by the broker (which stores it)
+# and the shell (which builds drafts and reads it): it knows neither of them, nor the transport.
+[[tool.importlinter.contracts]]
+name = "tools never imports broker, ipc, gi, agent, shell, voice or ui.gtk (S23)"
+type = "forbidden"
+source_modules = ["tumbleweed.tools"]
+forbidden_modules = [
+    "tumbleweed.broker",
+    "tumbleweed.ipc",
+    "tumbleweed.agent",
+    "tumbleweed.shell",
+    "tumbleweed.voice",
+    "tumbleweed.ui.gtk",
+    "gi",
+]
 
 [[tool.importlinter.contracts]]
 name = "core never imports gi (ARCHITECTURE section 10)"
