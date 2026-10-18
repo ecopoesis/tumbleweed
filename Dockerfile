@@ -8,11 +8,12 @@ FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime: GTK 4 and libadwaita typelibs, weston (headless display), fonts for Pango,
-# bubblewrap, slirp4netns and libseccomp (the sandbox, S14-S22), dbus-daemon (a private session
-# bus for the test that lists what the shell exports on it), sudo (for the second user below) and
-# git (the lock-file tests that build scratch repositories; the image has no history of its own, so
-# the lock-age check runs on the macOS jobs).
+# Runtime: GTK 4 and libadwaita typelibs, gdk-pixbuf's typelib and its WebP loader (the renderer
+# decodes PNG, JPEG and WebP through pinned gdk-pixbuf loaders, D21), weston (headless display),
+# fonts for Pango, bubblewrap, slirp4netns and libseccomp (the sandbox, S14-S22), dbus-daemon (a
+# private session bus for the test that lists what the shell exports on it), sudo (for the second
+# user below) and git (the lock-file tests that build scratch repositories; the image has no
+# history of its own, so the lock-age check runs on the macOS jobs).
 # Build: a toolchain, Python headers and the -dev packages PyGObject and pycairo compile against.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -22,6 +23,7 @@ RUN apt-get update \
         dbus-daemon \
         fonts-dejavu-core \
         gir1.2-adw-1 \
+        gir1.2-gdkpixbuf-2.0 \
         gir1.2-gtk-4.0 \
         git \
         libcairo2-dev \
@@ -32,6 +34,7 @@ RUN apt-get update \
         python3-dev \
         slirp4netns \
         sudo \
+        webp-pixbuf-loader \
         weston \
     && rm -rf /var/lib/apt/lists/*
 

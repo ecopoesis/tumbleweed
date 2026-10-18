@@ -21,7 +21,9 @@ from typing import Protocol, final
 from tumbleweed.shell._gi import GLib, Gtk
 from tumbleweed.ui.gtk.budget import TextBudget
 from tumbleweed.ui.gtk.guard import SignalHandler
+from tumbleweed.ui.gtk.imageview import ImageDecoder
 from tumbleweed.ui.gtk.text import TextBlock
+from tumbleweed.ui.images import ImageResolver
 from tumbleweed.ui.runtime import Change, Dispatch, UiEvent, UiRuntime, Value
 from tumbleweed.ui.spec.components import Component
 from tumbleweed.ui.spec.names import StateKey
@@ -56,10 +58,19 @@ class _Binding:
 
 @final
 class BuildContext:
-    """Shared by the builders of one rendered tool."""
+    """Shared by the builders of one rendered tool: the runtime, the bindings, the text budget, and
+    what an `image` is read and decoded with."""
 
-    def __init__(self, runtime: UiRuntime, build_child: BuildChild) -> None:
+    def __init__(
+        self,
+        runtime: UiRuntime,
+        build_child: BuildChild,
+        images: ImageResolver,
+        decoder: ImageDecoder,
+    ) -> None:
         self.runtime = runtime
+        self.images = images
+        self.decoder = decoder
         self.decls = runtime.spec.declarations()
         self.build_child = build_child
         self._bindings: list[_Binding] = []

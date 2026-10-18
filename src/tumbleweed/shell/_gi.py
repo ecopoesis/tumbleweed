@@ -9,6 +9,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
 gi.require_version("Adw", "1")
 gi.require_version("Pango", "1.0")
 gi.require_version("GLibUnix", "2.0")
@@ -17,6 +18,7 @@ gi.require_version("GLibUnix", "2.0")
 from gi.repository import (  # type: ignore[attr-defined]  # noqa: E402  (pygobject-stubs has no GLibUnix)
     Adw,
     Gdk,
+    GdkPixbuf,
     Gio,
     GLib,
     GLibUnix,
@@ -25,4 +27,4 @@ from gi.repository import (  # type: ignore[attr-defined]  # noqa: E402  (pygobj
     Pango,
 )
 
-__all__ = ["Adw", "GLib", "GLibUnix", "GObject", "Gdk", "Gio", "Gtk", "Pango"]
+__all__ = ["Adw", "GLib", "GLibUnix", "GObject", "Gdk", "GdkPixbuf", "Gio", "Gtk", "Pango"]

@@ -7,6 +7,7 @@ are the other kind: a node that is valid and still cannot be built, or cannot sh
 
 import logging
 from typing import TYPE_CHECKING
+from unittest import mock
 
 import pytest
 
@@ -210,43 +211,6 @@ class TestAnUpdateThatFailsLater:
         assert "error" in first.get_css_classes()
 
 
-class TestKindsThisStepDoesNotRenderYet:
-    def test_each_is_a_placeholder_naming_the_kind_and_the_rest_renders(self) -> None:
-        from tumbleweed.shell._gi import Gtk
-
-        state: list[Json] = [
-            *STATE,
-            {"kind": "image", "key": "img"},
-            {"kind": "table", "key": "tab"},
-        ]
-        root: Json = {
-            "kind": "box",
-            "children": [
-                {"kind": "image", "bind": "img"},
-                {"kind": "table", "bind": "tab"},
-                {"kind": "text_view", "bind": "s"},
-                {"kind": "tabs", "pages": [{"title": "T", "content": LABEL}]},
-                {"kind": "expander", "title": "E", "child": LABEL},
-                LABEL,
-            ],
-        }
-        from tests.ui.gtk.support import render
-
-        tool = render(spec_of(root, state))
-
-        shown = labels_text(tool)
-        assert shown == [
-            "A image cannot be shown yet.",
-            "A table cannot be shown yet.",
-            "A text_view cannot be shown yet.",
-            "A tabs cannot be shown yet.",
-            "A expander cannot be shown yet.",
-            "hello",
-        ]
-        assert tool.widget_at("root.children[3].pages[0].content") is None
-        assert isinstance(tool.widget_at("root.children[5]"), Gtk.Box)
-
-
 class TestStaleComputedValues:
     """A computed value held back by the state budget is marked, not shown as if current (#10)."""
 
@@ -335,3 +299,61 @@ class TestStaleComputedValues:
         assert bar.get_show_text() is False
         assert bar.get_fraction() == 0.5
         assert "error" not in bar.get_css_classes()
+
+
+RICH: dict[str, Json] = {
+    "image": {"kind": "image", "bind": "img"},
+    "table": {"kind": "table", "bind": "tab"},
+    "text_view": {"kind": "text_view", "bind": "s", "editable": True},
+    "tabs": {"kind": "tabs", "pages": [{"title": "t", "content": {"kind": "label", "bind": "s"}}]},
+    "expander": {"kind": "expander", "title": "e", "child": {"kind": "label", "bind": "s"}},
+}
+RICH_STATE: list[Json] = [
+    text("s", "hello"),
+    {"kind": "image", "key": "img"},
+    {"kind": "table", "key": "tab"},
+]
+
+
+def rich_tree(kind: str) -> Json:
+    return {"kind": "box", "children": [RICH[kind], {"kind": "label", "text": "sibling"}]}
+
+
+@pytest.mark.parametrize("kind", list(RICH))
+def test_a_rich_builder_that_raises_is_a_placeholder_and_the_sibling_renders(kind: str) -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    tool = RenderedTool(spec_of(rich_tree(kind), RICH_STATE), factories={kind: failing})
+
+    placeholder = tool.widget_at("root.children[0]")
+    assert isinstance(placeholder, Gtk.Label)
+    assert placeholder.get_text() == f"A {kind} could not be shown."
+    assert "error" in placeholder.get_css_classes()
+    assert labels_text(tool)[-1] == "sibling"
+
+
+@pytest.mark.parametrize("kind", ["image", "table", "text_view"])
+def test_a_rich_widget_that_cannot_show_its_first_value_is_a_placeholder(kind: str) -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+    from tumbleweed.ui.gtk import textview as textview_module
+    from tumbleweed.ui.gtk.imageview import ImageView
+    from tumbleweed.ui.gtk.table import TableWidget
+
+    broken: dict[str, tuple[object, str]] = {
+        "image": (ImageView, "set_ref"),
+        "table": (TableWidget, "set_table"),
+        "text_view": (textview_module, "harden_text_view"),
+    }
+    target, name = broken[kind]
+
+    with mock.patch.object(target, name, side_effect=RuntimeError("cannot show")):
+        tool = RenderedTool(spec_of(rich_tree(kind), RICH_STATE))
+
+    placeholder = tool.widget_at("root.children[0]")
+    assert isinstance(placeholder, Gtk.Label)
+    assert placeholder.get_text() == f"A {kind} could not be shown."
+    assert labels_text(tool)[-1] == "sibling"
+    tool.runtime.patch_state({"s": "changed"})  # nothing is still bound to the thrown-away widget
+    assert tool.runtime.store.value(key("s")) == "changed"

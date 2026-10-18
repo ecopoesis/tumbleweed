@@ -23,6 +23,24 @@ NO_SPACES = "x" * 1000
 OPTIONS = [f"option {i:02d} " + "m" * 118 for i in range(64)]
 
 
+HOSTILE_TABLE: Json = {
+    "columns": [
+        {"name": MARKUP[:60], "type": "string"},
+        {"name": "n" * 1000, "type": "int"},
+        {"name": "_mnemonic", "type": "float"},
+        {"name": "flag", "type": "bool"},
+    ],
+    "rows": [
+        [MARKUP, 2**53 - 1, 1e-300, True],
+        [LONG_BLOCK, -(2**53 - 1), 1.7976931348623157e308, False],
+        ["y" * 1000, 0, 0.0, True],
+        ["e" + "\u0301" * 900, 7, -0.5, False],
+        ["line\nbreaks\rand\u2028more", 1, 1.5, True],
+    ]
+    * 6,
+}
+
+
 def hostile_json() -> Json:
     state: list[Json] = [
         text("s", MARKUP, max_length=65536),
@@ -36,8 +54,8 @@ def hostile_json() -> Json:
         real("fine", 0.5, minimum=-1.0, maximum=1.0, step=0.000001),
         real("narrow", 0.0, minimum=0.0, maximum=5e-324),
         real("whole", 2.0, minimum=0.0, maximum=4.0, step=4.0),
-        {"kind": "image", "key": "img"},
-        {"kind": "table", "key": "tab"},
+        {"kind": "image", "key": "img", "default": {"path": "-rf.png"}},
+        {"kind": "table", "key": "tab", "default": HOSTILE_TABLE},
         computed("shown", "string", variadic("concat", ref("s"), lit_str(MARKUP)), ""),
         {
             **computed("bar", "float", binary("mul", ref("fine"), lit_int(2)), 0.0),
@@ -83,11 +101,26 @@ def hostile_json() -> Json:
         {"kind": "image", "bind": "img", "alt": MARKUP},
         {"kind": "table", "bind": "tab"},
         {"kind": "text_view", "bind": "s", "editable": True},
+        {"kind": "text_view", "bind": "long", "monospace": True},
+        {"kind": "text_view", "bind": "run"},
         {
             "kind": "tabs",
             "pages": [{"title": MARKUP[:80], "content": {"kind": "label", "bind": "s"}}],
         },
         {"kind": "expander", "title": MARKUP[:80], "child": {"kind": "label", "bind": "s"}},
+        {
+            "kind": "expander",
+            "title": LONG_LINE,
+            "expanded": True,
+            "child": {
+                "kind": "tabs",
+                "pages": [
+                    {"title": LONG_LINE, "content": {"kind": "table", "bind": "tab"}},
+                    {"title": "text", "content": {"kind": "text_view", "bind": "long"}},
+                    {"title": "image", "content": {"kind": "image", "bind": "img", "alt": MARKUP}},
+                ],
+            },
+        },
         {
             "kind": "grid",
             "columns": 12,
