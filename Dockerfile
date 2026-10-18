@@ -13,6 +13,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 # private session bus for the test that lists what the shell exports on it), sudo (for the second
 # user below) and git (the lock-file tests that build scratch repositories; the image has no
 # history of its own, so the lock-age check runs on the macOS jobs).
+# GStreamer (S06): the typelibs and the base plugins (audiotestsrc, audioconvert, audioresample,
+# capsfilter, appsink), so that the capture adapter is tested with a test tone, never a microphone;
+# the Pulse and PipeWire source plugins are not installed on purpose (no device in the container).
 # Build: a toolchain, Python headers and the -dev packages PyGObject and pycairo compile against.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -22,9 +25,12 @@ RUN apt-get update \
         dbus-daemon \
         fonts-dejavu-core \
         gir1.2-adw-1 \
+        gir1.2-gst-plugins-base-1.0 \
+        gir1.2-gstreamer-1.0 \
         gir1.2-gtk-4.0 \
         gir1.2-vte-3.91 \
         git \
+        gstreamer1.0-plugins-base \
         libcairo2-dev \
         libgirepository-2.0-dev \
         libseccomp2 \

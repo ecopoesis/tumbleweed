@@ -29,6 +29,8 @@ from tumbleweed.shell.viewmodel.chat import ChatController
 from tumbleweed.shell.viewmodel.session import ChatSession, HistoryOpener
 from tumbleweed.shell.viewmodel.terminal import TerminalSettings
 from tumbleweed.shell.viewmodel.transcript import Transcript
+from tumbleweed.shell.voice_controls import VoiceControls
+from tumbleweed.voice.factory import VoiceSetup
 
 WINDOW_TITLE = "Tumbleweed"
 DEFAULT_SIZE = (1100, 720)
@@ -45,6 +47,7 @@ class ShellWindow(Adw.ApplicationWindow):
         application: Adw.Application,
         responder: Responder,
         open_history: HistoryOpener | None = None,
+        voice: VoiceSetup | None = None,
         terminal: TerminalSettings | None = None,
     ) -> None:
         super().__init__(application=application)
@@ -66,6 +69,17 @@ class ShellWindow(Adw.ApplicationWindow):
             terminal if terminal is not None else default_settings(),
             self._focus_input_unless_closing,
         )
+        # Push-to-talk (S06): a mic button in the strip and Ctrl+Space; none if voice is off.
+        self.voice_controls: VoiceControls | None = None
+        if voice is not None:
+            self.voice_controls = VoiceControls(
+                voice.input,
+                self.status_strip.voice,
+                self.chat_panel,
+                edit_before_send=voice.edit_before_send,
+            )
+            self.status_strip.insert_child_after(self.voice_controls, self.status_strip.voice)
+            self.voice_controls.install_keys(self, self._terminal_has_focus)
 
         # The separator and the panel hide together.
         self._side = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -86,10 +100,10 @@ class ShellWindow(Adw.ApplicationWindow):
         root.append(self.status_strip)
         self.set_content(root)
 
-        # Esc stops the reply in flight, wherever the focus is in the window. A shortcut (not a
-        # GAction, which would be exported on the session bus), in the bubble phase: whatever
-        # wants Esc first (a popover, an entry) gets it, and while no reply is streaming the key
-        # is not consumed at all.
+        # Esc abandons an utterance being recorded, or else stops the reply in flight, wherever the
+        # focus is in the window. A shortcut (not a GAction, which would be exported on the session
+        # bus), in the bubble phase: whatever wants Esc first (a popover, an entry) gets it, and
+        # while nothing is recorded or streaming the key is not consumed at all.
         escape = Gtk.ShortcutController()
         escape.add_shortcut(
             Gtk.Shortcut.new(
@@ -167,27 +181,39 @@ class ShellWindow(Adw.ApplicationWindow):
             # Hiding the panel took the focus with it; do not leave the window with none.
             self.chat_panel.focus_input()
 
+    def _terminal_has_focus(self) -> bool:
+        focus = self.get_focus()
+        return focus is not None and (
+            focus is self.terminal_pane or focus.is_ancestor(self.terminal_pane)
+        )
+
     def _on_escape(self, _widget: Gtk.Widget, _args: object) -> bool:
+        if self.voice_controls is not None and self.voice_controls.cancel_listening():
+            return True
         if not self.controller.busy:
             return False
         self.controller.cancel()
         return True
 
     def shutdown(self) -> None:
-        """Stop the reply in flight, and stop observing it, before the widgets go away; then save
-        what it left (the failed reply) and release the chat history.
+        """Stop the utterance being recorded, and the reply in flight, and stop observing it, before
+        the widgets go away; then save what it left (the failed reply) and release the chat history.
 
         A window that is destroyed outright gets no `close-request`, so whoever ends the window
         calls this: the `close-request` handler does, and so does the application when it quits.
         """
         self._closing = True
         try:
-            self.chat_panel.shutdown()
+            if self.voice_controls is not None:
+                self.voice_controls.shutdown()
         finally:
             try:
-                self.terminal_pane.shutdown()
+                self.chat_panel.shutdown()
             finally:
-                self.session.close()
+                try:
+                    self.terminal_pane.shutdown()
+                finally:
+                    self.session.close()
 
     def _on_close_request(self, _window: Gtk.Window) -> bool:
         self.shutdown()

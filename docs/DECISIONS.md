@@ -461,7 +461,8 @@ rest of `src/` it is a denylist by name of the calls that feed or paste, read te
 screen or reach the pty, of any `.props` access, of the properties and signals that carry what the shell
 says or what is typed, of `emit` of those and of the clipboard signals, and of subclassing `Vte.*`.
 Gaps: outside the Vte modules an alias, `getattr` or a variable signal or property name; a key
-controller made elsewhere; methods Vte adds later (outside those modules); a widget handed to another
+controller made elsewhere (S06's push-to-talk is one, reviewed and pinned by test: it does nothing
+while the terminal has the focus, D20); methods Vte adds later (outside those modules); a widget handed to another
 module; deliberate obfuscation.
 Closing the terminal moves the focus to the chat input. That shows the side panel again if F9 hid
 it, because the input must be visible to take the focus; it applies whether the shell exits or F12
@@ -552,3 +553,68 @@ version of a tool the user has needs S24's flow (#95). Blobs are never garbage-c
 removes a tool (an orphan from a failed transaction stays and the next save of the same bytes finds
 it): #94, with the audit log's rotation (#82). A module named like a
 standard library module is a valid name; the sandbox loader keeps it from shadowing (#56).
+
+## D20 — Speech input: whisper-server over `httpx2`, a push-to-talk controller with two worker threads, GStreamer confined to one adapter (2026-10-18, accepted)
+
+**Context.** S06 adds push-to-talk dictation. whisper.cpp runs natively (Metal) and the shell reaches it
+over HTTP; the Anthropic SDK already brought `httpx2` (#43), so a second HTTP stack had to be justified.
+Capture needs GStreamer, which a Mac does not have by default and which the stubs type loosely. The
+transcript is text from a server, derived from whatever the microphone heard.
+**Decision.** (1) *HTTP: `httpx2`,* the library the SDK uses and `agent.anthropic_provider` already
+declares, in its synchronous client, because the call runs on a worker thread. The alternative, the
+standard library's `http.client`, would have added no dependency but needs multipart framing, timeouts and
+size limits written by hand; one stack with a tested configuration was preferred. The import contract
+allows `httpx2` in `voice.whisper` only, and `httpcore2` (httpx2's own transport library, now a declared
+dependency, already locked) in `voice.whisper` and `voice.budget`; `Closes #43`. (2) *Bounds in the client:* the answer is read with `iter_raw`
+(before any decoding) and counted, `Accept-Encoding: identity` is asked for and any content encoding is
+refused, redirects and environment proxies are off, **one deadline bounds the whole exchange**:
+httpx2's timeouts are per operation and each byte that arrives starts a new one (a server sending
+its status line a byte at a time held the worker for minutes), so the speech client's transport runs
+on `voice.budget.BudgetBackend`, a network backend that cuts every operation (lookup, connect, TLS,
+write, read) to what is left of `request_timeout`; only the OS resolver, once asked, cannot be
+shortened (the request stops waiting). An `AbortSignal` per utterance, set by `cancel`, shuts the
+request's sockets down, so Esc does not leave the next transcription queued behind it. Status, type and
+a strict pydantic model of the one field read are checked
+(`extra="ignore"` on purpose: a newer server may add a field). (3) *Threads:* `VoiceInput` lives on the
+main thread and does no I/O; an audio worker opens, stops and cancels the capture, a speech worker makes
+the request, both daemon threads, results posted back with the utterance's generation so that an
+abandoned utterance is dropped. Two workers, so that a slow server never delays the next *recording*; `cancel` aborts the request in flight so that it does not delay the next transcription either.
+(4) *GStreamer is optional and confined:* `voice._gst` pins `gi`, `voice.gstreamer` builds the pipeline
+from fixed element names (never `parse_launch`, never a user string), and `voice.factory` imports it
+lazily, so a host without it starts the shell and says so on the first press; the Linux image installs the
+typelibs and the base plugins only, and the adapter is tested with `audiotestsrc`. It is written against the
+raw GI API, not gst-python's overrides, which not every install has. Stop sends EOS and waits a bounded
+time before tearing the pipeline down. (5) *The transcript is the user's words.* It is cleaned in one
+function (`stt.clean_transcript`) and then enters the input as typing would, not framed as untrusted data
+to the model: it is what the user said, with the authority of typing. The real defences are that the
+microphone is open only while the user holds the key (or has toggled the button), that nothing
+voice-derived can answer a prompt (I10), and that the text is shown as plain text (I4). A draft already in
+the input is never sent by a transcript, and over plain http to an address that is not local
+(where the network could rewrite the transcript) no transcript is ever sent automatically:
+`edit_before_send` is forced on. (6) *Audio is never persisted:* no voice module can write a file (an AST scan), the pipeline is
+built from fixed elements none of which writes, a Python audit hook sees no write during a whole
+utterance (it cannot see native writes, so a Linux test runs a real capture and checks that no file
+appears). (7) *Push-to-talk is a key and a button,
+not `GAction`s,* which the session bus would export. The key is Ctrl+Space, fixed (#100); the button
+toggles. The key is a capture controller on the window, so it is the reviewed exception to S05's
+rule that the terminal's keystrokes are nobody's (D18): in the terminal pane it returns False and
+keeps no state (Ctrl+Space is the shell's: set-mark), and a test pins what its handlers read; the one other key it takes is a plain Esc while an
+utterance is in progress (the terminal would otherwise get the bubble-phase Esc), and the Mic button
+takes no focus, like the Terminal button. It is
+latched, so key repeat records nothing more and a space typed during a click-started recording does
+not end it. (8) *The indicator gains `TRANSCRIBING`* (S08's state machine names it); `THINKING` and `SPEAKING`
+stay for S07. (9) *Config:* a `[voice]` table beside `[agent]`, read apart from it (a mistake in one does not
+disable the other; a syntax error in the file is both's), the URL validated by `SttEndpoint` when the
+file is read; `TUMBLEWEED_STT_URL` overrides it. (10) *Models* are fetched by `scripts/whisper-model`
+against pinned SHA-256 hashes, and Homebrew's `whisper.cpp` formula builds without the server, so the
+README builds it from the tagged source (checked against v1.9.5 with Metal).
+**Deviations from the plan.** None in scope. The plan says "(listening -> transcribing)" and the S02
+indicator had no such state, so one was added.
+**Consequences.** A request takes at most its timeout (the OS resolver aside). A hung audio device
+leaves the audio worker stuck, since GStreamer's state change to NULL has no timeout: the indicator
+says "transcribing", or "idle" after Esc while the device may still be open, until the device returns
+(#101, deferred: the fix is a disposable thread with a bounded join and a visible "device busy" state);
+the main thread stays free. `agent.config` imports `voice.config`, and `voice.factory` imports `agent.config` (the loader)
+and `agent.errors`, nothing more between the packages (two contracts). The macOS and PipeWire/Pulse capture paths are not exercised in CI (no device, and no
+GStreamer on the macOS runner); the pipeline up to the source is (#102). Whisper can invent words from
+silence; only a tap under 300 ms and a bare annotation are dropped until S08's VAD (#103).

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Run whisper.cpp's whisper-server natively, for Tumbleweed's voice input (S06).
+#
+#   scripts/whisper-server            serve on 127.0.0.1:8080 with the model scripts/whisper-model fetched
+#
+# On Apple Silicon whisper.cpp uses Metal by default, so run this on the Mac itself, not in a
+# container or a VM (a VM has no GPU): the shell, in the VM or on the Mac, reaches it over HTTP
+# (`stt_url` in config.toml, or TUMBLEWEED_STT_URL).
+#
+# Settings, all optional, from the environment:
+#   WHISPER_SERVER_BIN  the whisper-server program   (default: whisper-server on PATH; Homebrew's
+#                       whisper.cpp does not ship it, build it as the README says)
+#   WHISPER_MODEL   path of the ggml model   (default: $XDG_DATA_HOME/tumbleweed/whisper/ggml-base.en.bin)
+#   WHISPER_HOST    address to listen on     (default: 127.0.0.1; see the README before changing it)
+#   WHISPER_PORT    TCP port                 (default: 8080)
+#
+# whisper-server has no authentication and no TLS: whoever can reach the port can send it audio,
+# use the CPU and the GPU, and even switch its model (/load). The default, the loopback, is only this machine. To serve a VM, bind to
+# the address of the host-only network (for example 192.168.64.1 in UTM or Parallels), never to
+# 0.0.0.0 on a network you share.
+set -euo pipefail
+
+host="${WHISPER_HOST:-127.0.0.1}"
+port="${WHISPER_PORT:-8080}"
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+model="${WHISPER_MODEL:-$data/tumbleweed/whisper/ggml-base.en.bin}"
+
+fail() { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 1; }
+
+# Checked even though the arguments go to exec as separate words, so a typo is an error here and
+# not a stranger one from the server.
+[[ "$host" =~ ^[A-Za-z0-9.:-]+$ ]] || fail "WHISPER_HOST must be an address or a name"
+[[ "$port" =~ ^[0-9]{1,5}$ ]] && (( port >= 1 && port <= 65535 )) || fail "WHISPER_PORT must be a port number"
+
+server="${WHISPER_SERVER_BIN:-whisper-server}"
+command -v "$server" >/dev/null 2>&1 \
+    || fail "$server was not found. Build whisper.cpp's server (README, section Voice) and put it on PATH, or set WHISPER_SERVER_BIN"
+[ -f "$model" ] \
+    || fail "no model at $model. Fetch one with scripts/whisper-model, or set WHISPER_MODEL"
+
+echo "whisper-server: model $model, listening on http://$host:$port (Ctrl+C to stop)" >&2
+exec "$server" --host "$host" --port "$port" --model "$model"
