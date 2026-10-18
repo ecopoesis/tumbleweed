@@ -103,7 +103,8 @@ class VoiceControls(Gtk.Box):
             self._syncing = False
 
     def transcribed(self, text: str) -> None:
-        self._show_message("")
+        # The message line is left alone: a notice that came with this utterance ("limited to 30
+        # seconds") is still news. The next LISTENING phase clears it.
         try:
             self._chat_panel.dictate(text, send=not self._edit_before_send)
         except Exception:

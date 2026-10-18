@@ -101,12 +101,14 @@ def indicator(v: Voiced) -> str:
     return v.shell.window.status_strip.voice.text
 
 
-def key(v: Voiced, name: str, keyval: int, *, ctrl: bool = True) -> bool:
+def key(v: Voiced, name: str, keyval: int, *, ctrl: bool = True, extra: int = 0) -> bool:
     from tumbleweed.shell._gi import Gdk
 
     keys = controls(v).keys
     assert keys is not None
-    state = Gdk.ModifierType.CONTROL_MASK if ctrl else Gdk.ModifierType(0)
+    state = (Gdk.ModifierType.CONTROL_MASK if ctrl else Gdk.ModifierType(0)) | Gdk.ModifierType(
+        extra
+    )
     return bool(keys.emit(name, keyval, 0, state))
 
 
@@ -167,6 +169,20 @@ class TestHoldingTheKey:
         key(v, "key-pressed", Gdk.KEY_a)
 
         assert indicator(v) == "Voice: listening"
+
+    @pytest.mark.parametrize("name", ["SHIFT_MASK", "ALT_MASK", "SUPER_MASK"])
+    def test_ctrl_with_another_modifier_and_space_does_not_start_recording(
+        self, build_voiced: VoicedBuilder, name: str
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        v = build_voiced()
+
+        taken = key(v, "key-pressed", Gdk.KEY_space, extra=int(getattr(Gdk.ModifierType, name)))
+
+        assert taken is False
+        assert indicator(v) == "Voice: idle"
+        assert v.source.starts == 0
 
     def test_key_repeat_is_one_utterance_and_never_types_spaces(
         self, build_voiced: VoicedBuilder
@@ -287,6 +303,22 @@ class TestWhatIsSaid:
 
 
 class TestProblems:
+    def test_the_length_notice_is_still_there_when_the_transcript_arrives(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        v = build_voiced(edit_before_send=True)
+        hold_and_speak(v, 3.0)  # the cap is 2 seconds: the recording stops by itself
+        message = controls(v).message
+
+        assert pump_until(lambda: input_text(v.shell) == "hello there")
+        assert message.get_visible()
+        assert "limited to 2 seconds" in message.get_text()
+        key(v, "key-released", Gdk.KEY_space)  # the late release changes nothing
+        key(v, "key-pressed", Gdk.KEY_space)  # the next utterance clears it
+        assert not message.get_visible()
+
     def test_a_failure_is_shown_next_to_the_mic_and_the_next_try_clears_it(
         self, build_voiced: VoicedBuilder
     ) -> None:

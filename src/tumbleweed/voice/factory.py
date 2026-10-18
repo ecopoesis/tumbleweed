@@ -31,6 +31,8 @@ class VoiceSetup:
 
     input: VoiceInput
     edit_before_send: bool
+    """Whether a transcript waits in the input to be edited and sent: `[voice] edit_before_send`,
+    and always when the speech server is reached over plain http at a non-loopback address."""
 
 
 def _gstreamer_source(config: VoiceConfig) -> AudioSource:
@@ -71,5 +73,14 @@ def build_voice(environ: Mapping[str, str], dispatcher: MainThreadDispatcher) ->
     except Exception as exc:  # noqa: BLE001  (an HTTP client that cannot be built must not stop the shell)
         logger.error("voice is off: the speech client cannot be set up (%s)", type(exc).__name__)
         return None
-    logger.info("voice input: speech server %s", config.endpoint.display)
-    return VoiceSetup(voice_input, config.edit_before_send)
+    endpoint = config.endpoint
+    # Over plain http to another host, whoever is on the network between can rewrite the transcript
+    # on its way back: it must wait in the input for the user to read, not be sent as typed.
+    edit_before_send = config.edit_before_send or endpoint.sends_audio_in_clear
+    if edit_before_send and not config.edit_before_send:
+        logger.warning(
+            "transcripts from %s are not sent automatically: plain http can be altered on the way",
+            endpoint.display,
+        )
+    logger.info("voice input: speech server %s", endpoint.display)
+    return VoiceSetup(voice_input, edit_before_send)

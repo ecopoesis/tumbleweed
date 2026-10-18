@@ -183,6 +183,41 @@ class TestBuildVoice:
         with caplog.at_level(logging.INFO):
             assert build_voice(environ_for(home), ManualDispatcher()) is None
 
+    @pytest.mark.parametrize(
+        ("url", "configured", "waits"),
+        [
+            ("http://10.0.0.5:8080", False, True),  # plain http to another host: always
+            ("http://stt.example.com", False, True),
+            ("http://10.0.0.5:8080", True, True),
+            ("http://127.0.0.1:8080", False, False),
+            ("http://localhost:8080", False, False),
+            ("http://[::1]:8080", False, False),
+            ("https://stt.example.com", False, False),
+            ("http://127.0.0.1:8080", True, True),
+        ],
+    )
+    def test_over_plain_http_to_another_host_a_transcript_always_waits_to_be_read(
+        self,
+        home: Path,
+        url: str,
+        configured: bool,
+        waits: bool,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        write_config(home, f"[voice]\nedit_before_send = {str(configured).lower()}\n")
+
+        with caplog.at_level(logging.WARNING):
+            setup = build_voice(environ_for(home, TUMBLEWEED_STT_URL=url), ManualDispatcher())
+        try:
+            assert setup is not None
+            assert setup.edit_before_send is waits
+            if waits and not configured:
+                assert "not sent automatically" in caplog.text
+                assert url.split("//")[1].split("/")[0] in caplog.text
+        finally:
+            if setup is not None:
+                setup.input.close()
+
     def test_the_default_is_voice_on(self, home: Path) -> None:
         setup = build_voice(environ_for(home), ManualDispatcher())
         try:
