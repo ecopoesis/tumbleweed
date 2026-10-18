@@ -629,13 +629,13 @@ alone and refused. A second server on a live path is refused and the first is no
   database_list`) and requires the file and directory there to be the ones it holds descriptors
   for; the directory path and the file in it are compared too. SQLite's own moved-check guards
   writes to the database file, not to the write-ahead log, which holds every message until it is
-  checkpointed and is made by path at the first write: so at the end of the open, before any
-  message is saved, `-wal` and `-shm` must exist in the directory the shell holds and the
-  resolved path is checked again. A swap before the first write is refused with no message
-  saved; the windows that remain (SQLite opening an attacker's file in the instant before the
-  first check, the first writes, with no message among them, landing in an attacker's directory
-  when the swap is between the last pre-write check and the first write) are described in
-  `history.files`. A file that is not ours is
+  checkpointed; so at the end of the open, before any message is saved, `-wal` and `-shm` must
+  exist in the directory the shell holds and the resolved path is checked again. These checks
+  refuse an accidental redirection (a symlinked or moved directory, a file that is not ours) and
+  a swap still in place at a check. They do not stop someone who can rename the directory or its
+  ancestors (this user, or root, who can read the history anyway) from swapping in and out
+  around the open's reads and sending `-wal`/`-shm` elsewhere; that is outside the threat model
+  (`history.files` has the detail, #80 the possible hardening). A file that is not ours is
   checked, read-only, before it is switched to WAL or written to. SQLite runs in defensive mode
   with `ATTACH` off and limits on a value, a statement and an expression's depth; text is read as
   bytes and decoded strictly; every row is validated into a typed record, and a read refuses

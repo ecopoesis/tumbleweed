@@ -31,21 +31,21 @@ descriptor, never through a second look at a path (CLAUDE.md, TOCTOU):
   file before it writes, guards writes to the *database file* (not to the write-ahead log).
 
   The side files matter as much: in WAL mode the `-wal` file holds every message until it is
-  checkpointed, and the schema written by a migration. SQLite makes `-wal` and `-shm` by path at
-  the first write (the switch to WAL). So at the end of the open, before any message is saved,
-  `require_sidecar` requires both to exist in the directory we hold (a plain file of ours, one
-  link) and the resolved path is checked again; otherwise the open is refused.
+  checkpointed, and the schema written by a migration. SQLite makes `-wal` and `-shm` by path.
+  So at the end of the open, before any message is saved, `require_sidecar` requires both to
+  exist in the directory we hold (a plain file of ours, one link) and the resolved path is
+  checked again; otherwise the open is refused.
 
-  What is guaranteed: no message is saved to a file we did not examine, if the swap is before the
-  check at the end of the open or after it (a later swap makes SQLite's moved-check refuse writes
-  to the database file; the write-ahead log is already open then, so it keeps going to the same
-  place). What is not: (1) in the instant before SQLite opens, someone able to write inside our
-  0700 directory, or to rename it or an ancestor (this user, or root), can make SQLite open the
-  attacker's file (and create it, empty, if it is missing); that is refused straight after,
-  before anything is read from it or written. (2) A swap between the last pre-write check and the
-  first write puts the first writes (the WAL switch and the migration's schema) in the attacker's
-  directory before the end-of-open check refuses it; no message is among them. An ACL on a
-  directory is not examined (#80).
+  What this is, plainly: the checks refuse an accidental redirection (a symlinked or moved
+  directory, a file that is not ours) and a swap that is still in place at one of the checks.
+  They do not stop someone who can rename our directory or one of its ancestors (this user, or
+  root, either of whom can read the history anyway) and who swaps in and out around the reads of
+  the open: such a swap can make SQLite open `-wal` and `-shm` in the attacker's directory, and
+  `require_sidecar` is satisfied if files of those names are already in ours (another shell's,
+  or, on some platforms, leftovers from an earlier close). That is outside the threat model.
+  Also not covered: in the instant before SQLite opens, SQLite can open the attacker's file (and
+  create it, empty, if it is missing), which is refused straight after; and an ACL on a directory
+  is not examined (#80, which also lists identity checks of the side files SQLite holds open).
 """
 
 import contextlib
