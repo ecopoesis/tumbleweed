@@ -44,7 +44,8 @@ pytestmark = [
 APPLICATION_PATH = "/io/github/ecopoesis/Tumbleweed"
 WINDOW_PATH = f"{APPLICATION_PATH}/window/1"
 # Every object the shell exports, with the interfaces on it (the standard org.freedesktop.DBus.*
-# ones apart), and every action in the action groups. Reviewed: all low-harm.
+# ones apart), and every action in the action groups. Reviewed: all low-harm. The terminal (F12 and
+# a button, S05) is deliberately not here: starting a shell is no GAction (DECISIONS D18).
 EXPECTED_INTERFACES = {
     APPLICATION_PATH: {"org.freedesktop.Application", "org.gtk.Actions", "org.gtk.Application"},
     WINDOW_PATH: {"org.gtk.Actions"},
