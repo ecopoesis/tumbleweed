@@ -200,6 +200,15 @@ def _entry(component: Entry, ctx: BuildContext) -> Gtk.Widget:
     editing = False  # inside this entry's own `changed`: it shows what the user typed already
     first = True
 
+    def focused() -> bool:
+        delegate = entry.get_delegate()  # the Gtk.Text inside, which is what has the focus
+        return isinstance(delegate, Gtk.Text) and delegate.is_focus()
+
+    def settle() -> None:
+        # Once the user is done (the next idle turn after an edit, and when the focus leaves) the
+        # claim is made again as any other: it fits, or the entry is marked like the others.
+        ctx.defer(entry, lambda: show(ctx.runtime.store.value(key)))
+
     def show(value: StateValue) -> None:
         text = _text_value(value)
         # Editable only while the whole text is shown: it is cut at the per-text cap and refused
@@ -207,7 +216,9 @@ def _entry(component: Entry, ctx: BuildContext) -> Gtk.Widget:
         # would write the cut text over the state's value. The state keeps all of it.
         shown = text[:MAX_SHOWN_PER_TEXT]
         whole = len(text) <= MAX_SHOWN_PER_TEXT
-        if ctx.budget.claim(entry, len(shown), keep=editing):
+        # The entry the user is in keeps its claim (it must not turn into a mark under their
+        # fingers), so at most that one entry is over the budget, by at most its cap.
+        if ctx.budget.claim(entry, len(shown), keep=editing or focused()):
             ctx.budget.stop_waiting(entry)
         else:
             shown, whole = NOT_SHOWN, False
@@ -245,7 +256,11 @@ def _entry(component: Entry, ctx: BuildContext) -> Gtk.Widget:
             ctx.user_input(key, entry.get_text(), change)
         finally:
             editing = False
+        settle()
 
+    focus = Gtk.EventControllerFocus()
+    entry.add_controller(focus)
+    ctx.connect(focus, "leave", lambda _controller: settle())
     ctx.connect(entry, "changed", on_changed)
     if activate is not None:
         ctx.connect(entry, "activate", lambda _entry: ctx.user_event(activate))

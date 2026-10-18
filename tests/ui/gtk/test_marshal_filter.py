@@ -5,6 +5,7 @@ every other GLib warning still takes PyGObject's own road, and tests that make w
 keep catching real ones.
 """
 
+import gc
 import warnings
 from typing import TYPE_CHECKING
 
@@ -17,14 +18,28 @@ if TYPE_CHECKING:
     from tests.ui.spec.support import Json
     from tumbleweed.ui.gtk import RenderedTool
 
-pytestmark = pytest.mark.gtk
+# A hang here would be the signal mutex: the signal-based timeout cannot interrupt a thread blocked
+# in C, so these tests use the thread method, which ends the run instead of wedging it.
+pytestmark = [pytest.mark.gtk, pytest.mark.timeout(60, method="thread")]
 
 
 def provoke_another_critical() -> None:
-    """A GLib-GObject warning that has nothing to do with spin buttons."""
+    """A GLib-GObject warning that has nothing to do with spin buttons.
+
+    GLib logs it while it holds the signal mutex, PyGObject turns the log into a Python warning
+    (an error here), and a garbage collection in between could dispose a GObject, which takes the
+    same mutex: so the collector is off while the warning is provoked.
+    """
     from tumbleweed.shell._gi import GObject, Gtk
 
-    GObject.signal_handler_disconnect(Gtk.Adjustment(), 987654)  # no such handler id
+    adjustment = Gtk.Adjustment()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        GObject.signal_handler_disconnect(adjustment, 987654)  # no such handler id
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def spin_tool() -> "RenderedTool":
@@ -122,3 +137,68 @@ def test_closing_the_tool_takes_the_filter_out_and_does_so_once() -> None:
     assert spin_filter_users() == before
     if before == 0:  # (a tool another test left open keeps the filter in force)
         assert not present()
+
+
+def test_a_message_that_merely_starts_like_ours_is_not_ignored() -> None:
+    from tumbleweed.shell._gi import GObject
+    from tumbleweed.ui.gtk.guard import _SPIN_INPUT_WARNING
+
+    tool = spin_tool()
+
+    own = [f for f in warnings.filters if f[2] is GObject.Warning and f[0] == "ignore"]
+    pattern = own[0][1]
+    assert pattern is not None
+    assert pattern.match(_SPIN_INPUT_WARNING)
+    assert not pattern.match(_SPIN_INPUT_WARNING + " EXTRA")
+    tool.close()
+
+
+def test_with_the_filter_in_force_the_message_plus_a_suffix_still_raises() -> None:
+    from tumbleweed.shell._gi import GObject
+    from tumbleweed.ui.gtk.guard import _SPIN_INPUT_WARNING
+
+    tool = (
+        spin_tool()
+    )  # warnings are errors in these tests; ours is ignored, the suffixed one is not
+
+    warnings.warn(_SPIN_INPUT_WARNING, GObject.Warning, stacklevel=1)  # ignored: no exception
+    with pytest.raises(GObject.Warning):
+        warnings.warn(_SPIN_INPUT_WARNING + " EXTRA", GObject.Warning, stacklevel=1)
+    tool.close()
+
+
+def test_the_filter_is_gone_from_warnings_once_the_last_spin_is_closed() -> None:
+    """In a fresh process, where no other test has left a spin button open."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[3]
+    probe = """
+import sys, warnings
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+from tests.ui.gtk.test_marshal_filter import spin_tool
+from tumbleweed.shell._gi import GObject
+
+def present():
+    return any(f[2] is GObject.Warning and f[0] == "ignore" for f in warnings.filters)
+
+assert not present()
+first, second = spin_tool(), spin_tool()
+assert present()
+first.close()
+assert present()  # one is still alive
+second.close()
+assert not present()
+print("ok")
+"""
+    result = subprocess.run(  # noqa: S603  (argv list, no shell; our own interpreter)
+        [sys.executable, "-I", "-c", probe, str(root), str(root / "src")],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=90,
+    )
+
+    assert result.returncode == 0, result.stderr[-800:]
+    assert result.stdout.strip() == "ok"

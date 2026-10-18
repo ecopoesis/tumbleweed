@@ -401,3 +401,27 @@ class TestParse:
     )
     def test_an_int_refuses_the_rest(self, text: str) -> None:
         assert self.int_range().parse(text) is None
+
+
+class TestSnapStepEdges:
+    def test_a_huge_ratio_of_move_to_step_is_not_an_overflow(self) -> None:
+        # [0, 10] with the smallest normal step is a valid slider; dragging to 5.0 is 2e307 steps.
+        numeric = range_of(real("x", 0.0, minimum=0.0, maximum=10.0, step=sys.float_info.min))
+
+        assert numeric.snap_step(5.0, 0.0) == 5.0
+        assert numeric.snap_step(10.0, 0.0) == 10.0
+        assert numeric.snap_step(-5.0, 5.0) == -5.0
+        assert numeric.snap_step(1e300, 0.0) == 1e300
+
+    def test_a_move_of_a_few_smallest_steps_is_still_a_step(self) -> None:
+        numeric = range_of(real("x", 0.0, minimum=0.0, maximum=10.0, step=sys.float_info.min))
+
+        assert numeric.snap_step(2 * sys.float_info.min, 0.0) == 2 * sys.float_info.min
+
+    def test_the_tolerance_is_inclusive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tumbleweed.ui.runtime import bindings
+
+        monkeypatch.setattr(bindings, "STEP_NOISE", 0.5)  # a binary fraction: an exact boundary
+        numeric = range_of(real("x", 0.0, minimum=0.0, maximum=100.0, step=1.0))
+
+        assert numeric.snap_step(2.5, 0.0) == 2.0  # 0.5 from 2.0: on the boundary, so snapped

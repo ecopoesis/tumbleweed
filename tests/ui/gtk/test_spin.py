@@ -445,3 +445,87 @@ def test_a_typed_number_that_looks_like_stepping_noise_is_kept_exactly() -> None
 
     assert tool.runtime.store.value(StateKey("x")) == 0.30000000000000004  # not "cleaned" to 0.3
     assert float(spin.get_text()) == 0.30000000000000004
+
+
+def test_a_page_increment_of_a_slider_is_snapped_like_a_step() -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    state: list[Json] = [real("x", 0.07, minimum=0.0, maximum=100.0, step=0.01)]
+    tool = RenderedTool(spec_of({"kind": "slider", "bind": "x"}, state))
+    (scale,) = of_type(tool, Gtk.Scale)
+    assert scale.get_adjustment().get_page_increment() == 10.0  # a tenth of the range
+
+    scale.emit("move-slider", Gtk.ScrollType.PAGE_FORWARD)
+
+    assert tool.runtime.store.value(StateKey("x")) == 10.07  # not 10.07000000000000028
+    assert scale.get_value() == 10.07
+
+
+def test_stepping_again_after_a_typed_value_is_snapped_again() -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    state: list[Json] = [real("x", 0.9, minimum=0.0, maximum=10.0, step=0.1)]
+    tool = RenderedTool(spec_of({"kind": "spin", "bind": "x"}, state))
+    (spin,) = of_type(tool, Gtk.SpinButton)
+
+    spin.set_text("0.2")
+    spin.update()  # typed: exact, and the "typed" mark is over
+    spin.spin(Gtk.SpinType.STEP_FORWARD, spin.get_increments()[0])
+
+    assert tool.runtime.store.value(StateKey("x")) == 0.3  # not 0.30000000000000004
+
+
+def test_a_slider_dragged_to_a_position_on_whole_steps_is_snapped_and_one_off_them_is_not() -> None:
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    state: list[Json] = [real("x", 50.0, minimum=0.0, maximum=100.0, step=0.01)]
+    tool = RenderedTool(spec_of({"kind": "slider", "bind": "x"}, state))
+    (scale,) = of_type(tool, Gtk.Scale)
+
+    scale.get_adjustment().set_value(50.0 + 0.01 * 3)  # 50.03 with its noise: whole steps from 50
+    assert tool.runtime.store.value(StateKey("x")) == 50.03
+    scale.get_adjustment().set_value(50.0 + 0.0123456789)  # a position with digits of its own
+    assert tool.runtime.store.value(StateKey("x")) == 50.0123456789
+
+
+def test_nothing_a_signal_handler_raises_reaches_gtk_and_the_widget_is_put_back(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from unittest import mock
+
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+    from tumbleweed.ui.runtime import NumericRange
+
+    state: list[Json] = [real("x", 0.25, minimum=0.0, maximum=1.0, step=0.01)]
+    tool = RenderedTool(spec_of({"kind": "slider", "bind": "x"}, state))
+    (scale,) = of_type(tool, Gtk.Scale)
+
+    with (
+        caplog.at_level("ERROR"),
+        mock.patch.object(NumericRange, "snap_step", side_effect=ZeroDivisionError("boom")),
+    ):
+        scale.get_adjustment().set_value(0.75)  # the handler raises; nothing may come out of GTK
+
+    assert "a signal handler of a rendered widget failed" in caplog.text
+    assert tool.runtime.store.value(StateKey("x")) == 0.25  # the state was not written
+    assert scale.get_value() == 0.25  # and the widget shows what the state holds
+
+
+def test_a_slider_over_the_smallest_step_can_be_dragged_anywhere() -> None:
+    import sys
+
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.ui.gtk import RenderedTool
+
+    state: list[Json] = [real("x", 0.0, minimum=0.0, maximum=10.0, step=sys.float_info.min)]
+    tool = RenderedTool(spec_of({"kind": "slider", "bind": "x"}, state))
+    (scale,) = of_type(tool, Gtk.Scale)
+
+    scale.get_adjustment().set_value(5.0)
+
+    assert tool.runtime.store.value(StateKey("x")) == 5.0
+    assert scale.get_value() == 5.0

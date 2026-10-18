@@ -38,6 +38,7 @@ RANGES: dict[str, Json] = {
     "float, smallest step": real("x", 0.0, minimum=0.0, maximum=1.0, step=SMALLEST),
     "float, 1e-20 wide, step 1e-22": real("x", 0.0, minimum=0.0, maximum=1e-20, step=1e-22),
     "float, 1e-20 wide, no step": real("x", 0.0, minimum=0.0, maximum=1e-20),
+    "float, 10 wide, smallest step": real("x", 5.0, minimum=0.0, maximum=10.0, step=SMALLEST),
     "float, tiny range and step": real("x", 1e-300, minimum=0.0, maximum=1e-290, step=SMALLEST),
     "float, fine step": real("x", 0.5, minimum=-1.0, maximum=1.0, step=1e-9),
     "float, step is the range": real("x", 0.0, minimum=0.0, maximum=3.0, step=3.0),
@@ -49,6 +50,7 @@ RANGES: dict[str, Json] = {
 
 
 SPIN_REFUSED = {  # a spin button needs a step above GTK's epsilon (1e-10); these are slider-only
+    "float, 10 wide, smallest step",
     "float, 1e-20 wide, step 1e-22",
     "float, 1e-20 wide, no step",
     "float, tiny range and step",

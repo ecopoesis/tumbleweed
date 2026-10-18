@@ -23,6 +23,7 @@ from tumbleweed.ui.gtk.budget import (
     TextBudget,
 )
 from tumbleweed.ui.spec.limits import MAX_COMPONENTS
+from tumbleweed.ui.spec.names import StateKey
 
 if TYPE_CHECKING:
     from tumbleweed.core.types import JsonValue
@@ -708,3 +709,95 @@ def labels_text_now(tool: "RenderedTool") -> list[str]:
         and not isinstance(w.get_parent(), TextBlock)
         and isinstance(w.get_parent(), Gtk.Box | Gtk.Grid)
     ]
+
+
+class TestTheOverrunEndsWithTheEditing:
+    def crowded_with_empty_entries(self, count: int) -> "RenderedTool":
+        from tumbleweed.ui.gtk import RenderedTool
+
+        state: list[Json] = [text("a", "x" * 8000, max_length=65536)]
+        state += [text(f"e{i}", "", max_length=65536) for i in range(count)]
+        kids: list[Json] = [{"kind": "label", "bind": "a"} for _ in range(8)]  # 64,000 of 65,536
+        kids += [{"kind": "entry", "bind": f"e{i}"} for i in range(count)]
+        return RenderedTool(spec_of(many_of(kids), state))
+
+    def test_typing_into_many_entries_does_not_grow_the_total_by_a_cap_each(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        tool = self.crowded_with_empty_entries(12)
+        entries = of_type(tool, Gtk.Entry)
+
+        for entry in entries:
+            entry.get_buffer().insert_text(0, "q" * 8192, -1)  # a full cap of typing in each
+            assert pump_until(lambda: tool.shown_text_total <= MAX_SHOWN_PER_TOOL)  # settles
+
+        assert tool.shown_text_total <= MAX_SHOWN_PER_TOOL  # nobody is in an entry now: no overrun
+        assert (
+            tool.runtime.store.value(StateKey("e11")) == "q" * 8192
+        )  # the state kept everything typed
+
+    def test_at_any_moment_at_most_the_entry_being_typed_in_is_over_the_budget(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        tool = self.crowded_with_empty_entries(12)
+        entries = of_type(tool, Gtk.Entry)
+        worst = 0
+
+        for entry in entries:
+            entry.get_buffer().insert_text(0, "q" * 8192, -1)
+            worst = max(worst, tool.shown_text_total)  # right after the edit, before any idle turn
+            pump(0.02)
+
+        assert worst <= MAX_SHOWN_PER_TOOL + MAX_SHOWN_PER_TEXT  # one entry's cap, not twelve
+
+    def test_when_the_focus_leaves_the_claim_is_made_again_like_any_other(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk import RenderedTool
+
+        state: list[Json] = [
+            text("s", "x" * 8000, max_length=65536),
+            text("t", "", max_length=65536),
+        ]
+        kids: list[Json] = [{"kind": "entry", "bind": "s"} for _ in range(8)]
+        kids.append({"kind": "entry", "bind": "t"})
+        tool = RenderedTool(spec_of(many_of(kids), state))
+        last = of_type(tool, Gtk.Entry)[-1]
+        (leave,) = [
+            c for c in last.observe_controllers() if isinstance(c, Gtk.EventControllerFocus)
+        ]
+
+        last.get_buffer().insert_text(0, "h" * 3000, -1)  # 64,000 + 3,000: over the budget
+        leave.emit("leave")  # the user goes elsewhere
+        pump(0.1)
+
+        assert tool.shown_text_total <= MAX_SHOWN_PER_TOOL
+        assert last.get_text() == NOT_SHOWN  # it no longer has a claim the others do not
+
+
+def test_a_focused_entry_keeps_its_claim_until_the_focus_leaves(echo_shell: Shell) -> None:
+    from tumbleweed.shell._gi import Gtk
+
+    state: list[Json] = [text("s", "x" * 8000, max_length=65536), text("t", "", max_length=65536)]
+    kids: list[Json] = [{"kind": "entry", "bind": "s"} for _ in range(8)]
+    kids.append({"kind": "entry", "bind": "t"})
+    window = echo_shell.window
+    tool = window.canvas.show_spec(spec_of(many_of(kids), state))
+    window.present()
+    assert pump_until(lambda: window.get_mapped() and window.canvas.get_width() > 0)
+    last = of_type(tool, Gtk.Entry)[-1]
+    delegate = last.get_delegate()
+    assert isinstance(delegate, Gtk.Text)
+    assert delegate.grab_focus()
+    assert pump_until(delegate.is_focus)
+
+    last.get_buffer().insert_text(0, "h" * 3000, -1)  # 64,000 + 3,000: over the budget
+    pump(0.2)  # idle turns come and go while the user is still in the entry
+
+    assert last.get_text() == "h" * 3000  # it kept its text: it is the focused one
+    assert last.get_editable() is True
+    assert tool.shown_text_total > MAX_SHOWN_PER_TOOL
+
+    window.set_focus(None)  # the user goes elsewhere
+    assert pump_until(lambda: tool.shown_text_total <= MAX_SHOWN_PER_TOOL)
+
+    assert last.get_text() == NOT_SHOWN

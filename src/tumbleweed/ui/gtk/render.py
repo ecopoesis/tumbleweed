@@ -75,6 +75,11 @@ class RenderedTool:
         self._widgets.clear()
         self._factories.clear()
 
+    @property
+    def shown_text_total(self) -> int:
+        """The characters of text the tool has claimed on the screen (`budget`)."""
+        return self._context.budget.total
+
     def flush(self) -> None:
         """Show the texts that are waiting for an idle turn (they are shown once per frame)."""
         self._context.flush()

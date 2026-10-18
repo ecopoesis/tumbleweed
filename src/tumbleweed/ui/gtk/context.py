@@ -81,9 +81,32 @@ class BuildContext:
 
         A handler refers to its widget and to this context, and a signal connection is a
         reference GC cannot see: without `close` every tool shown would stay alive.
+
+        The handler runs behind a boundary: whatever it raises is logged, and the widgets are put
+        back to what the state holds, so that a bug cannot leave a widget showing a value the state
+        does not have, nor an exception in GTK's signal machinery.
         """
-        handler_id = widget.connect(signal, handler)
+
+        def guarded(*args: object) -> object:
+            try:
+                return handler(*args)
+            except Exception:
+                logger.exception("a signal handler of a rendered widget failed")
+                self.resync()
+                return False  # what the signals that want an answer take as `not handled`
+
+        handler_id = widget.connect(signal, guarded)
         self._on_close.append(lambda: widget.disconnect(handler_id))
+
+    def resync(self) -> None:
+        """Show the state's values in every bound widget again."""
+        store = self.runtime.store
+        with self.programmatic():
+            for binding in tuple(self._bindings):
+                try:
+                    binding.update(store.value(binding.key), store.is_stale(binding.key))
+                except Exception:
+                    logger.exception("a widget could not be put back to %s", binding.key)
 
     def on_close(self, undo: Callable[[], None]) -> None:
         """Run `undo` when the tool is closed."""

@@ -173,6 +173,8 @@ class NumericRange:
         for unit in (self.step, self.page):
             if unit <= 0.0 or not math.isfinite(delta):
                 continue
+            if abs(delta) > (_MAX_STEPS + 0.5) * unit:
+                continue  # many steps away (and `delta / unit` may be infinite: no `round` of that)
             count = round(delta / unit)
             if count == 0 or abs(count) > _MAX_STEPS:
                 continue

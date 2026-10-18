@@ -89,9 +89,12 @@ def harden_text(widget: Gtk.Editable) -> Callable[[], None]:
 
 
 _SPIN_INPUT_WARNING = "g_value_get_double: assertion 'G_VALUE_HOLDS_DOUBLE (value)' failed"
+# `warnings` matches a filter's message with `re.match` (the start only): without the end anchor a
+# message that merely begins with ours would be ignored too.
+_SPIN_PATTERN = re.escape(_SPIN_INPUT_WARNING) + r"\Z"
 _SPIN_FILTER = (
     "ignore",
-    re.compile(re.escape(_SPIN_INPUT_WARNING), re.IGNORECASE),
+    re.compile(_SPIN_PATTERN, re.IGNORECASE),
     GObject.Warning,
     None,
     0,
@@ -121,9 +124,7 @@ def quiet_spin_input_marshalling() -> Callable[[], None]:
     if (
         _SPIN_FILTER not in warnings.filters
     ):  # (a test's `catch_warnings` may have restored it away)
-        warnings.filterwarnings(
-            "ignore", message=re.escape(_SPIN_INPUT_WARNING), category=GObject.Warning
-        )
+        warnings.filterwarnings("ignore", message=_SPIN_PATTERN, category=GObject.Warning)
     _spin_users += 1
     released = False
 
