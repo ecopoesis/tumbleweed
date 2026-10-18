@@ -8,18 +8,18 @@ This test keeps the next change from adding such a call, and keeps `Vte` confine
 modules that use it. (That the agent cannot import the shell at all is import-linter's contract
 "agent never imports shell".)
 
-Two rules, because a list of bad names keeps missing one:
+A tripwire against accidental or casual use, not a security boundary (a static check of Python
+cannot stop deliberate obfuscation: that is review's and the import contracts' job). Two rules,
+because a list of bad names keeps missing one:
 
-- **In the two modules that use Vte** (`VTE_MODULES`) it is an **allowlist**, and fails closed.
-  Every attribute name in them that does not start with an underscore (`terminal.set_hexpand`,
-  `Gtk.Box`, `os.waitid`, ...) must be in `ALLOWED_ATTRIBUTES`, which is exactly what those modules
-  use today, whatever object it is used on: a new Vte method (or a new anything) fails until a
-  reviewer adds its name here. Besides: only `child-exited` may be the name of a signal in
-  `connect*`/`emit*`/`signal_emit_by_name`, and it must be a constant; `getattr`, `setattr`,
-  `vars`, `eval`, `exec` are not used; no class derives from anything of Vte; no `do_*` method (the
-  virtual functions `do_commit`, `do_contents_changed`, ... of a subclass) is defined; and no
-  `Gtk.EventControllerKey` is made (a key controller on the terminal or an ancestor sees every
-  keystroke).
+- **In the two modules that use Vte** (`VTE_MODULES`) it is an **allowlist**: every attribute name
+  (single-underscore private names apart) must be in `ALLOWED_ATTRIBUTES`, exactly what those
+  modules use today, whatever object it is used on, so a new Vte method fails until a reviewer adds
+  its name; the imports are `PINNED_IMPORTS`, with no `as`; only the constant `child-exited` may be
+  a signal name in a call; no dunder but `__init__` and `__name__`; no call of a bare name that is
+  not defined or imported there; none of `RUN_TIME_NAMES` (`getattr`, `eval`, `attrgetter`, ...);
+  no class derived from Vte and no `do_*` method; no `Gtk.EventControllerKey` or
+  `EventControllerLegacy` (a key controller on the terminal or an ancestor sees every keystroke).
 - **In the rest of `src/`** it is a **denylist** of names: the Vte calls that feed, paste, read
   text, match or search the screen or reach the pty, the properties and signals that carry what
   the shell says or what is typed, `emit` of the clipboard and text
@@ -110,7 +110,62 @@ ALLOWED_ATTRIBUTES = frozenset(
     }
 )
 ALLOWED_SIGNALS = frozenset({"child-exited"})
-RUN_TIME_NAMES = frozenset({"getattr", "setattr", "vars", "eval", "exec"})
+# Names that look a member up, or build code, from a string: never used in the Vte modules.
+RUN_TIME_NAMES = frozenset(
+    {
+        "getattr",
+        "setattr",
+        "delattr",
+        "vars",
+        "eval",
+        "exec",
+        "compile",
+        "globals",
+        "locals",
+        "__import__",
+        "__builtins__",
+        "attrgetter",
+        "methodcaller",
+    }
+)
+ALLOWED_DUNDER_ATTRIBUTES = frozenset({"__init__", "__name__"})
+ALLOWED_DUNDER_NAMES = frozenset({"__name__"})
+# The builtins the Vte modules call (anything else called by a bare name must be defined in the
+# module or be one of the imports below).
+ALLOWED_BUILTIN_CALLS = frozenset({"dict", "isinstance", "list", "str", "super", "type"})
+# Exactly the imports of the Vte modules: ("import", "os") for `import os`, (module, name) for
+# `from module import name`. No `as` renames, nothing else.
+PINNED_IMPORTS = frozenset(
+    {
+        ("import", "functools"),
+        ("import", "logging"),
+        ("import", "os"),
+        ("import", "signal"),
+        ("import", "sys"),
+        ("import", "time"),
+        ("import", "gi"),
+        ("collections.abc", "Callable"),
+        ("typing", "TYPE_CHECKING"),
+        ("typing", "Final"),
+        ("typing", "final"),
+        ("gi.repository", "Vte"),
+        ("tumbleweed.shell._gi", "Gio"),
+        ("tumbleweed.shell._gi", "GLib"),
+        ("tumbleweed.shell._gi", "Gtk"),
+        ("tumbleweed.shell._vte", "vte_available"),
+        ("tumbleweed.shell._widgets", "plain_label"),
+        ("tumbleweed.shell.viewmodel.display", "display_text"),
+        ("tumbleweed.shell.viewmodel.terminal", "TerminalError"),
+        ("tumbleweed.shell.viewmodel.terminal", "TerminalSettings"),
+        ("tumbleweed.shell.viewmodel.terminal", "child_environment"),
+        ("tumbleweed.shell.viewmodel.terminal", "current_account"),
+        ("tumbleweed.shell.viewmodel.terminal", "external_command"),
+        ("tumbleweed.shell.viewmodel.terminal", "login_argv"),
+        ("tumbleweed.shell.viewmodel.terminal", "resolve_target"),
+        ("tumbleweed.shell.viewmodel.terminal_spawn", "SubprocessSpawner"),
+        ("tumbleweed.shell.viewmodel.terminal_spawn", "stop_group"),
+    }
+)
 
 # Denylist (everywhere): methods, as exact names or prefixes.
 FORBIDDEN = frozenset(
@@ -189,7 +244,8 @@ FORBIDDEN_SIGNALS = frozenset(
 # Of those, the ones that are harmless to *listen* to on our own widgets (the chat text has a
 # `copy-clipboard` handler) and only matter when something emits them at the terminal.
 CLIPBOARD_SIGNALS = frozenset({"paste-clipboard", "copy-clipboard"})
-KEY_SIGNALS = frozenset({"key-pressed", "key-released"})
+KEY_SIGNALS = frozenset({"key-pressed", "key-released", "event"})  # `event`: EventControllerLegacy
+KEY_CONTROLLERS = frozenset({"EventControllerKey", "EventControllerLegacy"})
 SIGNAL_METHODS = frozenset(
     {
         "connect",
@@ -218,6 +274,34 @@ def _constant(argument: ast.expr) -> str | None:
     return None
 
 
+def _private(attribute: str) -> bool:
+    """Ours: a single leading underscore (a dunder is Python's, and reaches anything)."""
+    return attribute.startswith("_") and not attribute.startswith("__")
+
+
+def _imports(tree: ast.AST) -> tuple[set[tuple[str, str]], set[str], list[str]]:
+    """The (module, name) pairs imported, the names they bind, and what is wrong with them."""
+    pairs: set[tuple[str, str]] = set()
+    bound: set[str] = set()
+    wrong: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            entries = [("import", alias) for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            entries = [(node.module or "", alias) for alias in node.names]
+        else:
+            continue
+        for module, alias in entries:
+            pair = (module, alias.name)
+            pairs.add(pair)
+            bound.add(alias.asname or alias.name.split(".")[0])
+            if alias.asname is not None:
+                wrong.append(f"line {node.lineno}: import {alias.name} as {alias.asname}")
+            elif pair not in PINNED_IMPORTS:
+                wrong.append(f"line {node.lineno}: import {module} {alias.name} is not pinned")
+    return pairs, bound, wrong
+
+
 def _forbidden_name(name: str) -> bool:
     return name in FORBIDDEN or name.startswith(FORBIDDEN_PREFIXES)
 
@@ -227,7 +311,15 @@ def offences(source: str, *, vte_module: bool = False, key_module: bool = False)
     allowlist (the two modules that use Vte), `key_module` also rejects key controllers (those and
     `window.py`)."""
     found = []
-    for node in ast.walk(ast.parse(source)):
+    tree = ast.parse(source)
+    callable_names = set(ALLOWED_BUILTIN_CALLS)
+    if vte_module:
+        _pairs, bound, wrong = _imports(tree)
+        found += wrong
+        callable_names |= bound | {
+            n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+        }
+    for node in ast.walk(tree):
         line = getattr(node, "lineno", 0)
         if isinstance(node, ast.Attribute):
             plain = node.attr.replace("_", "-")
@@ -239,19 +331,32 @@ def offences(source: str, *, vte_module: bool = False, key_module: bool = False)
                 found.append(f"line {line}: .props")
             if plain in FORBIDDEN_PROPERTIES and isinstance(node.value, ast.Attribute):
                 found.append(f"line {line}: .{node.attr}")
-            if (key_module or vte_module) and node.attr == "EventControllerKey":
-                found.append(f"line {line}: EventControllerKey")
-            if vte_module and not node.attr.startswith("_") and node.attr not in ALLOWED_ATTRIBUTES:
+            if (key_module or vte_module) and node.attr in KEY_CONTROLLERS:
+                found.append(f"line {line}: {node.attr}")
+            if vte_module and node.attr.startswith("__"):
+                if node.attr not in ALLOWED_DUNDER_ATTRIBUTES:
+                    found.append(f"line {line}: .{node.attr} (a dunder)")
+            elif vte_module and not _private(node.attr) and node.attr not in ALLOWED_ATTRIBUTES:
                 found.append(f"line {line}: .{node.attr} is not on the allowlist")
         if isinstance(node, ast.Name):
             if node.id in {"feed_child", "feed_child_binary"}:
                 found.append(f"line {line}: {node.id}")
-            if (key_module or vte_module) and node.id == "EventControllerKey":
-                found.append(f"line {line}: EventControllerKey")
+            if (key_module or vte_module) and node.id in KEY_CONTROLLERS:
+                found.append(f"line {line}: {node.id}")
             if vte_module and node.id in RUN_TIME_NAMES:
-                found.append(f"line {line}: {node.id} (a name built at run time)")
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            method = node.func.attr
+                found.append(
+                    f"line {line}: {node.id} (looks a member up, or builds code, at run time)"
+                )
+            if vte_module and node.id.startswith("__") and node.id not in ALLOWED_DUNDER_NAMES:
+                found.append(f"line {line}: {node.id} (a dunder)")
+        if isinstance(node, ast.Call) and isinstance(node.func, (ast.Attribute, ast.Name)):
+            method = node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+            if (
+                vte_module
+                and isinstance(node.func, ast.Name)
+                and node.func.id not in callable_names
+            ):
+                found.append(f"line {line}: call of {node.func.id}, not defined or imported here")
             if method in SIGNAL_METHODS:
                 for argument in _signal_names(node):
                     name = _constant(argument)
@@ -341,6 +446,16 @@ def test_the_allowlist_is_exactly_what_the_vte_modules_use() -> None:
                 used.add(node.attr)
 
     assert used == ALLOWED_ATTRIBUTES
+
+
+def test_the_pinned_imports_are_exactly_what_the_vte_modules_import() -> None:
+    used: set[tuple[str, str]] = set()
+    for relative in VTE_MODULES:
+        pairs, _bound, wrong = _imports(ast.parse((SOURCE / relative).read_text()))
+        used |= pairs
+        assert wrong == []
+
+    assert used == PINNED_IMPORTS
 
 
 def test_vte_is_used_only_by_the_pane_and_its_loader() -> None:
@@ -476,10 +591,46 @@ def test_get_text_and_feed_are_caught_in_the_modules_that_use_vte_only(snippet: 
         "class Mine(Gtk.Box):\n    def do_commit(self, text, size): ...",
         "keys = Gtk.EventControllerKey()",
         "keys = EventControllerKey()",
+        "keys = Gtk.EventControllerLegacy()",
     ],
 )
-def test_the_allowlist_in_the_vte_modules_fails_closed(snippet: str) -> None:
+def test_the_allowlist_in_the_vte_modules_catches_what_is_not_on_it(snippet: str) -> None:
     assert offences(snippet, vte_module=True) != []
+
+
+EMIT_PASTE = "{}(self._terminal, 'paste-clipboard')"
+BYPASSES = [
+    "from operator import attrgetter\nattrgetter('get_text')(self._terminal)()",
+    "from operator import methodcaller\nmethodcaller('feed_child', b'x')(self._terminal)",
+    "self._terminal.__getattribute__('get_text')()",
+    "type(self._terminal).__getattribute__(self._terminal, 'feed_child')(b'x')",
+    "self._terminal.__class__.__dict__",
+    "globals()['__builtins__']",
+    "locals()",
+    "__import__('builtins').getattr",
+    "compile('1', 'x', 'eval')",
+    "from builtins import getattr as g\ng(self._terminal, 'get_text')()",
+    "import builtins\nbuiltins.getattr",
+    "from tumbleweed.shell.helpers import read_it\nread_it(self._terminal)",
+    "from gi.repository.GObject import signal_emit_by_name as e\n" + EMIT_PASTE.format("e"),
+    "from gi.repository.GObject import signal_emit_by_name\n"
+    + EMIT_PASTE.format("signal_emit_by_name"),
+    "from gi.repository.GObject import Object as O\nO.get_property",
+    "from gi.repository import Vte as V",
+    "from os import *",
+    "unknown_function(self._terminal)",
+    "callback = self._terminal.connect\ncallback('commit', f)",
+]
+
+
+@pytest.mark.parametrize("snippet", BYPASSES)
+def test_the_known_ways_round_the_allowlist_are_caught_in_the_vte_modules(snippet: str) -> None:
+    assert offences(snippet, vte_module=True) != []
+
+
+def test_a_signal_call_by_a_bare_name_is_checked_outside_the_vte_modules_too() -> None:
+    assert offences("signal_emit_by_name(terminal, 'paste-clipboard')") != []
+    assert offences("emit('commit')") != []
 
 
 @pytest.mark.parametrize(
@@ -493,6 +644,10 @@ def test_the_allowlist_in_the_vte_modules_fails_closed(snippet: str) -> None:
         "terminal.set_allow_hyperlink(False)",
         "terminal.connect('child-exited', self._on_child_exited)",
         "terminal.connect('child_exited', self._on_child_exited)",
+        "self._terminal.connect('child-exited', lambda t, s: None)",
+        "super().__init__(orientation=1)",
+        "logger = logging.getLogger(__name__)",
+        "self._terminal._private_thing()",
         "terminal.spawn_async(pty_flags=Vte.PtyFlags.DEFAULT)",
         "self._terminal.grab_focus()",
         "self.remove(terminal)",
@@ -508,6 +663,8 @@ def test_what_the_pane_does_passes_the_allowlist(snippet: str) -> None:
     [
         "keys = Gtk.EventControllerKey()",
         "keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)",
+        "keys = Gtk.EventControllerLegacy()\nself.add_controller(keys)",
+        "keys = Gtk.EventControllerLegacy()\nkeys.connect('event', on_event)",
         "window.connect('key-pressed', handler)",
         "keys.connect('key-released', handler)",
     ],

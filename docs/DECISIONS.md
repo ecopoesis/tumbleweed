@@ -447,16 +447,22 @@ that GTK lets the key through to it.
 focus (#90). A configurable external terminal, and a check of the list against real terminals, are #91.
 A second terminal pane, tabs, copy and paste buttons and a configurable key are not in v1.
 **Consequences.** `Vte` is imported only by `tumbleweed.shell.terminal_pane` and its loader, and a test
-holds the line (`tests/shell/test_terminal_isolation.py`). In those two modules it is an allowlist that
-fails closed: every attribute name must be one they use today, only the signal `child-exited` may be
-connected (as a constant), no class derives from Vte, no `do_*` override, no `getattr`/`setattr`/`vars`,
-no `Gtk.EventControllerKey`. In the rest of `src/` it is a denylist by name of the calls that feed or
-paste, read text, match or search the screen or reach the pty, of the properties and signals that carry
-what the shell says or what is typed, of `emit` of those and of the clipboard signals, and of
-subclassing `Vte.*`; key controllers are rejected in `window.py` too. Gaps, by design: outside the
-Vte modules a call through an alias or `getattr`, a signal or property named by a variable, a key
-controller made elsewhere, methods Vte adds later; and a terminal widget handed to another module;
-review covers them. No code of ours types into the terminal or reads it, so I1 holds by absence.
+holds the line (`tests/shell/test_terminal_isolation.py`). That test is a tripwire against accidental or
+casual use, not a security boundary: a static check of Python cannot stop deliberate obfuscation (`exec`
+of a computed string, `ctypes`, a C extension, a monkeypatch from another module), which is what code
+review and the import contracts are for. I1 holds because no code of ours types into the terminal or
+reads it. In the two Vte modules the test allows only the attribute names they use today (private
+single-underscore names apart), pins the imports to the exact (module, name) pairs with no `as`, allows
+only the constant signal `child-exited`, no dunder but `__init__` and `__name__`, no call of an unknown
+bare name, none of `getattr`, `setattr`, `vars`, `eval`, `exec`, `compile`, `globals`, `locals`,
+`__import__`, `attrgetter`, `methodcaller`, no class derived from Vte and no `do_*` override, and no key
+controller (`EventControllerKey`, `EventControllerLegacy`), which it also rejects in `window.py`. In the
+rest of `src/` it is a denylist by name of the calls that feed or paste, read text, match or search the
+screen or reach the pty, of any `.props` access, of the properties and signals that carry what the shell
+says or what is typed, of `emit` of those and of the clipboard signals, and of subclassing `Vte.*`.
+Gaps: outside the Vte modules an alias, `getattr` or a variable signal or property name; a key
+controller made elsewhere; methods Vte adds later (outside those modules); a widget handed to another
+module; deliberate obfuscation.
 Closing the terminal moves the focus to the chat input. That shows the side panel again if F9 hid
 it, because the input must be visible to take the focus; it applies whether the shell exits or F12
 closes the pane, and it is deliberate: closing the terminal is a return to the chat.
