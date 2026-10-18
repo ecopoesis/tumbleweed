@@ -224,8 +224,6 @@ class ToolPackage(SpecModel):
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
-        if self.manifest.spec_version != self.ui.version:
-            raise InvalidValueError("the manifest's spec version is not the spec's")
         _check_ports_and_modules(self.manifest.inputs, self.manifest.outputs, self.modules, self.ui)
         return self
 

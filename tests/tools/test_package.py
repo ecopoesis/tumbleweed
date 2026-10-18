@@ -204,6 +204,20 @@ class TestTaint:
         assert problems_of_parse(text_of(data))
 
 
+class TestOneFormForSets:
+    def test_a_package_with_unsorted_or_repeated_tags_or_capabilities_is_refused(self) -> None:
+        cases: list[tuple[str, JsonValue]] = [
+            ("tags", ["b", "a"]),
+            ("tags", ["a", "a"]),
+            ("capabilities", ["net.full", "fs.read"]),
+        ]
+        for field, value in cases:
+            data = tree()
+            at(data, ("manifest",))[field] = value
+
+            assert any("sorted and distinct" in p for p in problems_of_parse(text_of(data)))
+
+
 class TestPorts:
     def ports(self, inputs: list[Json], outputs: list[Json]) -> Json:
         return draft_json(inputs=[*inputs], outputs=[*outputs])

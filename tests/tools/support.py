@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Sequence
+from functools import cache
 
 from tests.ui.spec.support import Json, accepted, build, golden
 from tumbleweed.core.ids import ToolId
@@ -13,6 +14,8 @@ from tumbleweed.tools import (
     build_package,
     canonical_package,
 )
+from tumbleweed.tools.errors import ToolTooLargeError
+from tumbleweed.tools.limits import MAX_MODULE_BYTES
 from tumbleweed.tools.package import DeclaredCapability, Taint
 from tumbleweed.ui.spec import UiSpec
 from tumbleweed.ui.spec.names import ModuleName
@@ -84,3 +87,35 @@ def simple_ui(*keys: str) -> UiSpec:
     """A spec with one string entry per key (for ports and limits)."""
     entries: list[Json] = [{"kind": "string", "key": key, "default": ""} for key in keys]
     return accepted(build(state=entries))
+
+
+@cache
+def near_limit_draft() -> ToolDraft:
+    """A valid draft whose canonical package is within a few bytes of `MAX_PACKAGE_BYTES`, made of
+    the characters that cost most to escape (quote, backslash, newline: two bytes each in the
+    package and four in an IPC frame that holds it), to show that the biggest package and its
+    bundle fit one frame."""
+    source = '"\\\n' * (MAX_MODULE_BYTES // 3)  # exactly MAX_MODULE_BYTES, 6 bytes per 3 characters
+    modules = [module("first", source), module("second", source)]
+
+    def made(fill: int) -> ToolDraft:
+        entries: list[Json] = [
+            {"kind": "string", "key": key, "default": '"' * fill, "max_length": 65_536}
+            for key in ("one", "two")
+        ]
+        return ToolDraft(name="Biggest", ui=accepted(build(state=entries)), modules=tuple(modules))
+
+    def size(fill: int) -> int | None:
+        try:
+            return len(package(source=made(fill)).data)
+        except ToolTooLargeError:
+            return None
+
+    low, high = 0, 65_536  # the largest fill that is not too large
+    while low < high:
+        middle = (low + high + 1) // 2
+        if size(middle) is None:
+            high = middle - 1
+        else:
+            low = middle
+    return made(low)

@@ -275,7 +275,7 @@ class TestBudget:
             canonicalize(dict.fromkeys(map(str, range(100_000)), 0), max_nodes=10)
 
     def test_a_million_nested_empty_lists_are_refused_by_the_node_budget(self) -> None:
-        many = [[] for _ in range(1_000_001)]
+        many: list[list[object]] = [[] for _ in range(1_000_001)]
 
         with pytest.raises(ValueError, match="more than 1000000 values"):
             canonicalize(many)
@@ -295,3 +295,8 @@ class TestBudget:
         assert jcs.MAX_NODES == 1_000_000
         assert jcs.MAX_BYTES == 16 * 1024 * 1024
         assert canonicalize(list(range(1000))).startswith("[0,1,2")
+
+    def test_a_lone_scalar_is_a_node_too(self) -> None:
+        assert canonicalize(1, max_nodes=1) == "1"
+        with pytest.raises(ValueError, match="more than 0 values"):
+            canonicalize(1, max_nodes=0)
