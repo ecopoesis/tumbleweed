@@ -1,13 +1,16 @@
-"""Audio is never persisted (S06, ARCHITECTURE section 9).
+"""Audio is never persisted (S06, ARCHITECTURE section 9). What each proof covers, honestly:
 
-Two proofs. Behaviour: a whole utterance (capture, WAV, HTTP, transcript) runs under an audit hook
-that records every write to the file system, and there is none. Structure: the voice package's
-sources contain no call that could write a file (an AST scan), and the GStreamer pipeline is built
-from a fixed list of elements, none of which writes (a file sink would be the way audio could reach
-a disk without a line of Python saying so).
+- *Python writes*: a whole utterance (capture buffer, WAV, HTTP, transcript) runs under an audit
+  hook that records every write the interpreter makes to the file system, and there is none. An
+  audit hook cannot see what native code does, so it says nothing about GStreamer's own writes;
+- *structure*: the voice package's sources contain no call that could write a file (an AST scan);
+- *GStreamer*: the pipeline is built from a fixed list of elements, none of which writes (a file
+  sink would be the way audio could reach a disk without a line of Python saying so), checked
+  here by name, and `test_gstreamer.py` runs a real capture and checks that no file appears.
 """
 
 import ast
+import os
 import sys
 import threading
 from collections.abc import Iterator
@@ -23,7 +26,7 @@ from tumbleweed.voice.input import VoiceInput, VoicePhase
 from tumbleweed.voice.whisper import WhisperServerBackend
 
 VOICE = Path(__file__).resolve().parents[2] / "src" / "tumbleweed" / "voice"
-_WRITE_FLAGS = 0o3 | 0o100 | 0o2000 | 0o1000  # O_WRONLY | O_RDWR | O_CREAT | O_APPEND | O_TRUNC
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
 _FILE_EVENTS = {
     "open",
     "os.mkdir",

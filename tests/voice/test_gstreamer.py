@@ -9,6 +9,7 @@ import struct
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -115,3 +116,26 @@ def test_a_platform_with_no_microphone_source_is_an_audio_error_not_a_crash() ->
 def test_a_missing_element_is_named_in_a_fixed_message() -> None:
     with pytest.raises(AudioError, match="no-such-element element is not installed"):
         _make("no-such-element")
+
+
+def test_a_real_capture_creates_no_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """What an audit hook cannot see: nothing GStreamer does leaves a file in the places a
+    program writes to (the working directory, HOME, TMPDIR, the XDG directories)."""
+    places = {name: tmp_path / name.lower() for name in ("HOME", "TMPDIR", "XDG_CACHE_HOME")}
+    places["XDG_DATA_HOME"] = tmp_path / "xdg_data"
+    for name, place in places.items():
+        place.mkdir()
+        monkeypatch.setenv(name, str(place))
+    monkeypatch.chdir(tmp_path)
+    before = sorted(tmp_path.rglob("*"))
+
+    capture = tone()
+    try:
+        capture.start(lambda: None)
+        time.sleep(0.5)
+        utterance = capture.stop()
+    finally:
+        capture.close()
+
+    assert utterance.byte_count > 0
+    assert sorted(tmp_path.rglob("*")) == before
