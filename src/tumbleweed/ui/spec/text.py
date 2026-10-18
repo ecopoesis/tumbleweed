@@ -40,6 +40,7 @@ from typing import Annotated, Final
 
 from pydantic import AfterValidator, BeforeValidator, Field, PlainValidator, WithJsonSchema
 
+from tumbleweed.core.canonical import normalize_text
 from tumbleweed.core.errors import InvalidValueError, excerpt
 from tumbleweed.core.jcs import double_of_int
 from tumbleweed.ui.spec.limits import (
@@ -120,7 +121,7 @@ def canonical_text(value: str) -> str:
     Two texts that are equal after this are one text once saved, so names that must be distinct
     (JSON keys, column names) are compared in this form.
     """
-    return unicodedata.normalize("NFC", value.replace("\r\n", "\n").replace("\r", "\n"))
+    return normalize_text(value)
 
 
 def double_of(value: int) -> float:

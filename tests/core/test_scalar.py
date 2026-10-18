@@ -13,7 +13,7 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 from pydantic_core import core_schema
 
-from tumbleweed.core import _scalar, errors, ids, jcs, types
+from tumbleweed.core import _scalar, canonical, errors, ids, jcs, types
 from tumbleweed.core._scalar import FrozenText
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.ids import EntityId, TaskId
@@ -146,7 +146,7 @@ class TestFinalAtRuntime:
             errors.InvalidValueError,
         }
         offenders = []
-        for module in (ids, types, errors, _scalar, jcs):
+        for module in (ids, types, errors, _scalar, jcs, canonical):
             for _, cls in inspect.getmembers(module, inspect.isclass):
                 if cls.__module__ != module.__name__ or cls in designed_for_subclassing:
                     continue
@@ -162,7 +162,7 @@ class TestFinalAtRuntime:
 
         modules = {m.name for m in pkgutil.iter_modules(tumbleweed.core.__path__)}
 
-        assert modules == {"_scalar", "errors", "ids", "jcs", "types"}
+        assert modules == {"_scalar", "canonical", "errors", "ids", "jcs", "types"}
         for name in modules:
             importlib.import_module(f"tumbleweed.core.{name}")
 

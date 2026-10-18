@@ -12,6 +12,14 @@ an integer in a value must stand for a double (`double_of_int`): the canonical f
 above 2**53 is its shortest digits padded with zeros (`2**60` is `1152921504606847000`), which
 reads back as an integer that is no longer exactly the double, and a canonicaliser that rounded
 such an integer silently would give two values one hash.
+
+Canonicalising is iterative and has a budget of values and of output bytes (`canonicalize`), so
+a hostile value costs a bounded amount of time and memory and cannot reach the recursion limit
+(#62). That bounds the work, not what is valid: callers still validate a value (a tool package is
+a strict model, `tumbleweed.tools`) and canonicalise only what passed.
+
+In a `json` value, an int and a float of the same value are one value here (`5.0` is written
+`5`), and the bytes are stable; a consumer must not depend on which of the two it had.
 """
 
 import math
@@ -22,6 +30,10 @@ from typing import Final
 # the double it equals).
 _DIGITS_LIMIT: Final = 10**21
 _MAX_DEPTH: Final = 200  # what the JSON parser of pydantic accepts, too
+MAX_NODES: Final = 1_000_000
+"""The default budget of values (containers, scalars and object keys) in one canonicalisation."""
+MAX_BYTES: Final = 16 * 1024 * 1024
+"""The default budget of output bytes (UTF-8) of one canonicalisation."""
 
 _ESCAPES: Final = {
     ord('"'): '\\"',
@@ -94,44 +106,89 @@ def _string(text: str) -> str:
     return '"' + text.translate(_ESCAPES) + '"'
 
 
-def _canonical(value: object, depth: int) -> str:
-    if depth > _MAX_DEPTH:
-        raise ValueError(f"nested deeper than {_MAX_DEPTH}")
-    kind = type(value)
-    if value is None:
-        return "null"
-    if kind is bool:
-        return "true" if value else "false"
-    if isinstance(value, str) and kind is str:
-        return _string(value)
-    if isinstance(value, int) and kind is int:
-        number = double_of_int(value)
-        if number is None:
-            raise ValueError("an integer that is not an IEEE-754 double: JCS would round it")
-        return es_number(number)
-    if isinstance(value, float) and kind is float:
-        return es_number(value)
-    if isinstance(value, list) and kind is list:
-        return "[" + ",".join(_canonical(item, depth + 1) for item in value) + "]"
-    if isinstance(value, dict) and kind is dict:
-        for key in value:
-            if type(key) is not str:
-                raise ValueError(f"a key of an object must be a string, got {type(key).__name__}")
-        members = sorted(value.items(), key=lambda member: member[0].encode("utf-16-be", "strict"))
-        return (
-            "{"
-            + ",".join(f"{_string(key)}:{_canonical(item, depth + 1)}" for key, item in members)
-            + "}"
-        )
-    raise ValueError(f"not a JSON value: {kind.__name__}")
+def _text_bytes(text: str) -> int:
+    return len(text) if text.isascii() else len(text.encode("utf-8"))
 
 
-def canonicalize(value: object) -> str:
+def _check_key(key: object) -> str:
+    if type(key) is not str:
+        raise ValueError(f"a key of an object must be a string, got {type(key).__name__}")
+    return key
+
+
+def canonicalize(value: object, *, max_nodes: int = MAX_NODES, max_bytes: int = MAX_BYTES) -> str:
     """The canonical JSON text (RFC 8785) of a JSON value; `ValueError` if it is not one.
 
     Only exact `dict`, `list`, `str`, `int`, `float`, `bool` and `None` are JSON values here
     (a tuple, a set or a subclass is not), object keys must be strings, text must be well
     formed (no lone surrogate), a float must be finite, an integer must stand for a double
     (`double_of_int`) and nesting is at most 200 deep. Nothing is ever rounded silently.
+
+    The walk is iterative, so no depth can exhaust the interpreter's stack, and it is bounded:
+    at most `max_nodes` values (every container, scalar and object key counts, so a list of a
+    million empty lists is refused as it is read, not after it is built) and `max_bytes` bytes
+    of output, in UTF-8. A hostile value that is over either is a `ValueError` after at most
+    that much work.
     """
-    return _canonical(value, 1)
+    # Entries are a value with its depth, or a piece of output already decided (a string).
+    stack: list[tuple[object, int] | str] = [(value, 1)]
+    out: list[str] = []
+    nodes = 0
+    size = 0
+    while stack:
+        entry = stack.pop()
+        if isinstance(entry, str):
+            piece = entry
+        else:
+            item, depth = entry
+            nodes += 1
+            if nodes > max_nodes:
+                raise ValueError(f"more than {max_nodes} values")
+            if depth > _MAX_DEPTH:
+                raise ValueError(f"nested deeper than {_MAX_DEPTH}")
+            kind = type(item)
+            if item is None:
+                piece = "null"
+            elif kind is bool:
+                piece = "true" if item else "false"
+            elif isinstance(item, str) and kind is str:
+                piece = _string(item)
+            elif isinstance(item, int) and kind is int:
+                number = double_of_int(item)
+                if number is None:
+                    raise ValueError(
+                        "an integer that is not an IEEE-754 double: JCS would round it"
+                    )
+                piece = es_number(number)
+            elif isinstance(item, float) and kind is float:
+                piece = es_number(item)
+            elif isinstance(item, list) and kind is list:
+                if nodes + len(item) > max_nodes:
+                    raise ValueError(f"more than {max_nodes} values")
+                piece = "["
+                stack.append("]")
+                for position in range(len(item) - 1, -1, -1):
+                    stack.append((item[position], depth + 1))
+                    if position:
+                        stack.append(",")
+            elif isinstance(item, dict) and kind is dict:
+                if nodes + 2 * len(item) > max_nodes:
+                    raise ValueError(f"more than {max_nodes} values")
+                keys = [_check_key(key) for key in item]
+                keys.sort(key=lambda key: key.encode("utf-16-be", "strict"))
+                piece = "{"
+                stack.append("}")
+                for position in range(len(keys) - 1, -1, -1):
+                    key = keys[position]
+                    stack.append((item[key], depth + 1))
+                    stack.append(_string(key) + ":")
+                    if position:
+                        stack.append(",")
+                nodes += len(keys)  # the keys; the values count when they are visited
+            else:
+                raise ValueError(f"not a JSON value: {kind.__name__}")
+        size += _text_bytes(piece)
+        if size > max_bytes:
+            raise ValueError(f"more than {max_bytes} bytes of output")
+        out.append(piece)
+    return "".join(out)

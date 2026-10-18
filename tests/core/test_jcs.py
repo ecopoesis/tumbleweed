@@ -7,6 +7,7 @@ it (`tests/ui/spec/test_numbers.py`), so it is itself checked against the RFC's 
 import json
 import math
 import struct
+import sys
 
 import pytest
 
@@ -220,3 +221,77 @@ class TestCanonicalize:
         once = canonicalize(data)
 
         assert canonicalize(json.loads(once)) == once
+
+
+class TestBudget:
+    """#62: the walk is iterative and bounded, so a hostile value costs a bounded amount."""
+
+    def test_the_walk_does_not_use_the_interpreters_stack(self) -> None:
+        value: object = 1
+        for _ in range(199):
+            value = [value]
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(60)  # a recursive walk of 199 levels cannot run under this
+        try:
+            written = canonicalize(value)
+        finally:
+            sys.setrecursionlimit(limit)
+
+        assert written == "[" * 199 + "1" + "]" * 199
+
+    def test_a_deep_object_is_walked_without_recursion_too(self) -> None:
+        value: object = None
+        for _ in range(150):
+            value = {"k": value}
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(60)
+        try:
+            written = canonicalize(value)
+        finally:
+            sys.setrecursionlimit(limit)
+
+        assert written == '{"k":' * 150 + "null" + "}" * 150
+
+    def test_the_node_budget_counts_containers_and_scalars(self) -> None:
+        value = [1, 2, 3]  # the list and three numbers: four nodes
+
+        assert canonicalize(value, max_nodes=4) == "[1,2,3]"
+        with pytest.raises(ValueError, match="more than 3 values"):
+            canonicalize(value, max_nodes=3)
+
+    def test_object_keys_are_nodes(self) -> None:
+        value = {"a": 1, "b": 2}  # the object, two keys and two values: five nodes
+
+        assert canonicalize(value, max_nodes=5) == '{"a":1,"b":2}'
+        with pytest.raises(ValueError, match="more than 4 values"):
+            canonicalize(value, max_nodes=4)
+
+    def test_a_wide_container_is_refused_before_it_is_walked(self) -> None:
+        wide = [0] * 100_000
+
+        with pytest.raises(ValueError, match="more than 10 values"):
+            canonicalize(wide, max_nodes=10)
+        with pytest.raises(ValueError, match="more than 10 values"):
+            canonicalize(dict.fromkeys(map(str, range(100_000)), 0), max_nodes=10)
+
+    def test_a_million_nested_empty_lists_are_refused_by_the_node_budget(self) -> None:
+        many = [[] for _ in range(1_000_001)]
+
+        with pytest.raises(ValueError, match="more than 1000000 values"):
+            canonicalize(many)
+
+    def test_the_byte_budget_counts_utf8_bytes_of_the_output(self) -> None:
+        assert canonicalize("é" * 5, max_bytes=12) == '"ééééé"'  # 5 * 2 bytes + 2 quotes
+        with pytest.raises(ValueError, match="more than 11 bytes of output"):
+            canonicalize("é" * 5, max_bytes=11)
+
+    def test_the_byte_budget_stops_the_output_of_many_small_values(self) -> None:
+        with pytest.raises(ValueError, match="bytes of output"):
+            canonicalize([1] * 1000, max_bytes=100)
+
+    def test_the_defaults_are_generous_and_finite(self) -> None:
+        from tumbleweed.core import jcs
+
+        assert jcs.MAX_NODES == 1_000_000
+        assert jcs.MAX_BYTES == 16 * 1024 * 1024
+        assert canonicalize(list(range(1000))).startswith("[0,1,2")
