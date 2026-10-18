@@ -143,6 +143,11 @@ class ToolStoreFullError(ToolStoreError):
     """The store is at one of its limits (tools, versions of a tool, bytes)."""
 
 
+class ToolTaintConflictError(ToolStoreError):
+    """A refinement would give a tool both fs and net taint (I12): the task it is saved from and
+    the version it refines cannot be combined."""
+
+
 class ToolBlobWriteError(ToolStoreError):
     """A package could not be written to the store (the disk is full, the directory unwritable, the
     bytes are not what their name says): not a sign that anything stored was tampered with."""

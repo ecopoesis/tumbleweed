@@ -207,13 +207,13 @@ class TestDraftsAreNormalisedThenValidated:
         # U+105D2 U+0307 composes in Unicode 16.0 and not in 15.0: Pythons would hash it apart.
         for field in ("name", "description"):
             problems = draft_problems(draft_json(**{field: "\U000105d2\u0307"}))
-            assert any("Unicode 15.0" in p for p in problems)
+            assert any("newer than Unicode 15.0" in p and "leave it out" in p for p in problems)
 
     def test_the_same_in_a_package_is_refused_when_it_is_made(self) -> None:
         module: Json = {"name": "csv_view", "source": "x = '\U000105d2\u0307'\n"}
         # A draft is refused as written; a package built by hand (a model is not the only way in)
         # is refused when it is normalised.
-        with pytest.raises(ToolPackageError, match=r"Unicode 15\.0"):
+        with pytest.raises(ToolPackageError, match=r"newer than Unicode 15\.0"):
             parse_draft(text_of(draft_json(modules=[module])))
         assert draft_problems(draft_json(tags=["a"], description="\U000105d2"))
 

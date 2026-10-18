@@ -300,3 +300,12 @@ class TestBudget:
         assert canonicalize(1, max_nodes=1) == "1"
         with pytest.raises(ValueError, match="more than 0 values"):
             canonicalize(1, max_nodes=0)
+
+    def test_keys_count_toward_the_budget_across_nesting(self) -> None:
+        # Five nodes in all: two objects, two keys, one number. Each object alone passes the check
+        # made before its members are walked; only the keys counted on the way make the total.
+        value = {"a": {"b": 1}}
+
+        assert canonicalize(value, max_nodes=5) == '{"a":{"b":1}}'
+        with pytest.raises(ValueError, match="more than 4 values"):
+            canonicalize(value, max_nodes=4)

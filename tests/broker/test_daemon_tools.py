@@ -541,6 +541,63 @@ class TestImport:
 
         run(scenario)
 
+    @pytest.mark.parametrize("failure", ["integrity", "error"])
+    def test_a_refusal_that_cannot_be_recorded_is_still_answered_for_integrity_and_error(
+        self, monkeypatch: pytest.MonkeyPatch, failure: str
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                text = bundle_text()
+                if failure == "integrity":
+                    await client.import_tool(text)
+                    (blob,) = (rig.config.broker_directory / BLOB_DIRECTORY).iterdir()
+                    blob.write_bytes(b"planted")
+                    expected = "unsafe"
+                else:
+
+                    def broken(*_args: object, **_kwargs: object) -> None:
+                        raise StoreError("the database is on fire")
+
+                    monkeypatch.setattr(ToolStore, "import_", broken)
+                    expected = "unavailable"
+                refuse_audit_of(ToolImportRefused, monkeypatch)
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.import_tool(text)
+
+                assert caught.value.reason == expected  # the refusal, not "the audit log failed"
+                assert rig.audit_of(ToolImportRefused) == []
+
+        run(scenario)
+
+    @pytest.mark.parametrize("reason", ["invalid", "conflict", "full"])
+    def test_a_refusal_that_cannot_be_recorded_is_unavailable_for_the_other_reasons(
+        self, monkeypatch: pytest.MonkeyPatch, reason: str
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                text = "not a bundle"
+                if reason == "conflict":
+                    stored = package()
+                    await client.import_tool(export_bundle(stored).decode("utf-8"))
+                    hostile = package(
+                        tool=stored.package.manifest.id, source=draft(description="Evil.")
+                    )
+                    text = export_bundle(hostile).decode("utf-8")
+                elif reason == "full":
+                    monkeypatch.setattr("tumbleweed.broker.toolstore.MAX_TOOLS", 0)
+                    text = bundle_text()
+                refuse_audit_of(ToolImportRefused, monkeypatch)
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.import_tool(text)
+
+                assert caught.value.reason == "unavailable"  # the audit's failure propagates
+
+        run(scenario)
+
     def test_an_import_whose_entry_cannot_be_written_does_not_happen(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -91,6 +91,7 @@ from tumbleweed.broker.errors import (
     ToolConflictError,
     ToolNotFoundError,
     ToolStoreFullError,
+    ToolTaintConflictError,
     ToolVersionExhaustedError,
     UnknownTaskError,
     WorkspaceError,
@@ -591,6 +592,12 @@ class BrokerService:
             )
         except ToolStoreFullError:
             return Refused(kind="refused", reason="busy", message="the tool store is full")
+        except ToolTaintConflictError:
+            return Refused(
+                kind="refused",
+                reason="denied",
+                message="the task's taint cannot be combined with the tool's",
+            )
         except ToolVersionExhaustedError:
             return Refused(
                 kind="refused", reason="too_large", message="the tool has no version number left"

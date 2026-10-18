@@ -35,7 +35,10 @@ def normalize_text(value: str) -> str:
 
 def _stable(text: str) -> str:
     if first_unstable(text) is not None:
-        raise ValueError("text holds a character that Unicode 15.0 had not assigned")
+        raise ValueError(
+            "text contains a character newer than Unicode 15.0: it is not accepted, because its "
+            "normal form differs between Python versions; leave it out or use another character"
+        )
     return text
 
 

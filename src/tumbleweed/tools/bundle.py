@@ -21,9 +21,10 @@ and otherwise raises `ToolPackageError` and changes nothing:
   repaired, so that the hash a bundle states is the hash of what is stored;
 - the stated hash is the SHA-256 of those bytes.
 
-What a bundle does not carry is also what it cannot vouch for: its `taint` is the exporter's
-claim, kept as written (a claim can only be of a restriction: nothing is gained by claiming none
-for code that holds no data of ours, and the store never lowers the taint of a version it has).
+A bundle's `taint` is only the exporter's claim. It stays in the package, so that the hash is the
+bundle's and export and import are hash-stable; the store taints every import `fs` whatever it
+claims (`toolstore.effective_taint`, I12), because a bundle is file input that may embed file
+content, and keeps the claim beside it for display.
 """
 
 from typing import Final

@@ -178,9 +178,9 @@ class TestUnicodeStability:
 
     def test_text_with_a_character_unassigned_in_unicode_15_is_refused(self) -> None:
         for text in (self.NEW_IN_16, "a\u0378b", "x\U0010ffffy", "\ufdd0", "\U0001fffe"):
-            with pytest.raises(ValueError, match=r"Unicode 15\.0 had not assigned"):
+            with pytest.raises(ValueError, match=r"contains a character newer than Unicode 15\.0"):
                 canonical_bytes({"k": text})
-            with pytest.raises(ValueError, match=r"Unicode 15\.0 had not assigned"):
+            with pytest.raises(ValueError, match=r"contains a character newer than Unicode 15\.0"):
                 canonical_bytes({text: 1})
 
     def test_text_assigned_in_unicode_15_is_accepted(self) -> None:

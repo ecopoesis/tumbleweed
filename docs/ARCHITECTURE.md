@@ -600,6 +600,13 @@ blob, writing it again if it was lost, so importing repairs a store); any other 
 `ToolId` is refused as a `conflict`, so an import can neither replace a version nor appear as the
 next version of a tool the user has.
 
+**A refinement never cleans a lineage (I12).** The newest version is the one that is opened, so a
+version saved from a task that read nothing, as a refinement of one that carried `fs`, would drop
+what the first carried. So a refined version's effective taint is its task's taint **plus the
+effective taint of the version it refines**; if that would combine `fs` and `net` the save is
+refused (`ToolTaintConflictError`, answered `denied`). The package still records its task's taint
+as its claim. `open` checks a refinement's taint against its predecessor's.
+
 **Taint of an import (I12).** A bundle is input from the user's file system or from elsewhere: a task
 that could read files and write one could have made it, with their content in it, under any claim.
 So **an imported package is `fs`-tainted whatever it claims**. The index keeps two fields:
@@ -715,10 +722,14 @@ audited.
   configured.
 - **Exfiltration rule (I12).** Each task has a sticky taint set. It becomes `fs`-tainted the
   moment it is issued any fs grant outside its workspace (any scope, used or not, picker
-  included) or opens a saved tool whose package is fs-tainted, and `net`-tainted the moment
-  it is issued `net.full`. The broker refuses any grant that would make a task both, and
-  refuses `open_tool` of an fs-tainted package in a net-tainted task (the model is told to
-  call `start_task(..., fresh_context=true)`). Applying a tool grant to a run counts as issuing it to the task for
+  included) or opens a saved tool whose stored version is fs-tainted, and `net`-tainted the
+  moment it is issued `net.full`. "Tainted" for a stored version is **the index's
+  `ToolRecord.taint`**: the task's taint plus that of the version it refines, for a save; the
+  package's claim plus `fs`, for an import (section 5); never the package's own `taint`, which is
+  only a claim. The broker refuses any grant that would make a task both, refuses `open_tool` of
+  an fs-tainted version in a net-tainted task (the model is told to call
+  `start_task(..., fresh_context=true)`), and refuses `open_tool` of a version whose taint is both
+  `fs` and `net` (an import that claimed `net`) in every task. Applying a tool grant to a run counts as issuing it to the task for
   taint purposes; a tool grant that would conflict with the task's taint is withheld from
   that run. Tool grants are applied oldest first, so of two conflicting ones the older applies
   and the newer is withheld: the older is the one the user made first, and the result then does
@@ -727,7 +738,8 @@ audited.
   `start_task` passes `fresh_context` to the broker, which copies the ended task's taint to
   the new task unless it is true. The broker's taint state is authoritative. A tool
   package records the taint of the task it was saved from, because its code and defaults
-  may embed what that task saw. Data reaches a net-tainted task from an fs-tainted one only
+  may embed what that task saw; an imported package may embed anything, so it is `fs`-tainted
+  whatever it says, and a refinement keeps the taint of what it refines. Data reaches a net-tainted task from an fs-tainted one only
   through a cross-task connection the user approved in a trusted prompt; the model context
   of a net-tainted task excludes every turn of fs-tainted tasks (§2).
 - **Writes are off until undo exists.** Until snapshots ship (S21), policy refuses every
@@ -851,7 +863,8 @@ Each invariant names where it is enforced. Reviews check every change against th
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps
   what it reads. Workspace references are relative and validated.
 - **I12 — No exfiltration combos.** No task is ever both fs-tainted and net-tainted (sticky,
-  from grant issuance, including picker grants and fs-tainted tool packages). A net-tainted
+  from grant issuance, including picker grants and fs-tainted stored tool versions, imports
+  always among them). A net-tainted
   task's model context contains no turns from fs-tainted tasks. Data crosses that line only
   through a user-approved cross-task connection (§6, §7).
 - **I13 — No write without undo.** A run with write grants starts only after a snapshot of

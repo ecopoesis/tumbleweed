@@ -53,6 +53,7 @@ from tumbleweed.broker.errors import (
     ToolConflictError,
     ToolNotFoundError,
     ToolStoreFullError,
+    ToolTaintConflictError,
     ToolVersionExhaustedError,
 )
 from tumbleweed.broker.store import BrokerStore, ToolRecord
@@ -110,11 +111,17 @@ def taint_kinds(names: tuple[Taint, ...]) -> frozenset[TaintKind]:
 
 
 def effective_taint(
-    claimed: frozenset[TaintKind], origin: Literal["saved", "imported"]
+    claimed: frozenset[TaintKind],
+    origin: Literal["saved", "imported"],
+    refines: frozenset[TaintKind] = frozenset(),
 ) -> frozenset[TaintKind]:
     """The taint a decision about a stored version must use (`ToolRecord.taint`).
 
-    A saved version has the taint of the task it was saved from, which the broker recorded itself.
+    A saved version has the taint of the task it was saved from, which the broker recorded itself,
+    together with the effective taint of the version it refines (`refines`): a lineage never gets
+    cleaner by being saved again from a task that read nothing, or the newest version, which is the
+    one that is opened, would drop what the first one carried. (Saving from a task whose taint
+    would add `net` to an `fs` lineage, or the reverse, is refused: `ToolTaintConflictError`.)
     An imported package is input from the user's file system or from elsewhere: it may have been
     written by a task that read files and could write one, with those files' content in it, under
     any claim, so it is `fs`-tainted whatever it says, and what it says is kept beside it
@@ -128,7 +135,7 @@ def effective_taint(
     detected. Editing the broker's database is what only this user's other processes can do
     (ARCHITECTURE section 8, out of scope), as it is for the grants beside it.
     """
-    return claimed if origin == "saved" else claimed | {TaintKind.FS}
+    return claimed | refines if origin == "saved" else claimed | {TaintKind.FS}
 
 
 @final
@@ -183,6 +190,7 @@ class ToolStore:
         `tool` is not in the store, `ToolStoreFullError` at a limit, `ToolPackageError` if the
         draft does not survive normalisation.
         """
+        refines: frozenset[TaintKind] = frozenset()
         if tool is None:
             identifier, version = ToolId.new(), ToolVersion(1)
         else:
@@ -192,12 +200,17 @@ class ToolStore:
             if self._store.version_count(tool) >= MAX_VERSIONS_PER_TOOL:
                 raise ToolStoreFullError(_FULL)
             identifier = tool
+            previous = self._store.tool_record(tool, latest)
+            refines = frozenset() if previous is None else previous.taint
+            if len(taint | refines) > 1:
+                raise ToolTaintConflictError("the task's taint and the tool's cannot be combined")
             try:
                 version = ToolVersion(int(latest) + 1)
             except InvalidValueError:
                 raise ToolVersionExhaustedError("the tool has no version number left") from None
         package = build_package(draft, tool=identifier, version=version, taint=taint_names(taint))
-        return StoredTool(self._add(canonical_package(package), at, "saved"), created=True)
+        stored = self._add(canonical_package(package), at, "saved", refines)
+        return StoredTool(stored, created=True)
 
     def import_(self, canonical: CanonicalPackage, at: datetime) -> StoredTool:
         """Store an accepted bundle's package as a tool the store does not have.
@@ -219,7 +232,11 @@ class ToolStore:
         return StoredTool(self._add(canonical, at, "imported"), created=True)
 
     def _add(
-        self, canonical: CanonicalPackage, at: datetime, origin: Literal["saved", "imported"]
+        self,
+        canonical: CanonicalPackage,
+        at: datetime,
+        origin: Literal["saved", "imported"],
+        refines: frozenset[TaintKind] = frozenset(),
     ) -> ToolRecord:
         manifest = canonical.package.manifest
         claimed = taint_kinds(canonical.package.taint)
@@ -235,7 +252,7 @@ class ToolStore:
             name=manifest.name,
             description=manifest.description,
             tags=manifest.tags,
-            taint=effective_taint(claimed, origin),
+            taint=effective_taint(claimed, origin, refines),
             claimed_taint=claimed,
             origin=origin,
             saved_at=at,
@@ -281,8 +298,18 @@ class ToolStore:
             or manifest.description != record.description
             or manifest.tags != record.tags
             or taint_kinds(package.taint) != record.claimed_taint
-            or effective_taint(record.claimed_taint, record.origin) != record.taint
+            or self._taint_differs(record)
             or len(data) != record.size
         ):
             raise ToolBlobError("a stored tool package does not match its index")
         return OpenedTool(record=record, canonical=CanonicalPackage(package, data, record.hash))
+
+    def _taint_differs(self, record: ToolRecord) -> bool:
+        """Whether the index's taint is not what the version's origin and lineage give."""
+        refines: frozenset[TaintKind] = frozenset()
+        if record.origin == "saved" and record.version > 1:
+            previous = self._store.tool_record(record.tool, ToolVersion(int(record.version) - 1))
+            if previous is None:
+                return True  # a refinement whose predecessor is gone: its taint cannot be checked
+            refines = previous.taint
+        return effective_taint(record.claimed_taint, record.origin, refines) != record.taint

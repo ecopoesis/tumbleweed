@@ -418,7 +418,9 @@ its hash is the bundle's and export and import are hash-stable (the alternative,
 taint and recomputing the hash, would make a re-export a different tool). The origin is the
 index's to say, because a package cannot record how it came without changing its hash; editing the
 database is out of scope (section 8). Lowering an import's taint is a user's decision in a trusted
-prompt (S18, S24; #98). (9) *Saving takes the taint from the task, inside the block that stores it.*
+prompt (S18, S24; #98). A refinement never cleans a lineage either: the newest version is the one
+that is opened, so a refined version's taint is its task's plus the effective taint of the version it
+refines, and a save that would make that both is refused. (9) *Saving takes the taint from the task, inside the block that stores it.*
 `BrokerService.save_tool` reads the broker's record of the task and stores the version in one synchronous section with its
 audit entry, so a grant that arrived a moment ago is in it (I12). It has no IPC request: the model's
 `save_tool` is S24's. (10) *Audit:* a saved or imported version, an export and a refused import

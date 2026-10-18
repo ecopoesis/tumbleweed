@@ -835,9 +835,12 @@ access.
 - Retrieval before generation: matching saved tools are offered to the model (top-k FTS
   plus model re-ranking).
 - Saved tools run code from the broker's store (I8).
-- Opening an fs-tainted package taints the current task (I12); `open_tool` of an
-  fs-tainted package in a net-tainted task is refused, and the model is told to call
-  `start_task(..., fresh_context=true)`.
+- Opening a saved tool whose stored version is fs-tainted taints the current task (I12);
+  `open_tool` of an fs-tainted version in a net-tainted task is refused, and the model is told to
+  call `start_task(..., fresh_context=true)`. "Tainted" is the index's `ToolRecord.taint` (S23,
+  D19), never the package's own claim: an imported version is fs-tainted whatever its bundle says,
+  a refined version carries the taint of what it refines, and a version that is both fs and net
+  is refused by `open_tool` in every task.
 - Tool grants:
   - prompts gain "allow for this tool";
   - tool-scoped grants bind to (ToolId, hash) and apply only to user-triggered handler runs

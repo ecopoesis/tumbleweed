@@ -16,9 +16,10 @@ from tumbleweed.broker.errors import (
     ToolConflictError,
     ToolNotFoundError,
     ToolStoreFullError,
+    ToolTaintConflictError,
     ToolVersionExhaustedError,
 )
-from tumbleweed.broker.store import DATABASE_NAME, BrokerStore
+from tumbleweed.broker.store import DATABASE_NAME, BrokerStore, ToolRecord
 from tumbleweed.broker.task import TaintKind
 from tumbleweed.broker.toolblobs import BLOB_DIRECTORY, ToolBlobs
 from tumbleweed.broker.toolstore import ToolStore
@@ -166,12 +167,15 @@ class TestTaint:
         with pytest.raises(ToolPackageError):
             rig.save(taint=frozenset({TaintKind.FS, TaintKind.NET}))
 
-    def test_a_refined_version_has_the_taint_of_the_task_it_was_saved_from(self, rig: Rig) -> None:
+    def test_a_refined_version_records_its_tasks_taint_as_its_claim_and_keeps_the_lineages(
+        self, rig: Rig
+    ) -> None:
         first = rig.save(taint=frozenset({TaintKind.FS}))
         second = rig.save(tool=first.record.tool, taint=frozenset())
 
         assert first.record.taint == {TaintKind.FS}
-        assert second.record.taint == frozenset()
+        assert second.record.claimed_taint == frozenset()
+        assert second.record.taint == {TaintKind.FS}
         assert rig.tools.open(first.record.tool, ToolVersion(1)).record.taint == {TaintKind.FS}
 
     def test_the_taint_cannot_be_lowered_by_editing_the_index(self, rig: Rig) -> None:
@@ -183,6 +187,75 @@ class TestTaint:
         rig.sql("UPDATE tool_versions SET claimed_taint = 'none'")  # both lowered
         with pytest.raises(ToolBlobError, match="does not match its index"):
             rig.tools.open(saved.record.tool)
+
+
+class TestRefiningNeverCleansALineage:
+    """I12: the newest version is the one that is opened, so it carries what the lineage carried."""
+
+    def test_refining_an_fs_tainted_version_from_an_untainted_task_is_fs_tainted(
+        self, rig: Rig
+    ) -> None:
+        first = rig.save(taint=frozenset({TaintKind.FS}))
+
+        second = rig.save(tool=first.record.tool, taint=frozenset())
+
+        assert second.record.taint == {TaintKind.FS}
+        assert second.record.claimed_taint == frozenset()  # what its task had; not what decides
+        assert rig.tools.open(first.record.tool).record.taint == {TaintKind.FS}
+
+    def test_the_taint_is_inherited_down_a_lineage(self, rig: Rig) -> None:
+        first = rig.save(taint=frozenset({TaintKind.NET}))
+        second = rig.save(tool=first.record.tool, taint=frozenset())
+        third = rig.save(tool=first.record.tool, taint=frozenset())
+
+        assert second.record.taint == third.record.taint == {TaintKind.NET}
+
+    def test_refusing_a_refinement_that_would_make_the_lineage_both(self, rig: Rig) -> None:
+        first = rig.save(taint=frozenset({TaintKind.FS}))
+        blobs = rig.blobs()
+
+        with pytest.raises(ToolTaintConflictError):
+            rig.save(tool=first.record.tool, taint=frozenset({TaintKind.NET}))
+
+        assert rig.blobs() == blobs
+        assert rig.store.latest_version(first.record.tool) == 1
+
+    def test_a_laundered_import_cannot_be_cleaned_by_refining(self, rig: Rig) -> None:
+        laundered = package(taint=())  # claims nothing; stored fs-tainted
+        with rig.store.transaction():
+            rig.tools.import_(laundered, NOW)
+
+        refined = rig.save(tool=laundered.package.manifest.id, taint=frozenset())
+
+        assert refined.record.taint == {TaintKind.FS}
+        assert rig.tools.open(laundered.package.manifest.id).record.version == 2
+
+    def test_an_import_that_claims_net_cannot_be_refined_by_any_task(self, rig: Rig) -> None:
+        both = package(taint=("net",))  # stored fs + net
+        with rig.store.transaction():
+            stored = rig.tools.import_(both, NOW)
+        assert stored.record.taint == {TaintKind.FS, TaintKind.NET}
+
+        for taint in (frozenset(), frozenset({TaintKind.FS}), frozenset({TaintKind.NET})):
+            with pytest.raises(ToolTaintConflictError):
+                rig.save(tool=both.package.manifest.id, taint=taint)
+
+    def test_open_refuses_a_refinement_whose_index_taint_was_lowered(self, rig: Rig) -> None:
+        first = rig.save(taint=frozenset({TaintKind.FS}))
+        second = rig.save(tool=first.record.tool, taint=frozenset())
+        rig.sql("UPDATE tool_versions SET taint = 'none' WHERE version = 2")
+
+        assert second.record.taint == {TaintKind.FS}
+        with pytest.raises(ToolBlobError, match="does not match its index"):
+            rig.tools.open(first.record.tool)
+
+    def test_open_refuses_a_refinement_whose_predecessor_is_gone(self, rig: Rig) -> None:
+        first = rig.save(taint=frozenset({TaintKind.FS}))
+        rig.save(tool=first.record.tool, taint=frozenset())
+        rig.sql("DELETE FROM tool_versions WHERE version = 1")
+
+        with pytest.raises(ToolBlobError, match="does not match its index"):
+            rig.tools.open(first.record.tool)
 
 
 class TestImportedTaint:
@@ -211,6 +284,23 @@ class TestImportedTaint:
         opened = rig.tools.open(stored.record.tool)
         assert opened.record.taint == effective
         assert opened.canonical.package.taint == claim  # the package is as it was written
+
+    def test_a_record_with_two_claimed_taints_cannot_exist(self, rig: Rig) -> None:
+        record = rig.save().record
+        fields = record.model_dump()
+
+        with pytest.raises(ValueError, match="at most one"):
+            ToolRecord.model_validate(
+                fields
+                | {
+                    "taint": frozenset({TaintKind.FS, TaintKind.NET}),
+                    "claimed_taint": frozenset({TaintKind.FS, TaintKind.NET}),
+                }
+            )
+        with pytest.raises(ValueError, match="part of the taint"):
+            ToolRecord.model_validate(
+                fields | {"taint": frozenset(), "claimed_taint": frozenset({TaintKind.FS})}
+            )
 
     def test_a_saved_version_has_exactly_the_taint_of_its_task(self, rig: Rig) -> None:
         for taint in (frozenset(), frozenset({TaintKind.NET}), frozenset({TaintKind.FS})):
@@ -571,7 +661,7 @@ class TestImport:
         assert rig.blobs() == blobs
         assert rig.tools.open(saved.record.tool).record.version == 1
 
-    def test_an_imported_tool_can_be_refined_like_any_other(self, rig: Rig) -> None:
+    def test_an_imported_tool_can_be_refined_and_keeps_its_taint(self, rig: Rig) -> None:
         imported = package(tool=ToolId.new(), version=4)
         with rig.store.transaction():
             rig.tools.import_(imported, NOW)
@@ -579,6 +669,9 @@ class TestImport:
         refined = rig.save(draft(description="Mine."), tool=imported.package.manifest.id)
 
         assert refined.record.version == 5
+        assert refined.record.taint == {TaintKind.FS}  # from an untainted task: still fs
+        assert refined.record.claimed_taint == frozenset()
+        assert rig.tools.open(imported.package.manifest.id).record.taint == {TaintKind.FS}
 
     def test_the_blob_of_a_transaction_that_failed_is_found_again(self, rig: Rig) -> None:
         bundle = package()
