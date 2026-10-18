@@ -49,6 +49,7 @@ class ShellWindow(Adw.ApplicationWindow):
     ) -> None:
         super().__init__(application=application)
         self._closing = False
+        self._focus_went_with_panel = False
         self.set_title(WINDOW_TITLE)
         self.set_default_size(*DEFAULT_SIZE)
 
@@ -156,10 +157,21 @@ class ShellWindow(Adw.ApplicationWindow):
         self.chat_panel.focus_input()
 
     def _toggle_side_panel(self) -> None:
-        self._side.set_visible(not self._side.get_visible())
-        if self._side.get_visible() and self.get_focus() is None:
-            # Hiding the panel took the focus with it; do not leave the window with none.
+        if self._side.get_visible():
+            focus = self.get_focus()
+            self._focus_went_with_panel = focus is not None and focus.is_ancestor(self._side)
+            self._side.set_visible(False)
+            return
+        self._side.set_visible(True)
+        focus = self.get_focus()
+        # Hiding the panel took the focus with it: GTK drops it, or (on some hosts) moves it to
+        # the next widget that can take it, such as the terminal button. Do not leave the window
+        # with the focus lost; a focus the user put elsewhere is left alone.
+        if focus is None or (
+            self._focus_went_with_panel and focus is self.status_strip.terminal_button
+        ):
             self.chat_panel.focus_input()
+        self._focus_went_with_panel = False
 
     def _on_escape(self, _widget: Gtk.Widget, _args: object) -> bool:
         if not self.controller.busy:
