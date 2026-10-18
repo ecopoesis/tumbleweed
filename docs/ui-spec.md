@@ -400,14 +400,15 @@ cannot see symlinks.
 
 **A reference is a file name and nothing else.** Trusted code opens it only through a directory
 file descriptor (`dirfd`: `openat`, component by component, with `O_NOFOLLOW`), without following
-links (I11), and still sniffs an image's bytes before decoding it (S11). It is never passed to
+links (I11), and sniffs an image's bytes before decoding it (section 8). It is never passed to
 anything that interprets a string: not `expanduser` (`~root/x.png` is a directory called `~root`,
 not a home), not a URI builder or a URL or percent decoder (`%2e%2e/x.png` is a directory called
 `%2e%2e`, not `..`, and a `file:` URI is never made from one), not a glob or a shell, and not an
 argument of a command unless it goes after `--` or has `./` in front (`-rf.png` is a valid
 reference, and an option to most programs). The spec accepts all three of those names on purpose,
 each being a legal file name; the code that opens a reference is what has to treat them as
-plain names (S11 tests `-rf.png`, `~root/x.png` and `%2e%2e/x.png`).
+plain names. The resolver contract (`tumbleweed.ui.images`) says so, and
+`tests/ui/image_contract.py` tests it, on those three names among others, for every resolver.
 
 **`Table`** is `{"columns": [{"name": ..., "type": ...}], "rows": [[...], ...]}`. A column type is
 `string`, `int`, `float` or `bool`, and every row has one cell of that type per column (an
@@ -672,6 +673,43 @@ for as long as it has the focus the tool may show up to 8,192 characters more th
 that one entry; once the focus leaves (or, for an edit made without focus, at the next idle turn)
 it claims like any other.
 
+**The rich widgets (S11)** keep to the same bounds. What follows is the reference renderer's
+behaviour (`tumbleweed.ui.gtk`; the numbers are renderer constants, not spec limits); DECISIONS D21
+has the reasons.
+
+- **`image`** shows the file an `ImageRef` names. The host passes a resolver that reads it
+  (`RenderedTool(spec, images=...)`; with none every image says that images are not available): the
+  ref is a file name and nothing else, opened without following links (see section 6), and what
+  comes back is at most 8 MiB. Those bytes are *looked at before they are decoded*: the magic number
+  must be a PNG, a JPEG or a still WebP (an SVG is none, whatever the file is called, and an animated
+  WebP is refused), and the size in the header must be at most 8,192 pixels a side and 16,777,216
+  pixels (width times height times 4 bytes is at most 64 MiB decoded). Only then do the bytes go to a
+  decoder, pinned to the format that was found, on a worker thread: the interface never waits for a
+  file or a decode. What is refused, missing or broken is a line of fixed text in the image's place
+  (`The image was not found.`, `The image is not allowed.`, `The image is too large.`,
+  `Only PNG, JPEG and WebP images can be shown.`, `The image could not be read.`), never a word of the
+  file or the error; a line `Loading the image...` stands there while it loads. A new ref (or the same
+  one assigned again) replaces what is shown at once: the widget never shows an image the entry no
+  longer holds. An image is scaled down to fit 480 pixels, never up, and `alt` is for assistive
+  technology only (it is not displayed).
+- **`table`** is a `Gtk.ColumnView` of the columns and rows of a `table` entry, rebuilt when the
+  entry changes. At most 1,000 rows are shown; a cell shows at most 256 characters (then ` (cut)`) on
+  one line (line ends become spaces), a column name at most 64; every text goes through the display
+  transform and into a label with `set_text`, and all of it counts in the tool's text budget, so
+  rows that do not fit are left out, the table ends in `(more rows not shown)`, and they are added
+  when room appears. Columns are typed: `int` and `float` cells are right-aligned and a `bool` reads
+  `yes` or `no`. There is no selection, the columns cannot be dragged, and there is no header menu.
+- **`text_view`** is a `Gtk.TextView` that wraps at any character. It shows a `string` entry as it
+  is (no display transform: nothing is inserted into the text, so what the user selects and copies
+  is the source text), at most 8,192 characters then ` (cut)`, counted in the budget like an entry,
+  and is two-way only while the whole text is shown (a cut text, or one the budget has no room for,
+  is read-only with a warning style). What the user types or pastes is held to the entry's
+  `max_length` and to 8,192 characters: an insert that would pass it is refused whole.
+- **`tabs`** are a `Gtk.Notebook` (the tab menu is off, tabs cannot be reordered or detached), each
+  title one plain, ellipsized line counted in the budget, and **`expander`** is a `Gtk.Expander`
+  with a plain title. Their pages and child are built like any other child, so a page that cannot
+  be built is a placeholder inside its tab.
+
 What a widget shows or edits is an entry named by `bind`. The entry's declaration supplies range,
 options and limits, so they are written once. Which kinds of entry a component accepts:
 
@@ -878,8 +916,8 @@ one means, is `tumbleweed.ui/2`.
   `image` entry (a handler rewriting the same file) refresh the widget: the store notifies on
   assignment, not on change. The state is kept within `MAX_STATE_TEXT_BYTES`. The GTK adapter
   (`tumbleweed.ui.gtk`) creates no popup, dialog, tooltip or drag icon from a spec (a `dropdown` is
-  a list in place, ARCHITECTURE I5), and shows an image, table, text view, tabs and expander as a
-  placeholder until S11.
+  a list in place, ARCHITECTURE I5) and renders all 18 kinds (S11, section 8); the host gives it an
+  `ImageResolver` (`tumbleweed.ui.images`: S19 passes the broker's) for the images.
 - **Agent (S12).** `parse_ui_spec` for text and `validate_ui_spec` for a tool call's arguments;
   return `SpecError.problems` to the model; `UiSpec.validate_patch(patch, current=...)` for
   `patch_state`; the system prompt section is generated from `schemas/ui-spec.v1.json` and this

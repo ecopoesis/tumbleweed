@@ -476,3 +476,74 @@ version of a tool the user has needs S24's flow (#95). Blobs are never garbage-c
 removes a tool (an orphan from a failed transaction stays and the next save of the same bytes finds
 it): #94, with the audit log's rotation (#82). A module named like a
 standard library module is a valid name; the sandbox loader keeps it from shadowing (#56).
+
+## D21 — Rich widgets: an image is inspected before it is decoded, off the main thread, by a pinned loader; a text view shows the text as it is (2026-10-18, accepted)
+
+**Context.** S11 gives the renderer the widgets real tools need (image, table, text view, tabs,
+expander). Each one takes untrusted data into a native library or a layout: an image is a hostile
+file from a sandbox (I11) that a C decoder parses in the shell's process, a table can bring 20,000
+cells, a text view long text, and every one of them runs on the thread that also serves the trusted
+chrome (I9). **Decision.**
+(1) *Images are resolved, inspected, then decoded, in that order* (`tumbleweed.ui.images`,
+`tumbleweed.ui.gtk.imageview`). The `ImageResolver` protocol (`read(ref, limit) -> bytes`) is the
+only way to a file; the renderer never opens a path, and a renderer given none refuses every image.
+The contract is written in the module and tested by `tests/ui/image_contract.py`, which every
+implementation passes: it opens the ref component by component without following links, never
+leaves the workspace, returns at most the limit, and treats the ref as a literal name, so `-rf.png`,
+`~root/x.png` and `%2e%2e/x.png` are a file and two directories called that (the tests put a trap
+on each: a home directory with an `x.png`, a file next to the workspace). In S11 the resolver is a
+fake (`FakeResolver`, in memory) and a reference opener over a real directory (`DirfdResolver`, in
+the tests), both passing the contract; S19's broker-backed resolver adds its own subclass.
+(2) *Inspection reads the bytes, not the name.* `inspect_image` recognises PNG, JPEG and WebP by
+their magic numbers and reads the size from the header (PNG's IHDR, the first frame header of a
+JPEG found by walking its segments by their lengths, a WebP's VP8, VP8L or VP8X chunk), by hand, with
+no library: an SVG named `x.png` starts with `<`, and is refused as not an image. An animated WebP
+is refused (its frames are as many decodes). The caps are 8 MiB for the file, 8,192 pixels a
+side and 16,777,216 pixels (`MAX_DECODED_BYTES`, 64 MiB of RGBA); they are renderer constants, set so
+that the largest image costs a decode of a second or so on a worker and 64 MiB at most, and are
+checked before the decoder is made.
+(3) *The decoder is pinned.* gdk-pixbuf, asked to load bytes, sniffs them and picks any installed
+loader, SVG's included; `Gdk.Texture.new_from_bytes` sniffs the same way (and falls back to
+gdk-pixbuf). `PixbufDecoder` instead makes the loader for the one format that was inspected
+(`PixbufLoader.new_with_type`), so a PNG loader given SVG text refuses it
+(`test_a_loader_is_made_for_the_format_that_was_inspected_and_never_sniffs` makes `inspect_image`
+lie to prove it, and shows that a sniffing loader would have decoded the same bytes). The loader's
+`size-prepared` signal, which comes before it allocates pixels, is checked against the header's
+size (a loader told to make 1 by 1 if they differ), and the pixbuf is checked again after.
+WebP needs gdk-pixbuf's WebP loader (`webp-pixbuf-loader`, which the test image installs); a system
+without it shows the line for an unsupported format. The libraries behind the loaders still parse
+hostile bytes in the shell's process: that is the accepted residual risk of ARCHITECTURE section 8,
+and decoding in the sandbox is #33.
+(4) *Nothing slow runs on the main thread.* The read, the inspection and the decode run on two daemon
+worker threads shared by every image in the process; the result (a `Gdk.Texture`, or an `ImageError`
+that carries the fixed line to show) comes back with `GLib.idle_add`. A widget has one job in flight
+and wants one ref: a newer ref replaces the one waiting, a result for a ref no longer wanted is
+dropped, a closed tool ignores what arrives. A resolver that never returns holds a worker, not the
+interface (its contract says it bounds its wait); a decode cannot be cancelled, only bounded by (2).
+(5) *A table is a `Gtk.ColumnView` of plain-text labels, built from strings made when the value
+arrives.* At most 1,000 rows, cells of at most 256 characters on one line, names of 64; all of it
+claimed from the tool's text budget (`TextBudget.room`), so the rows that do not fit are left out
+with a line saying so and are added when room appears. There is one factory per possible column
+(32), made once, so every signal handler is the tool's guarded one and is undone on close. Not
+selectable, columns not draggable (a drag has an icon), no header menu. Sorting was left out: it
+needs a comparison per type and a Python callback in GTK's sorter for a feature the spec does not
+ask for.
+(6) *A text view takes the text as it is.* A label needs the display transform, which inserts
+U+200B to make long runs wrap and has to take them out again when text is copied (#63). A
+`Gtk.TextView` wraps at any character and lays out line by line (8,192 characters of one run, of
+CJK or of one grapheme cluster measured in a few hundredths of a second), so nothing is inserted and
+a selection, the primary selection included, is the source text. Bounds as for an entry: 8,192 shown
+characters, the budget, read-only when cut, typing and pasting held to the cap (`insert-text` is
+stopped, so a megabyte paste changes nothing). #63's remaining part, a transcript that reuses
+this, is not done here: it is S04's code; #107 records that a read-only `Gtk.TextView` is the way.
+(7) *Tabs are a `Gtk.Notebook`, an expander a `Gtk.Expander`*, titles plain, ellipsized lines claimed
+from the budget; the notebook's tab menu is off. (8) *No surface:* `harden_text_view` gives a text
+view what `harden_text` gave entries (D14); the column view and notebook have no popover to
+turn off, and `tests/ui/gtk/test_no_surfaces.py` renders a hostile spec that has all of these, with
+a real image decoded, every tab visited and every view typed in, and finds none. **Consequences.**
+An image appears a moment after its ref is set (`Loading the image...` meanwhile). A table is the
+first 1,000 rows however the budget stands; a cell is a line of at most 256 characters. A text view
+is a fixed 160 pixels tall and scrolls. A text view's text cannot be edited while it is cut or the
+budget has no room for it, like an entry. The default `RenderedTool` has no resolver, so
+`tumbleweed-render` shows every image as unavailable until S19. **Deviations from the plan.** None;
+the resolver is a fake in the renderer's tests, as the plan says, and the real one is S19's.
