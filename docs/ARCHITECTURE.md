@@ -61,18 +61,30 @@ A terminal is always one keystroke (F12) or one button (the status strip's "Term
 whether or not an API key is configured and whatever state the agent is in: it does not depend on
 the responder, the configuration or the broker. It is the **user's** tool in the trusted shell, not
 a tool of the agent (I1): there is no code path from the model to it, and the pane has no method
-that types into the terminal or reads what it shows (`tests/shell/test_terminal_isolation.py`
-rejects, by method name anywhere in `src/`: feeding or pasting (`feed_child*`, `paste_*`), reading text
-(`get_text_range*`, `get_text_selected*`, `get_text_format`, `get_text_include_trailing_spaces`,
-`write_contents_sync`, `copy_*`), the pty (`get_pty`, `set_pty`, `Pty.new_sync`, `new_foreign_sync`,
-`get_fd`, `spawn_sync`, `spawn_with_fds_async`), what is on screen (`match_check*`,
-`hyperlink_check_event`, `event_check_*`, `search_find_*`) and what the shell says (`get_current_*_uri`,
-`get_window_title`, `get_icon_title`); `get_text` and `feed` only in the two modules that use Vte;
-and `connect*` of the signals `commit` (every keystroke), `contents-changed`, `text-inserted`,
-`text-deleted`, `selection-changed`, `cursor-moved` when the name is a string constant. It does
-**not** see a call through an alias or `getattr`, a signal named by a variable, a terminal handed to
-a module that does not use Vte, or a method Vte gains later: it sees names, is no boundary, and
-review is the other half).
+that types into the terminal or reads what it shows. `tests/shell/test_terminal_isolation.py` holds
+that line with two rules. In the two modules that use Vte it is an **allowlist** that fails closed:
+every attribute name in them (not starting with an underscore) must be on a list that is exactly what
+they use today, whatever it is used on, so a new Vte method fails until a reviewer adds it; only the
+signal `child-exited` may be connected, as a constant; `getattr`, `setattr`, `vars`, `eval` and
+`exec` are not used; no class derives from anything of Vte and no `do_*` virtual function is
+defined; and no `Gtk.EventControllerKey` is made (it would see every keystroke), also in `window.py`.
+In the rest of `src/` it is a **denylist** of names: feeding and pasting (`feed_child*`, `paste_*`),
+reading text (`get_text_range*`, `get_text_selected*` including `_full`, `get_text_format`,
+`get_text_include_trailing_spaces`, `write_contents_sync`, `copy_clipboard*`, `copy_primary`), the pty
+(`get_pty`, `set_pty`, `Pty.new_sync`, `new_foreign_sync`, `get_fd`, `spawn_sync`,
+`spawn_with_fds_async`), what is on screen (`match_check*`, `check_match_at`, `check_regex_simple_at`,
+`check_hyperlink_at`, `hyperlink_check_event`, `event_check_*`, `search_find_*`), what the shell says
+(`get_current_*_uri`, `get_window_title`, `get_icon_title`, and `.props.x`, `get_property` or
+`set_property` of `window-title`, `icon-title`, `current-directory-uri`, `current-file-uri`,
+`hyperlink-hover-uri`, `pty`, and `notify::` of those), connecting to the signals `commit` (every
+keystroke), `contents-changed`, `text-inserted`, `text-deleted`, `text-modified`, `text-scrolled`,
+`selection-changed`, `cursor-moved` and the `*-changed` ones for the title and URIs, `emit` or
+`signal_emit_by_name` of those and of `paste-clipboard` and `copy-clipboard`, subclassing `Vte.*`, and
+`key-pressed` or `key-released` connects in the Vte modules and `window.py`. What remains, because
+it is a lint of names and no boundary: outside the Vte modules, a call through an alias or `getattr`,
+a signal or property named by a variable, a key controller made elsewhere than the Vte modules and
+`window.py`, and methods Vte gains later; and a terminal widget handed to another module (it never
+is: review).
 
 - **Embedded**, where Vte 3.91 (the GTK 4 build) is installed (the Linux image, the target): a
   pane under the canvas with a VTE terminal running the user's **login shell**, taken from the
@@ -82,11 +94,12 @@ review is the other half).
   environment is built from nothing: `PATH`, the locale, the session variables (display, bus,
   `XAUTHORITY`, `XDG_*`, `SSH_AUTH_SOCK`) copied when present, `HOME`, `SHELL`, `USER`, `LOGNAME` from
   the passwd entry, and the constants `TERM` and `COLORTERM`; never the API key or any `TUMBLEWEED_*` setting (I6).
-  Hiding the pane keeps the shell; its exit closes the pane and moves the focus to the chat input,
-  showing the side panel first if the user hid it with F9 (the input must be visible to take the
-  focus; closing the terminal is a deliberate return to the chat) (a start that fails, or a shell that
+  Hiding the pane keeps the shell; its exit closes the pane (a start that fails, or a shell that
   ends within two seconds with a non-zero status, is reported in the pane instead); closing the window
-  sends it SIGHUP (SIGKILL after a second), waiting at most two seconds.
+  sends it SIGHUP (SIGKILL after a second), waiting at most two seconds. Whether the shell exits or
+  F12 closes the pane, the focus moves to the chat input, and the side panel is shown first if the
+  user hid it with F9: the input must be visible to take the focus, and closing the terminal is a
+  deliberate return to the chat.
 - **External**, where there is no VTE (macOS): `/usr/bin/open -b com.apple.Terminal <home>` there, elsewhere the
   first of a fixed list of known terminals found on the absolute entries of `PATH`, started with no
   arguments, in the home directory, with the same environment and in a session of its own. Nothing

@@ -419,9 +419,21 @@ that GTK lets the key through to it.
 **Not done.** Ctrl+Q (quit the shell) and F9 (the side panel) still take their keys while the terminal has the
 focus (#90). A configurable external terminal, and a check of the list against real terminals, are #91.
 A second terminal pane, tabs, copy and paste buttons and a configurable key are not in v1.
-**Consequences.** `Vte` is imported only by `tumbleweed.shell.terminal_pane` and its loader (a test
-holds the line, and also rejects, by name, the calls that feed or paste, read text (`get_text_range*`, `get_text_selected*`, `write_contents_sync`, `copy_*`), reach the pty (`get_pty`, `Pty.new_sync`, `get_fd`), read the screen (`match_check*`, `hyperlink_check_event`, `event_check_*`, `search_find_*`) or the shell's words (`get_window_title`, `get_current_*_uri`), `connect` to the signals `commit`, `contents-changed`, `text-inserted`, `text-deleted`, `selection-changed` and `cursor-moved` when the name is a constant, and, in the modules that use Vte, `get_text` and `feed`. Gaps, by design: a call through an alias or `getattr`, a signal named by a variable, a terminal handed to a module that does not use Vte, methods Vte adds later; review covers them. Closing the terminal shows the side panel again if F9 hid it, so that the input can take the focus (a deliberate return to the chat): no code of ours types into
-the terminal or reads it, so I1 holds by absence). The stubs have two gaps, both in that one module:
+**Consequences.** `Vte` is imported only by `tumbleweed.shell.terminal_pane` and its loader, and a test
+holds the line (`tests/shell/test_terminal_isolation.py`). In those two modules it is an allowlist that
+fails closed: every attribute name must be one they use today, only the signal `child-exited` may be
+connected (as a constant), no class derives from Vte, no `do_*` override, no `getattr`/`setattr`/`vars`,
+no `Gtk.EventControllerKey`. In the rest of `src/` it is a denylist by name of the calls that feed or
+paste, read text, match or search the screen or reach the pty, of the properties and signals that carry
+what the shell says or what is typed, of `emit` of those and of the clipboard signals, and of
+subclassing `Vte.*`; key controllers are rejected in `window.py` too. Gaps, by design: outside the
+Vte modules a call through an alias or `getattr`, a signal or property named by a variable, a key
+controller made elsewhere, methods Vte adds later; and a terminal widget handed to another module;
+review covers them. No code of ours types into the terminal or reads it, so I1 holds by absence.
+Closing the terminal moves the focus to the chat input. That shows the side panel again if F9 hid
+it, because the input must be visible to take the focus; it applies whether the shell exits or F12
+closes the pane, and it is deliberate: closing the terminal is a return to the chat.
+The stubs have two gaps, both in that one module:
 `spawn_async` lacks the `child_setup_data` argument, and `os.waitid` is missing from the macOS stubs. A shell closed
 with the window is signalled and its exit is *seen* (`waitid` with `WNOWAIT`), not reaped by us, so that
 we never reap behind VTE's GLib child watch (which would make GLib warn about `ECHILD`); when the main loop is
