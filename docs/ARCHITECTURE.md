@@ -55,6 +55,36 @@ In v1 the broker runs as a separate process under the same uid as the shell (sys
 service on the target; started on demand by the shell in development, with reconnect).
 Running the broker and sandboxes under dedicated uids is post-v1 hardening.
 
+### The terminal escape hatch (S05, D18)
+
+A terminal is always one keystroke (F12) or one button (the status strip's "Terminal") away,
+whether or not an API key is configured and whatever state the agent is in: it does not depend on
+the responder, the configuration or the broker. It is the **user's** tool in the trusted shell, not
+a tool of the agent (I1): there is no code path from the model to it, and the pane has no method
+that types into the terminal or reads what it shows (`tests/shell/test_terminal_isolation.py`
+rejects the VTE calls that would).
+
+- **Embedded**, where Vte 3.91 (the GTK 4 build) is installed (the Linux image, the target): a
+  pane under the canvas with a VTE terminal running the user's **login shell**, taken from the
+  passwd database (`pwd.getpwuid`), not from `$SHELL`, which is whatever started the shell
+  set; `/bin/sh` if the entry is unusable. It starts as `env -i NAME=value ... shell -l` in the
+  home directory, because VTE adds this process's whole environment to any it is given. The
+  environment is built from nothing: `PATH`, the locale, the session variables (display, bus,
+  `XDG_*`, `SSH_AUTH_SOCK`) copied when present, and `HOME`, `SHELL`, `USER`, `LOGNAME`, `TERM`,
+  `COLORTERM` from the passwd entry; never the API key or any `TUMBLEWEED_*` setting (I6).
+  Hiding the pane keeps the shell; its exit closes the pane (a start that fails, or a shell that
+  ends within two seconds with a non-zero status, is reported in the pane instead); closing the window
+  sends it SIGHUP (SIGKILL after a second), waiting at most two seconds.
+- **External**, where there is no VTE (macOS): `/usr/bin/open -a Terminal <home>` there, elsewhere the
+  first of a fixed list of known terminals found on the absolute entries of `PATH`, started with no
+  arguments, in the home directory, with the same environment and in a session of its own. Nothing
+  is read from configuration to choose the program, and every program is started from an argv
+  list (`subprocess.Popen`, `shell=False`), so no text is interpolated into a command line. At most
+  eight started terminals may be open; closing the window ends the ones still running.
+- The shortcut is a `Gtk.Shortcut` and the button a widget, **not** GActions: actions are exported
+  on the session bus, where any process of the user could ask for a shell to be started. The set
+  pinned by `tests/shell/test_session_bus.py` is unchanged.
+
 ### Tasks and workspace agents (see D7)
 
 A **task** (`TaskId`) is a unit of work with its own workspace directory, its own grants, and
@@ -777,7 +807,8 @@ Each invariant names where it is enforced. Reviews check every change against th
 - **I1 — No execution of model output outside a sandbox.** The shell and broker never
   `eval`/`exec`/`compile` model text, never import model-provided modules, never pass model
   text to a shell, never parse expression strings. `subprocess` only with argv lists,
-  never `shell=True`.
+  never `shell=True`. The terminal escape hatch (below) is the user's own tool: nothing the
+  model produced reaches it, and no code of the shell types into it or reads from it.
 - **I2 — Grants only from policy or the user.** No code path turns model output into a grant
   without a user decision in trusted UI. Static deny rules beat every grant. The broker
   never imports LLM code (enforced by import-linter).
@@ -819,7 +850,9 @@ Each invariant names where it is enforced. Reviews check every change against th
   inherits it), reads a key file only if it is a regular file of the user's with mode 0600 and not a
   symlink, holds it in an object that cannot print, and shows the user only fixed error texts: a
   provider's own words are never displayed or logged. The SDK's DEBUG and INFO logging, which would
-  hold prompts and error text, is turned down to WARNING.
+  hold prompts and error text, is turned down to WARNING. The terminal's shell is started with an
+  environment built from a fixed list of names (`tumbleweed.shell.viewmodel.terminal`), so the
+  key, or anything else the shell's environment holds, does not reach it.
 - **I7 — Everything privileged is audited.** Every grant decision, sandbox run, snapshot,
   restore and revocation is appended to the broker's audit log (S17: `audit.jsonl`, section 2
   "Broker daemon"), before the act it records, so an act whose entry cannot be written does not
@@ -994,7 +1027,7 @@ src/tumbleweed/
   ui/runtime/ state store, expression interpreter, bindings, handler dispatch (no GTK)
   ui/gtk/     GTK4 adapter that renders specs
   shell/      Adw application, window, chat panel, trusted prompts, terminal pane
-  shell/viewmodel/  transcript view-model and chat controller (no GTK)
+  shell/viewmodel/  transcript view-model, chat controller, terminal choices and spawner (no GTK)
   agent/      agent loop, tool registry, LLM providers, invocation recorder, prompts, config;
               the `Responder` interface the shell is built against (`agent/responder.py`)
   voice/      audio capture, STT, TTS, VAD, wake word
@@ -1033,7 +1066,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   nothing of that runs on Linux. whisper.cpp and Piper run natively (Metal) and are
   reachable over HTTP from a VM. Linux-only parts (bubblewrap, Landlock, seccomp, btrfs) are
   exercised through the Docker harness `scripts/test-linux`.
-- **Docker harness**: runs as a non-root user with `--security-opt seccomp=unconfined
+- **Docker harness**: has the GTK 4, libadwaita and VTE (`gir1.2-vte-3.91`) typelibs, so the
+  terminal pane's embedded path runs there and in CI (macOS has no VTE: the fallback path runs
+  there). It runs as a non-root user with `--security-opt seccomp=unconfined
   --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device
   /dev/net/tun`, so bubblewrap can create user namespaces and mount a fresh `/proc`, and
   slirp4netns can create its tap device. GTK tests run under weston's headless

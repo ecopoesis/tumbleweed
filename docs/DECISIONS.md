@@ -369,6 +369,62 @@ cannot be deleted by the retention sweep; it is reported and retried after a pau
 each failure, so that it does not hold up the rest (#84). S18 must extend the prompt interface (a
 `PromptId`, the picker, the requesting tool) and the wire for broker-to-shell requests.
 
+## D18 — The terminal escape hatch: the passwd shell, an environment made with `env -i`, a shortcut that is not a GAction (2026-10-17, accepted)
+
+**Context.** S05 gives the user a terminal that works when the agent is broken. It is also the
+one place in the shell where a process the user controls is started, so what it runs, with what, and who
+can ask for it matter (I1, I6). Four things were not obvious.
+**Decision.** (1) *Which shell.* The passwd entry (`pwd.getpwuid(os.getuid())`), not `$SHELL`: `$SHELL`
+is set by whatever started the shell (a launcher, a parent a user did not write), and the passwd entry
+is what `login(1)` and `chsh(1)` use. A shell that is not an absolute path to an executable regular
+file (or has an `=` in the path, which `env` would read as an assignment) falls back to `/bin/sh`, logged;
+a uid with no passwd entry gets `/bin/sh` in `/`. The working directory is the passwd home if it is a
+directory, `/` otherwise. It is not a `CanonicalPath`: no decision about access is made from it and
+nothing is opened through it by the shell (I11 is about workspaces).
+(2) *The environment, and `env -i`.* VTE's `spawn_async` documents `envv` as "variables to add"; it adds them to a copy
+of the *parent's* environment (measured: the first test run saw `GSK_RENDERER`, `UV` and
+`PYTEST_CURRENT_TEST` in a shell that had been given a short list). So an explicit list cannot be
+passed to VTE. The argv is `/usr/bin/env -i NAME=value ... shell -l`, which clears what VTE added and
+sets exactly ours, with no Python between `fork` and `exec` (a `child_setup` callback would run
+Python in the forked child of a process with threads: D13 rejected the same for `preexec_fn`). The
+list is `PATH`, `LANG`, `LANGUAGE`, `TZ`, `LC_*`, the session (`DISPLAY`, `WAYLAND_DISPLAY`,
+`XDG_*`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`: the user's own terminal should reach the
+user's own session and agent) and what the passwd entry gives (`HOME`, `SHELL`, `USER`, `LOGNAME`), plus `TERM` and
+`COLORTERM`; `SECRET_ENV_VARIABLES` are removed even if the list were extended, and a value that is not plain
+printable text of at most 4096 characters is dropped. The external terminals get the same
+environment through `subprocess`, which does not merge.
+(3) *The external terminal.* Chosen from a constant: `/usr/bin/open -a Terminal <home>` on macOS (the only
+way to open a window in a directory without Apple events), elsewhere the first of `x-terminal-emulator`,
+`gnome-terminal`, `kgx`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `foot`, `xterm` that is
+executable on the *absolute* entries of `PATH` (an empty or relative entry would search the current
+directory). `PATH` is the user's own, trusted as far as the shell they type into is. No configuration, no
+`$TERMINAL`, no `$TERM_PROGRAM`: a file or a variable that names the program is a command line to
+trust. The program gets no arguments and the home directory as its working directory, which each of
+them gives the shell it starts, so no per-terminal flag table (and no text in any argv but the home
+directory on macOS, passed as one argument). It runs in a session of its own and is ended with the
+shell (a bounded SIGTERM, then SIGKILL; at most eight at a time).
+(4) *Shortcut, not GAction.* The window's and the application's actions are exported on the session bus
+(#54, `test_session_bus.py`), so any process of the user could activate one. Showing a pane is harmless, but
+this one **starts a process**, and "no way for anyone else to start a shell in the user's UI" is a
+property worth the one line of code: F12 is a `Gtk.Shortcut` in the capture phase (VTE would take
+the key if it came later, and the pane could never be closed from the keyboard) and the button a plain
+widget, as the Esc key and the "New session" button already are. The pinned set is unchanged, and
+`tests/shell/test_terminal_pane.py` checks that no action of the window or application mentions the
+terminal. F12 because it is the key of the drop-down terminals (Guake, Yakuake), no application the
+shell shows uses it, and a Ctrl chord would take one from the shell itself; and Ctrl+L, which *is* a
+chord the shell uses (clear screen), is a GAction that is disabled while the terminal has the focus, so
+that GTK lets the key through to it.
+**Not done.** Ctrl+Q (quit the shell) and F9 (the side panel) still take their keys while the terminal has the
+focus (#90). A configurable external terminal, and a check of the list against real terminals, are #91.
+A second terminal pane, tabs, copy and paste buttons and a configurable key are not in v1.
+**Consequences.** `Vte` is imported only by `tumbleweed.shell.terminal_pane` and its loader (a test
+holds the line, and also rejects `feed_child`, `get_text_range` and the pty: no code of ours types into
+the terminal or reads it, so I1 holds by absence). The stubs have two gaps, both in that one module:
+`spawn_async` lacks the `child_setup_data` argument, and `os.waitid` is missing from the macOS stubs. A shell closed
+with the window is signalled and its exit is *seen* (`waitid` with `WNOWAIT`), not reaped by us, so that
+we never reap behind VTE's GLib child watch (which would make GLib warn about `ECHILD`); when the main loop is
+ending, init reaps it. The image gets `gir1.2-vte-3.91`.
+
 ## D19 — The tool store: one canonical package, an index in the broker's database, blobs named by their hash (2026-10-18, accepted)
 
 **Context.** S23 gives the broker durable, versioned tool packages (ARCHITECTURE section 5). The
