@@ -59,6 +59,12 @@ class TestCleanTranscript:
             "(soft gentle music)",
             "[ Background noise ]",
             "[Blank_Audio]",
+            "[typing]",
+            "[sighs]",
+            "[laughs]",
+            "(clears throat)",
+            "(wind blowing)",
+            "[ MUSIC PLAYING ] (applause)",
         ],
     )
     def test_nothing_said_is_none(self, raw: str) -> None:
@@ -146,3 +152,15 @@ class TestFakeStt:
 
         with pytest.raises(SttError, match="down"):
             stt.transcribe(Utterance(pcm(1), max_bytes=max_bytes(2)))
+
+
+class TestAnnotationBounds:
+    def test_a_group_longer_than_an_annotation_can_be_is_speech(self) -> None:
+        """Whisper's annotations are short; a long bracket of the same words is someone talking."""
+        long = "(" + " ".join(["music"] * 20) + ")"
+
+        assert clean_transcript(long, max_bytes=CAP) == long
+
+    @pytest.mark.parametrize("raw", ["(music music)", "[ MUSIC ][ MUSIC ][ MUSIC ]"])
+    def test_a_short_one_or_a_run_of_them_is_not(self, raw: str) -> None:
+        assert clean_transcript(raw, max_bytes=CAP) is None

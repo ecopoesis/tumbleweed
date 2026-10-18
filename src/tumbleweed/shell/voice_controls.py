@@ -18,7 +18,8 @@ able to switch the microphone on (ARCHITECTURE I10, section 8).
   window losing focus, so a key release that is never delivered cannot leave the microphone open
   (the recording also stops by itself at its length limit).
 - **Click the mic** to start and click again to stop; the button shows pressed while listening.
-- **Esc** while listening or transcribing abandons the utterance (`ShellWindow`).
+- **Esc** while listening or transcribing abandons the utterance, wherever the focus is, the
+  terminal included (the same capture controller; with nothing in progress the key is left alone).
 
 Nothing here blocks: `VoiceInput` does the audio and the network on worker threads.
 """
@@ -75,6 +76,12 @@ class VoiceControls(Gtk.Box):
 
         self.mic_button = Gtk.ToggleButton(label="Mic")
         self.mic_button.add_css_class("flat")
+        # Not in the tab order and no focus from a click, like the Terminal button: the button goes
+        # insensitive while it transcribes, which would take the focus off it and leave the window
+        # with none, and a Space on a focused Mic would start a recording by itself. The keyboard
+        # way is Ctrl+Space.
+        self.mic_button.set_focusable(False)
+        self.mic_button.set_focus_on_click(False)
         # No tooltip: a tooltip is a surface of its own, and none is allowed in the window (#53).
         self.mic_button.connect("toggled", self._on_toggled)
         self.message = plain_label("", css_classes=["caption", "error"])
@@ -154,7 +161,9 @@ def install_push_to_talk(
     reviewed as such (`tests/shell/test_terminal_isolation.py`): it looks at the key value and the
     modifiers of a press or release, nothing else, and it does nothing at all, letting the event
     through untouched, while `in_terminal()` says the focus is in the terminal pane (Ctrl+Space is
-    the shell's own key there: set-mark in Emacs and readline).
+    the shell's own key there: set-mark in Emacs and readline). The one other key it takes is a
+    plain Esc while an utterance is in progress, which abandons it (the terminal would otherwise
+    get it).
 
     The key is *latched*: only the first Ctrl+Space press starts a recording, key repeat is consumed
     and ignored, and only the release of Space or Ctrl (or the window losing focus) ends what the
@@ -170,6 +179,14 @@ def install_push_to_talk(
         _controller: Gtk.EventControllerKey, keyval: int, _keycode: int, state: Gdk.ModifierType
     ) -> bool:
         nonlocal held
+        if keyval == Gdk.KEY_Escape:
+            # Esc abandons an utterance in progress, wherever the focus is (the terminal takes the
+            # bubble-phase Esc); with nothing in progress it is not ours, and vim still gets it.
+            if state & Gtk.accelerator_get_default_mod_mask() or voice.phase is VoicePhase.IDLE:
+                return False
+            held = False
+            voice.cancel()
+            return True
         if keyval != Gdk.KEY_space:
             return False
         if state & Gtk.accelerator_get_default_mod_mask() != Gdk.ModifierType.CONTROL_MASK:

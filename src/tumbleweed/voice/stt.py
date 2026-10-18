@@ -37,7 +37,10 @@ _ANNOTATION_WORDS: Final = frozenset(
         "clapping", "laughter", "laughing", "noise", "noises", "inaudible", "crosstalk", "no",
         "speech", "pause", "sigh", "sighs", "cough", "coughing", "upbeat", "soft", "gentle",
         "dramatic", "background", "light", "loud", "sad", "calm", "static", "sound", "sounds",
-        "typing", "breathing",
+        "typing", "breathing", "laughs", "laughed", "clears", "throat", "wind", "blowing",
+        "birds", "chirping", "rain", "thunder", "beep", "beeping", "ringing", "bell", "phone",
+        "clicking", "footsteps", "door", "keyboard", "engine", "gasps", "gasp",
+        "mumbling", "whispering", "snoring", "sneezes", "sneezing", "yawns", "yawning",
     }
 )  # fmt: skip
 _GROUP: Final = r"[\[(]([^\[\]()]{0,60})[\])]"

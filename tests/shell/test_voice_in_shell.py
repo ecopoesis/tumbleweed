@@ -294,6 +294,95 @@ class TestInsideTheTerminal:
         assert indicator(v) == "Voice: listening"
 
 
+class TestEscape:
+    def test_esc_abandons_an_utterance_even_with_the_terminal_focused(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk, Gtk
+
+        v = build_voiced()
+        window = v.shell.window
+        show(v.shell)
+        controls(v).mic_button.set_active(
+            True
+        )  # started by the button; the focus goes to the terminal
+        assert pump_until(lambda: v.source.capturing)
+        inside = Gtk.Box()
+        inside.set_focusable(True)
+        window.terminal_pane.append(inside)
+        window.terminal_pane.set_visible(True)
+        window.set_focus(inside)
+        assert window.get_focus() is inside
+
+        taken = key(v, "key-pressed", Gdk.KEY_Escape, ctrl=False)
+
+        assert taken is True  # the terminal (bubble phase) never sees this one
+        assert indicator(v) == "Voice: idle"
+        assert pump_until(lambda: v.source.cancels == 1)
+
+    def test_esc_with_nothing_in_progress_is_left_for_the_terminal_and_vim(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        v = build_voiced()
+
+        assert key(v, "key-pressed", Gdk.KEY_Escape, ctrl=False) is False
+
+    def test_esc_with_a_modifier_is_not_ours(self, build_voiced: VoicedBuilder) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        v = build_voiced(hold_stt=True)
+        hold_and_speak(v)
+
+        taken = key(
+            v, "key-pressed", Gdk.KEY_Escape, ctrl=False, extra=int(Gdk.ModifierType.SHIFT_MASK)
+        )
+
+        assert taken is False
+        assert indicator(v) == "Voice: listening"
+
+
+class TestTheMicButtonKeepsTheFocusAlone:
+    def test_it_takes_no_focus_from_a_click_or_the_tab_order(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        v = build_voiced()
+        button = controls(v).mic_button
+
+        assert not button.get_focusable()
+        assert not button.get_focus_on_click()
+        assert not button.grab_focus()
+
+    def test_the_focus_is_where_it_was_after_an_utterance_and_after_a_failed_start(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        from tumbleweed.voice.errors import AudioError
+
+        v = build_voiced(["one"])
+        window = v.shell.window
+        show(v.shell)
+        window.set_focus(window.chat_panel.input_view)
+        button = controls(v).mic_button
+
+        button.set_active(True)
+        assert pump_until(lambda: v.source.capturing)
+        v.source.feed(pcm(1.0))
+        button.set_active(False)
+        assert pump_until(lambda: indicator(v) == "Voice: idle")
+        pump_until(lambda: False, timeout=0.2)
+
+        assert window.get_focus() is window.chat_panel.input_view
+
+        v.source.start_error = AudioError("No mic.")
+        button.set_active(True)
+        assert pump_until(lambda: controls(v).message.get_visible())
+        pump_until(lambda: False, timeout=0.2)
+
+        assert window.get_focus() is window.chat_panel.input_view
+        assert not button.get_active()
+
+
 class TestTheMicButton:
     def test_a_click_starts_and_a_second_click_sends(self, build_voiced: VoicedBuilder) -> None:
         v = build_voiced(hold_stt=True)

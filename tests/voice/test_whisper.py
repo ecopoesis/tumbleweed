@@ -709,6 +709,7 @@ class TestTls:
                 second.read(1, 30.0)  # the library would wait 30 s
             assert time.monotonic() - started < 2
             second.close()
+            assert network._streams == []  # noqa: SLF001  (the plain streams were swapped, not kept)
         finally:
             done.set()
             listener.close()
@@ -991,3 +992,129 @@ class TestOneBigWrite:
         assert time.monotonic() - started < 2
         assert 3 <= len(written) <= 5
         assert max(written) <= 16 * 1024
+
+
+class TestTheBudgetsBookkeeping:
+    def test_nothing_is_left_tracked_after_requests(self, stub: StubServer) -> None:
+        backend = WhisperServerBackend(SttEndpoint(stub.url), language="auto", limits=limits())
+        try:
+            for _ in range(3):
+                backend.transcribe(utterance(0.1))
+            network = backend._network  # noqa: SLF001
+            assert network is not None
+            assert network._streams == []  # noqa: SLF001  (every stream was forgotten on close)
+            assert network._budget is None  # noqa: SLF001
+            with pytest.raises(httpcore2.ConnectError):
+                network.budget()
+        finally:
+            backend.close()
+
+    def test_ending_an_old_budget_leaves_the_newer_one(self) -> None:
+        network = budget.BudgetBackend()
+        old = network.begin(timedelta(seconds=5), AbortSignal())
+        new = network.begin(timedelta(seconds=5), AbortSignal())
+
+        network.end(old)
+
+        assert network.budget() is new
+        network.end(new)
+        with pytest.raises(httpcore2.ConnectError):
+            network.budget()
+
+    def test_the_connect_is_given_what_is_left_not_the_librarys_longer_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        given: list[float | None] = []
+
+        def record(
+            self: httpcore2.SyncBackend,
+            host: str,
+            port: int,
+            timeout: float | None = None,
+            *a: object,
+            **k: object,
+        ) -> object:
+            given.append(timeout)
+            raise httpcore2.ConnectError("refused")
+
+        monkeypatch.setattr(httpcore2.SyncBackend, "connect_tcp", record)
+        network = budget.BudgetBackend()
+        network.begin(timedelta(seconds=1), AbortSignal())
+
+        with pytest.raises(httpcore2.ConnectError):
+            network.connect_tcp("127.0.0.1", 9, 30.0)
+
+        assert len(given) == 1
+        assert given[0] is not None
+        assert 0 < given[0] <= 1.0
+
+    def test_a_handshake_that_never_finishes_is_cut_off_at_the_deadline(self) -> None:
+        import ssl
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        held: list[socket.socket] = []
+        threading.Thread(target=lambda: held.append(listener.accept()[0]), daemon=True).start()
+        network = budget.BudgetBackend()
+        network.begin(timedelta(seconds=1), AbortSignal())
+        try:
+            stream = network.connect_tcp("127.0.0.1", listener.getsockname()[1], 5.0)
+            started = time.monotonic()
+            with pytest.raises(httpcore2.TimeoutException):
+                stream.start_tls(ssl.create_default_context(), "localhost", 30.0)
+
+            assert time.monotonic() - started < 2.5
+            stream.close()
+        finally:
+            for connection in held:
+                connection.close()
+            listener.close()
+
+    def test_a_pieces_timeout_is_what_is_left_not_the_librarys(self) -> None:
+        given: list[float | None] = []
+
+        class Peer(httpcore2.NetworkStream):
+            def write(self, buffer: bytes, timeout: float | None = None) -> None:
+                given.append(timeout)
+
+        owner = budget.BudgetBackend()
+        owner.begin(timedelta(seconds=1), AbortSignal())
+
+        budget._BudgetStream(Peer(), owner).write(b"x" * 40_000, 30.0)  # noqa: SLF001
+
+        assert len(given) == 3
+        assert all(t is not None and 0 < t <= 1.0 for t in given)
+
+
+class TestAnErrorWhileAbandoningIsAbandoning:
+    """Whatever the library raises once the user gave the request up, the answer is `Cancelled`."""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            httpx2.ReadTimeout("slow"),
+            httpx2.ConnectError("refused"),
+            httpx2.DecodingError("broken"),
+        ],
+        ids=["timeout", "transport", "http-error"],
+    )
+    def test_it_is_a_cancellation_and_not_an_error_to_show(self, error: httpx2.HTTPError) -> None:
+        signal = AbortSignal()
+
+        class Transport(httpx2.BaseTransport):
+            def handle_request(self, request: httpx2.Request) -> httpx2.Response:
+                request.read()
+                signal.set()
+                raise error
+
+        voice_limits = limits(request_timeout_seconds=5)
+        backend = WhisperServerBackend(
+            SttEndpoint("http://127.0.0.1:1"),
+            language="auto",
+            limits=voice_limits,
+            client=build_http_client(voice_limits, transport=Transport()),
+        )
+
+        with pytest.raises(SttCancelledError):
+            backend.transcribe(utterance(), signal)

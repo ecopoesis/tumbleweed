@@ -563,7 +563,11 @@ generation, so what an abandoned utterance finds later is dropped.
   (set-mark), and no keystroke typed there is looked at beyond its key value. Elsewhere the key is
   *latched*: the first press starts a recording, repeat is consumed and ignored (a held or stuck key
   cannot record again when its utterance ends), the release of Space or Ctrl ends what the keyboard
-  started (not a recording the Mic button started), and so does the window losing focus.
+  started (not a recording the Mic button started), and so does the window losing focus. The one
+  other key it takes is a plain Esc **while an utterance is in progress**, which abandons it even
+  with the terminal focused (the terminal gets the bubble-phase Esc first); with nothing in progress
+  Esc is untouched, so vim still gets it. The Mic button takes no focus (like the Terminal button),
+  so an utterance never leaves the window without a focused widget.
 - *Configuration.* `[voice]` is read apart from `[agent]` (`agent.config.load_voice_config`): a
   mistake in it turns voice off, with a logged message, and leaves the agent working, and the other
   way round; a syntax error in the file is both's.

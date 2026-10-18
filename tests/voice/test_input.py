@@ -377,6 +377,55 @@ class TestAbandoning:
         assert r.recorder.texts == []
 
 
+class IgnoresAbort:
+    """A backend that does not look at the abort signal: it answers when its gate opens."""
+
+    def __init__(self, gate: threading.Event, text: str) -> None:
+        self._gate = gate
+        self._text = text
+        self.asked = 0
+
+    def transcribe(self, utterance: Utterance, abort: AbortSignal | None = None) -> str:
+        self.asked += 1
+        self._gate.wait(timeout=10)
+        return self._text
+
+    def close(self) -> None:
+        return
+
+
+class TestALateResult:
+    def test_the_answer_of_an_abandoned_utterance_is_dropped_while_a_new_one_listens(
+        self, rig: RigFactory
+    ) -> None:
+        gate = threading.Event()
+        stt = IgnoresAbort(gate, "old words")
+        r = rig(stt=stt)  # type: ignore[arg-type]  # a backend of its own
+        r.talk()
+        assert r.dispatcher.pump_until(lambda: stt.asked == 1)
+        r.voice.cancel()
+        r.voice.press()  # the next utterance is listening when the old answer comes in
+        assert r.dispatcher.pump_until(lambda: r.source.capturing)
+
+        gate.set()
+        r.dispatcher.settle(0.3)
+
+        assert r.recorder.texts == []
+        assert r.current_phase() is VoicePhase.LISTENING
+
+    def test_a_cancelled_request_posts_nothing(self, rig: RigFactory) -> None:
+        gate = threading.Event()
+        r = rig(stt=FakeStt(["answer"], gate=gate))
+        r.talk()
+        assert r.dispatcher.pump_until(lambda: len(r.stt.heard) == 1)  # type: ignore[union-attr]
+        r.voice.cancel()
+        assert r.dispatcher.pump_until(lambda: r.stt.aborted == 1)  # type: ignore[union-attr]
+        r.dispatcher.settle(0.2)
+
+        assert r.recorder.problems == []
+        assert r.recorder.texts == []
+
+
 class TestTheLengthLimit:
     def test_a_recording_stops_by_itself_at_the_cap_and_the_cap_is_what_is_sent(
         self, rig: RigFactory

@@ -598,7 +598,9 @@ appears). (7) *Push-to-talk is a key and a button,
 not `GAction`s,* which the session bus would export. The key is Ctrl+Space, fixed (#100); the button
 toggles. The key is a capture controller on the window, so it is the reviewed exception to S05's
 rule that the terminal's keystrokes are nobody's (D18): in the terminal pane it returns False and
-keeps no state (Ctrl+Space is the shell's: set-mark), and a test pins what its handlers read. It is
+keeps no state (Ctrl+Space is the shell's: set-mark), and a test pins what its handlers read; the one other key it takes is a plain Esc while an
+utterance is in progress (the terminal would otherwise get the bubble-phase Esc), and the Mic button
+takes no focus, like the Terminal button. It is
 latched, so key repeat records nothing more and a space typed during a click-started recording does
 not end it. (8) *The indicator gains `TRANSCRIBING`* (S08's state machine names it); `THINKING` and `SPEAKING`
 stay for S07. (9) *Config:* a `[voice]` table beside `[agent]`, read apart from it (a mistake in one does not

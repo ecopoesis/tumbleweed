@@ -699,6 +699,7 @@ PUSH_TO_TALK_HANDLER_NAMES = frozenset(
     {
         "Gdk", "Gtk", "keyval", "state", "in_terminal", "held", "voice", "_RELEASE_KEYS",
         "KEY_space", "accelerator_get_default_mod_mask", "ModifierType", "CONTROL_MASK",
+        "KEY_Escape", "phase", "VoicePhase", "IDLE",
     }
 )  # fmt: skip
 
@@ -742,5 +743,5 @@ def test_the_push_to_talk_controller_reads_nothing_but_the_key_and_the_modifiers
             for node in ast.walk(statement)
             if isinstance(node, ast.Name | ast.Attribute)
             and not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
-        } - {"press", "release"}
+        } - {"press", "release", "cancel"}
         assert loaded <= PUSH_TO_TALK_HANDLER_NAMES, (handler, loaded - PUSH_TO_TALK_HANDLER_NAMES)

@@ -106,7 +106,7 @@ status strip. It is your tool, not the agent's: nothing the model says can type 
   shell (SIGHUP, then SIGKILL after a second). While the terminal has the focus, Ctrl+L is the shell's (clear
   screen) and not "focus the input"; Ctrl+Q and F9 still act on the shell (#90). Ctrl+Space is the
   shell's too (set-mark in Emacs and readline): push-to-talk ([Voice input](#voice-input)) does nothing,
-  and lets the key through untouched, while the terminal has the focus; use the Mic button there.
+  and lets the key through untouched, while the terminal has the focus; use the Mic button there. Esc is yours too, except that it abandons a voice utterance in progress.
 - **Where there is no VTE** (macOS, whose Homebrew has no GTK 4 build of it): F12 opens an external terminal
   window, in your home directory: Terminal.app (`open -b com.apple.Terminal`) on a Mac, otherwise the first of
   `x-terminal-emulator`, `gnome-terminal`, `kgx`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `foot`,
