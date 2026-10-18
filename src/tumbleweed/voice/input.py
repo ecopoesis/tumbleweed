@@ -24,7 +24,6 @@ never persisted (`audio`).
 
 import enum
 import logging
-import queue
 import threading
 from collections.abc import Callable
 from typing import Final, Protocol, final
@@ -33,6 +32,7 @@ from tumbleweed.voice.audio import AudioSource, Utterance
 from tumbleweed.voice.errors import AudioError, SttCancelledError, VoiceError, WrongThreadError
 from tumbleweed.voice.limits import MAX_TRANSCRIPT_BYTES, VoiceLimits
 from tumbleweed.voice.stt import AbortSignal, SttBackend, clean_transcript
+from tumbleweed.voice.worker import Worker
 
 logger = logging.getLogger(__name__)
 
@@ -74,30 +74,6 @@ class VoiceObserver(Protocol):
 
 
 @final
-class _Worker:
-    """One daemon thread that runs jobs in order. A job that raises is logged, not fatal."""
-
-    def __init__(self, name: str) -> None:
-        self._jobs: queue.SimpleQueue[Callable[[], None] | None] = queue.SimpleQueue()
-        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
-        self._thread.start()
-
-    def submit(self, job: Callable[[], None]) -> None:
-        self._jobs.put(job)
-
-    def close(self) -> None:
-        """Stop after the jobs already queued; does not wait for them."""
-        self._jobs.put(None)
-
-    def _run(self) -> None:
-        while (job := self._jobs.get()) is not None:
-            try:
-                job()
-            except Exception:
-                logger.exception("a voice job failed")
-
-
-@final
 class VoiceInput:
     """Push-to-talk over an `AudioSource` and an `SttBackend` (see the module docstring)."""
 
@@ -122,8 +98,8 @@ class VoiceInput:
         # Touched only by the audio worker:
         self._source: AudioSource | None = None
         self._capturing = False
-        self._audio_worker = _Worker("tumbleweed-audio")
-        self._speech_worker = _Worker("tumbleweed-stt")
+        self._audio_worker = Worker("tumbleweed-audio")
+        self._speech_worker = Worker("tumbleweed-stt")
 
     @property
     def phase(self) -> VoicePhase:

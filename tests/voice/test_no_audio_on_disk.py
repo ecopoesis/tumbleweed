@@ -3,6 +3,10 @@
 - *Python writes*: a whole utterance (capture buffer, WAV, HTTP, transcript) runs under an audit
   hook that records every write the interpreter makes to the file system, and there is none. An
   audit hook cannot see what native code does, so it says nothing about GStreamer's own writes;
+- *speech output* (S07) is held to the same: a whole spoken reply (Piper's process, the synthesised
+  audio, the player) makes no Python write either; what Piper and GStreamer do natively is, as
+  above, out of an audit hook's sight (a Linux test plays through a real pipeline and checks that
+  no file appears);
 - *structure*: the voice package's sources contain no call that could write a file (an AST scan);
 - *GStreamer*: the pipeline is built from a fixed list of elements, none of which writes (a file
   sink would be the way audio could reach a disk without a line of Python saying so), checked
@@ -49,7 +53,9 @@ def _hook(event: str, args: tuple[object, ...]) -> None:
     if not _recording.is_set() or event not in _FILE_EVENTS:
         return
     if event == "open":
-        _path, mode, flags = args
+        path, mode, flags = args
+        if isinstance(path, int):
+            return  # a descriptor wrapped in a file object (a subprocess's pipes): no file is made
         flags_int = flags if isinstance(flags, int) else 0
         mode_text = mode if isinstance(mode, str) else ""
         if not (set(mode_text) & set("wax+")) and not flags_int & _WRITE_FLAGS:
@@ -108,6 +114,54 @@ def test_a_whole_utterance_writes_nothing_to_the_file_system(
     assert sorted(tmp_path.rglob("*")) == before
 
 
+def spoken_reply_through_everything(piper_dir: Path) -> list[str]:
+    from tumbleweed.voice.config import TtsConfig
+    from tumbleweed.voice.fake import FakeAudioPlayer
+    from tumbleweed.voice.output import SpeechOutput, SpeechPhase
+    from tumbleweed.voice.piper import PiperBackend, piper_paths
+
+    program, model = piper_dir / "piper", piper_dir / "voice.onnx"
+    config = TtsConfig(piper_path=str(program), voice_model=str(model))
+    piper, voice = piper_paths(str(program), str(model))
+    dispatcher = ManualDispatcher()
+    player = FakeAudioPlayer()
+    speech = SpeechOutput(
+        backend=PiperBackend(piper, voice, config=config),
+        player=lambda: player,
+        dispatcher=dispatcher,
+        config=config,
+    )
+    try:
+        speech.begin_reply()
+        speech.feed("The first sentence is here. The second one follows it.")
+        speech.end_reply()
+        assert dispatcher.pump_until(lambda: len(player.played) == 2)
+        assert dispatcher.pump_until(lambda: speech.phase is SpeechPhase.IDLE)
+    finally:
+        speech.close()
+    return [str(len(audio.pcm)) for audio in player.played]
+
+
+def test_a_whole_spoken_reply_writes_nothing_to_the_file_system(
+    writes: list[tuple[str, tuple[object, ...]]], tmp_path: Path
+) -> None:
+    from tests.voice.fake_piper import make_fake_piper
+
+    piper_dir = tmp_path / "piper"
+    piper_dir.mkdir()
+    make_fake_piper(piper_dir)
+    spoken_reply_through_everything(piper_dir)  # a first run imports everything
+    before = sorted(tmp_path.rglob("*"))
+
+    _recording.set()
+    played = spoken_reply_through_everything(piper_dir)
+    _recording.clear()
+
+    assert len(played) == 2
+    assert writes == []
+    assert sorted(tmp_path.rglob("*")) == before
+
+
 def test_the_audit_hook_would_have_noticed_a_write(
     writes: list[tuple[str, tuple[object, ...]]], tmp_path: Path
 ) -> None:
@@ -138,16 +192,17 @@ def test_no_voice_module_can_write_a_file() -> None:
     }
     problems: list[str] = []
     for name, tree in _sources().items():
+        allowed = _ALLOWED_IMPORTS.get(name, frozenset())
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 problems += [
                     f"{name}: imports {a.name}"
                     for a in node.names
-                    if a.name.split(".")[0] in forbidden_modules
+                    if a.name.split(".")[0] in forbidden_modules - allowed
                 ]
             elif (
                 isinstance(node, ast.ImportFrom)
-                and (node.module or "").split(".")[0] in forbidden_modules
+                and (node.module or "").split(".")[0] in forbidden_modules - allowed
             ):
                 problems.append(f"{name}: imports from {node.module}")
             elif isinstance(node, ast.Call):
@@ -162,6 +217,27 @@ def test_no_voice_module_can_write_a_file() -> None:
 
     # The one `open` there is: the WAV wrapper writes to an in-memory buffer.
     assert problems == [f"whisper.py:{_wave_open_line()}: calls open"]
+
+
+# Piper (S07) is the one module that may import `os`: it checks the voice model's file type, kills
+# a process group and reads and writes the child's pipes. The next test pins everything it does
+# with it, so the exception cannot grow into a way to write a file.
+_ALLOWED_IMPORTS = {"piper.py": frozenset({"os"})}
+_PIPER_OS_CALLS = {"stat", "access", "killpg", "set_blocking", "read", "write"}
+
+
+def test_piper_uses_os_only_for_file_types_process_groups_and_pipes() -> None:
+    tree = _sources()["piper.py"]
+    used = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    }
+
+    assert used <= _PIPER_OS_CALLS | {"X_OK"}
+    assert {"killpg", "set_blocking"} <= used
 
 
 def _wave_open_line() -> int:
@@ -197,7 +273,16 @@ def test_the_gstreamer_pipeline_is_built_from_fixed_elements_none_of_which_write
         and " " not in node.value
     }
 
-    assert made == {"audiotestsrc", "audioconvert", "audioresample", "capsfilter", "appsink"}
+    assert made == {
+        "audiotestsrc",
+        "audioconvert",
+        "audioresample",
+        "capsfilter",
+        "appsink",
+        "appsrc",
+        "volume",
+        "fakesink",
+    }
     assert {"filesink", "multifilesink", "splitmuxsink", "wavenc"}.isdisjoint(named)
     assert named <= {
         "audiotestsrc",
@@ -206,6 +291,13 @@ def test_the_gstreamer_pipeline_is_built_from_fixed_elements_none_of_which_write
         "pipewiresrc",
         "pulsesrc",
         "autoaudiosrc",
+        # Playback (S07): the speakers' sinks, and the test sink, which discards.
+        "appsrc",
+        "fakesink",
+        "osxaudiosink",
+        "pipewiresink",
+        "pulsesink",
+        "autoaudiosink",
     }
     source = (VOICE / "gstreamer.py").read_text(encoding="utf-8")
     assert "parse_launch" not in source

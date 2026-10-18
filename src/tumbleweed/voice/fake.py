@@ -1,6 +1,7 @@
-"""Fakes of the voice protocols, for tests and for trying the shell without a microphone or a
-speech server: `FakeAudioSource` and `FakeStt`. They behave like the real thing (bounded buffer,
-scripted answers, errors, a gate to hold a call open) rather than mocking it.
+"""Fakes of the voice protocols, for tests and for trying the shell without a microphone, a speech
+server, Piper or a speaker: `FakeAudioSource`, `FakeStt`, `FakeTts` and `FakeAudioPlayer`. They
+behave like the real thing (bounded buffer, scripted answers, errors, a gate to hold a call open,
+giving up at once when aborted) rather than mocking it.
 """
 
 import threading
@@ -11,8 +12,16 @@ from typing import final
 
 from tumbleweed.core.types import ByteCount
 from tumbleweed.voice.audio import BoundedPcm, Utterance
-from tumbleweed.voice.errors import AudioError, SttCancelledError, SttError
+from tumbleweed.voice.errors import (
+    AudioError,
+    PlaybackError,
+    SttCancelledError,
+    SttError,
+    TtsCancelledError,
+    TtsError,
+)
 from tumbleweed.voice.stt import AbortSignal
+from tumbleweed.voice.tts import SpeechAudio
 
 
 @final
@@ -121,6 +130,100 @@ class FakeStt:
         if isinstance(answer, SttError):
             raise answer
         return answer.text if isinstance(answer, Heard) else answer
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@final
+class FakeTts:
+    """A `TtsBackend` that makes a silence as long as the sentence (`samples_per_char` samples a
+    character) and keeps what it was asked to say, in order.
+
+    `errors` maps a sentence to the `TtsError` to raise for it; `gate`, if given, makes
+    `synthesize` wait for it (with a deadline, giving up at once if `abort` is set), to play a slow
+    synthesiser.
+    """
+
+    def __init__(
+        self,
+        *,
+        sample_rate_hz: int = 22_050,
+        samples_per_char: int = 100,
+        errors: dict[str, TtsError] | None = None,
+        gate: threading.Event | None = None,
+    ) -> None:
+        self._rate = sample_rate_hz
+        self._samples_per_char = samples_per_char
+        self._errors = errors or {}
+        self._gate = gate
+        self.spoken: list[str] = []
+        self.aborted = 0
+        self.closed = False
+
+    def synthesize(self, text: str, abort: AbortSignal) -> SpeechAudio:
+        self.spoken.append(text)
+        if self._gate is not None:
+            deadline = time.monotonic() + 10
+            while not self._gate.wait(timeout=0.005):
+                if abort.is_set:
+                    self.aborted += 1
+                    raise TtsCancelledError("Cancelled.")
+                if time.monotonic() > deadline:
+                    break
+        if abort.is_set:
+            self.aborted += 1
+            raise TtsCancelledError("Cancelled.")
+        if text in self._errors:
+            raise self._errors[text]
+        pcm = bytes(2 * self._samples_per_char * len(text))
+        return SpeechAudio(pcm, sample_rate_hz=self._rate, max_bytes=ByteCount(len(pcm)))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@final
+class FakeAudioPlayer:
+    """An `AudioPlayer` that keeps what it was given to play, in order.
+
+    `hold`, if given, makes `play` last until it is set (with a deadline), to play audio that takes
+    time; an abort ends it at once (`interrupted` counts those). `error` is raised by `play`.
+    `playing` is set while a `play` is in progress, for a test to wait on.
+    """
+
+    def __init__(
+        self, *, hold: threading.Event | None = None, error: PlaybackError | None = None
+    ) -> None:
+        self._hold = hold
+        self.error = error
+        self.played: list[SpeechAudio] = []
+        self.interrupted = 0
+        self.closed = False
+        self.playing = threading.Event()
+
+    def play(self, audio: SpeechAudio, abort: AbortSignal) -> None:
+        if self.error is not None:
+            raise self.error
+
+        def aborted() -> bool:  # a call, so the checker does not take the first answer for good
+            return abort.is_set
+
+        if aborted():
+            return
+        self.played.append(audio)
+        self.playing.set()
+        try:
+            if self._hold is not None:
+                deadline = time.monotonic() + 10
+                while not self._hold.wait(timeout=0.002):
+                    if aborted():
+                        self.interrupted += 1
+                        return
+                    if time.monotonic() > deadline:
+                        return
+        finally:
+            self.playing.clear()
 
     def close(self) -> None:
         self.closed = True

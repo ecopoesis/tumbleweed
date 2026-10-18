@@ -1,6 +1,7 @@
 """Fixtures of the voice tests."""
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -14,3 +15,10 @@ def stub() -> Iterator[StubServer]:
     server.start()
     yield server
     server.close()
+
+
+@pytest.fixture
+def home(tmp_path: Path) -> Path:
+    """A home with the configuration directory made, as `environ_for` and `write_config` use it."""
+    (tmp_path / "config" / "tumbleweed").mkdir(parents=True, mode=0o700)
+    return tmp_path
