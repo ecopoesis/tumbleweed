@@ -29,6 +29,7 @@ from tumbleweed.broker.store import BrokerStore
 from tumbleweed.core.ids import RunId, TaskId
 from tumbleweed.ipc.broker_messages import EnvPair
 from tumbleweed.ipc.errors import RequestTimeoutError
+from tumbleweed.sandbox.errors import InvalidPolicyError
 
 COMMAND = ("/usr/bin/python3", "-c", "print(1)")
 PHOTO = "Photos/a.jpg"
@@ -591,5 +592,82 @@ class TestTheHeartbeat:
                 async with asyncio.timeout(10):
                     while not client.heartbeat_stopped:  # noqa: ASYNC110  (bounded)
                         await asyncio.sleep(0.02)
+
+        run(scenario)
+
+
+class TestMoreRefusalsAreRecorded:
+    def test_a_directory_swapped_after_the_decision_leaves_a_refused_listing_entry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await granted(rig, client)
+                directory = rig.home / "Photos" / "2026"
+                real = open_granted
+
+                def swapping(stored: object, *, rules: object) -> object:
+                    opened = real(stored, rules=rules)  # type: ignore[arg-type]  # a stand-in takes object
+                    directory.rename(rig.home / "Photos" / "2026.old")
+                    directory.mkdir()
+                    return opened
+
+                monkeypatch.setattr("tumbleweed.broker.service.open_granted", swapping)
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.list_dir(task, RunId.new(), str(directory))
+
+                assert caught.value.reason == "unsafe"
+                outcomes = [(e.operation, e.outcome, e.reason) for e in rig.audit_of(FileAccess)]
+                assert outcomes == [
+                    ("list_dir", "allowed", None),
+                    ("list_dir", "refused", "identity_mismatch"),
+                ]
+
+        run(scenario)
+
+    def test_exactly_the_cap_of_runs_is_allowed_and_one_more_is_a_recorded_refusal(self) -> None:
+        async def scenario() -> None:
+            async with running(config=lambda c: replace_config(c, max_runs_per_task=3)) as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+
+                for _ in range(3):
+                    await client.run_in_sandbox(task, RunId.new(), COMMAND)
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.run_in_sandbox(task, RunId.new(), COMMAND)
+
+                assert caught.value.reason == "busy"
+                assert len(rig.sandbox.policies) == 3
+                entries = rig.audit_of(SandboxRun)
+                assert [e.outcome for e in entries if e.outcome == "authorised"] == [
+                    "authorised"
+                ] * 3
+                assert [e.reason for e in entries if e.outcome == "refused"] == ["run_cap"]
+
+        run(scenario)
+
+    def test_a_policy_the_sandbox_refuses_is_a_recorded_refusal_and_nothing_runs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await granted(rig, client)
+
+                def refusing(**_: object) -> object:
+                    raise InvalidPolicyError("a grant over /secret")
+
+                monkeypatch.setattr("tumbleweed.broker.service.SandboxPolicy", refusing)
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.run_in_sandbox(task, RunId.new(), COMMAND)
+
+                assert caught.value.reason == "invalid_request"
+                assert "secret" not in str(caught.value)
+                assert rig.sandbox.policies == []
+                (entry,) = rig.audit_of(SandboxRun)
+                assert (entry.outcome, entry.reason) == ("refused", "policy_refused")
 
         run(scenario)

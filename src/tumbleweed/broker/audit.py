@@ -44,7 +44,9 @@ MAX_ENTRY_BYTES: Final = 64 * 1024
 FORMAT_VERSION: Final = 1
 _TEXT: Final = 500
 _PATH: Final = 4096
-_MAX_LIST: Final = 64
+MAX_AUDITED_IDS: Final = 64
+MAX_ROLLED_BACK_KINDS: Final = 128
+_MAX_LIST: Final = MAX_AUDITED_IDS
 
 
 class _AuditModel(BaseModel):
@@ -94,7 +96,8 @@ class TaskEnded(_AuditModel):
     kind: Literal["task_ended"] = "task_ended"
     task: TaskId
     reason: TaskEndReason
-    revoked: GrantIds
+    revoked: GrantIds  # the first `MAX_AUDITED_IDS`; `revoked_count` says how many in all
+    revoked_count: Annotated[int, Field(ge=0)] | None = None
 
 
 class GrantDecision(_AuditModel):
@@ -181,10 +184,20 @@ class SandboxRunResult(_AuditModel):
 
 class RolledBack(_AuditModel):
     """The act the entries just before this one recorded did not happen: its transaction could
-    not be committed after they were written. `entries` are their kinds, in order."""
+    not be committed after they were written. `entries` are the kinds of the first
+    `MAX_ROLLED_BACK_KINDS` of them, in order, and `count` how many there were.
+
+    It follows a failed commit, and is also written when the end of a task whose connection had
+    gone could not be committed: in that case the task is ended in memory (it is unusable, its
+    runs are stopped) while the database still says live, until the next start ends it on record
+    (`task_ended` with reason `startup`).
+    """
 
     kind: Literal["rolled_back"] = "rolled_back"
-    entries: Annotated[tuple[Annotated[str, Field(max_length=32)], ...], Field(max_length=130)]
+    entries: Annotated[
+        tuple[Annotated[str, Field(max_length=32)], ...], Field(max_length=MAX_ROLLED_BACK_KINDS)
+    ]
+    count: Annotated[int, Field(ge=0)]
 
 
 class WorkspaceDeleted(_AuditModel):

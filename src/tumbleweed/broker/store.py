@@ -73,6 +73,7 @@ type Row = tuple[object, ...]
 type Signature = tuple[tuple[str, str, str, str], ...]
 
 _MILLIS = "BETWEEN 0 AND 253402300799999"
+MAX_FAILURES: Final = 1_000_000
 _U64_TEXT = "length(%s) BETWEEN 1 AND 20 AND %s NOT GLOB '*[^0-9]*'"
 
 # Append a migration to change the schema; never edit an earlier one.
@@ -87,6 +88,9 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     workspace TEXT NOT NULL CHECK (workspace IN ('present', 'deleted')),
     workspace_fsid TEXT NOT NULL CHECK ({_U64_TEXT % ("workspace_fsid", "workspace_fsid")}),
     workspace_ino TEXT NOT NULL CHECK ({_U64_TEXT % ("workspace_ino", "workspace_ino")}),
+    delete_failures INTEGER NOT NULL DEFAULT 0
+        CHECK (delete_failures BETWEEN 0 AND {MAX_FAILURES}),
+    delete_after INTEGER CHECK (delete_after IS NULL OR delete_after {_MILLIS}),
     CHECK ((state = 'live') = (ended_at IS NULL))
 ) STRICT""",
         "CREATE INDEX tasks_by_end ON tasks (state, ended_at)",
@@ -99,18 +103,6 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     revoked_at INTEGER CHECK (revoked_at IS NULL OR revoked_at {_MILLIS})
 ) STRICT""",
         "CREATE INDEX grants_by_task ON grants (task_id, revoked_at)",
-    ),
-    (
-        # Retention backs off from a workspace it cannot delete (how many times it failed, and
-        # when to try again), so that undeletable ones do not hold up the queue.
-        (
-            "ALTER TABLE tasks ADD COLUMN delete_failures INTEGER NOT NULL DEFAULT 0 "
-            "CHECK (delete_failures BETWEEN 0 AND 1000000)"
-        ),
-        (
-            "ALTER TABLE tasks ADD COLUMN delete_after INTEGER "
-            f"CHECK (delete_after IS NULL OR delete_after {_MILLIS})"
-        ),
     ),
 )
 
@@ -308,6 +300,15 @@ def _taint_of(text: str) -> frozenset[TaintKind]:
         raise StoreCorruptError("the broker's database holds an unknown taint") from None
 
 
+def _failures(value: object) -> int:
+    """The count of failed deletions as stored, which a hand-edited file can make anything: a
+    number out of range is a record that cannot be real (the row is skipped)."""
+    count = _integer(value)
+    if not 0 <= count <= MAX_FAILURES:
+        raise StoreCorruptError("the broker's database holds a malformed count")
+    return count
+
+
 def _identity(fsid: str, ino: str) -> FsIdentity:
     try:
         return FsIdentity(fsid=int(fsid), ino=int(ino))
@@ -501,7 +502,7 @@ class BrokerStore:
                 ended_at=None if row[3] is None else _moment(row[3]),
                 workspace_present=_text(row[4]) == "present",
                 workspace=_identity(_text(row[5]), _text(row[6])),
-                failures=_integer(row[7]),
+                failures=_failures(row[7]),
             )
         except (InvalidValueError, ValidationError):
             raise StoreCorruptError("the broker's database holds a malformed task") from None

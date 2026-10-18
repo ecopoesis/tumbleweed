@@ -254,8 +254,8 @@ cannot parse, which only a bug in the runner can produce. It runs with an empty 
 is given the program's variables as arguments, applied at the `exec`, so that `LD_PRELOAD` in a
 policy cannot run code in it before Landlock; the policy refuses loader variables as well. It
 reads its environment from `/proc/self/environ`, because Python adds `LC_CTYPE` to its own. (4) The
-Landlock ruleset is computed from the policy's mounts by a pure function and given as arguments, so the
-mounts and the ruleset are one fact. `require_landlock` is a policy field that defaults to true, and
+Landlock ruleset is computed from the policy's mounts by a pure function and given as arguments,
+so the mounts and the ruleset are one fact. `require_landlock` is a policy field that defaults to true, and
 a missing Landlock is `SandboxUnavailable` before the program starts; false records "unavailable"
 in every result. (5) Tests prove each denial against a control run in the namespaces alone, since
 the sandbox has no capabilities and many denials would otherwise look the same.
@@ -291,42 +291,41 @@ after, because a crash in between must not leave a run that started unrecorded. 
 after the entries were written, a `rolled_back` entry follows them. Every refusal once the task is
 known is recorded too (a refused run is a `sandbox_run` entry with outcome `refused`), the taint a
 new task inherits is read where it is recorded, and what a request reserves (a place under a cap, a
-`RunId`) is reserved before its first `await`. (3) *Owners.* A task
-belongs to the connection that made it and ends with it; a broker that starts ends what a dead one
-left (grants revoked, workspaces kept 7 days, taint kept for the task that replaces it). The daemon,
-not the caller, owns taint. (4) *The two host requirements are the daemon's settings, on by default,
-never a request's.* `--no-landlock` and `--allow-unenforced-limits` are for a development host
-(Docker Desktop's kernel has no Landlock; the container and CI have no systemd user manager); the
-audit log's start entry records them, and every result says what was not enforced. Where required, a
-run on a host whose runner reports `pids` or total memory as unenforced is refused before anything
-is opened. (5) *The sandbox's own paths are deny entries.* `/tmp`, `/workspace`, `/inputs`, the
-launcher's file and the runtime's paths are added to the deny list, so a grant the sandbox would
-refuse is refused when it is asked for (a prompt is never shown for what cannot run), instead of
-remapped: a remap would show the user a different path from the one that is granted. The directory
-of `$SSH_AUTH_SOCK` joins them (#71). (6) *The broker owns the environment* of a run: five fixed
-variables, and a request may add only `LANG`, `LC_ALL` and `TZ`; any other name is refused, not
-dropped. (7) *Filesystem calls can be abandoned.* Anything that walks or opens a path runs on a
-four-thread pool of its own with a deadline, because a hung mount blocks a thread for as long as it
-likes; a late result is discarded and a descriptor it opened is closed. (8) *The prompt is an
-interface the broker asks, with `AutoDeny` until S18.* Its answer is checked against the scopes
-offered and re-checked by `issue_grant`; a timeout, an exception and a malformed answer are denials.
-(9) *Heartbeat, not deadlines.* `BrokerClient` pings every 30 s and the daemon closes a connection
-that is silent for 90 s while nothing is in progress (#59). The per-request deadline and cancel
-frame (#60) and per-direction unions (#61) are not done here: nothing in S17 needs them (a run ends
-at its own limit and the connection ending cancels it), and S18's prompts do. (10) *The store is
-accepted only after one read snapshot shows it is exactly ours*, including the automatic index rows
-of `sqlite_master`, and is not touched before (not even switched to WAL). **Deviations from the
-plan.** The broker's IPC handler timeout is 170 s (the longest run, its setup and 30 s), not the
-connection default of 25 s. `read_file`, `list_dir` and `request_grant` take the `RunId` from the caller instead of the
-broker allocating one for non-run operations (S16's note): a once grant binds to a run the caller
-names, and a caller that names a fresh one gets nothing from a once grant. The wire has no tool
-binding or trigger yet, so tool grants are modelled and stored but never apply (S24 adds them). The
+`RunId`) is reserved before its first `await`. (3) *Owners.* A task belongs to the connection that
+made it and ends with it; a broker that starts ends what a dead one left (grants revoked, workspaces
+kept 7 days, taint kept for the task that replaces it). The daemon, not the caller, owns taint. (4)
+*The two host requirements are the daemon's settings, on by default, never a request's.*
+`--no-landlock` and `--allow-unenforced-limits` are for a development host (Docker Desktop's kernel
+has no Landlock; the container and CI have no systemd user manager); the audit log's start entry
+records them, and every result says what was not enforced. Where required, a run on a host whose
+runner reports `pids` or total memory as unenforced is refused before anything is opened. (5) *The
+sandbox's own paths are deny entries.* `/tmp`, `/workspace`, `/inputs`, the launcher's file and the
+runtime's paths are added to the deny list, so a grant the sandbox would refuse is refused when it
+is asked for (a prompt is never shown for what cannot run), instead of remapped: a remap would show
+the user a different path from the one that is granted. The directory of `$SSH_AUTH_SOCK` joins them
+(#71). (6) *The broker owns the environment* of a run: five fixed variables, and a request may add
+only `LANG`, `LC_ALL` and `TZ`; any other name is refused, not dropped. (7) *Filesystem calls can be
+abandoned.* Anything that walks or opens a path runs on a four-thread pool of its own with a
+deadline, because a hung mount blocks a thread for as long as it likes; a late result is discarded
+and a descriptor it opened is closed. (8) *The prompt is an interface the broker asks, with
+`AutoDeny` until S18.* Its answer is checked against the scopes offered and re-checked by
+`issue_grant`; a timeout, an exception and a malformed answer are denials. (9) *Heartbeat, not
+deadlines.* `BrokerClient` pings every 30 s and the daemon closes a connection that is silent for 90
+s while nothing is in progress (#59). The per-request deadline and cancel frame (#60) and
+per-direction unions (#61) are not done here: nothing in S17 needs them (a run ends at its own limit
+and the connection ending cancels it), and S18's prompts do. (10) *The store is accepted only after
+one read snapshot shows it is exactly ours*, including the automatic index rows of `sqlite_master`,
+and is not touched before (not even switched to WAL). **Deviations from the plan.** The broker's IPC
+handler timeout is 170 s (the longest run, its setup and 30 s), not the connection default of 25 s.
+`read_file`, `list_dir` and `request_grant` take the `RunId` from the caller instead of the broker
+allocating one for non-run operations (S16's note): a once grant binds to a run the caller names,
+and a caller that names a fresh one gets nothing from a once grant. The wire has no tool binding or
+trigger yet, so tool grants are modelled and stored but never apply (S24 adds them). The
 start-on-demand connector is in `tumbleweed.broker.client`, not wired into the shell (S19). Reads of
 a task's own workspace are not audited (they are not decisions). **Consequences.** Every request
 does at least one path walk on a worker and rebuilds the deny rules (about a hundred walks: 15 ms on
 a Mac, 8 ms in the container, measured), and the rules must be fresh at each decision (S16). The
 audit log is neither fsynced, rotated nor tamper evident (#82). A tree nested more than 128 levels
 cannot be deleted by the retention sweep; it is reported and retried after a pause that doubles with
-each failure, so that it does not hold up the rest (#84). S18 must extend the
-prompt interface (a `PromptId`, the picker, the requesting tool) and the wire for broker-to-shell
-requests.
+each failure, so that it does not hold up the rest (#84). S18 must extend the prompt interface (a
+`PromptId`, the picker, the requesting tool) and the wire for broker-to-shell requests.

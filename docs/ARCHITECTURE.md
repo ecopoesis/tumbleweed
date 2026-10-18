@@ -326,7 +326,10 @@ of the broker. Nothing in the broker imports the agent or an LLM (I2).
   one of the two kinds are all a denial. The grant is issued by `policy.issue_grant` after the
   deny rules are rebuilt, against the path as it was resolved *before* the prompt, so what the user
   saw is what is recorded. Beyond S16's rules the broker refuses, at decision time and without
-  asking, what the sandbox would refuse to mount (section 7).
+  asking, what the sandbox would refuse to mount (section 7). A once grant that has been used up is
+  dropped at that moment (and marked revoked in the database), so the grants a task holds, at most
+  64, are the ones that can still be used; an audit entry that lists grant IDs holds the first 64
+  and says how many there were, so that no task is too big to end.
 - **Files.** `read_file` and `list_dir` take an absolute path and a `RunId`; they never prompt. The
   decision (`decide`), the consumption of a once grant, the task's taint and the audit entry are
   one transaction, written before anything is opened; then the grant is opened with
@@ -350,15 +353,15 @@ of the broker. Nothing in the broker imports the agent or an LLM (I2).
   that arrive together cannot all pass; at most 4 runs are in progress (a fifth is refused, not
   queued) and 1000 per task. Every refusal once the task is known (a forbidden variable, a reused
   ID, a cap, a granted path that was swapped, grants that changed while the run was set up, a
-  timeout, the host's limits) is recorded as a `sandbox_run` entry with outcome `refused` and a
-  reason; a run cancelled before it was authorised is recorded the same way. The limits a request
-  may set are bounded (at most 120 s of wall clock, 256 KiB of output per stream) and the rest are
-  the broker's. **The host must be able to enforce what I3 requires:** unless the daemon was told
-  otherwise (`--allow-unenforced-limits`) a run is refused, before anything is opened, when the
-  runner reports the `pids` or total-memory limit as unenforced; and Landlock is required unless
-  `--no-landlock` (above). Both settings are the daemon's and are written to the audit log at
-  start. Ending a task, or its connection ending, cancels its runs: the sandbox is killed and the
-  run's result entry says `cancelled`.
+  timeout, the host's limits; except when the audit log or the database itself fails) is recorded
+  as a `sandbox_run` entry with outcome `refused` and a reason; a run cancelled before it was
+  authorised is recorded the same way. The limits a request may set are bounded (at most 120 s of
+  wall clock, 256 KiB of output per stream) and the rest are the broker's. **The host must be able
+  to enforce what I3 requires:** unless the daemon was told otherwise (`--allow-unenforced-limits`)
+  a run is refused, before anything is opened, when the runner reports the `pids` or total-memory
+  limit as unenforced; and Landlock is required unless `--no-landlock` (above). Both settings are
+  the daemon's and are written to the audit log at start. Ending a task, or its connection ending,
+  cancels its runs: the sandbox is killed and the run's result entry says `cancelled`.
 - **The audit log (I7).** `<broker>/audit.jsonl`: append-only JSONL, one typed entry
   (`tumbleweed.broker.audit`, a pydantic model with a `kind` and a format version `v`) per daemon
   start, task start and end, grant decision (covered, granted, denied, with the model's reason
@@ -376,8 +379,8 @@ of the broker. Nothing in the broker imports the agent or an LLM (I2).
   entries were written, a `rolled_back` entry follows them, naming their kinds: the log never
   keeps saying that something happened which did not. It is not fsynced (it survives a
   crash of the broker, not a loss of power), not tamper evident and not rotated: anything running
-  as the user can edit it, which section 8 puts out of scope, and rotation is a follow-up (#82). Later
-  steps add fields with defaults or kinds of entry; this step hashes no content.
+  as the user can edit it, which section 8 puts out of scope, and rotation is a follow-up (#82).
+  Later steps add fields with defaults or kinds of entry; this step hashes no content.
 - **The store.** `<broker>/broker.sqlite3` holds tasks (taint, when they ended, the identity of
   their workspace) and grants (their JSON, validated strictly when read back; a record that
   cannot be read grants nothing and is skipped). It is accepted only after one read snapshot shows
@@ -388,7 +391,8 @@ of the broker. Nothing in the broker imports the agent or an LLM (I2).
   integers are signed.
 - **Workspaces and retention.** A workspace is opened by the identity recorded when it was made
   (`StoredPath.open`), never by name. Seven days after its task ended (`BrokerConfig.retention`,
-  checked in the background as soon as the broker has started, and every hour) it is deleted through descriptors only: nothing a symlink in it
+  checked in the background as soon as the broker has started, and every hour) it is deleted
+  through descriptors only: nothing a symlink in it
   points at is touched, a directory the program made unreadable is given a mode first, and a tree
   nested deeper than 128 levels is left in place and reported as failed. A workspace that cannot
   be deleted is tried again after a pause that doubles with every failure (an hour, up to a day;

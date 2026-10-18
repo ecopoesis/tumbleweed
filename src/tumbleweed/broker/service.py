@@ -36,9 +36,10 @@ import asyncio
 import base64
 import contextlib
 import dataclasses
+import itertools
 import logging
 import os
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -46,6 +47,8 @@ from functools import partial
 from typing import Final, Literal, NewType, Protocol, assert_never, final
 
 from tumbleweed.broker.audit import (
+    MAX_AUDITED_IDS,
+    MAX_ROLLED_BACK_KINDS,
     AuditEntry,
     AuditLog,
     DaemonStart,
@@ -233,9 +236,15 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _ids(ids: Iterable[GrantId]) -> tuple[GrantId, ...]:
+    """The first `MAX_AUDITED_IDS` of some grant IDs, which is all an audit entry holds (the entry
+    says how many there were where that matters): an entry can never be too long to build."""
+    return tuple(itertools.islice(ids, MAX_AUDITED_IDS))
+
+
 def _retry_after(failures: int) -> timedelta:
     """How long to leave a workspace that could not be deleted: an hour, doubling, up to a day."""
-    return min(timedelta(hours=1) * (1 << min(failures, 8)), timedelta(days=1))
+    return min(timedelta(hours=1) * (1 << max(0, min(failures, 8))), timedelta(days=1))
 
 
 def _taint_names(taint: frozenset[TaintKind]) -> tuple[Taint, ...]:
@@ -393,7 +402,12 @@ class BrokerService:
             )
         )
         for record in self._store.live_tasks():
-            self._end_stale(record, now)
+            try:
+                self._end_stale(record, now)
+            except Exception:  # noqa: BLE001  (one task that cannot be ended must not stop the start)
+                # Not live in memory, so unusable whatever the database says; tried again at the
+                # next start.
+                _log.exception("a task left live by a stopped broker could not be ended on record")
         # Orphans and the first sweep can take as long as deleting takes: not before serving.
         self._sweeper = asyncio.get_running_loop().create_task(
             self._sweep_forever(), name="broker-retention-sweep"
@@ -493,7 +507,7 @@ class BrokerService:
                 if first:
                     await self._remove_orphans()
                 await self.sweep()
-            except (AuditError, StoreError, FsTimeoutError):
+            except Exception:  # noqa: BLE001  (the sweep outlives anything: it is tried again)
                 _log.exception("the retention sweep failed; it is tried again at the next one")
             first = False
             await asyncio.sleep(self._config.sweep_interval.total_seconds())
@@ -569,11 +583,12 @@ class BrokerService:
             try:
                 with self._atomic() as entries:
                     self._end_stored(live, TaskEndReason.CONNECTION_CLOSED, self._now(), entries)
-            except (AuditError, StoreError):
-                # The connection is gone whatever happens: the task must not stay usable. The
-                # database still says live, and the next start ends it.
+            except Exception:  # noqa: BLE001  (whatever it is, the task must still end in memory)
+                # The connection is gone whatever happens: the task must not stay usable and its
+                # runs must stop. The database still says live, and the next start ends it.
                 _log.exception("a task of a closed connection could not be ended on record")
-            self._apply_ended(live)
+            finally:
+                self._apply_ended(live)
 
     # --- atomic sections and the end of a task -------------------------------------------------
 
@@ -598,8 +613,14 @@ class BrokerService:
         except BaseException:
             if written:
                 try:
-                    self._audit.append(RolledBack(at=self._now(), entries=tuple(written)))
-                except (AuditError, InvalidValueError):
+                    self._audit.append(
+                        RolledBack(
+                            at=self._now(),
+                            entries=tuple(written[:MAX_ROLLED_BACK_KINDS]),
+                            count=len(written),
+                        )
+                    )
+                except (AuditError, ValueError):  # a ValidationError is one
                     _log.error("entries were written for an act that was rolled back")
             raise
 
@@ -613,7 +634,15 @@ class BrokerService:
             self._store.revoke_grant(grant, now)
             entries.append(GrantRevoked(at=now, task=task, grant=grant, reason="task_ended"))
         self._store.end_task(task, now)
-        entries.append(TaskEndedEntry(at=now, task=task, reason=reason, revoked=tuple(revoked)))
+        entries.append(
+            TaskEndedEntry(
+                at=now,
+                task=task,
+                reason=reason,
+                revoked=_ids(revoked),
+                revoked_count=len(revoked),
+            )
+        )
         return revoked
 
     def _apply_ended(self, live: _Live) -> None:
@@ -959,7 +988,7 @@ class BrokerService:
     @staticmethod
     def _held(live: _Live) -> int:
         """The grants a task holds against its cap: not the once grants that are used up."""
-        return sum(1 for g in live.grants if not (isinstance(g, OnceGrant) and g.consumed_by))
+        return len(live.grants)  # used-up once grants are dropped when they are used up
 
     def _denied(
         self,
@@ -1168,7 +1197,8 @@ class BrokerService:
         taint = TaskState(task=live.state.task, taint=allow.task_taint)
         with self._atomic() as entries:
             if spent is not None:
-                self._store.replace_grant(spent)
+                self._store.replace_grant(spent)  # the record says by which run it was used up
+                self._store.revoke_grant(spent.id, now)  # and it is over: nothing is left to revoke
             if allow.task_taint != live.state.taint:
                 self._store.set_taint(live.state.task, allow.task_taint)
             entries.append(
@@ -1184,7 +1214,7 @@ class BrokerService:
                 )
             )
         if spent is not None:
-            live.grants[live.grants.index(grant)] = spent
+            live.grants.remove(grant)  # a used-up grant is not held: not counted, not revoked
         live.state = taint
         return stored
 
@@ -1401,7 +1431,10 @@ class BrokerService:
         entry is written, in one transaction (S16: persist before acting)."""
         if self._live.get(live.state.task) is not live:
             raise _Refuse("unknown_task", "the task ended")
-        if request.run in live.runs:  # reserved at the start, and re-checked where it is recorded
+        # Defence in depth, not observable on its own: the reservation made at the start already
+        # keeps a second run with this ID, and a run past the cap, from getting here. Re-checked
+        # where the run is recorded so that this function is right whatever its caller did.
+        if request.run in live.runs:
             raise _Refuse("invalid_request", "that run ID was already used", "run_id_reused")
         if len(live.runs) >= self._config.max_runs_per_task:
             raise _Refuse("busy", "the task has used all the runs it may", "run_cap")
@@ -1420,6 +1453,7 @@ class BrokerService:
         with self._atomic() as entries:
             for grant in spent:
                 self._store.replace_grant(grant)
+                self._store.revoke_grant(grant.id, now)
             if selection.task_taint != live.state.taint:
                 self._store.set_taint(live.state.task, selection.task_taint)
             entries.append(
@@ -1432,15 +1466,15 @@ class BrokerService:
                     program=cut(request.command[0]),
                     arguments=len(request.command) - 1,
                     env_names=tuple(pair.name for pair in request.env),
-                    mounted=tuple(mount.grant for mount in mounts),
-                    consumed=tuple(grant.id for grant in spent),
+                    mounted=_ids(mount.grant for mount in mounts),
+                    consumed=_ids(grant.id for grant in spent),
                     wall_seconds=request.wall_seconds,
                     require_landlock=self._config.require_landlock,
                 )
             )
         live.runs.add(request.run)
-        for old, new in zip(once, spent, strict=True):
-            live.grants[live.grants.index(old)] = new
+        for old in once:
+            live.grants.remove(old)  # used up by this run
         live.state = TaskState(task=live.state.task, taint=selection.task_taint)
 
     async def _run_authorised(
