@@ -4,7 +4,7 @@ session."""
 import fcntl
 import os
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from pathlib import Path
 
@@ -29,6 +29,7 @@ from tumbleweed.history.records import (
     MAX_MESSAGES_PER_SESSION,
     MAX_SESSIONS,
     EpochMillis,
+    StoredSession,
 )
 from tumbleweed.history.repository import SessionRepository
 from tumbleweed.history.store import (
@@ -861,11 +862,15 @@ class TestPruningThatFails:
                 old.append(session)
         calls: list[int] = []
 
-        def failing(self: SessionRepository, session_ids: Sequence[SessionId]) -> None:
-            calls.append(len(session_ids))
+        def failing(
+            self: SessionRepository,
+            chats: Sequence[StoredSession],
+            empties: Sequence[SessionId],
+        ) -> frozenset[SessionId]:
+            calls.append(len(chats) + len(empties))
             raise HistoryError("disk full")
 
-        monkeypatch.setattr(SessionRepository, "delete", failing)
+        monkeypatch.setattr(SessionRepository, "delete_stale", failing)
         second = open_store(tmp_path)
         second.begin(limit=10)
         second.new_session()  # prunes: must not raise
@@ -886,3 +891,204 @@ class TestPruningThatFails:
         finally:
             claims.close()
         second.close()
+
+
+class TestADeleteMustNotTakeWhatChangedSinceItWasListed:
+    """Pruning lists sessions, claims them, then deletes. Another shell can restore a listed
+    session, save a message and quit in between; deleting by ID would cascade the message away."""
+
+    def racing_empty(
+        self, monkeypatch: pytest.MonkeyPatch, victim: SessionId, intervene: Callable[[], None]
+    ) -> list[bool]:
+        real = SessionRepository.empty
+        fired: list[bool] = []
+
+        def empty(
+            self: SessionRepository, batch: int, *, user_started: bool = False
+        ) -> tuple[SessionId, ...]:
+            ids = real(self, batch, user_started=user_started)
+            if victim in ids and not fired:
+                fired.append(True)
+                intervene()
+            return ids
+
+        monkeypatch.setattr(SessionRepository, "empty", empty)
+        return fired
+
+    def test_an_empty_session_that_gained_a_message_is_not_deleted_race_py(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = Ticks()
+        real = open_store(tmp_path, clock)
+        real.begin(limit=10)
+        real.append(user("real chat"))
+        real.close()
+        holder = open_store(tmp_path, clock)
+        holder.begin(limit=10)  # holds the real chat
+        left = open_store(tmp_path, clock)
+        left.begin(limit=10)
+        x = left.new_session().id  # an empty user-started session, left behind
+        left.close()
+
+        def other_shell_fills_it() -> None:
+            other = open_store(tmp_path, clock)
+            assert other.begin(limit=10).session.id == x
+            other.append(user("saved in between"))
+            other.close()
+
+        fired = self.racing_empty(monkeypatch, x, other_shell_fills_it)
+
+        holder.new_session()  # prunes: listed X as empty, then it gained a message
+        monkeypatch.undo()
+
+        assert fired == [True]
+        with raw(history_directory(tmp_path)) as connection:
+            texts = [row[0] for row in connection.execute("SELECT text FROM messages")]
+        assert "saved in between" in texts
+        holder.close()
+
+    def test_a_session_the_holder_filled_and_closed_between_listing_and_claiming_survives(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """probe_r4: C holds its empty user-started session, B lists it as empty, C types and
+        quits, B then claims it."""
+        clock = Ticks()
+        c = open_store(tmp_path, clock)
+        c.begin(limit=10)
+        c.append(user("old"))
+        c_session = c.new_session().id
+        b = open_store(tmp_path, clock)
+        b.begin(limit=10)
+
+        def c_types_and_quits() -> None:
+            c.append(user("C's important chat"))
+            c.close()
+
+        fired = self.racing_empty(monkeypatch, c_session, c_types_and_quits)
+
+        b.new_session()
+        monkeypatch.undo()
+        b.close()
+
+        assert fired == [True]
+        with raw(history_directory(tmp_path)) as connection:
+            texts = [row[0] for row in connection.execute("SELECT text FROM messages")]
+        assert "C's important chat" in texts
+
+    def test_delete_stale_takes_a_chat_only_if_it_is_still_as_listed(self, tmp_path: Path) -> None:
+        store = open_store(tmp_path)
+        repository = store._sessions  # noqa: SLF001
+        old, used = SessionId.new(), SessionId.new()
+        for session_id, updated in ((old, 1_000), (used, 2_000)):
+            repository.create(session_id, EpochMillis(updated))
+            store._messages.append(session_id, user("x"))  # noqa: SLF001  (sets updated_at: now)
+        with raw(history_directory(tmp_path)) as connection:
+            connection.execute("UPDATE sessions SET updated_at = 5 WHERE id = ?", (str(old),))
+        stale_listing = StoredSession.model_validate(
+            {"id": used, "created_at": 1, "updated_at": 4, "user_started": False}
+        )
+        current = repository.get(old)
+        assert current is not None
+
+        deleted = repository.delete_stale([stale_listing, current], [])
+
+        assert deleted == frozenset({old})  # `used` changed since it was listed: kept
+        assert repository.get(used) is not None
+        assert repository.get(old) is None
+        store.close()
+
+    def test_delete_stale_takes_an_empty_session_only_if_it_is_still_empty(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_store(tmp_path)
+        repository = store._sessions  # noqa: SLF001
+        filled, empty = SessionId.new(), SessionId.new()
+        repository.create(filled, EpochMillis(1))
+        repository.create(empty, EpochMillis(2))
+        store._messages.append(filled, user("saved since it was listed"))  # noqa: SLF001
+
+        deleted = repository.delete_stale([], [filled, empty])
+
+        assert deleted == frozenset({empty})
+        assert repository.get(filled) is not None
+        store.close()
+
+
+class TestWhoReapsWhatOnCloseAndStart:
+    def sessions(self, tmp_path: Path) -> set[str]:
+        with raw(history_directory(tmp_path)) as connection:
+            return {row[0] for row in connection.execute("SELECT id FROM sessions")}
+
+    def test_a_shell_whose_user_started_session_has_a_chat_does_not_reap_on_close(
+        self, tmp_path: Path
+    ) -> None:
+        clock = Ticks()
+        a = open_store(tmp_path, clock)
+        a.begin(limit=10)
+        a.new_session()
+        a.append(user("A pressed New session and then chatted"))
+        b = open_store(tmp_path, clock)
+        b.begin(limit=10)
+        u_b = b.new_session().id  # B pressed New session and left it empty
+        b.close()  # keeps it
+
+        a.close()  # A's session has messages: A has nothing to reap for
+
+        assert str(u_b) in self.sessions(tmp_path)
+
+    def test_a_shell_with_an_ordinary_session_does_not_reap_the_empty_one_a_user_left(
+        self, tmp_path: Path
+    ) -> None:
+        """New session, quit, start must give an empty chat even if an accidental second shell
+        closes in between: the accidental shell's own session is not user-started."""
+        clock = Ticks()
+        real = open_store(tmp_path, clock)
+        real.begin(limit=10)
+        real.append(user("the real chat, still open in one shell"))
+        c = open_store(tmp_path, clock)
+        c.begin(limit=10)
+        u_c = c.new_session().id  # the user cleared the chat here ...
+        accident = open_store(tmp_path, clock)  # ... an accidental shell starts: all held
+        auto = accident.begin(limit=10).session
+        assert auto.user_started is False
+        c.close()  # ... and quits, leaving the empty session
+        accident.close()  # the accident goes: it must not take the user's empty chat with it
+        real.close()
+
+        restored = open_store(tmp_path, clock).begin(limit=10)
+
+        assert str(u_c) in self.sessions(tmp_path)
+        assert restored.session.id == u_c
+        assert restored.messages == ()
+
+    def test_new_session_deletes_the_empty_one_a_closed_shell_left(self, tmp_path: Path) -> None:
+        clock = Ticks()
+        c = open_store(tmp_path, clock)
+        c.begin(limit=10)
+        c.append(user("old"))
+        left = c.new_session().id
+        d = open_store(tmp_path, clock)
+        d.begin(limit=10)  # `left` is held by C, so D has a session of its own
+        c.close()  # now `left` is empty, kept, and nobody's
+
+        mine = d.new_session().id  # reaps it (without closing)
+
+        assert str(left) not in self.sessions(tmp_path)
+        assert str(mine) in self.sessions(tmp_path)
+        d.close()
+
+    def test_a_start_that_finds_nothing_to_restore_prunes_the_empty_leftovers(
+        self, tmp_path: Path
+    ) -> None:
+        directory = history_directory(tmp_path)
+        open_store(tmp_path).close()
+        leftovers = [SessionId.new() for _ in range(3)]
+        with raw(directory) as connection:  # what killed shells left: empty, nobody's
+            for index, session_id in enumerate(leftovers):
+                insert_session(connection, session_id, 10**13 + index)
+
+        store = open_store(tmp_path)
+        store.begin(limit=10)  # nothing kept to restore: a fresh session, and a prune
+
+        assert not {str(s) for s in leftovers} & self.sessions(tmp_path)
+        store.close()

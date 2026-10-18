@@ -188,9 +188,13 @@ class HistoryStore:
             return
         self._closed = True
         try:
-            if self._session is not None and self._session.user_started:
-                # This one may be kept (if it is still empty): the empty ones the user started in
-                # shells that have closed meanwhile go, so that one is left across shells.
+            if (
+                self._session is not None
+                and self._session.user_started
+                and self._sessions.is_empty(self._session.id)
+            ):
+                # This one is about to be kept, empty: the empty ones the user started in shells
+                # that have closed meanwhile go, so that one is left across shells.
                 self._prune(reap_user_started=True)
             self._let_go(self._session, self._claim, keep_user_started=True)
         finally:
@@ -241,10 +245,11 @@ class HistoryStore:
         holds, and no write at all if there is nothing to delete. With `reap_user_started`, the
         empty sessions the user started (in other shells, now closed) go too. Empty sessions do
         not count towards `MAX_SESSIONS`, so they cannot push a real chat out."""
-        claims: list[Claim] = []
+        claims: dict[SessionId, Claim] = {}
+        deleted: frozenset[SessionId] = frozenset()
         try:
-            candidates = (
-                *self._sessions.beyond(MAX_SESSIONS, PRUNE_BATCH),
+            chats = self._sessions.beyond(MAX_SESSIONS, PRUNE_BATCH)
+            empties = (
                 *self._sessions.empty(PRUNE_BATCH),
                 # Starting a session of the user's own replaces the empty ones that other shells
                 # left (not one a shell holds): only the newest is kept, across shells.
@@ -254,18 +259,26 @@ class HistoryStore:
                     else ()
                 ),
             )
-            for session_id in candidates:
-                if (claim := self._claims.try_claim(session_id)) is not None:
-                    claims.append(claim)
+            for session_id in (*(chat.id for chat in chats), *empties):
+                if (
+                    session_id not in claims
+                    and (claim := self._claims.try_claim(session_id)) is not None
+                ):
+                    claims[session_id] = claim
+            held_chats = [chat for chat in chats if chat.id in claims]
+            held_empties = [session_id for session_id in empties if session_id in claims]
             if claims:
-                self._sessions.delete([claim.session_id for claim in claims])
+                deleted = self._sessions.delete_stale(held_chats, held_empties)
         except HistoryError:
             logger.warning("could not prune old chat sessions")
-            for claim in claims:
+            for claim in claims.values():
                 claim.release()  # still in the file: their lock files stay
             return
-        for claim in claims:
+        for session_id, claim in claims.items():
             try:
-                claim.forget()
+                if session_id in deleted:
+                    claim.forget()
+                else:
+                    claim.release()  # not deleted (it changed since it was listed): keep it
             except HistoryError:
                 logger.warning("could not remove a lock file")

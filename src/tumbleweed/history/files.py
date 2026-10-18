@@ -28,16 +28,23 @@ descriptor, never through a second look at a path (CLAUDE.md, TOCTOU):
   older checks stay: `same_directory` compares the directory path as it is now with our
   descriptor, `same_file` the file in it, `check_sidecar` the side files. Because the resolved
   path is ours, SQLite's own "file has moved" check, which compares that same path with the open
-  file before it writes, guards every later write to the database.
+  file before it writes, guards writes to the *database file* (not to the write-ahead log).
 
-  What is guaranteed: nothing of ours is written to a file that is not the one we examined, if
-  the swap happens before the check. What is not: (1) in the instant before SQLite opens, someone
-  able to write inside our 0700 directory, or to rename it or an ancestor (this user, or root),
-  could make SQLite open the attacker's file (and create it, empty, if it is missing); it is
-  refused straight after, before anything is read from it or written. (2) A swap *after* the
-  check is caught for the database file by SQLite's own moved-check, but the `-wal` and `-shm`
-  files are opened by their path when SQLite first needs them, so they could be created in the
-  attacker's directory; whoever can rename our directory can do far more than that. An ACL on a
+  The side files matter as much: in WAL mode the `-wal` file holds every message until it is
+  checkpointed, and the schema written by a migration. SQLite makes `-wal` and `-shm` by path at
+  the first write (the switch to WAL). So at the end of the open, before any message is saved,
+  `require_sidecar` requires both to exist in the directory we hold (a plain file of ours, one
+  link) and the resolved path is checked again; otherwise the open is refused.
+
+  What is guaranteed: no message is saved to a file we did not examine, if the swap is before the
+  check at the end of the open or after it (a later swap makes SQLite's moved-check refuse writes
+  to the database file; the write-ahead log is already open then, so it keeps going to the same
+  place). What is not: (1) in the instant before SQLite opens, someone able to write inside our
+  0700 directory, or to rename it or an ancestor (this user, or root), can make SQLite open the
+  attacker's file (and create it, empty, if it is missing); that is refused straight after,
+  before anything is read from it or written. (2) A swap between the last pre-write check and the
+  first write puts the first writes (the WAL switch and the migration's schema) in the attacker's
+  directory before the end-of-open check refuses it; no message is among them. An ACL on a
   directory is not examined (#80).
 """
 
@@ -184,6 +191,21 @@ def check_sidecar(directory: int, name: str) -> None:
         info = os.stat(name, dir_fd=directory, follow_symlinks=False)
     except FileNotFoundError:
         return
+    except OSError:
+        raise HistoryIoError("A chat history file cannot be examined.") from None
+    if info.st_nlink == 0:  # a connection closing in another shell just deleted it: absent
+        return
+    _check_regular(info, "side file")
+
+
+def require_sidecar(directory: int, name: str) -> None:
+    """Refuse unless `name` exists in `directory` as a plain file of ours: once the database is
+    open in WAL mode, SQLite has made its `-wal` and `-shm` files, and if they are not in the
+    directory we hold they are somewhere else."""
+    try:
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        raise _refused("side file", "it is not where the database is") from None
     except OSError:
         raise HistoryIoError("A chat history file cannot be examined.") from None
     _check_regular(info, "side file")

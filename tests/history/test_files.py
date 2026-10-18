@@ -298,6 +298,68 @@ class TestALockFileThatIsGone:
         assert "more than one link" in caplog.text
 
 
+class TestSideFiles:
+    def directory(self, tmp_path: Path) -> int:
+        (tmp_path / "dir").mkdir(mode=0o700)
+        return os.open(tmp_path / "dir", os.O_RDONLY | os.O_DIRECTORY)
+
+    def test_an_absent_side_file_is_fine_and_a_required_one_is_not(self, tmp_path: Path) -> None:
+        descriptor = self.directory(tmp_path)
+        try:
+            files.check_sidecar(descriptor, "chat.sqlite3-wal")
+            with pytest.raises(HistoryRefusedError):
+                files.require_sidecar(descriptor, "chat.sqlite3-wal")
+        finally:
+            os.close(descriptor)
+
+    def test_a_side_file_a_closing_connection_just_deleted_counts_as_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        descriptor = self.directory(tmp_path)
+        (tmp_path / "dir" / "chat.sqlite3-wal").write_bytes(b"")
+        real = os.stat
+
+        def gone(path: str, **options: object) -> os.stat_result:
+            info = real(path, **options)  # type: ignore[arg-type]  # a test double
+            return os.stat_result(
+                (info.st_mode, info.st_ino, info.st_dev, 0, info.st_uid, *info[5:])
+            )
+
+        monkeypatch.setattr(os, "stat", gone)
+        try:
+            with caplog.at_level(logging.WARNING):
+                files.check_sidecar(descriptor, "chat.sqlite3-wal")  # no refusal, no warning
+        finally:
+            os.close(descriptor)
+        assert caplog.text == ""
+
+    def test_a_side_file_with_a_second_link_is_still_refused(self, tmp_path: Path) -> None:
+        descriptor = self.directory(tmp_path)
+        (tmp_path / "dir" / "chat.sqlite3-wal").write_bytes(b"")
+        os.link(tmp_path / "dir" / "chat.sqlite3-wal", tmp_path / "second")
+        try:
+            with pytest.raises(HistoryRefusedError):
+                files.check_sidecar(descriptor, "chat.sqlite3-wal")
+        finally:
+            os.close(descriptor)
+
+    def test_same_resolved_does_not_follow_a_symlink_for_the_file(self, tmp_path: Path) -> None:
+        directory = tmp_path / "dir"
+        directory.mkdir(mode=0o700)
+        (directory / "real").write_bytes(b"")
+        (directory / "link").symlink_to(directory / "real")
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        file_fd = os.open(directory / "real", os.O_RDWR)
+        try:
+            assert files.same_resolved(str(directory / "real"), file_fd, dir_fd)
+            # The same inode, reached through a link: SQLite never reports a link (it resolves
+            # it), so a link here means something is wrong: not accepted.
+            assert not files.same_resolved(str(directory / "link"), file_fd, dir_fd)
+        finally:
+            os.close(file_fd)
+            os.close(dir_fd)
+
+
 class TestSwappedUnderUs:
     def test_a_database_replaced_between_our_check_and_sqlite_opening_it_is_refused(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

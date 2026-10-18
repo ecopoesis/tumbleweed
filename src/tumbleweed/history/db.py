@@ -47,6 +47,7 @@ from tumbleweed.history.files import (
     check_sidecar,
     open_private_directory,
     open_private_file,
+    require_sidecar,
     same_directory,
     same_file,
     same_resolved,
@@ -68,6 +69,23 @@ _BUSY: Final = frozenset({5, 6})  # SQLITE_BUSY, SQLITE_LOCKED
 _DAMAGED: Final = frozenset({11, 18, 20, 24, 25, 26})  # CORRUPT TOOBIG MISMATCH FORMAT RANGE NOTADB
 
 type Row = tuple[object, ...]
+
+
+def _require_ours(
+    connection: sqlite3.Connection, directory: Path, directory_fd: int, file_fd: int
+) -> None:
+    """Refuse unless what SQLite has open is our file in our directory, looked at three ways: the
+    path it resolved and kept (`PRAGMA database_list`), the file in the directory we hold, and
+    the directory's path as it is now."""
+    rows = connection.execute("PRAGMA database_list").fetchall()
+    resolved = next((row[2] for row in rows if row[1] == b"main"), None)
+    if not (
+        type(resolved) is bytes
+        and same_resolved(os.fsdecode(resolved), file_fd, directory_fd)
+        and same_file(directory_fd, DATABASE_NAME, file_fd)
+        and same_directory(directory, directory_fd)
+    ):
+        raise HistoryRefusedError("The chat history file was replaced while opening.")
 
 
 def _primary_code(error: sqlite3.Error) -> int | None:
@@ -153,23 +171,10 @@ class Database:
         directory_path, directory_fd = directory
         # The path SQLite resolved and kept, which is what it opens, checks and derives the side
         # files from: it must be our file in our directory, before anything is read or written.
-        rows = connection.execute("PRAGMA database_list").fetchall()
-        resolved = next((row[2] for row in rows if row[1] == b"main"), None)
-        if type(resolved) is not bytes or not same_resolved(
-            os.fsdecode(resolved), file_fd, directory_fd
-        ):
-            raise HistoryRefusedError("The chat history file was replaced while opening.")
+        _require_ours(connection, directory_path, directory_fd, file_fd)
         # Reads only: a file that is not ours is refused before it is switched to WAL or written.
         verify(connection, migrations)
-        # SQLite has opened the file by now, by the path string it was given (on Linux a
-        # `/proc/self/fd/<n>` path would not help: SQLite resolves it to the plain path, and
-        # opens that). That path must still be the file we examined, in the directory we hold;
-        # a directory swapped in between is refused here, before anything is written.
-        if not (
-            same_file(directory_fd, DATABASE_NAME, file_fd)
-            and same_directory(directory_path, directory_fd)
-        ):
-            raise HistoryRefusedError("The chat history file was replaced while opening.")
+        _require_ours(connection, directory_path, directory_fd, file_fd)
         mode = connection.execute("PRAGMA journal_mode = WAL").fetchone()
         for suffix in SIDECAR_SUFFIXES:
             check_sidecar(directory_fd, DATABASE_NAME + suffix)
@@ -179,6 +184,13 @@ class Database:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA secure_delete = ON")
         migrate(connection, migrations)
+        # The first writes (the WAL switch, the migration) have made the write-ahead log and the
+        # shared-memory file, which hold the schema and every message from now on. They are made
+        # by path, so a directory swapped after the checks above would have them made elsewhere:
+        # they must be here, and the path SQLite keeps must still be ours, before any message.
+        for suffix in ("-wal", "-shm"):
+            require_sidecar(directory_fd, DATABASE_NAME + suffix)
+        _require_ours(connection, directory_path, directory_fd, file_fd)
 
     @property
     def directory_fd(self) -> int:

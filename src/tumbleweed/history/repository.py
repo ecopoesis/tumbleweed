@@ -164,17 +164,23 @@ class SessionRepository:
                 logger.warning("skipped a session row that is not valid")
         return tuple(sessions)
 
-    def beyond(self, keep: int, batch: int) -> tuple[SessionId, ...]:
+    def beyond(self, keep: int, batch: int) -> tuple[StoredSession, ...]:
         """Up to `batch` sessions with messages older than the newest `keep` of them, oldest
-        first, for deleting. Empty sessions, those the user started included, do not count
-        towards `keep`."""
+        first, for deleting (with `delete_stale`, which deletes a session only if it is still as
+        listed). Empty sessions, those the user started included, do not count towards `keep`."""
         if not (1 <= batch <= MAX_SEQUENCE and 0 <= keep <= MAX_SEQUENCE):
             raise ValueError("batch must be positive and keep not negative")
         rows = self._database.query(
             _CHATS + "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
             (SCAN_WINDOW, batch, keep),
         )
-        return tuple(reversed(_ids(rows)))
+        found: list[StoredSession] = []
+        for row in rows:
+            try:
+                found.append(session_from_row(row))
+            except HistoryCorruptError:
+                logger.warning("skipped a session row that is not valid")
+        return tuple(reversed(found))
 
     def empty(self, batch: int, *, user_started: bool = False) -> tuple[SessionId, ...]:
         """Up to `batch` of the oldest sessions without messages (among the newest `SCAN_WINDOW`),
@@ -192,11 +198,42 @@ class SessionRepository:
         )
         return _ids(rows)
 
-    def delete(self, session_ids: Sequence[SessionId]) -> None:
-        """Delete sessions and, through the foreign key, their messages, in one transaction."""
+    def delete_stale(
+        self, chats: Sequence[StoredSession], empties: Sequence[SessionId]
+    ) -> frozenset[SessionId]:
+        """Delete, in one transaction, sessions listed for deleting, if they are still as listed;
+        which were deleted.
+
+        Listing and deleting are separate steps, and in between another shell can restore a
+        session and save a message to it, which deleting by ID would take with it (the cascade).
+        So a chat goes only if its `updated_at` is what was listed (a message changes it), and an
+        empty session only if it still has no messages, both checked in the same statement.
+        """
+        deleted: set[SessionId] = set()
         with self._database.write() as connection:
-            for session_id in session_ids:
-                connection.execute("DELETE FROM sessions WHERE id = ?", (str(session_id),))
+            for chat in chats:
+                done = connection.execute(
+                    "DELETE FROM sessions WHERE id = ? AND updated_at = ?",
+                    (str(chat.id), chat.updated_at),
+                )
+                if done.rowcount == 1:
+                    deleted.add(chat.id)
+            for session_id in empties:
+                done = connection.execute(
+                    "DELETE FROM sessions WHERE id = ? "
+                    "AND NOT EXISTS (SELECT 1 FROM messages WHERE session_id = ?)",
+                    (str(session_id), str(session_id)),
+                )
+                if done.rowcount == 1:
+                    deleted.add(session_id)
+        return frozenset(deleted)
+
+    def is_empty(self, session_id: SessionId) -> bool:
+        """Whether the session has no messages."""
+        rows = self._database.query(
+            "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1", (str(session_id),)
+        )
+        return not rows
 
     def delete_if_empty(self, session_id: SessionId, *, keep_user_started: bool) -> bool:
         """Delete the session if it has no messages (and, with `keep_user_started`, was not made

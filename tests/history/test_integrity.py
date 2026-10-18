@@ -23,6 +23,7 @@ from tests.history.support import (
 )
 from tumbleweed.core.ids import MessageId, SessionId
 from tumbleweed.core.types import ByteCount
+from tumbleweed.history import db as database_module
 from tumbleweed.history import files, schema
 from tumbleweed.history.db import (
     BUSY_TIMEOUT,
@@ -250,6 +251,54 @@ class TestADirectorySwappedInsideTheOpen:
             HistoryStore.open(shell)
 
         assert (evil / DATABASE_NAME).read_bytes() == before  # nothing of ours went there
+        assert not (evil / "chat.locks").exists()
+
+    @pytest.mark.parametrize("swap_back", [False, True], ids=["swapped", "swapped and back"])
+    def test_a_swap_after_the_checks_is_refused_before_a_message_can_go_there(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, swap_back: bool
+    ) -> None:
+        """After the last check and before SQLite's first write (the WAL switch), `shell/` is
+        swapped for a symlink to the attacker's, with a hard link to our database in it so that
+        SQLite's own moved-check passes: SQLite makes `-wal` and `-shm` there, by path, and every
+        message would follow them. They are required to be in our directory; and if the swap is
+        undone before the end-of-open check, so that every path looks right again, their absence
+        from our directory is what shows it."""
+        shell = history_directory(tmp_path)
+        moved = shell.parent / "shell.moved"
+        evil = tmp_path / "evil"
+        evil.mkdir()
+        real = database_module._require_ours  # noqa: SLF001
+        real_sidecar = files.require_sidecar
+        calls: list[int] = []
+
+        def undo() -> None:
+            if swap_back and shell.is_symlink():  # the attacker is gone again
+                shell.unlink()
+                moved.rename(shell)
+
+        def require_then_swap(*arguments: object) -> None:
+            calls.append(1)
+            if len(calls) == 3:
+                undo()
+            real(*arguments)  # type: ignore[arg-type]  # forwards exactly what it was given
+            if len(calls) == 2:  # the last check before the first write
+                shell.rename(moved)
+                shell.symlink_to(evil)
+                # SQLite refuses to write a database that moved; a hard link to the same file
+                # in the attacker's directory is what gets past that, as the probe does.
+                os.link(moved / DATABASE_NAME, evil / DATABASE_NAME)
+
+        def sidecar(directory: int, name: str) -> None:
+            undo()
+            real_sidecar(directory, name)
+
+        monkeypatch.setattr(database_module, "_require_ours", require_then_swap)
+        monkeypatch.setattr(database_module, "require_sidecar", sidecar)
+
+        with pytest.raises(HistoryRefusedError):
+            HistoryStore.open(shell)
+
+        assert len(calls) >= 2
         assert not (evil / "chat.locks").exists()
 
     def test_the_path_sqlite_uses_is_what_is_checked(self, tmp_path: Path) -> None:
