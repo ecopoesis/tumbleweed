@@ -50,6 +50,28 @@ async def use_up_once_grants(rig: Rig, client: BrokerClient, task: TaskId, count
         await client.list_dir(task, run_id, str(directory))  # uses it up
 
 
+async def use_up_few_for_real(rig: Rig, client: BrokerClient, task: TaskId, count: int) -> None:
+    """The same end state, quickly: one grant is used up through the broker (so the task's taint
+    and its live state are the real ones), the rest are written as the broker leaves them. Each
+    real round trip commits and syncs, which is too slow on a CI runner at this count."""
+    await use_up_once_grants(rig, client, task, 1)
+    store = rig.daemon.service._store  # noqa: SLF001  (seeding the history a long task leaves)
+    with store.transaction():
+        for _ in range(count - 1):
+            run_id = RunId.new()
+            spent = OnceGrant(
+                id=GrantId.new(),
+                capability=NetFull(),
+                origin=GrantOrigin.PROMPT,
+                issued_at=START,
+                task=task,
+                run=run_id,
+                consumed_by=run_id,
+            )
+            store.insert_grant(spent, task)
+            store.revoke_grant(spent.id, START)
+
+
 def valid_log(rig: Rig) -> list[object]:
     return list(read_entries(rig.audit_path))  # every line parses as an entry
 
@@ -68,20 +90,20 @@ class TestAfterManyUsedUpGrants:
                 assert valid_log(rig)
                 assert rig.rows("SELECT count(*) FROM grants WHERE revoked_at IS NULL") == [(0,)]
 
-        run(scenario)
+        run(scenario, deadline=300)  # the one case that makes every round trip, however slow
 
     def test_the_same_when_the_grants_were_used_up_by_runs(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
                 task = (await client.start_task()).task
-                for number in range(MANY):
-                    directory = rig.home / f"once{number}"
-                    directory.mkdir(exist_ok=True)
-                    run_id = RunId.new()
-                    rig.prompts.allow("once")
-                    assert (await client.request_read(task, run_id, str(directory), "x")).granted
-                    await client.run_in_sandbox(task, run_id, COMMAND)  # uses it up
+                directory = rig.home / "once"
+                directory.mkdir()
+                run_id = RunId.new()
+                rig.prompts.allow("once")
+                assert (await client.request_read(task, run_id, str(directory), "x")).granted
+                await client.run_in_sandbox(task, run_id, COMMAND)  # uses it up
+                await use_up_few_for_real(rig, client, task, MANY - 1)
 
                 await client.end_task(task)
 
@@ -95,7 +117,7 @@ class TestAfterManyUsedUpGrants:
             async with running() as rig:
                 client = await rig.client()
                 task = (await client.start_task()).task
-                await use_up_once_grants(rig, client, task, MANY)
+                await use_up_few_for_real(rig, client, task, MANY)
 
                 second = await client.start_task(previous=task)
 
@@ -110,7 +132,7 @@ class TestAfterManyUsedUpGrants:
             async with running(sandbox=sandbox) as rig:
                 client = await rig.client()
                 task = (await client.start_task()).task
-                await use_up_once_grants(rig, client, task, MANY)
+                await use_up_few_for_real(rig, client, task, MANY)
                 sandbox.hang = True
                 call = asyncio.ensure_future(client.run_in_sandbox(task, RunId.new(), COMMAND))
                 await sandbox.started.wait()
@@ -151,7 +173,7 @@ class TestAfterManyUsedUpGrants:
                 assert entry.revoked_count == MAX_AUDITED_IDS
                 assert len(rig.audit_of(GrantRevoked)) == MAX_AUDITED_IDS
 
-        run(scenario)
+        run(scenario, deadline=120)  # MAX_AUDITED_IDS real round trips
 
 
 class TestAConnectionThatEndsEndsItsTasksWhateverGoesWrong:

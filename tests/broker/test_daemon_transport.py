@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.broker.rig import Rig, running
+from tests.broker.rig import Rig, running, until
 from tests.ipc.bounded import run
 from tests.ipc.creds import FixedUid, other_uid
 from tests.ipc.helpers import RawPeer
@@ -126,7 +126,8 @@ def test_a_real_second_user_is_closed_out_of_the_broker_while_we_are_served(
             assert ours.stdout.split()[:2] == ["connected", "data"], ours.stderr
             assert theirs.stdout.split()[0] == "connected", theirs.stderr
             assert theirs.stdout.split()[1] in {"eof", "error"}  # not a word
-            assert [e.task for e in rig.audit_of(TaskStarted)] != []  # ours was served
+            # The client reports the broker's hello, which comes before the request is handled.
+            await until(lambda: rig.audit_of(TaskStarted) != [], deadline=30)  # ours was served
             assert len(rig.audit_of(TaskStarted)) == 1  # and theirs was not
 
     run(scenario, deadline=120)
