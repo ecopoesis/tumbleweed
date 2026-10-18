@@ -29,6 +29,30 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         "core never imports gi",
         (),
     ),
+    "history imports gi": (
+        "history/records.py",
+        "import gi",
+        "history never imports gi",
+        (),
+    ),
+    "history imports gi indirectly, through the GTK adapter": (
+        "history/store.py",
+        "import tumbleweed.shell.window",
+        "history never imports gi",
+        (),
+    ),
+    "history imports the shell": (
+        "history/store.py",
+        "import tumbleweed.shell.viewmodel.transcript",
+        "history never imports shell or agent",
+        (),
+    ),
+    "history imports the agent": (
+        "history/errors.py",
+        "import tumbleweed.agent.llm",
+        "history never imports shell or agent",
+        (),
+    ),
     "the view-model imports gi": (
         "shell/viewmodel/transcript.py",
         "import gi",

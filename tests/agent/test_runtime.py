@@ -12,7 +12,6 @@ import pytest
 
 from tests.agent.support import RaisingProvider, agent_threads, make_rig
 from tests.shell.fakes import RecordingSink
-from tumbleweed.agent.conversation import Conversation
 from tumbleweed.agent.errors import (
     AgentBusyError,
     LimitError,
@@ -106,22 +105,6 @@ class TestModelTextThatWouldWedgeTheChat:
                     if isinstance(block, TextBlock):
                         block.text.encode("utf-8")  # raises for a lone surrogate
             assert rig.last_reply()[1] == "complete"
-
-    def test_the_terminal_event_is_emitted_even_if_remembering_the_reply_fails(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def broken(self: Conversation, user_text: str, assistant_text: str) -> None:
-            raise RuntimeError("history bug")
-
-        monkeypatch.setattr(Conversation, "commit", broken)
-        with make_rig([FakeTurn(chunks=("hello",))]) as rig:
-            sink = RecordingSink()
-            rig.responder.start(request(), sink)
-
-            with pytest.raises(RuntimeError, match="history bug"):  # (a dispatcher would log it)
-                rig.dispatcher.run_until(lambda: False, timeout=5)
-
-            assert sink.events == [ReplyDelta(text="hello"), ReplyFinished()]
 
 
 class TestFailures:

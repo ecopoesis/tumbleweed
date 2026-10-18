@@ -8,6 +8,12 @@ bounded (a huge grapheme cluster, or text with no break opportunity, would wreck
 I9). The transcript scrolls in both directions as needed and never passes its content's size on
 to the window.
 
+With a `ChatSession` the panel also has a "New session" button above the transcript, and a line for
+what the chat history has to say (it could not be opened, a save failed: fixed text, never text
+from the history file). The button is a widget and not a `GAction` or an accelerator: actions are
+exported on the session bus (`tests/shell/test_session_bus.py` pins the set), and emptying the chat
+is not something another process should be able to trigger.
+
 What the user takes out of a message is meant to be the message's own text, not the text as it is
 laid out (which has zero-width spaces added where a long run could not break). That holds for Copy
 (Ctrl+C, the context menu) and for dragging the selection out (a drag source of our own over the
@@ -27,6 +33,7 @@ from tumbleweed.shell._gi import Gdk, Gtk, Pango
 from tumbleweed.shell._widgets import plain_label
 from tumbleweed.shell.viewmodel.chat import ChatController, describe_error
 from tumbleweed.shell.viewmodel.display import DisplayChunks, display_text
+from tumbleweed.shell.viewmodel.session import ChatSession
 from tumbleweed.shell.viewmodel.transcript import (
     MessageState,
     ReplyInFlightError,
@@ -167,12 +174,18 @@ class MessageRow(Gtk.Box):
 class ChatPanel(Gtk.Box):
     """The transcript list, the input and the send button, wired to the view-model."""
 
-    def __init__(self, controller: ChatController, transcript: Transcript) -> None:
+    def __init__(
+        self,
+        controller: ChatController,
+        transcript: Transcript,
+        session: ChatSession | None = None,
+    ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.set_name("tumbleweed-chat")
         self.set_hexpand(False)  # the canvas takes the spare width, the panel keeps its own
         self._controller = controller
         self._transcript = transcript
+        self._session = session
         self._rows: dict[MessageId, MessageRow] = {}
         self._follow_tail = True
 
@@ -189,6 +202,29 @@ class ChatPanel(Gtk.Box):
         vadjustment = self._scrolled.get_vadjustment()
         vadjustment.connect("value-changed", self._on_scrolled)
         vadjustment.connect("notify::upper", self._on_content_grew)
+
+        # What the history says (it could not be opened, a save failed): fixed text, shown until
+        # the next session changes it. Apart from `notice`, which the next send clears.
+        self.history_notice = plain_label("", wrap=True, css_classes=["error", "caption"])
+        self.history_notice.set_margin_start(8)
+        self.history_notice.set_margin_end(8)
+        self.history_notice.set_visible(False)
+
+        self.new_session_button: Gtk.Button | None = None
+        header: Gtk.Box | None = None
+        if session is not None:
+            header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            header.set_margin_top(6)
+            header.set_margin_start(8)
+            header.set_margin_end(8)
+            title = plain_label("Chat", css_classes=["heading"])
+            title.set_hexpand(True)
+            title.set_xalign(0)
+            self.new_session_button = Gtk.Button(label="New session")
+            self.new_session_button.add_css_class("flat")
+            self.new_session_button.connect("clicked", self._on_new_session_clicked)
+            header.append(title)
+            header.append(self.new_session_button)
 
         self.notice = plain_label("", wrap=True, css_classes=["error", "caption"])
         self.notice.set_visible(False)
@@ -229,6 +265,9 @@ class ChatPanel(Gtk.Box):
         entry_row.set_margin_end(8)
         entry_row.set_margin_bottom(8)
 
+        if header is not None:
+            self.append(header)
+        self.append(self.history_notice)
         self.append(self._scrolled)
         self.append(self.notice)
         self.append(entry_row)
@@ -236,6 +275,9 @@ class ChatPanel(Gtk.Box):
         for message in transcript.messages:
             self.message_added(message)
         transcript.subscribe(self)
+        if session is not None:
+            session.subscribe_notice(self._show_history_notice)
+            self._show_history_notice(session.notice)
         self._refresh_send_button()
 
     def row_for(self, message_id: MessageId) -> MessageRow:
@@ -259,6 +301,15 @@ class ChatPanel(Gtk.Box):
         row = MessageRow(message)
         self._rows[message.id] = row
         self.transcript_list.append(row)
+        self._refresh_send_button()
+
+    def messages_replaced(self, messages: tuple[TranscriptMessage, ...]) -> None:
+        self.transcript_list.remove_all()
+        self._rows.clear()
+        for message in messages:
+            self.message_added(message)
+        self._follow_tail = True
+        self._show_notice("")
         self._refresh_send_button()
 
     def message_changed(self, message: TranscriptMessage) -> None:
@@ -299,6 +350,26 @@ class ChatPanel(Gtk.Box):
             return
         buffer.set_text("")
         self._show_notice("")
+
+    def _show_history_notice(self, text: str) -> None:
+        self.history_notice.set_text(display_text(text))
+        self.history_notice.set_visible(bool(text))
+
+    def new_session(self) -> None:
+        """Start a fresh session, as the "New session" button does. Nothing escapes."""
+        if self._session is None:
+            return
+        try:
+            self._session.new_session()
+        except TumbleweedError as exc:
+            self._show_notice(describe_error(exc))
+        except Exception:
+            logger.exception("starting a new session failed")
+            self._show_notice("Something went wrong while starting a new session.")
+
+    def _on_new_session_clicked(self, _button: Gtk.Button) -> None:
+        self.new_session()
+        self.input_view.grab_focus()
 
     def _show_notice(self, text: str, *, busy: bool = False) -> None:
         self.notice.set_text(display_text(text))

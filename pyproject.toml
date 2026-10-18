@@ -279,6 +279,19 @@ source_modules = ["tumbleweed.ui.spec"]
 forbidden_modules = ["gi"]
 
 [[tool.importlinter.contracts]]
+name = "history never imports gi (ARCHITECTURE section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.history"]
+forbidden_modules = ["gi"]
+
+# The shell depends on the history through `ChatHistory`, never the other way round.
+[[tool.importlinter.contracts]]
+name = "history never imports shell or agent (the shell depends on it, section 10)"
+type = "forbidden"
+source_modules = ["tumbleweed.history"]
+forbidden_modules = ["tumbleweed.shell", "tumbleweed.agent"]
+
+[[tool.importlinter.contracts]]
 name = "agent never imports gi (ARCHITECTURE section 10)"
 type = "forbidden"
 source_modules = ["tumbleweed.agent"]

@@ -174,6 +174,45 @@ invocation log and that the key is not in it:
 TUMBLEWEED_LIVE=1 ANTHROPIC_API_KEY="$(cat path/to/key)" uv run pytest -m live tests/agent -v
 ```
 
+### Chat history
+
+The chat is kept between runs. `tumbleweed-shell` restores the last session when it starts (its newest
+messages, at most 998 and 4 MiB of text; the chat then has room for more) and saves each message as it
+goes: yours when you send it, the reply when it ends. **New session** (the button above the chat) stops
+the reply in flight, starts an empty session and keeps the old one in the file; it is also what to press
+when the chat says it is full (1000 messages). The model is told about the restored conversation, the
+newest exchanges that fit a budget of at most 120,000 estimated tokens (a text counts as its UTF-8
+bytes, which overcounts ordinary English several times over, on purpose; ARCHITECTURE section 9 and
+D16).
+
+It lives in `$XDG_DATA_HOME/tumbleweed/shell/chat.sqlite3` (default `~/.local/share/...`), in directories of
+mode 0700 and files of mode 0600, and holds only what the chat shows: no API key, no configuration (what you
+type is stored as you typed it, so do not paste a secret into the chat). To forget everything, quit the shell
+and delete `chat.sqlite3*` and `chat.locks/` there. A `tumbleweed/` or `shell/` directory that is a symlink is
+refused (the shell then runs without history, and says so). It keeps the newest 20 sessions that have
+messages, of at most 1000 messages each. Each write waits at most about 2 seconds for another shell's, then
+fails and is reported (opening, restoring and starting a session are a few writes each), so no one write
+holds the window for longer than that.
+
+**New session and quitting.** An empty session you made with the **New session** button is kept: it is the
+last session, so after you quit and start again the chat is empty (your old chat is still in the file, but is
+not shown: there is no session browser yet, #80). Only the one newest such session is kept (starting another, in any shell, deletes the
+empty ones nobody is using), and one that got messages is an ordinary session. The empty session a shell makes by itself when it starts is not kept: it is
+deleted when that shell closes or starts another session, and one left by a shell that was killed is deleted
+by the next shell that starts a session.
+
+Two shells can run at once, and each owns its own session: a session a running shell holds is never taken by
+another. A shell started while another runs gets the newest session that has messages (or that you started
+empty) and that nobody holds, which is an older chat if there is one, or else an empty chat. An accidental
+second shell therefore leaves nothing behind: its empty session is deleted when it closes, and the next start
+restores the real chat. If a message cannot be saved (the disk is full, another shell held the file for too
+long) the chat says so above the messages and the rest of that session is not saved; **New session** tries
+the history again. If the file cannot be used (not a database, a symlink, another user's, written by a newer
+version) the shell starts anyway, says so above the chat, and does not save; it leaves the file alone. If the
+last session's data is damaged, a new session starts and the old data stays in the file. The mode of a
+directory or file of yours that is too open is corrected, with a log line. Deferred pieces (a session
+browser, and others) are in #80.
+
 ### Checks
 
 ```sh

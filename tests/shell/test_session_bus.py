@@ -240,6 +240,7 @@ def test_the_shell_exports_exactly_the_reviewed_objects_and_actions_on_the_sessi
     bus = Bus(tmp_path)
     environment = {name: os.environ[name] for name in PASSED_ON if name in os.environ}
     environment["DBUS_SESSION_BUS_ADDRESS"] = bus.address
+    environment["XDG_DATA_HOME"] = str(tmp_path / "data")  # the chat history is not the user's
     shell = subprocess.Popen(
         [sys.executable, "-m", "tumbleweed.shell"],
         stdin=subprocess.DEVNULL,
