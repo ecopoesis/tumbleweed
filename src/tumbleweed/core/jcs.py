@@ -128,7 +128,8 @@ def canonicalize(value: object, *, max_nodes: int = MAX_NODES, max_bytes: int = 
     at most `max_nodes` values (every container, scalar and object key counts, so a list of a
     million empty lists is refused as it is read, not after it is built) and `max_bytes` bytes
     of output, in UTF-8. A hostile value that is over either is a `ValueError` after at most
-    that much work.
+    that much work. (A container's size is checked before its members are pushed, which bounds the
+    memory of the walk, not its outcome: without that check the budget is still refused, later.)
     """
     # Entries are a value with its depth, or a piece of output already decided (a string).
     stack: list[tuple[object, int] | str] = [(value, 1)]

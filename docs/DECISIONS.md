@@ -384,10 +384,14 @@ normalised bytes and the hash are in `core.canonical` on top of `core.jcs`, the 
 package*, not only the code: manifest, spec, modules and taint. A tool grant binds to the hash, so a
 change of what a tool declares, or of what it may embed, needs a new grant. The taint is inside the
 package for the same reason: it cannot be edited out of a stored version without breaking the hash.
-(3) *Normalise, then validate again.* Every string and key is normalised before the bytes are made,
-and the normalised package is parsed by the strict models; NFC can lengthen a text, so a draft that
-is valid as written and not as stored is refused. A bundle must *already* be in normal form and is
-refused, not repaired, when it is not: otherwise the hash it states would not be the hash stored.
+(3) *Normalise, then validate.* Every string and key is normalised before the bytes are made, and the
+normalised package is parsed by the strict models; NFC can lengthen a text, so a draft that is valid
+as written and not as stored is refused. A draft from outside (`parse_draft`) is normalised before it
+is validated, so it is judged by the length it is stored with. Text with a code point Unicode 15.0
+had not assigned is refused (`core.unicode15`): NFC changes between Unicode versions (U+105D2
+U+0307 composes in 16.0), so Python 3.12 and 3.14 would otherwise hash one text two ways. A bundle must *already* be in normal form and is
+refused, not repaired, when it is not: otherwise the hash it states would not be the hash stored; and
+the file is exactly canonical JSON, so that the bytes hashed are the bytes in the file.
 (4) *No archive.* A bundle is one canonical JSON document around the package's own bytes, so there
 is no member, path or expansion to attack; it is parsed by the same closed models as a stored
 package, which is how nothing but the declared fields (no grant, no state) can travel (I8). (5)
@@ -404,13 +408,18 @@ plus one, assigned where it is stored. (7) *An import never touches a lineage it
 does not have; the same version byte for byte changes nothing; any other bundle for a known ID is
 a `conflict`. A bundle that could be the "next version" of a tool the user has would show a stranger's
 code in the place of the user's, and the alternative (renaming the ID) changes the hash the bundle
-states. Updating from a bundle is a flow of S24. (8) *A bundle's taint is its exporter's claim and is
-kept.* Taint exists because a package may embed what *this* user's task saw; a bundle from
-elsewhere has none of it, and one the user exported from their own tainted task carries the taint it
-was saved with. Lowering it by editing a stored version is detected (the taint is in the hash and
-the index is cross-checked); lowering it in a file the user edits is the user's own act. (9)
-*Saving takes the taint from the task, inside the block that stores it.* `BrokerService.save_tool`
-reads the broker's record of the task and stores the version in one synchronous section with its
+states. Updating from a bundle is a flow of S24. (8) *An import is `fs`-tainted whatever it claims.* The first version of this decision kept a
+bundle's claimed taint, on the premise that a bundle holds none of this user's data; that was
+false, because a bundle is file input that a task which could read files and write one may have
+made, with their content in it, claiming none (I12). The index now keeps two fields: `taint`, what
+open and grant decisions must read (S24), is the claim plus `fs` for an import and the task's own
+for a save; `claimed_taint` is the package's own, for display. The package is not rewritten, so
+its hash is the bundle's and export and import are hash-stable (the alternative, rewriting the
+taint and recomputing the hash, would make a re-export a different tool). The origin is the
+index's to say, because a package cannot record how it came without changing its hash; editing the
+database is out of scope (section 8). Lowering an import's taint is a user's decision in a trusted
+prompt (S18, S24; #98). (9) *Saving takes the taint from the task, inside the block that stores it.*
+`BrokerService.save_tool` reads the broker's record of the task and stores the version in one synchronous section with its
 audit entry, so a grant that arrived a moment ago is in it (I12). It has no IPC request: the model's
 `save_tool` is S24's. (10) *Audit:* a saved or imported version, an export and a refused import
 have entries, written before the act in its transaction; listing, showing and searching do not (they
@@ -423,7 +432,9 @@ reduced to at most eight quoted prefix terms before FTS5 sees it, so no syntax (
 or costly form) is reachable; the number of tools is bounded, so is the cost of a query. (13) *Limits:*
 400 KiB a package, 256 KiB its spec, 16 modules of 48 KiB (96 KiB in all), 500 tools, 100 versions of
 one, 256 MiB in all; the biggest package and its bundle fit one IPC frame with room to spare.
-(14) *#62 and #23.* `jcs.canonicalize` walks iteratively with a budget of values and bytes (a
+(14) *Version numbers* stop at 2**53 (the largest integer a JSON double holds exactly), so a version
+survives canonicalisation; a tool at the last one cannot be refined, and says so.
+(15) *#62 and #23.* `jcs.canonicalize` walks iteratively with a budget of values and bytes (a
 hostile value costs a bounded amount and cannot reach the recursion limit), and only validated
 values are canonicalised here. Inside a `json` value an int and a float of one value are one value
 once canonicalised; the bytes and the hash are stable, and consumers must not depend on the

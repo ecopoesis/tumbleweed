@@ -222,9 +222,10 @@ class ToolSaved(_AuditModel):
     version: ToolVersion
     hash: ContentHash
     size: Annotated[int, Field(ge=0)]
-    taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=1)]
+    taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=2)]  # effective (I12)
     origin: Literal["saved", "imported"]
     task: TaskId | None
+    claimed_taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=1)] = ()
 
 
 class ToolExported(_AuditModel):
@@ -235,14 +236,16 @@ class ToolExported(_AuditModel):
     tool: ToolId
     version: ToolVersion
     hash: ContentHash
-    taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=1)]
+    taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=2)]  # effective (I12)
 
 
 class ToolImportRefused(_AuditModel):
-    """A bundle was refused, with a closed reason; nothing of it is kept (it is hostile input)."""
+    """A bundle was refused, with a closed reason; nothing of it is kept (it is hostile input).
+    `integrity` is a stored package that failed its check while the import looked at it, `error`
+    any other failure of the store or the disk."""
 
     kind: Literal["tool_import_refused"] = "tool_import_refused"
-    reason: Literal["invalid", "too_large", "conflict", "full"]
+    reason: Literal["invalid", "too_large", "conflict", "full", "integrity", "error"]
 
 
 type AuditEntry = Annotated[

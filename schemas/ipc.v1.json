@@ -236,7 +236,7 @@
         "version": {
           "anyOf": [
             {
-              "maximum": 9223372036854775807,
+              "maximum": 9007199254740992,
               "minimum": 1,
               "type": "integer"
             },
@@ -1146,7 +1146,7 @@
         "version": {
           "anyOf": [
             {
-              "maximum": 9223372036854775807,
+              "maximum": 9007199254740992,
               "minimum": 1,
               "type": "integer"
             },
@@ -1357,8 +1357,20 @@
     },
     "ToolSummary": {
       "additionalProperties": false,
-      "description": "One stored version of a tool, as the index lists it. `name`, `description` and `tags` are\nthe author's text (the model's, usually): bounded, and not to be shown as the broker's own.\n`taint` is what the package records of the task it was saved from.",
+      "description": "One stored version of a tool, as the index lists it. `name`, `description` and `tags` are\nthe author's text (the model's, usually): bounded, and not to be shown as the broker's own.\n`taint` is the taint a decision must use (I12): for a saved version the task's, for an imported\none its claim plus `fs`; `claimed_taint` is what the package itself records.",
       "properties": {
+        "claimed_taint": {
+          "items": {
+            "enum": [
+              "fs",
+              "net"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Claimed Taint",
+          "type": "array"
+        },
         "description": {
           "maxLength": 1000,
           "title": "Description",
@@ -1406,7 +1418,7 @@
             ],
             "type": "string"
           },
-          "maxItems": 1,
+          "maxItems": 2,
           "title": "Taint",
           "type": "array"
         },
@@ -1416,7 +1428,7 @@
           "type": "string"
         },
         "version": {
-          "maximum": 9223372036854775807,
+          "maximum": 9007199254740992,
           "minimum": 1,
           "title": "Version",
           "type": "integer"
@@ -1430,6 +1442,7 @@
         "description",
         "tags",
         "taint",
+        "claimed_taint",
         "origin",
         "saved_at"
       ],

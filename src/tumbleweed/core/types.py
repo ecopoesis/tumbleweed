@@ -9,8 +9,9 @@ paths do not, because they must not be usable as file names without going throug
 open. Durations are plain `datetime.timedelta`.
 
 Validation is strict: `ByteCount` takes an `int`, not `"5"`, `True`, a float or a `Decimal`,
-and an int outside 0..2**63-1 (for `ToolVersion`: 1..2**63-1) is refused. In pydantic models
-these types accept their raw JSON form, and dump to it in JSON mode.
+and an int outside 0..2**63-1 (for `ToolVersion`: 1..2**53, the largest integer every JSON
+double holds exactly, so that a version survives RFC 8785 canonicalisation) is refused. In
+pydantic models these types accept their raw JSON form, and dump to it in JSON mode.
 
 Two limits of building the numeric and string primitives on `int` and `str`:
 
@@ -165,7 +166,7 @@ class TokenCount(_BoundedInt, minimum=0):
 
 
 @final
-class ToolVersion(_BoundedInt, minimum=1):
+class ToolVersion(_BoundedInt, minimum=1, maximum=2**53):
     """The version of a saved tool: 1 for the first save, then 2, 3, ..."""
 
     __slots__ = ()

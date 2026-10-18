@@ -12,6 +12,8 @@ must be granted again).
 and otherwise raises `ToolPackageError` and changes nothing:
 
 - it is at most `MAX_BUNDLE_BYTES`, checked before it is parsed;
+- the file is exactly canonical JSON (RFC 8785: no whitespace, members in order, `\\u` escapes only
+  where JSON requires them), so that what is hashed is what lies in the file;
 - it is UTF-8 JSON with no repeated key, an object with exactly the three members above;
 - the package is valid (`parse_package`: every limit, every cross-check), and **is already in
   normal form**: NFC, LF, canonical RFC 8785 bytes, exactly what `canonical_package` would write
@@ -89,4 +91,8 @@ def parse_bundle(data: bytes) -> CanonicalPackage:
         )
     if canonical.hash != stated:
         raise ToolPackageError(["the bundle's hash is not the hash of its package"])
+    if canonicalize(document).encode("utf-8") != data:
+        # Not only the package: the file is what `export_bundle` writes, byte for byte, so that
+        # the bytes hashed are the bytes of the package as they lie in the file.
+        raise ToolPackageError(["the bundle is not written as canonical JSON (RFC 8785)"])
     return canonical

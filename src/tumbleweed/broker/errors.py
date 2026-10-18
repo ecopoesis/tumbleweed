@@ -143,6 +143,15 @@ class ToolStoreFullError(ToolStoreError):
     """The store is at one of its limits (tools, versions of a tool, bytes)."""
 
 
+class ToolBlobWriteError(ToolStoreError):
+    """A package could not be written to the store (the disk is full, the directory unwritable, the
+    bytes are not what their name says): not a sign that anything stored was tampered with."""
+
+
+class ToolVersionExhaustedError(ToolStoreError):
+    """A tool has no version number left (`ToolVersion` ends at 2**53)."""
+
+
 class ToolBlobError(ToolStoreError):
     """A stored package is missing or is not what its hash says (tampered, truncated, replaced by
     a symlink or another kind of file). It is refused, never repaired or deleted."""

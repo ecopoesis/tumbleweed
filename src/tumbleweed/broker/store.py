@@ -38,7 +38,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Final, Literal, Self, final
 
-from pydantic import AwareDatetime, Field, TypeAdapter, ValidationError
+from pydantic import AwareDatetime, Field, TypeAdapter, ValidationError, model_validator
 
 from tumbleweed.broker.errors import StoreCorruptError, StoreError, StoreRefusedError
 from tumbleweed.broker.grants import Grant, ToolGrant
@@ -109,7 +109,10 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     ),
     # S23: the tool store's index. A package is a file (`toolblobs`); these rows say which exist,
     # and the name, description and tags are copies of the package's own, for listing and search
-    # (a read that opens a package checks them against it). `tool_search` indexes the newest
+    # (a read that opens a package checks them against it). `taint` is what a decision must use: for
+    # a saved version it is the package's own, for an imported one the package's claim plus `fs`
+    # (an imported package is user-filesystem input of unknown provenance, I12); `claimed_taint` is
+    # the package's own, for display. `tool_search` indexes the newest
     # version of each tool, under the rowid of its `tools` row.
     (
         """CREATE TABLE tools (
@@ -125,7 +128,8 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) <= 1024),
     description TEXT NOT NULL CHECK (length(CAST(description AS BLOB)) <= 8192),
     tags TEXT NOT NULL CHECK (length(CAST(tags AS BLOB)) <= 512),
-    taint TEXT NOT NULL CHECK (taint IN ('none', 'fs', 'net')),
+    taint TEXT NOT NULL CHECK (taint IN ('none', 'fs', 'net', 'both')),
+    claimed_taint TEXT NOT NULL CHECK (claimed_taint IN ('none', 'fs', 'net')),
     origin TEXT NOT NULL CHECK (origin IN ('saved', 'imported')),
     saved_at INTEGER NOT NULL CHECK (saved_at {_MILLIS}),
     PRIMARY KEY (tool, version)
@@ -331,15 +335,33 @@ class ToolRecord(PolicyModel):
     name: Name
     description: Description
     tags: Annotated[tuple[ToolTag, ...], Field(max_length=8)]
-    taint: frozenset[TaintKind]
+    taint: frozenset[TaintKind]  # effective: what open_tool and grants must use (I12)
+    claimed_taint: frozenset[TaintKind]  # what the package itself records
     origin: Literal["saved", "imported"]
     saved_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _claim_is_one_taint_at_most(self) -> Self:
+        if len(self.claimed_taint) > 1 or not self.claimed_taint <= self.taint:
+            raise InvalidValueError("a package's own taint is at most one, and part of the taint")
+        return self
 
 
 def _taint_text(taint: frozenset[TaintKind]) -> str:
     if len(taint) > 1:
         raise InvalidValueError("a task is never both fs- and net-tainted (I12)")
     return next(iter(taint)).value if taint else "none"
+
+
+def _tool_taint_text(taint: frozenset[TaintKind]) -> str:
+    """A tool's taint, which unlike a task's can be both (an imported package that claims net)."""
+    return "both" if len(taint) > 1 else _taint_text(taint)
+
+
+def _tool_taint_of(text: str) -> frozenset[TaintKind]:
+    if text == "both":
+        return frozenset({TaintKind.FS, TaintKind.NET})
+    return _taint_of(text)
 
 
 def _taint_of(text: str) -> frozenset[TaintKind]:
@@ -701,7 +723,7 @@ class BrokerStore:
         sequence = _integer(known[0][0])
         self._execute(
             "INSERT INTO tool_versions (tool, version, hash, size, name, description, tags, "
-            "taint, origin, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "taint, claimed_taint, origin, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 sequence,
                 int(record.version),
@@ -710,7 +732,8 @@ class BrokerStore:
                 record.name,
                 record.description,
                 " ".join(record.tags),
-                _taint_text(record.taint),
+                _tool_taint_text(record.taint),
+                _taint_text(record.claimed_taint),
                 record.origin,
                 _millis(record.saved_at),
             ),
@@ -771,9 +794,10 @@ class BrokerStore:
                 name=_text(row[4]),
                 description=_text(row[5]),
                 tags=tuple(ToolTag(tag) for tag in _text(row[6]).split()),
-                taint=_taint_of(_text(row[7])),
-                origin=_origin(_text(row[8])),
-                saved_at=_moment(row[9]),
+                taint=_tool_taint_of(_text(row[7])),
+                claimed_taint=_taint_of(_text(row[8])),
+                origin=_origin(_text(row[9])),
+                saved_at=_moment(row[10]),
             )
         except (InvalidValueError, ValidationError):
             raise StoreCorruptError("the broker's database holds a malformed tool") from None
@@ -789,8 +813,8 @@ class BrokerStore:
 
 
 _TOOL_COLUMNS: Final = (
-    "SELECT t.id, v.version, v.hash, v.size, v.name, v.description, v.tags, v.taint, v.origin, "
-    "v.saved_at"
+    "SELECT t.id, v.version, v.hash, v.size, v.name, v.description, v.tags, v.taint, "
+    "v.claimed_taint, v.origin, v.saved_at"
 )
 
 _TASK_COLUMNS: Final = (

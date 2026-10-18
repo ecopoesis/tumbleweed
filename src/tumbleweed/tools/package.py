@@ -37,7 +37,7 @@ from typing import Annotated, Final, Literal, Self, final
 
 from pydantic import AfterValidator, BeforeValidator, Field, ValidationError, model_validator
 
-from tumbleweed.core.canonical import canonical_bytes, content_hash
+from tumbleweed.core.canonical import canonical_bytes, content_hash, normalize_tree
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.ids import ToolId
 from tumbleweed.core.jcs import canonicalize
@@ -312,14 +312,25 @@ def parse_package(data: bytes) -> ToolPackage:
 def parse_draft(data: bytes) -> ToolDraft:
     """Parse and validate the JSON of a draft (what a tool is saved from), exactly as strictly as
     `parse_package` does a package: `ToolPackageError` and nothing else, `ToolTooLargeError` over
-    `MAX_PACKAGE_BYTES`."""
+    `MAX_PACKAGE_BYTES`.
+
+    The draft is **normalised first and validated after** (as `canonical_package` does): a text
+    is judged by the length it will be stored with, so a name of forty accented letters written as
+    eighty (letter and combining mark) is a name of forty, not too long. A text with a character
+    that Unicode 15.0 had not assigned is refused (`core.unicode15`).
+    """
     if type(data) is not bytes:
         raise ToolPackageError([f"expected bytes, got {type(data).__name__}"])
     if len(data) > MAX_PACKAGE_BYTES:
         raise ToolTooLargeError([f"the draft is over {MAX_PACKAGE_BYTES} bytes"])
-    load_json(data, what="draft")
     try:
-        return ToolDraft.model_validate_json(data)
+        text = json.dumps(
+            normalize_tree(load_json(data, what="draft")), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8")
+    except ValueError as error:
+        raise ToolPackageError([f"the draft cannot be normalised: {str(error)[:200]}"]) from None
+    try:
+        return ToolDraft.model_validate_json(text)
     except ValidationError as error:
         raise ToolPackageError(problems_of(error)) from None
 

@@ -9,18 +9,26 @@ well-formed conjunction of at most `MAX_QUERY_TERMS` prefix terms. The text is a
 SQLite as a bound parameter, never spliced into SQL.
 """
 
-import re
 from typing import Final
 
+import regex
+
+from tumbleweed.core.canonical import normalize_text
 from tumbleweed.tools.limits import MAX_QUERY_CHARS, MAX_QUERY_TERMS, MAX_TERM_CHARS
 
-_WORD: Final = re.compile(r"\w+")
+# Letters, digits and the combining marks that belong to them: a letter with no precomposed form
+# (`x` and U+0301) is one word, not two.
+_WORD: Final = regex.compile(r"[\w\p{M}]+")
 
 
 def fts_match(text: str) -> str | None:
     """The `MATCH` string for what the user typed, or None if there is no word in it."""
-    terms = _WORD.findall(text[:MAX_QUERY_CHARS])[:MAX_QUERY_TERMS]
+    # NFC first, as the stored text is: an accent typed as a second character (NFD) is the same
+    # word as the stored one. The cut comes after, so the limit is on what is searched; the first
+    # cut only bounds the work of a text that is far too long.
+    searched = normalize_text(text[: MAX_QUERY_CHARS * 4])[:MAX_QUERY_CHARS]
+    terms = _WORD.findall(searched)[:MAX_QUERY_TERMS]
     if not terms:
         return None
-    # `\w` never matches a double quote, so a term cannot end the FTS5 string it is put in.
+    # Neither `\w` nor a mark is a double quote, so a term cannot end the FTS5 string it is in.
     return " ".join(f'"{term[:MAX_TERM_CHARS]}"*' for term in terms)

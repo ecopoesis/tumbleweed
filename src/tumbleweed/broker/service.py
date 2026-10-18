@@ -87,9 +87,11 @@ from tumbleweed.broker.errors import (
     PathFault,
     StoreError,
     ToolBlobError,
+    ToolBlobWriteError,
     ToolConflictError,
     ToolNotFoundError,
     ToolStoreFullError,
+    ToolVersionExhaustedError,
     UnknownTaskError,
     WorkspaceError,
     describe_fault,
@@ -589,6 +591,14 @@ class BrokerService:
             )
         except ToolStoreFullError:
             return Refused(kind="refused", reason="busy", message="the tool store is full")
+        except ToolVersionExhaustedError:
+            return Refused(
+                kind="refused", reason="too_large", message="the tool has no version number left"
+            )
+        except ToolBlobWriteError:
+            return Refused(
+                kind="refused", reason="unavailable", message="the tool store cannot be written"
+            )
         except ToolBlobError:
             return Refused(
                 kind="refused",
@@ -718,15 +728,32 @@ class BrokerService:
         except ToolStoreFullError:
             self._audit_import_refused("full")
             raise
+        except ToolBlobError:
+            self._audit_import_refused("integrity", best_effort=True)
+            raise
+        except (ToolBlobWriteError, StoreError):
+            self._audit_import_refused("error", best_effort=True)
+            raise
         return ToolImported(
             kind="tool_imported", summary=_tool_summary(stored.record), created=stored.created
         )
 
     def _audit_import_refused(
-        self, reason: Literal["invalid", "too_large", "conflict", "full"]
+        self,
+        reason: Literal["invalid", "too_large", "conflict", "full", "integrity", "error"],
+        *,
+        best_effort: bool = False,
     ) -> None:
-        with self._atomic() as entries:
-            entries.append(ToolImportRefused(at=self._now(), reason=reason))
+        """Record a refused import. With `best_effort` (a failure of the store or the disk, which
+        may be why the log cannot be written either) a failure to record is logged, and the
+        refusal the caller is about to raise is what the request gets."""
+        try:
+            with self._atomic() as entries:
+                entries.append(ToolImportRefused(at=self._now(), reason=reason))
+        except (AuditError, StoreError):
+            if not best_effort:
+                raise
+            _log.error("a refused tool import could not be recorded")
 
     def save_tool(
         self, owner: Owner, task: TaskId, draft: ToolDraft, *, tool: ToolId | None = None
@@ -1717,6 +1744,7 @@ class BrokerService:
 
 def _tool_summary(record: ToolRecord) -> ToolSummary:
     return ToolSummary(
+        claimed_taint=taint_names(record.claimed_taint),
         tool=record.tool,
         version=record.version,
         hash=record.hash,
@@ -1738,6 +1766,7 @@ def _saved_entry(stored: StoredTool, at: datetime, *, task: TaskId | None) -> To
         hash=record.hash,
         size=int(record.size),
         taint=taint_names(record.taint),
+        claimed_taint=taint_names(record.claimed_taint),
         origin=record.origin,
         task=task,
     )

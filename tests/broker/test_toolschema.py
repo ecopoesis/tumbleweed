@@ -1,5 +1,7 @@
 """The tool store's tables in the broker's database: migration, an exact schema, hostile rows."""
 
+# ruff: noqa: E501  (rows written out in full)
+
 import sqlite3
 from pathlib import Path
 
@@ -138,15 +140,19 @@ class TestTheTablesRefuseWhatCannotBeReal:
         [
             "INSERT INTO tools (id, latest) VALUES ('nope', 1)",
             "INSERT INTO tools (id, latest) VALUES ('tool_01m56q3ayn1sqq4f1newcs9742', 0)",
-            "INSERT INTO tool_versions VALUES (1, 0, '{h}', 5, 'n', '', '', 'none', 'saved', 1)",
-            "INSERT INTO tool_versions VALUES (1, 1, 'XYZ', 5, 'n', '', '', 'none', 'saved', 1)",
-            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 0, 'n', '', '', 'none', 'saved', 1)",
-            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 500000, 'n', '', '', 'none', 'saved', 1)",  # noqa: E501
-            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'both', 'saved', 1)",
-            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'none', 'forged', 1)",
-            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'none', 'saved', -1)",
-            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'none', 'saved', 'x')",
-            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'none', 'saved', 1.5)",
+            "INSERT INTO tool_versions VALUES (1, 0, '{h}', 5, 'n', '', '', 'none', 'none', 'saved', 1)",
+            "INSERT INTO tool_versions VALUES (1, 1, 'XYZ', 5, 'n', '', '', 'none', 'none', 'saved', 1)",
+            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 0, 'n', '', '', 'none', 'none', 'saved', 1)",
+            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 500000, 'n', '', '', 'none', 'none', 'saved', 1)",
+            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'none', 'both', 'saved', 1)",
+            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'none', 'none', 'forged', 1)",
+            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'weird', 'none', 'saved', 1)",
+            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '"
+            + "t" * 600
+            + "', 'none', 'none', 'saved', 1)",
+            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'none', 'none', 'saved', -1)",
+            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'none', 'none', 'saved', 'x')",
+            "INSERT INTO tool_versions VALUES (1, 1, '{h}', 5, 'n', '', '', 'none', 'none', 'saved', 1.5)",
         ],
     )
     def test_a_row_that_cannot_be_real_is_refused_by_the_database(

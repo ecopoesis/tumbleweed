@@ -508,7 +508,8 @@ tool grants are S24's.
 
 **The package** (`tumbleweed.tools.package`, pure, no I/O; the broker and the shell both use it).
 Every model is closed (`extra="forbid"`, strict, frozen), so a grant, a task or a current state
-value has nowhere to go (I8).
+value has nowhere to go (I8). A `ToolVersion` is 1 to 2**53 (the largest integer a JSON double
+holds exactly, so it survives canonicalisation); a tool at the last one cannot be refined.
 - *Manifest.* `ToolId`, name (1 to 64 characters), description (at most 1000), at most 8 tags
   (lowercase ASCII words, sorted, distinct), `ToolVersion`, the spec version (`tumbleweed.ui/1`),
   the declared capabilities (kinds only, `fs.read`, `fs.write`, `net.full`: a path is the user's to
@@ -523,16 +524,23 @@ value has nowhere to go (I8).
   96 KiB in all). Every `sandbox` handler must name a module that exists. A module is a value in the
   JSON document, never a file in the store, so no name ever becomes a path; the sandbox loader (S20)
   imports modules by name under a private package (#56).
-- *Taint.* `[]`, `["fs"]` or `["net"]`, never both: the broker's own record of the task the tool
-  was saved from (I12), part of the package and so of its hash.
+- *Taint.* `[]`, `["fs"]` or `["net"]`, never both: what the package records, part of it and so of
+  its hash. For a saved version it is the broker's own record of the task the tool was saved from
+  (I12). For an imported package it is only the exporter's *claim*, kept as written so that export
+  and import are hash-stable; the taint that decisions use is a separate field of the index (see
+  "Taint of an import" below).
 - *Size.* The canonical package is at most 400 KiB. A bundle is at most 401 KiB, and a JSON string
   that holds a JSON document is at most twice its size, so the largest package, its bundle and the
   answers that carry them each fit the 1 MiB frame (a test sends them over a real connection).
 
 **Canonical form and hash.** `canonical_package` takes a package and normalises every string and
-every object key (Unicode NFC; a line feed for `\r\n` and `\r`), validates the *normalised* package
+every object key (Unicode NFC; a line feed for `\r\n` and `\r`), refuses text that holds a code
+point Unicode 15.0 had not assigned (NFC changes between Unicode versions, so Python 3.12 and 3.14
+would hash such text apart: `core.unicode15` pins the table), validates the *normalised* package
 again (NFC can lengthen a text and can make two names one, so a draft that does not survive is
-refused, not stored), writes it as RFC 8785 JSON with `tumbleweed.core.jcs.canonicalize` and takes
+refused, not stored; `parse_draft`, the entry for a draft from outside, normalises *before* it
+validates, so a name of forty accented letters written as eighty characters is a name of forty),
+writes it as RFC 8785 JSON with `tumbleweed.core.jcs.canonicalize` and takes
 the SHA-256 of those UTF-8 bytes: the `ContentHash`. The package it returns was parsed back from
 those bytes. Inside a `json` value an int and a float of one value are one value (`5.0` is `5`):
 the bytes are stable, and a consumer must not depend on which it had. `jcs.canonicalize` is
@@ -543,7 +551,7 @@ change to any of them is a new hash and, for a tool grant, a new grant.
 **The store** (`tumbleweed.broker.toolstore`). Two parts that must agree:
 - the **index**, in `broker.sqlite3` (schema version 2): `tools` (one row per ToolId and its newest
   version), `tool_versions` (one row per stored version: its hash, size, a copy of name,
-  description, tags and taint, how it came, when) and `tool_search`, an FTS5 table over name,
+  description and tags, the package's own taint and the taint a decision uses, how it came, when) and `tool_search`, an FTS5 table over name,
   description and tags of each tool's *newest* version (`unicode61`, case and accents ignored,
   every word a prefix, name over tag over description by `bm25`). The primary key
   `(tool, version)` and the unique hash refuse a second row for a version;
@@ -560,8 +568,9 @@ change to any of them is a new hash and, for a tool grant, a new grant.
 
 `open` (what S24's `open_tool` and the sandbox run will use) reads the blob, parses it with the
 strict models, and checks that the index row is a faithful copy of it (id, version, name,
-description, tags, taint, size): a package whose blob or row was edited is refused, so the taint of
-a stored version cannot be lowered by editing the database either. Listing and searching show the
+description, tags, the package's taint, the taint its origin gives, size): a package whose blob or
+row was edited is refused, so the taint of a saved version cannot be lowered by editing the
+database either (for an import, see "Taint of an import"). Listing and searching show the
 index (the copies); showing, exporting and opening read the package. At most 500 tools, 100
 versions of one and 256 MiB of packages are kept; beyond that a save or import is refused (`busy`),
 never evicted. A search is words only: `fts_match` drops the syntax of FTS5 (operators, quotes,
@@ -581,20 +590,37 @@ no path, no nesting and no expansion to attack: `{"format": "tumbleweed.tool-bun
 a bundle only if it is at most 401 KiB, UTF-8 JSON with no repeated key and exactly those three
 members, the package passes every check of a stored one **and is already in normal form** (NFC, LF,
 every field written, canonical bytes: a bundle that is not is refused, not repaired, so that the
-hash it states is the hash that is stored), and the stated hash is the hash of those bytes. A
+hash it states is the hash that is stored), the stated hash is the hash of those bytes, and the
+whole file is exactly canonical JSON (RFC 8785), so that the bytes that are hashed are the bytes of
+the package as they lie in the file: a pretty-printed or `\u`-escaped bundle is refused. A
 bundle cannot carry what a package cannot: no grant, no state, no task, no unknown field anywhere
 (I8); an imported tool is granted again like any other version. It adds a tool whose `ToolId` the
-store does not know; the very same version again, byte for byte, changes nothing; any other
-bundle for a known `ToolId` is refused as a `conflict`, so an import can neither replace a
-version nor appear as the next version of a tool the user has. Its taint is its exporter's claim,
-kept as written: a package holds none of *this* user's data unless the user exported it from their
-own task, and then the claim travels with it.
+store does not know; the very same version again, byte for byte, changes no row (and verifies the
+blob, writing it again if it was lost, so importing repairs a store); any other bundle for a known
+`ToolId` is refused as a `conflict`, so an import can neither replace a version nor appear as the
+next version of a tool the user has.
 
-**Audit.** A saved or imported version (`tool_saved`: tool, version, hash, size, taint, origin,
-and the task for a save), an export (`tool_exported`: written before the bundle is returned, taint
-included, because a bundle is content that leaves the broker's custody) and a refused import
-(`tool_import_refused`, a closed reason, nothing of the bundle) are written before the act, in its
-transaction. Listing, showing and searching are reads of the broker's own store and are not
+**Taint of an import (I12).** A bundle is input from the user's file system or from elsewhere: a task
+that could read files and write one could have made it, with their content in it, under any claim.
+So **an imported package is `fs`-tainted whatever it claims**. The index keeps two fields:
+`taint`, what open and grant decisions **must read** (S24's `open_tool`, tool grants): for a saved
+version the task's taint, for an imported one the claim plus `fs` (so a claim of `net` makes `fs`
+and `net`, which no task can hold and which opens nowhere); and `claimed_taint`, what the package
+says, for display (`tumbleweed-tools` shows both). The package itself is not rewritten, so the
+hash is the bundle's. `open` refuses a version whose `taint` is not what its origin and package
+give. The origin lives in the index (a package cannot record how it came without changing the hash
+it is exported with), so rewriting both fields of an index row is not detected: editing the broker's
+database is out of scope (section 8), as for the grants beside it. Editing a bundle's claim and its
+hash gains nothing: it is another package, and an import is `fs`-tainted anyway. Lowering the taint
+of an import later is a user's decision in a trusted prompt (S18, S24; #98).
+
+**Audit.** A saved or imported version (`tool_saved`: tool, version, hash, size, the effective
+taint and the package's claim, origin, and the task for a save), an export (`tool_exported`: written before the bundle is returned, the
+effective taint included, because a bundle is content that leaves the broker's custody) and a
+refused import (`tool_import_refused`: `invalid`, `too_large`, `conflict`, `full`, `integrity` for a
+stored package that failed its check while the import looked at it, `error` for any other failure
+of the store or the disk; nothing of the bundle) are written before the act, in its transaction (a
+refusal that is itself a failure of the store is recorded if the log can take it). Listing, showing and searching are reads of the broker's own store and are not
 decisions; an import that finds the very same version stored changes nothing and has no entry.
 
 **`tumbleweed-tools`** (`tumbleweed.broker.toolscli`: `list [QUERY]`, `show TOOL [--version N]
@@ -603,7 +629,13 @@ client of the running broker and opens no database and no blob: one process writ
 writers cannot corrupt it, every export and import is audited, and the checks are made in one
 place. It does not start the broker, waits at most 5 s to connect and 60 s in all, escapes every
 character of tool text that is not printable, reads a bundle file as a regular file (never a
-symlink) of at most 401 KiB, and creates an export 0600 and never over an existing file.
+symlink) of at most 401 KiB, and creates an export 0600 and never over an existing file. An export
+to `-` is refused when standard output is a terminal (a bundle is raw text, and a terminal obeys
+controls that `printable` would have escaped), and is the canonical bytes to a pipe or a file;
+`show --json` is the canonical bytes to a pipe and, on a terminal, the same JSON value with every
+non-printable character escaped as JSON. `import` prints the taint the package claims and the taint
+kept. A write failure (a full disk) is answered `unavailable`, apart from `unsafe`, which means a
+stored package failed its check.
 
 ## 6. Composition
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tumbleweed.broker.errors import PrivateFsError, ToolBlobError
+from tumbleweed.broker.errors import PrivateFsError, ToolBlobError, ToolBlobWriteError
 from tumbleweed.broker.toolblobs import BLOB_DIRECTORY, ToolBlobs
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.types import ContentHash
@@ -61,7 +61,7 @@ class TestWriteAndRead:
     def test_bytes_that_are_not_what_the_name_says_are_not_written(
         self, tmp_path: Path, blobs: ToolBlobs
     ) -> None:
-        with pytest.raises(ToolBlobError, match="not what their hash says"):
+        with pytest.raises(ToolBlobWriteError, match="not what their hash says"):
             blobs.write(name_of(b"other"), DATA)
 
         assert listing(tmp_path) == {}
@@ -69,7 +69,7 @@ class TestWriteAndRead:
     def test_bytes_over_the_limit_are_not_written(self, tmp_path: Path, blobs: ToolBlobs) -> None:
         big = b"x" * (MAX_PACKAGE_BYTES + 1)
 
-        with pytest.raises(ToolBlobError):
+        with pytest.raises(ToolBlobWriteError):
             blobs.write(name_of(big), big)
 
         assert listing(tmp_path) == {}
@@ -86,6 +86,59 @@ class TestWriteAndRead:
         after = blob_path(tmp_path, name).stat()
         assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
         assert listing(tmp_path) == {str(name): DATA}
+
+
+class TestDurabilityAndFailures:
+    def test_the_directory_is_fsynced_after_the_link_and_before_write_returns(
+        self, tmp_path: Path, blobs: ToolBlobs, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        events: list[str] = []
+        real_fsync, real_link = os.fsync, os.link
+        directory = (tmp_path / BLOB_DIRECTORY).stat()
+
+        def fsync(descriptor: int) -> None:
+            info = os.fstat(descriptor)
+            kind = "directory" if stat.S_ISDIR(info.st_mode) else "file"
+            assert kind != "directory" or info.st_ino == directory.st_ino
+            events.append(f"fsync {kind}")
+            real_fsync(descriptor)
+
+        def link(*args: object, **kwargs: object) -> None:
+            events.append("link")
+            real_link(*args, **kwargs)  # type: ignore[arg-type]  # forwarded as received
+
+        monkeypatch.setattr(os, "fsync", fsync)
+        monkeypatch.setattr(os, "link", link)
+
+        blobs.write(name_of(DATA), DATA)
+
+        assert events == ["fsync file", "link", "fsync directory"]
+
+    def test_a_full_disk_is_a_write_failure_not_an_integrity_failure(
+        self, tmp_path: Path, blobs: ToolBlobs, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def full(_descriptor: int, _data: object) -> int:
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(os, "write", full)
+
+        with pytest.raises(ToolBlobWriteError) as caught:
+            blobs.write(name_of(DATA), DATA)
+
+        assert not isinstance(caught.value, ToolBlobError)
+        assert listing(tmp_path) == {}
+
+    def test_a_directory_that_cannot_be_written_is_a_write_failure(
+        self, tmp_path: Path, blobs: ToolBlobs
+    ) -> None:
+        (tmp_path / BLOB_DIRECTORY).chmod(0o500)
+        try:
+            if os.access(tmp_path / BLOB_DIRECTORY, os.W_OK):
+                pytest.skip("this user can write to a directory it has no write permission on")
+            with pytest.raises(ToolBlobWriteError):
+                blobs.write(name_of(DATA), DATA)
+        finally:
+            (tmp_path / BLOB_DIRECTORY).chmod(0o700)
 
 
 class TestAReadVerifies:
@@ -179,6 +232,36 @@ class TestAReadVerifies:
         with pytest.raises(ToolBlobError):
             blobs.read(name)
 
+    def test_what_cannot_be_a_blob_is_refused_before_a_byte_is_read(
+        self,
+        tmp_path: Path,
+        blobs: ToolBlobs,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        def read_nothing(_descriptor: int) -> bytes:
+            raise AssertionError("a file that cannot be a blob was read")
+
+        monkeypatch.setattr(ToolBlobs, "_read_all", staticmethod(read_nothing))
+        name, path = self.written(tmp_path, blobs)
+
+        with path.open("r+b") as file:  # over the limit
+            file.truncate(50 * MAX_PACKAGE_BYTES)
+        with pytest.raises(ToolBlobError):
+            blobs.read(name)
+        assert "over the size limit" in caplog.text
+        path.unlink()
+        os.mkfifo(path)  # not a regular file
+        with pytest.raises(ToolBlobError):
+            blobs.read(name)
+        assert "not a regular file" in caplog.text
+        path.unlink()
+        path.mkdir()
+        caplog.clear()
+        with pytest.raises(ToolBlobError):
+            blobs.read(name)
+        assert "not a regular file" in caplog.text
+
     def test_a_loose_mode_is_set_back_to_0600_and_the_read_goes_on(
         self, tmp_path: Path, blobs: ToolBlobs
     ) -> None:
@@ -224,7 +307,7 @@ class TestAWriteCannotReplace:
 
         monkeypatch.setattr(os, "link", broken)
 
-        with pytest.raises(ToolBlobError, match="cannot be written"):
+        with pytest.raises(ToolBlobWriteError, match="cannot be written"):
             blobs.write(name_of(DATA), DATA)
 
         assert listing(tmp_path) == {}

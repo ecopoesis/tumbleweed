@@ -402,9 +402,12 @@ uv run tumbleweed-tools export tool_01j... csv.tool.json   # a new file, mode 06
 uv run tumbleweed-tools import csv.tool.json      # `-` is stdin; no grant or state comes with it
 ```
 
-A bundle is one JSON file; an import refuses anything that is not exactly what an export writes
-(unknown fields, a wrong hash, text that is not NFC with LF line endings, too big) and never
-changes a tool the store already has. `uv run pytest tests/tools tests/broker/test_toolstore.py
+A bundle is one canonical JSON file; an import refuses anything that is not exactly what an export
+writes (unknown fields, a wrong hash, pretty-printed or escaped JSON, text that is not NFC with LF
+line endings, too big) and never changes a tool the store already has. An imported tool is
+tainted as if it had read files (`fs`) whatever the bundle says; `import` prints both what the
+package claims and what is kept. `export TOOL -` refuses to print on a terminal; use a file or a
+pipe. `uv run pytest tests/tools tests/broker/test_toolstore.py
 tests/broker/test_daemon_tools.py` are the tests that matter most here.
 
 ### UI spec

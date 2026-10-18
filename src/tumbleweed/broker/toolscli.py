@@ -15,7 +15,10 @@ the connection attempt (5 s) and the whole command (60 s).
 
 Everything printed that came from a tool (its name, description, tags) is untrusted text: every
 character that is not printable (escape sequences, bidirectional overrides, line breaks) is
-written as `\\uXXXX`, so a tool cannot move the cursor or forge a line in the terminal. A bundle
+written as `\\uXXXX`, so a tool cannot move the cursor or forge a line in the terminal. `export`
+refuses to write a bundle to a terminal (`-` when stdout is one), because a bundle is raw text;
+to a file or a pipe it is the canonical bytes. `show --json` is the canonical bytes to a pipe and,
+on a terminal, the same JSON value with every non-printable character escaped. A bundle
 file is read as a regular file (never a symlink), at most `MAX_BUNDLE_BYTES`; an export never
 overwrites a file and creates it with mode 0600.
 
@@ -45,7 +48,7 @@ from tumbleweed.ipc.errors import IpcError
 from tumbleweed.ipc.sockdir import SocketDirectory
 from tumbleweed.ipc.tool_messages import ToolSummary
 from tumbleweed.tools import Port, ToolPackageError, parse_package
-from tumbleweed.tools.limits import MAX_BUNDLE_BYTES
+from tumbleweed.tools.limits import MAX_BUNDLE_BYTES, MAX_QUERY_CHARS
 from tumbleweed.ui.spec.errors import printable
 
 CONNECT_TIMEOUT: Final = timedelta(seconds=5)
@@ -73,6 +76,12 @@ def _version(text: str) -> ToolVersion:
         raise argparse.ArgumentTypeError("not a version number (1 or more)") from None
 
 
+def _query(text: str) -> str:
+    if len(text) > MAX_QUERY_CHARS:
+        raise argparse.ArgumentTypeError(f"at most {MAX_QUERY_CHARS} characters")
+    return text
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tumbleweed-tools", description="The tools the broker has saved."
@@ -80,11 +89,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--socket-name", default=SOCKET_NAME, help="the broker's socket name")
     commands = parser.add_subparsers(dest="command", required=True)
     listing = commands.add_parser("list", help="list the tools, or search them")
-    listing.add_argument("query", nargs="?", help="words to look for in name, description, tags")
+    listing.add_argument(
+        "query", nargs="?", type=_query, help="words to look for in name, description, tags"
+    )
     show = commands.add_parser("show", help="show one tool")
     show.add_argument("tool", type=_tool_id)
     show.add_argument("--version", type=_version, help="a version (default: the newest)")
-    show.add_argument("--json", action="store_true", help="print the package's canonical JSON")
+    show.add_argument(
+        "--json",
+        action="store_true",
+        help="print the package's canonical JSON (to a terminal it is escaped for the terminal, "
+        "which makes it valid JSON of the same value but not the canonical bytes)",
+    )
     export = commands.add_parser("export", help="write a tool's bundle to a file")
     export.add_argument("tool", type=_tool_id)
     export.add_argument("file", help="the file to create, or - for standard output")
@@ -123,9 +139,18 @@ def read_bundle(name: str) -> str:
         raise CliError("the bundle is not UTF-8 text") from None
 
 
+def refuse_terminal(stdout: TextIO) -> None:
+    """A bundle is the text of a tool, which can hold anything a terminal obeys (C1 controls such
+    as the 8-bit forms of OSC 52, bidirectional overrides): it goes to a file or a pipe, never
+    to a terminal."""
+    if stdout.isatty():
+        raise CliError("export to a file or a pipe: a bundle is not safe to print on a terminal")
+
+
 def write_bundle(name: str, bundle: str, stdout: TextIO) -> None:
     """Write a bundle to a new file (never an existing one, mode 0600), or to standard output."""
     if name == "-":
+        refuse_terminal(stdout)
         stdout.write(bundle)
         return
     try:
@@ -183,7 +208,10 @@ def _show(summary: ToolSummary, document: str, stdout: TextIO) -> None:
         f"{printable(manifest.name)}  ({manifest.id}, version {manifest.version})",
         f"hash:         {summary.hash}",
         f"saved:        {summary.saved_at.isoformat()} ({summary.origin})",
-        f"taint:        {', '.join(package.taint) or 'none'}",
+        (
+            f"taint:        {', '.join(summary.taint) or 'none'} "
+            f"(the package claims {', '.join(package.taint) or 'none'})"
+        ),
         f"tags:         {printable(', '.join(manifest.tags)) or 'none'}",
         f"capabilities: {', '.join(manifest.capabilities) or 'none'}",
         f"inputs:       {ports(manifest.inputs)}",
@@ -196,6 +224,34 @@ def _show(summary: ToolSummary, document: str, stdout: TextIO) -> None:
         f"description:  {printable(manifest.description)}",
     ]
     stdout.write("\n".join(lines) + "\n")
+
+
+def json_escaped(text: str) -> str:
+    """`text` (JSON) with every character that is not printable written as a JSON `\\uXXXX` escape
+    (a surrogate pair for a character beyond the basic plane): the same JSON value, safe to print.
+    Only strings hold such characters, so the escape is valid wherever one occurs."""
+    out: list[str] = []
+    for char in text:
+        if char.isprintable():
+            out.append(char)
+            continue
+        code = ord(char)
+        if code > 0xFFFF:
+            code -= 0x10000
+            out.append(f"\\u{0xD800 + (code >> 10):04x}\\u{0xDC00 + (code & 0x3FF):04x}")
+        else:
+            out.append(f"\\u{code:04x}")
+    return "".join(out)
+
+
+def write_json(document: str, stdout: TextIO) -> None:
+    """The package's canonical JSON, exactly (no newline added, so that a pipe's bytes hash to the
+    package's hash), or, on a terminal, escaped for it and said to be so."""
+    if stdout.isatty():
+        stdout.write(json_escaped(document) + "\n")
+        sys.stderr.write("tumbleweed-tools: escaped for the terminal: not the canonical bytes\n")
+    else:
+        stdout.write(document)
 
 
 # --- commands ---------------------------------------------------------------------------------
@@ -216,6 +272,8 @@ async def connect(socket_name: str) -> BrokerClient:
 async def _run(args: argparse.Namespace, stdout: TextIO) -> None:
     command: str = args.command
     bundle = read_bundle(args.file) if command == "import" else ""
+    if command == "export" and args.file == "-":
+        refuse_terminal(stdout)  # before asking: an export is audited when it is handed out
     async with asyncio.timeout(COMMAND_TIMEOUT.total_seconds()):
         client = await connect(args.socket_name)
         async with client:
@@ -227,7 +285,7 @@ async def _run(args: argparse.Namespace, stdout: TextIO) -> None:
                 case "show":
                     shown = await client.show_tool(args.tool, args.version)
                     if args.json:
-                        stdout.write(printable(shown.document) + "\n")
+                        write_json(shown.document, stdout)
                     else:
                         _show(shown.summary, shown.document, stdout)
                 case "export":
@@ -236,7 +294,12 @@ async def _run(args: argparse.Namespace, stdout: TextIO) -> None:
                 case "import":
                     added = await client.import_tool(bundle)
                     verb = "imported" if added.created else "already stored"
+                    claimed = ", ".join(added.summary.claimed_taint) or "none"
+                    effective = ", ".join(added.summary.taint) or "none"
                     stdout.write(f"{verb}: {_line(added.summary)}\n")
+                    stdout.write(
+                        f"  taint the package claims: {claimed}; taint kept: {effective}\n"
+                    )
                 case _:
                     raise CliError("unknown command")
 

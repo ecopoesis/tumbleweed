@@ -13,12 +13,17 @@ trusts least of its own data, so every access goes through descriptors (CLAUDE.m
   `MAX_PACKAGE_BYTES`, is read in full under that bound, and its SHA-256 must be its name.
   Anything else (missing, a symlink, a FIFO, another owner, too big, other bytes) is a
   `ToolBlobError` and the bytes are not returned. A bad blob is never repaired and never deleted:
-  nothing here removes a file it did not just make.
-- **A write cannot replace.** The bytes go to a temporary name (`O_EXCL`, mode 0600, fsynced) and
-  are then linked to their final name, which fails if the name exists: a stored blob is never
-  overwritten. If it exists, it must verify as above (the same bytes, stored before: by an earlier
-  save whose database transaction did not commit, say), and if it does not, the write is refused
-  and the bad file is left alone. The temporary name is removed afterwards; a crash can leave
+  nothing here removes a file it did not just make. The one thing set right is a mode other than
+  0600 on a blob that verifies (`fchmod`, logged, as `privatefs` does for its files): the mode is
+  not part of what the hash vouches for, and the file is ours.
+- **A write cannot replace, and is durable before it is used.** The bytes go to a temporary name
+  (`O_EXCL`, mode 0600, fsynced) and are then linked to their final name, which fails if the name
+  exists: a stored blob is never overwritten. The directory is fsynced after the link, so that the
+  name is on disk before the database row that names it commits. Failures of a write (a full disk)
+  are `ToolBlobWriteError`, apart from `ToolBlobError`, which means "what is stored is not right".
+  If the name exists, it must verify as above (the same bytes, stored before: by an earlier save
+  whose database transaction did not commit, say), and if it does not, the write is refused and
+  the bad file is left alone. The temporary name is removed afterwards; a crash can leave
   one, and `open` removes the ones it finds (at most `_STALE_LIMIT`).
 
 What this does not do: it is not a garbage collector (a blob whose transaction did not commit
@@ -36,7 +41,7 @@ import stat
 from pathlib import Path
 from typing import Final, Self, final
 
-from tumbleweed.broker.errors import ToolBlobError
+from tumbleweed.broker.errors import ToolBlobError, ToolBlobWriteError
 from tumbleweed.broker.privatefs import open_private_directory
 from tumbleweed.core.types import ContentHash
 from tumbleweed.tools.limits import MAX_PACKAGE_BYTES
@@ -71,6 +76,11 @@ def _remove_stale(directory_fd: int) -> None:
                 removed += 1
             except OSError:
                 _log.warning("a temporary tool file could not be removed")
+
+
+def _write_failed(exc: OSError) -> ToolBlobWriteError:
+    _log.error("a tool blob cannot be written: %s", errno.errorcode.get(exc.errno or 0))
+    return ToolBlobWriteError("the tool store cannot be written")
 
 
 @final
@@ -134,18 +144,17 @@ class ToolBlobs:
     def write(self, name: ContentHash, data: bytes) -> None:
         """Store `data` as the blob `name`, which must be its SHA-256.
 
-        If the blob is already there it is verified instead, and left as it is. `ToolBlobError` if
-        the bytes are not what `name` says, are too big, or the name is taken by a blob that does
-        not verify.
+        If the blob is already there it is verified instead, and left as it is. `ToolBlobWriteError`
+        if the bytes are not what `name` says, are too big, or cannot be written; `ToolBlobError` if
+        the name is taken by a blob that does not verify.
         """
         if len(data) > MAX_PACKAGE_BYTES or hashlib.sha256(data).hexdigest() != str(name):
-            raise ToolBlobError("the bytes to store are not what their hash says")
+            raise ToolBlobWriteError("the bytes to store are not what their hash says")
         temporary = f"{_TEMPORARY_PREFIX}{secrets.token_hex(8)}"
         try:
             descriptor = os.open(temporary, _WRITE_FLAGS, 0o600, dir_fd=self._directory_fd)
         except OSError as exc:
-            _log.error("a tool blob cannot be written: %s", errno.errorcode.get(exc.errno or 0))
-            raise ToolBlobError("the tool store cannot be written") from None
+            raise _write_failed(exc) from None
         try:
             try:
                 view = memoryview(data)
@@ -164,9 +173,10 @@ class ToolBlobs:
                 )
             except FileExistsError:
                 self.read(name)  # refuses a blob that does not verify; one that does is these bytes
+            else:
+                os.fsync(self._directory_fd)
         except OSError as exc:
-            _log.error("a tool blob cannot be written: %s", errno.errorcode.get(exc.errno or 0))
-            raise ToolBlobError("the tool store cannot be written") from None
+            raise _write_failed(exc) from None
         finally:
             try:
                 os.unlink(temporary, dir_fd=self._directory_fd)

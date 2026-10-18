@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import os
 import subprocess
 import sys
@@ -15,10 +16,13 @@ from tests.broker.rig import Rig, running
 from tests.broker.test_daemon_tools import save
 from tests.ipc.bounded import run
 from tests.tools.support import draft, package
+from tests.ui.spec.support import Json, accepted, build
 from tumbleweed.broker import toolscli
+from tumbleweed.broker.audit import ToolExported
 from tumbleweed.broker.toolscli import CliError, main, read_bundle, write_bundle
+from tumbleweed.core.canonical import content_hash
 from tumbleweed.core.ids import ToolId
-from tumbleweed.tools import export_bundle, parse_bundle
+from tumbleweed.tools import ToolDraft, export_bundle, parse_bundle
 from tumbleweed.tools.limits import MAX_BUNDLE_BYTES
 
 
@@ -99,6 +103,24 @@ class TestCommands:
 
         run(scenario)
 
+    def test_import_says_what_the_package_claims_and_what_is_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                source = tmp_path / "in.json"
+                source.write_text(bundle_of(), encoding="utf-8")
+
+                added = await tools(rig, monkeypatch, capsys, "import", str(source))
+                tool = (await (await rig.client()).list_tools()).tools[0].tool
+                shown = await tools(rig, monkeypatch, capsys, "show", str(tool))
+
+                assert "taint the package claims: none; taint kept: fs" in added.out
+                assert "taint:fs" in added.out
+                assert "taint:        fs (the package claims none)" in shown.out
+
+        run(scenario)
+
     def test_standard_input_and_output_are_dash(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -172,6 +194,100 @@ class TestCommands:
         assert "Traceback" not in captured.err
 
 
+HOSTILE = "x\N{RIGHT-TO-LEFT OVERRIDE}\N{NEXT LINE}\N{CANCEL CHARACTER}\U000e0001y"
+
+
+class FakeTerminal(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def hostile_draft() -> ToolDraft:
+    state: list[Json] = [{"kind": "string", "key": "note", "default": HOSTILE}]
+    return ToolDraft(name="Evil", ui=accepted(build(state=state)))
+
+
+class TestTheTerminal:
+    def test_a_bundle_is_never_printed_on_a_terminal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                tool = await save(rig, hostile_draft())
+                terminal = FakeTerminal()
+                monkeypatch.setattr(sys, "stdout", terminal)
+
+                refused = await tools(rig, monkeypatch, capsys, "export", str(tool), "-")
+                monkeypatch.setattr(sys, "stdout", sys.__stdout__)
+
+                assert refused.status == 1
+                assert "export to a file or a pipe" in refused.err
+                assert terminal.getvalue() == ""  # nothing of the tool reached it
+                assert rig.audit_of(ToolExported) == []  # and nothing was handed out
+
+        run(scenario)
+
+    def test_to_a_file_or_a_pipe_the_bundle_is_the_canonical_bytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                tool = await save(rig, hostile_draft())
+                target = tmp_path / "evil.json"
+
+                to_file = await tools(rig, monkeypatch, capsys, "export", str(tool), str(target))
+                to_pipe = await tools(rig, monkeypatch, capsys, "export", str(tool), "-")
+
+                assert to_file.status == to_pipe.status == 0
+                assert HOSTILE in target.read_text(encoding="utf-8")
+                assert to_pipe.out == target.read_text(encoding="utf-8")
+                assert parse_bundle(target.read_bytes()).hash
+
+        run(scenario)
+
+    def test_the_text_of_a_tool_is_escaped_in_json_on_a_terminal_and_exact_in_a_pipe(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                tool = await save(rig, hostile_draft())
+                shown = (await (await rig.client()).show_tool(tool)).document
+
+                piped = await tools(rig, monkeypatch, capsys, "show", str(tool), "--json")
+                terminal = FakeTerminal()
+                monkeypatch.setattr(sys, "stdout", terminal)
+                escaped = await tools(rig, monkeypatch, capsys, "show", str(tool), "--json")
+                monkeypatch.setattr(sys, "stdout", sys.__stdout__)
+                on_terminal = terminal.getvalue()
+
+                assert piped.out == shown  # exactly the canonical bytes, no newline added
+                assert (
+                    content_hash(piped.out.encode())
+                    == parse_bundle(
+                        (await (await rig.client()).export_tool(tool)).bundle.encode()
+                    ).hash
+                )
+                assert all(char.isprintable() or char == "\n" for char in on_terminal)
+                assert json.loads(on_terminal) == json.loads(shown)  # the same value
+                assert "\\udb40\\udc01" in on_terminal  # an astral character as a surrogate pair
+                assert "not the canonical bytes" in escaped.err
+
+        run(scenario)
+
+    def test_json_escaping_is_valid_json_for_every_non_printable_character(self) -> None:
+        from tumbleweed.broker.toolscli import json_escaped
+
+        every = "".join(
+            chr(c) for c in (0x1, 0x7F, 0x85, 0x202E, 0x2028, 0xFEFF, 0xE0001, 0x10FFFD)
+        )
+        document = json.dumps({"k": every}, ensure_ascii=False)
+
+        escaped = json_escaped(document)
+
+        assert all(c.isprintable() for c in escaped)
+        assert json.loads(escaped) == {"k": every}
+
+
 class TestTheCommandLine:
     @pytest.mark.parametrize(
         "args",
@@ -193,6 +309,25 @@ class TestTheCommandLine:
 
         assert caught.value.code == 2
         assert "usage:" in capsys.readouterr().err
+
+    def test_a_query_over_the_limit_is_a_usage_error_and_is_not_echoed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        secret = "SECRET" + "x" * 300
+
+        with pytest.raises(SystemExit) as caught:
+            main(["list", secret])
+
+        captured = capsys.readouterr()
+        assert caught.value.code == 2
+        assert "at most 200 characters" in captured.err
+        assert "SECRET" not in captured.err
+        assert "Traceback" not in captured.err
+
+    def test_a_query_of_exactly_the_limit_is_fine(self) -> None:
+        from tumbleweed.broker.toolscli import _parser
+
+        assert _parser().parse_args(["list", "x" * 200]).query == "x" * 200
 
     def test_a_version_is_a_number_from_one(self, capsys: pytest.CaptureFixture[str]) -> None:
         for bad in ("0", "-1", "x", "1.5", ""):

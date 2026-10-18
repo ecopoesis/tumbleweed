@@ -6,7 +6,7 @@ from typing import cast
 
 import pytest
 
-from tests.tools.support import package, text_of, tree
+from tests.tools.support import draft, package, text_of, tree
 from tests.tools.test_package import at
 from tests.ui.spec.support import Json
 from tumbleweed.core.canonical import content_hash
@@ -75,11 +75,14 @@ class TestWhatImportRefuses:
         with pytest.raises(ToolTooLargeError):
             parse_bundle(b"{" * (MAX_BUNDLE_BYTES + 1))
 
-    def test_exactly_the_limit_is_not_too_large(self) -> None:
+    def test_exactly_the_limit_is_not_too_large_and_one_more_is(self) -> None:
+        # Padding is not canonical, so a padded bundle is refused, but for that and not for size.
         bundle = export_bundle(package())
         padded = bundle + b" " * (MAX_BUNDLE_BYTES - len(bundle))
 
-        assert parse_bundle(padded).hash == parse_bundle(bundle).hash
+        with pytest.raises(ToolPackageError, match="canonical JSON") as at_limit:
+            parse_bundle(padded)
+        assert not isinstance(at_limit.value, ToolTooLargeError)
         with pytest.raises(ToolTooLargeError):
             parse_bundle(padded + b" ")
 
@@ -179,6 +182,37 @@ class TestWhatImportRefuses:
         )
 
         assert refusal(bundle)
+
+
+class TestTheFileIsCanonical:
+    """The bytes hashed are the bytes of the package as they lie in the file (F1)."""
+
+    def test_a_pretty_printed_bundle_is_refused(self) -> None:
+        document = json.loads(export_bundle(package()))
+
+        for text in (
+            json.dumps(document, indent=2),
+            json.dumps(document, indent=2, sort_keys=True),
+            json.dumps(document),
+        ):
+            assert any("canonical JSON" in p for p in refusal(text.encode("utf-8"))), text[:40]
+
+    def test_an_ascii_escaped_bundle_is_refused(self) -> None:
+        stored = package(source=draft(description="caf\N{LATIN SMALL LETTER E WITH ACUTE}"))
+        document = json.loads(export_bundle(stored))
+        sorted_ascii = json.dumps(document, sort_keys=True, separators=(",", ":"))
+
+        assert "\\u00e9" in sorted_ascii
+        assert any("canonical JSON" in p for p in refusal(sorted_ascii.encode("ascii")))
+
+    def test_whitespace_around_a_good_bundle_is_refused(self) -> None:
+        bundle = export_bundle(package())
+
+        assert refusal(bundle + b"\n")
+        assert refusal(b" " + bundle)
+
+    def test_the_bundle_an_export_wrote_is_accepted(self) -> None:
+        assert parse_bundle(export_bundle(package())).hash
 
 
 class TestNothingCanBeSmuggledIn:

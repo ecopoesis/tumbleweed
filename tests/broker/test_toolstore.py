@@ -1,5 +1,6 @@
 """The tool store: versions, search, immutability, import, and a tampered store (S23)."""
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -15,15 +16,17 @@ from tumbleweed.broker.errors import (
     ToolConflictError,
     ToolNotFoundError,
     ToolStoreFullError,
+    ToolVersionExhaustedError,
 )
 from tumbleweed.broker.store import DATABASE_NAME, BrokerStore
 from tumbleweed.broker.task import TaintKind
 from tumbleweed.broker.toolblobs import BLOB_DIRECTORY, ToolBlobs
 from tumbleweed.broker.toolstore import ToolStore
 from tumbleweed.core.ids import ToolId
-from tumbleweed.core.types import ToolVersion
-from tumbleweed.tools import ToolPackageError, export_bundle, parse_bundle
+from tumbleweed.core.types import ContentHash, ToolVersion
+from tumbleweed.tools import ToolPackageError, export_bundle, parse_bundle, parse_package
 from tumbleweed.tools.limits import MAX_RESULTS
+from tumbleweed.tools.package import Taint
 
 NOW = datetime(2026, 10, 18, 12, 0, tzinfo=UTC)
 NFD = "e\N{COMBINING ACUTE ACCENT}"
@@ -173,10 +176,88 @@ class TestTaint:
 
     def test_the_taint_cannot_be_lowered_by_editing_the_index(self, rig: Rig) -> None:
         saved = rig.save(taint=frozenset({TaintKind.FS}))
-        rig.sql("UPDATE tool_versions SET taint = 'none'")
 
+        rig.sql("UPDATE tool_versions SET taint = 'none'")  # the claim is no longer inside it
+        with pytest.raises(StoreError):
+            rig.tools.open(saved.record.tool)
+        rig.sql("UPDATE tool_versions SET claimed_taint = 'none'")  # both lowered
         with pytest.raises(ToolBlobError, match="does not match its index"):
             rig.tools.open(saved.record.tool)
+
+
+class TestImportedTaint:
+    """I12: a bundle is file input, so an import is fs-tainted whatever it claims."""
+
+    def imported(self, rig: Rig, claim: tuple[Taint, ...]) -> toolstore.StoredTool:
+        canonical = package(taint=claim)
+        with rig.store.transaction():
+            return rig.tools.import_(canonical, NOW)
+
+    @pytest.mark.parametrize(
+        ("claim", "effective"),
+        [
+            ((), {TaintKind.FS}),
+            (("fs",), {TaintKind.FS}),
+            (("net",), {TaintKind.FS, TaintKind.NET}),
+        ],
+    )
+    def test_the_effective_taint_includes_fs_whatever_the_bundle_claims(
+        self, rig: Rig, claim: tuple[Taint, ...], effective: set[TaintKind]
+    ) -> None:
+        stored = self.imported(rig, claim)
+
+        assert stored.record.taint == effective
+        assert stored.record.claimed_taint == toolstore.taint_kinds(claim)
+        opened = rig.tools.open(stored.record.tool)
+        assert opened.record.taint == effective
+        assert opened.canonical.package.taint == claim  # the package is as it was written
+
+    def test_a_saved_version_has_exactly_the_taint_of_its_task(self, rig: Rig) -> None:
+        for taint in (frozenset(), frozenset({TaintKind.NET}), frozenset({TaintKind.FS})):
+            saved = rig.save(taint=taint)
+
+            assert saved.record.taint == saved.record.claimed_taint == taint
+
+    def test_the_hash_is_the_bundles_so_export_and_import_are_stable(self, rig: Rig) -> None:
+        canonical = package(taint=("net",))
+        with rig.store.transaction():
+            stored = rig.tools.import_(canonical, NOW)
+
+        assert stored.record.hash == canonical.hash
+        assert rig.tools.open(stored.record.tool).canonical.data == canonical.data
+        assert export_bundle(rig.tools.open(stored.record.tool).canonical) == export_bundle(
+            canonical
+        )
+
+    def test_editing_the_claim_and_the_hash_gains_nothing(self, rig: Rig) -> None:
+        # The laundering probe: take an fs-tainted bundle, change its taint to none, recompute the
+        # hash. It is another package (another hash, so another tool grant) and, as every import,
+        # fs-tainted: the claim is not what decides.
+        tool = ToolId.new()
+        honest = self.imported_with(rig, tool, ("fs",), version=1)
+        forged = package(tool=ToolId.new(), taint=())
+        with rig.store.transaction():
+            stored = rig.tools.import_(forged, NOW)
+
+        assert honest.record.hash != stored.record.hash
+        assert TaintKind.FS in stored.record.taint
+        # And the forged claim cannot replace the honest version either.
+        replacement = package(tool=tool, version=1, taint=())
+        with pytest.raises(ToolConflictError), rig.store.transaction():
+            rig.tools.import_(replacement, NOW)
+
+    def imported_with(
+        self, rig: Rig, tool: ToolId, claim: tuple[Taint, ...], *, version: int
+    ) -> toolstore.StoredTool:
+        with rig.store.transaction():
+            return rig.tools.import_(package(tool=tool, taint=claim, version=version), NOW)
+
+    def test_an_index_that_says_less_than_the_origin_gives_is_refused(self, rig: Rig) -> None:
+        stored = self.imported(rig, ())
+        rig.sql("UPDATE tool_versions SET taint = 'none'")  # the lie: an import with no fs taint
+
+        with pytest.raises(ToolBlobError, match="does not match its index"):
+            rig.tools.open(stored.record.tool)
 
 
 class TestImmutableVersions:
@@ -314,6 +395,18 @@ class TestOpeningVerifies:
         assert [r.tool for r in rig.tools.find(None)] == [good.record.tool]
         with pytest.raises(StoreError):
             rig.tools.open(bad.record.tool)
+
+    def test_a_blob_that_matches_its_hash_but_is_not_a_package_is_refused(self, rig: Rig) -> None:
+        import hashlib
+
+        saved = rig.save()
+        junk = b'{"not":"a package"}'
+        name = ContentHash(hashlib.sha256(junk).hexdigest())
+        rig.tools._blobs.write(name, junk)  # noqa: SLF001  (planting what a tamperer could)
+        rig.sql("UPDATE tool_versions SET hash = ?, size = ?", str(name), len(junk))
+
+        with pytest.raises(ToolBlobError, match="not a valid package"):
+            rig.tools.open(saved.record.tool)
 
     def test_unknown_tool_and_version(self, rig: Rig) -> None:
         saved = rig.save()
@@ -516,6 +609,99 @@ class TestImport:
         assert rig.blobs() == {str(bundle.hash): b"planted"}
 
 
+class TestDurabilityOfAnImport:
+    def test_importing_a_version_whose_blob_was_lost_writes_it_again(self, rig: Rig) -> None:
+        canonical = package()
+        with rig.store.transaction():
+            rig.tools.import_(canonical, NOW)
+        (rig.directory / BLOB_DIRECTORY / str(canonical.hash)).unlink()
+        with pytest.raises(ToolBlobError):
+            rig.tools.open(canonical.package.manifest.id)
+
+        with rig.store.transaction():
+            again = rig.tools.import_(canonical, NOW)
+
+        assert not again.created
+        assert rig.blobs() == {str(canonical.hash): canonical.data}
+        assert rig.tools.open(canonical.package.manifest.id).canonical.data == canonical.data
+
+    def test_importing_a_version_whose_blob_was_tampered_with_is_refused_and_leaves_it(
+        self, rig: Rig
+    ) -> None:
+        canonical = package()
+        with rig.store.transaction():
+            rig.tools.import_(canonical, NOW)
+        path = rig.directory / BLOB_DIRECTORY / str(canonical.hash)
+        path.write_bytes(b"planted")
+
+        with pytest.raises(ToolBlobError), rig.store.transaction():
+            rig.tools.import_(canonical, NOW)
+
+        assert path.read_bytes() == b"planted"
+
+
+class TestVersionNumbers:
+    def test_a_tool_at_the_last_version_has_a_clear_error_not_a_full_store(self, rig: Rig) -> None:
+        last = package(version=2**53)
+        with rig.store.transaction():
+            rig.tools.import_(last, NOW)
+
+        with pytest.raises(ToolVersionExhaustedError, match="no version number left"):
+            rig.save(tool=last.package.manifest.id)
+
+        assert rig.store.latest_version(last.package.manifest.id) == 2**53
+
+    def test_a_version_beyond_what_json_holds_exactly_is_not_a_version(self) -> None:
+        with pytest.raises(ValueError):  # noqa: PT011 -- InvalidValueError, a ValueError
+            ToolVersion(2**53 + 1)
+        data = json.loads(package().data)
+        data["manifest"]["version"] = 2**53 + 1
+        with pytest.raises(ToolPackageError):
+            parse_package(json.dumps(data).encode())
+
+    def test_the_last_version_survives_canonicalisation(self) -> None:
+        canonical = package(version=2**53)
+
+        assert b'"version":9007199254740992' in canonical.data
+        assert parse_bundle(export_bundle(canonical)).package.manifest.version == 2**53
+
+
+class TestSearchWords:
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "cr\N{LATIN SMALL LETTER E}\N{COMBINING GRAVE ACCENT}me",
+            "br\N{LATIN SMALL LETTER U}\N{COMBINING CIRCUMFLEX ACCENT}l\N{LATIN SMALL LETTER E}e",
+            "\N{LATIN CAPITAL LETTER E}\N{COMBINING ACUTE ACCENT}cole",
+            "CR\N{LATIN CAPITAL LETTER E}\N{COMBINING GRAVE ACCENT}ME",
+        ],
+    )
+    def test_an_accent_typed_inside_a_word_as_a_second_character_finds_it(
+        self, rig: Rig, query: str
+    ) -> None:
+        saved = rig.save(
+            named(
+                "cr\N{LATIN SMALL LETTER E WITH GRAVE}me br\N{LATIN SMALL LETTER U WITH CIRCUMFLEX}"
+                "l\N{LATIN SMALL LETTER E WITH ACUTE}e \N{LATIN CAPITAL LETTER E WITH ACUTE}cole"
+            )
+        )
+
+        assert [r.tool for r in rig.tools.find(query)] == [saved.record.tool]
+
+    def test_the_weights_are_name_then_tag_then_description_with_texts_of_equal_shape(
+        self, rig: Rig
+    ) -> None:
+        # Every tool has two words in each of name, description and tags, one of them `zeta` in
+        # the column under test, so length does not decide the order: the weights do.
+        in_description = rig.save(named("alpha beta", "zeta gamma", ("tone", "ttwo")))
+        in_tag = rig.save(named("delta epsilon", "eta theta", ("zeta", "tthree")))
+        in_name = rig.save(named("zeta iota", "kappa lambda", ("tfour", "tfive")))
+
+        order = [r.tool for r in rig.tools.find("zeta")]
+
+        assert order == [in_name.record.tool, in_tag.record.tool, in_description.record.tool]
+
+
 class TestLimits:
     def test_the_number_of_tools(self, rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(toolstore, "MAX_TOOLS", 2)
@@ -550,13 +736,17 @@ class TestLimits:
 
         assert rig.store.version_count(first.record.tool) == 2
 
-    def test_the_bytes_of_all_packages(self, rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
-        size = rig.save().record.size
-        monkeypatch.setattr(toolstore, "MAX_STORE_BYTES", int(size) * 2 + 10)
-        rig.save(draft(name="Second"))
+    def test_the_bytes_of_all_packages_at_the_boundary(
+        self, rig: Rig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        size = int(rig.save(draft(name="AAAA")).record.size)  # names of one length: one size
+        monkeypatch.setattr(toolstore, "MAX_STORE_BYTES", size * 3 - 1)
+        rig.save(draft(name="BBBB"))  # two packages: within
 
-        with pytest.raises(ToolStoreFullError):
-            rig.save(draft(name="Third"))
+        with pytest.raises(ToolStoreFullError):  # a third would be one byte over
+            rig.save(draft(name="CCCC"))
+        monkeypatch.setattr(toolstore, "MAX_STORE_BYTES", size * 3)
+        rig.save(draft(name="CCCC"))  # exactly the limit is fine
 
     def test_import_is_bounded_too(self, rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(toolstore, "MAX_TOOLS", 1)

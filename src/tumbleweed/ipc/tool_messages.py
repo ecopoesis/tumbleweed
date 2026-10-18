@@ -7,7 +7,8 @@ package's canonical JSON and `ToolBundle.bundle`/`ImportTool.bundle` a bundle's,
 package limits of `tumbleweed.tools.limits`. A JSON string that holds a JSON document is at most
 twice its size (every quote and backslash of the document gets one more backslash), so with the
 rest of the frame each fits the 1 MiB frame limit with room to spare, in either direction
-(`tests/broker/test_tool_ipc.py` sends the worst case through a real connection).
+(`tests/broker/test_daemon_tools.py::TestEverythingFitsAFrame` sends the worst case through a
+real connection).
 
 A bundle is validated by the broker, not by this schema: a request whose bundle is too long for the
 schema ends the connection as any malformed frame does, and one that is within it but not an
@@ -43,7 +44,8 @@ MAX_LISTED: Final = MAX_RESULTS
 class ToolSummary(IpcMessage):
     """One stored version of a tool, as the index lists it. `name`, `description` and `tags` are
     the author's text (the model's, usually): bounded, and not to be shown as the broker's own.
-    `taint` is what the package records of the task it was saved from."""
+    `taint` is the taint a decision must use (I12): for a saved version the task's, for an imported
+    one its claim plus `fs`; `claimed_taint` is what the package itself records."""
 
     tool: ToolId
     version: ToolVersion
@@ -54,7 +56,8 @@ class ToolSummary(IpcMessage):
         tuple[Annotated[str, Field(min_length=1, max_length=MAX_TAG_LENGTH)], ...],
         Field(max_length=MAX_TAGS),
     ]
-    taint: Annotated[tuple[Taint, ...], Field(max_length=1)]
+    taint: Annotated[tuple[Taint, ...], Field(max_length=2)]
+    claimed_taint: Annotated[tuple[Taint, ...], Field(max_length=1)]
     origin: Literal["saved", "imported"]
     saved_at: AwareDatetime
 

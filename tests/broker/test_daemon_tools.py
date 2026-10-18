@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -18,9 +19,16 @@ from tumbleweed.broker.audit import (
 )
 from tumbleweed.broker.client import BrokerRefused
 from tumbleweed.broker.config import BrokerConfig
-from tumbleweed.broker.errors import AuditError, PrivateFsError, UnknownTaskError
+from tumbleweed.broker.errors import (
+    AuditError,
+    PrivateFsError,
+    StoreError,
+    ToolBlobWriteError,
+    UnknownTaskError,
+)
 from tumbleweed.broker.service import Owner
-from tumbleweed.broker.toolblobs import BLOB_DIRECTORY
+from tumbleweed.broker.toolblobs import BLOB_DIRECTORY, ToolBlobs
+from tumbleweed.broker.toolstore import ToolStore
 from tumbleweed.core.canonical import content_hash
 from tumbleweed.core.ids import RunId, TaskId, ToolId
 from tumbleweed.core.jcs import canonicalize
@@ -29,6 +37,9 @@ from tumbleweed.ipc.broker_messages import EndTask, RequestGrant, StartTask, Tas
 from tumbleweed.ipc.tool_messages import ImportTool
 from tumbleweed.tools import BUNDLE_FORMAT, ToolDraft, export_bundle, parse_bundle, parse_package
 from tumbleweed.tools.limits import MAX_BUNDLE_BYTES
+
+if TYPE_CHECKING:
+    from tumbleweed.tools.package import Taint
 
 SAVER = Owner(10_000)  # an owner the daemon's own connections never get: for `save_tool`
 
@@ -270,6 +281,35 @@ class TestImport:
 
         run(scenario)
 
+    def test_an_import_is_fs_tainted_whatever_the_bundle_claims(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                cases: list[tuple[tuple[Taint, ...], tuple[Taint, ...]]] = [
+                    ((), ("fs",)),
+                    (("net",), ("fs", "net")),
+                ]
+                for claim, effective in cases:
+                    stored = package(taint=claim)
+
+                    imported = await client.import_tool(export_bundle(stored).decode("utf-8"))
+
+                    assert imported.summary.claimed_taint == claim
+                    assert imported.summary.taint == effective
+                    entry = rig.audit_of(ToolSaved)[-1]
+                    assert (entry.claimed_taint, entry.taint) == (claim, effective)
+                    listed = [t for t in (await client.list_tools()).tools if t.hash == stored.hash]
+                    assert listed[0].taint == effective
+                    shown = await client.show_tool(stored.package.manifest.id)
+                    assert shown.summary.taint == effective
+                    exported = await client.export_tool(stored.package.manifest.id)
+                    assert exported.summary.taint == effective
+                    assert rig.audit_of(ToolExported)[-1].taint == effective
+                    # and the bundle that goes out is the one that came in: hash-stable
+                    assert exported.bundle.encode("utf-8") == export_bundle(stored)
+
+        run(scenario)
+
     def test_the_same_bundle_again_changes_nothing_and_is_not_recorded(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
@@ -424,6 +464,83 @@ class TestImport:
 
         run(scenario)
 
+    def test_a_stored_package_that_fails_its_check_during_an_import_is_recorded(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                text = bundle_text()
+                await client.import_tool(text)
+                (blob,) = (rig.config.broker_directory / BLOB_DIRECTORY).iterdir()
+                blob.write_bytes(b"planted")
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.import_tool(text)
+
+                assert caught.value.reason == "unsafe"
+                assert [e.reason for e in rig.audit_of(ToolImportRefused)] == ["integrity"]
+                assert blob.read_bytes() == b"planted"
+
+        run(scenario)
+
+    def test_a_failure_of_the_store_is_recorded_as_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+
+                def broken(*_args: object, **_kwargs: object) -> None:
+                    raise StoreError("the database is on fire")
+
+                monkeypatch.setattr(ToolStore, "import_", broken)
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.import_tool(bundle_text())
+
+                assert caught.value.reason == "unavailable"
+                assert [e.reason for e in rig.audit_of(ToolImportRefused)] == ["error"]
+
+        run(scenario)
+
+    def test_a_full_disk_is_unavailable_not_unsafe_and_is_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+
+                def full(*_args: object, **_kwargs: object) -> None:
+                    raise ToolBlobWriteError("the tool store cannot be written")
+
+                monkeypatch.setattr(ToolBlobs, "write", full)  # the OSError itself: test_toolblobs
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.import_tool(bundle_text())
+
+                assert caught.value.reason == "unavailable"
+                assert "integrity" not in caught.value.message
+                assert [e.reason for e in rig.audit_of(ToolImportRefused)] == ["error"]
+                assert rig.rows("SELECT count(*) FROM tool_versions") == [(0,)]
+
+        run(scenario)
+
+    def test_an_error_that_cannot_be_recorded_still_gets_its_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+
+                def broken(*_args: object, **_kwargs: object) -> None:
+                    raise StoreError("the database is on fire")
+
+                monkeypatch.setattr(ToolStore, "import_", broken)
+                refuse_audit_of(ToolImportRefused, monkeypatch)
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.import_tool(bundle_text())
+
+                assert caught.value.reason == "unavailable"
+
+        run(scenario)
+
     def test_an_import_whose_entry_cannot_be_written_does_not_happen(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -451,8 +568,11 @@ class TestImport:
                     await client.import_tool(bundle_text())
 
                 assert caught.value.reason == "unavailable"
-                (rolled_back,) = rig.audit_of(RolledBack)
-                assert rolled_back.entries == ("tool_saved",)
+                # The import, then the record of its refusal, which the failing commit undoes too.
+                assert [r.entries for r in rig.audit_of(RolledBack)] == [
+                    ("tool_saved",),
+                    ("tool_import_refused",),
+                ]
                 assert rig.rows("SELECT count(*) FROM tool_versions") == [(0,)]
 
         run(scenario)

@@ -3,6 +3,7 @@
 import hashlib
 import sys
 import unicodedata
+from itertools import pairwise
 
 import pytest
 from hypothesis import given
@@ -167,3 +168,46 @@ class TestCanonicalBytesAndHash:
             return
 
         assert canonical_bytes(normalize_tree(data)) == once
+
+
+class TestUnicodeStability:
+    """NFC changes with the Unicode version (U+105D2 U+0307 composes in 16.0, not in 15.0), so text
+    that holds a character 15.0 had not assigned is refused: one text, one hash, on every Python."""
+
+    NEW_IN_16 = "\U000105d2\u0307"
+
+    def test_text_with_a_character_unassigned_in_unicode_15_is_refused(self) -> None:
+        for text in (self.NEW_IN_16, "a\u0378b", "x\U0010ffffy", "\ufdd0", "\U0001fffe"):
+            with pytest.raises(ValueError, match=r"Unicode 15\.0 had not assigned"):
+                canonical_bytes({"k": text})
+            with pytest.raises(ValueError, match=r"Unicode 15\.0 had not assigned"):
+                canonical_bytes({text: 1})
+
+    def test_text_assigned_in_unicode_15_is_accepted(self) -> None:
+        for text in ("plain", NFC, "\u0e86", "\U00020000", "\U0010fffd", "\U0001f600", "\ue000"):
+            assert canonical_bytes([text])
+
+    def test_the_table_is_what_unicode_15_says_wherever_python_has_it(self) -> None:
+        import unicodedata
+
+        from tumbleweed.core import unicode15
+
+        if unicodedata.unidata_version != "15.0.0":
+            pytest.skip(f"this Python has Unicode {unicodedata.unidata_version}, not 15.0")
+        for code in range(0x110000):
+            char = chr(code)
+            assert unicode15.is_stable(char) == (unicodedata.category(char) != "Cn"), hex(code)
+
+    def test_the_table_is_sorted_and_disjoint(self) -> None:
+        from tumbleweed.core.unicode15 import UNASSIGNED_15_0
+
+        assert all(a <= b for a, b in UNASSIGNED_15_0)
+        assert all(b1 < a2 for (_, b1), (a2, _) in pairwise(UNASSIGNED_15_0))
+
+
+def test_nfc_not_nfkc_a_ligature_stays_a_ligature() -> None:
+    # NFKC would write "fi"; the canonical form is NFC. A literal, as a change would change hashes.
+    assert canonical_bytes(["\N{LATIN SMALL LIGATURE FI}"]) == '["\ufb01"]'.encode()
+    assert (
+        content_hash(canonical_bytes("\ufb01")) == hashlib.sha256('"\ufb01"'.encode()).hexdigest()
+    )

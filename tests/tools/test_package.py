@@ -21,7 +21,7 @@ from tumbleweed.tools import (
     parse_draft,
     parse_package,
 )
-from tumbleweed.tools.limits import MAX_PACKAGE_BYTES
+from tumbleweed.tools.limits import MAX_MODULE_BYTES, MAX_PACKAGE_BYTES
 
 if TYPE_CHECKING:
     from tumbleweed.tools.package import Taint
@@ -181,6 +181,51 @@ class TestNormalisationOnSave:
 
         with pytest.raises(ToolPackageError, match="cannot be written canonically"):
             package()
+
+
+class TestDraftsAreNormalisedThenValidated:
+    def test_a_name_is_judged_by_the_length_it_is_stored_with(self) -> None:
+        letter = "e\N{COMBINING ACUTE ACCENT}"
+        nfd = letter * 40  # 80 characters, 40 once stored
+        data = draft_json(name=nfd)
+
+        made = parse_draft(text_of(data))
+
+        assert made.name == "\N{LATIN SMALL LETTER E WITH ACUTE}" * 40
+        assert len(nfd) == 80
+        assert package(source=made).package.manifest.name == made.name
+
+    def test_text_that_is_too_long_even_once_stored_is_refused(self) -> None:
+        assert draft_problems(draft_json(name="\N{LATIN SMALL LETTER E WITH ACUTE}" * 65))
+
+    def test_crlf_in_code_is_one_character_shorter_per_line_when_checked(self) -> None:
+        entry: Json = {"name": "csv_view", "source": "a\r\n" * (MAX_MODULE_BYTES // 3)}
+
+        assert parse_draft(text_of(draft_json(modules=[entry]))).modules[0].source.count("\r") == 0
+
+    def test_a_character_unicode_15_had_not_assigned_is_refused(self) -> None:
+        # U+105D2 U+0307 composes in Unicode 16.0 and not in 15.0: Pythons would hash it apart.
+        for field in ("name", "description"):
+            problems = draft_problems(draft_json(**{field: "\U000105d2\u0307"}))
+            assert any("Unicode 15.0" in p for p in problems)
+
+    def test_the_same_in_a_package_is_refused_when_it_is_made(self) -> None:
+        module: Json = {"name": "csv_view", "source": "x = '\U000105d2\u0307'\n"}
+        # A draft is refused as written; a package built by hand (a model is not the only way in)
+        # is refused when it is normalised.
+        with pytest.raises(ToolPackageError, match=r"Unicode 15\.0"):
+            parse_draft(text_of(draft_json(modules=[module])))
+        assert draft_problems(draft_json(tags=["a"], description="\U000105d2"))
+
+    def test_the_size_limit_of_a_draft_and_its_boundary(self) -> None:
+        good = text_of(draft_json())
+        padded = good + b" " * (MAX_PACKAGE_BYTES - len(good))
+
+        assert parse_draft(padded).name == "CSV viewer"
+        with pytest.raises(ToolTooLargeError):
+            parse_draft(padded + b" ")
+        with pytest.raises(ToolPackageError, match="expected bytes"):
+            parse_draft("{}")  # type: ignore[arg-type]  # the point
 
 
 class TestTaint:
@@ -421,6 +466,17 @@ class TestSize:
         assert parse_package(padded) == stored.package
         with pytest.raises(ToolTooLargeError):
             parse_package(padded + b" ")
+
+    def test_the_spec_limit_is_exact(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tumbleweed.core.jcs import canonicalize
+
+        size = len(canonicalize(draft().ui.model_dump(mode="json")).encode("utf-8"))
+
+        monkeypatch.setattr("tumbleweed.tools.package.MAX_SPEC_BYTES", size)
+        package()  # exactly the limit is fine
+        monkeypatch.setattr("tumbleweed.tools.package.MAX_SPEC_BYTES", size - 1)
+        with pytest.raises(ToolTooLargeError, match="the spec is over"):
+            package()
 
     def test_the_spec_limit_is_on_the_canonical_spec_not_on_how_it_was_written(self) -> None:
         # `1e20` is five bytes as written and 21 as canonical JSON writes it, so a spec that is
