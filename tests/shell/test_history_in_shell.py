@@ -215,7 +215,9 @@ class TestRestoreOnStart:
         elapsed = time.monotonic() - started
         shown = len(rows(shell))
         assert 0 < shown <= 4 * 1024 * 1024 // 65_000  # the byte budget, not 998 messages
-        assert elapsed < 10.0, f"restoring {shown} maximal messages took {elapsed:.1f}s"
+        # A guard against pathological restores (minutes), not a benchmark: about 2.5 s in the
+        # container on a laptop, but CI's runners are about four times slower (#92).
+        assert elapsed < 30.0, f"restoring {shown} maximal messages took {elapsed:.1f}s"
 
 
 class TestNewSession:
