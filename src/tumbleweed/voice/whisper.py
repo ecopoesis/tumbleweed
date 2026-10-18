@@ -10,10 +10,12 @@ worker thread (`VoiceInput`), never on the GTK main thread.
 
 What a server can make us do is bounded (I9), on the bytes as they arrive:
 
-- the request timeout bounds every wait of the library (connect, write, each read), and a deadline
-  of the same length for the whole request is checked as each piece of the answer arrives, so a
-  server that sends a byte at a time cannot hold the worker for long: at most the timeout, plus
-  one more wait of at most the timeout for the piece it was in the middle of;
+- the request timeout bounds every wait of the library (connect 5 s, each write at most 10 s, each
+  read the timeout), and a deadline of the same length for the whole request is checked between
+  pieces of the upload (`_DeadlineBody`) and as each piece of the answer arrives, so a server that
+  reads or sends a few bytes at a time cannot hold the worker for long: the upload ends at the
+  deadline, and the answer, which the server may take the whole timeout to begin, at most one
+  timeout after that (twice the timeout and a write in all);
 - the body is read with `iter_raw` (before any decoding) and counted, at most `max_response_bytes`;
   it is asked for with `Accept-Encoding: identity` and a response with any other encoding is refused
   without reading it, because a decompressing layer would make the count meaningless;
@@ -33,6 +35,7 @@ import io
 import logging
 import time
 import wave
+from collections.abc import Iterator
 from typing import Final, final
 
 import httpx2
@@ -49,6 +52,8 @@ logger = logging.getLogger(__name__)
 
 CONNECT_TIMEOUT: Final = 5.0
 POOL_TIMEOUT: Final = 5.0
+_UPLOAD_PIECE_BYTES = 16 * 1024
+_MAX_WRITE_TIMEOUT = 10.0
 _IDENTITY_ENCODINGS = frozenset({"", "identity"})
 
 
@@ -64,6 +69,30 @@ class _WhisperAnswer(BaseModel):
     model_config = ConfigDict(strict=True, extra="ignore", frozen=True)
 
     text: str
+
+
+@final
+class _DeadlineBody(httpx2.SyncByteStream):
+    """A request body that fails once the request's deadline has passed.
+
+    The library's timeouts apply to each write, and a server that reads a few kilobytes at a time
+    keeps every write succeeding for as long as it likes. Checked between small pieces, the
+    deadline is what ends that, with the same error as any other timeout.
+    """
+
+    def __init__(self, inner: httpx2.SyncByteStream, deadline: float) -> None:
+        self._inner = inner
+        self._deadline = deadline
+
+    def __iter__(self) -> Iterator[bytes]:
+        for chunk in self._inner:
+            for start in range(0, len(chunk), _UPLOAD_PIECE_BYTES):
+                if time.monotonic() > self._deadline:
+                    raise httpx2.WriteTimeout("the request deadline passed while sending")
+                yield chunk[start : start + _UPLOAD_PIECE_BYTES]
+
+    def close(self) -> None:
+        self._inner.close()
 
 
 def wav_bytes(utterance: Utterance) -> bytes:
@@ -87,7 +116,10 @@ def build_http_client(
         follow_redirects=False,
         trust_env=False,
         timeout=httpx2.Timeout(
-            connect=CONNECT_TIMEOUT, read=seconds, write=seconds, pool=POOL_TIMEOUT
+            connect=CONNECT_TIMEOUT,
+            read=seconds,
+            write=min(seconds, _MAX_WRITE_TIMEOUT),
+            pool=POOL_TIMEOUT,
         ),
         headers={"Accept": "application/json", "Accept-Encoding": "identity"},
     )
@@ -128,6 +160,7 @@ class WhisperServerBackend:
             request = self._client.build_request(
                 "POST", self._endpoint.inference_url, files=files, data=data
             )
+            request.stream = _DeadlineBody(request.stream, deadline)  # type: ignore[arg-type]  # a multipart body is sync
             # `send(stream=True)`: the body is read by `_read_body`, counted, not buffered by the
             # library. (Not the client's `.stream()`: tests/agent/test_chokepoint.py reserves that
             # name for model calls.)
@@ -162,7 +195,12 @@ class WhisperServerBackend:
         if media_type != "application/json":
             raise SttResponseError("The speech server's answer is not JSON.")
         declared = response.headers.get("content-length", "")
-        if declared.isascii() and declared.isdigit() and int(declared) > limit:
+        # (at most 18 digits: int() refuses a longer string than the interpreter's limit allows)
+        if (
+            declared.isascii()
+            and declared.isdigit()
+            and (len(declared) > 18 or int(declared) > limit)
+        ):
             raise SttResponseError("The speech server's answer is larger than allowed.")
         body = bytearray()
         for chunk in response.iter_raw():  # as they arrive: a chunk size would batch a slow drip

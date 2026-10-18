@@ -7,6 +7,7 @@ outlives its test or holds the run.
 
 import email.parser
 import email.policy
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -66,12 +67,18 @@ class StubServer:
         self.reply = Reply()
         self.requests: list[Recorded] = []
         self.stop = threading.Event()
+        self.read_slowly = 0.0  # seconds to wait per 512 bytes of the request body (0: read it all)
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length", "0"))
-                body = self.rfile.read(length)
+                if stub.read_slowly:
+                    body = b""
+                    while len(body) < length and not stub.stop.wait(stub.read_slowly):
+                        body += self.rfile.read(min(512, length - len(body)))
+                else:
+                    body = self.rfile.read(length)
                 stub.requests.append(
                     Recorded(
                         "POST",
@@ -86,6 +93,8 @@ class StubServer:
                 return
 
         self._server = _Server(("127.0.0.1", 0), Handler)
+        # A small receive buffer, so that a server that reads slowly stalls the sender soon.
+        self._server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
         self._thread = threading.Thread(
             target=self._server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
         )

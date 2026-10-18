@@ -12,6 +12,7 @@ import wave
 from collections.abc import Iterator
 from typing import Protocol
 
+import httpx2
 import pytest
 
 from tests.voice.stub_server import JSON, Reply, StubServer
@@ -21,7 +22,7 @@ from tumbleweed.voice.audio import Utterance
 from tumbleweed.voice.endpoint import SttEndpoint
 from tumbleweed.voice.errors import SttResponseError, SttUnavailableError
 from tumbleweed.voice.limits import VoiceLimits
-from tumbleweed.voice.whisper import WhisperServerBackend
+from tumbleweed.voice.whisper import WhisperServerBackend, build_http_client
 
 
 def utterance(seconds: float = 1.0) -> Utterance:
@@ -347,3 +348,108 @@ class TestWhatIsLogged:
                 WhisperServerBackend(SttEndpoint(url), language="auto", limits=limits()).close()
 
         assert caplog.text == ""
+
+
+class TestTheUploadDeadline:
+    """The library's write timeout applies to each write; a server that reads slowly keeps every
+    write succeeding. The deadline is checked between pieces of the upload."""
+
+    def test_a_body_stops_at_the_deadline_with_a_timeout_error(self) -> None:
+        from tumbleweed.voice.whisper import _DeadlineBody
+
+        class Chunks(httpx2.SyncByteStream):
+            def __iter__(self) -> Iterator[bytes]:
+                yield b"x" * 100_000
+
+        expired = _DeadlineBody(Chunks(), time.monotonic() - 1)
+
+        with pytest.raises(httpx2.WriteTimeout):
+            list(expired)
+
+    def test_a_body_before_its_deadline_is_passed_on_whole_and_in_small_pieces(self) -> None:
+        from tumbleweed.voice.whisper import _DeadlineBody
+
+        class Chunks(httpx2.SyncByteStream):
+            def __iter__(self) -> Iterator[bytes]:
+                yield b"a" * 40_000
+                yield b"b" * 5
+
+        pieces = list(_DeadlineBody(Chunks(), time.monotonic() + 60))
+
+        assert b"".join(pieces) == b"a" * 40_000 + b"b" * 5
+        assert max(len(piece) for piece in pieces) <= 16 * 1024
+
+    def test_a_server_that_reads_a_few_bytes_at_a_time_cannot_hold_the_worker(
+        self, make: Make, stub: StubServer
+    ) -> None:
+        stub.reply = Reply(delay=0.0)
+        stub.read_slowly = 0.05  # seconds per 512 bytes of the request, far under what it needs
+        backend = make(voice_limits=limits(request_timeout_seconds=1))
+        big = Utterance(pcm(30), max_bytes=max_bytes(30))
+        started = time.monotonic()
+
+        with pytest.raises(SttUnavailableError, match="did not answer in time"):
+            backend.transcribe(big)
+
+        assert time.monotonic() - started < 4
+
+
+class TestAHostileContentLength:
+    @pytest.mark.parametrize("length", ["9" * 5000, "-1", "1e9", " 10 ", "١٢"])
+    def test_a_length_that_is_not_a_sane_number_is_an_error_not_a_crash(
+        self, stub: StubServer, make: Make, length: str
+    ) -> None:
+        stub.reply = Reply(headers={**JSON, "Content-Length": length}, length=False)
+
+        with pytest.raises((SttResponseError, SttUnavailableError)):
+            make().transcribe(utterance())
+
+
+class TestWithoutANetwork:
+    """The same client over a transport of the test's own, for what a real socket cannot show."""
+
+    @staticmethod
+    def backend(transport: httpx2.BaseTransport, seconds: int = 1) -> WhisperServerBackend:
+        voice_limits = limits(request_timeout_seconds=seconds)
+        return WhisperServerBackend(
+            SttEndpoint("http://127.0.0.1:1"),
+            language="auto",
+            limits=voice_limits,
+            client=build_http_client(voice_limits, transport=transport),
+        )
+
+    def test_the_upload_is_cut_off_by_the_deadline_however_well_each_write_goes(self) -> None:
+        class SlowReader(httpx2.BaseTransport):
+            def handle_request(self, request: httpx2.Request) -> httpx2.Response:
+                pieces = iter(request.stream)  # type: ignore[arg-type]  # a multipart body is sync
+                next(pieces)
+                time.sleep(1.3)  # every piece is accepted, but slowly
+                for _ in pieces:
+                    pass
+                return httpx2.Response(200, headers=JSON, content=b'{"text": "late"}')
+
+        with pytest.raises(SttUnavailableError, match="did not answer in time"):
+            self.backend(SlowReader()).transcribe(Utterance(pcm(5), max_bytes=max_bytes(30)))
+
+    def test_a_content_length_of_thousands_of_digits_is_refused_not_parsed(self) -> None:
+        class Hostile(httpx2.BaseTransport):
+            def handle_request(self, request: httpx2.Request) -> httpx2.Response:
+                request.read()
+                return httpx2.Response(
+                    200,
+                    headers={**JSON, "Content-Length": "9" * 5000},
+                    content=b'{"text": "x"}',
+                )
+
+        with pytest.raises(SttResponseError, match="larger than allowed"):
+            self.backend(Hostile()).transcribe(utterance())
+
+    def test_a_good_answer_over_the_same_transport_is_read(self) -> None:
+        class Good(httpx2.BaseTransport):
+            def handle_request(self, request: httpx2.Request) -> httpx2.Response:
+                request.read()
+                return httpx2.Response(
+                    200, headers=JSON, stream=httpx2.ByteStream(b'{"text": "fine"}')
+                )
+
+        assert self.backend(Good()).transcribe(utterance()) == "fine"

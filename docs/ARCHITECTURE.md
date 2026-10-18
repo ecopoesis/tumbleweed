@@ -459,9 +459,11 @@ generation, so what an abandoned utterance finds later is dropped.
   exported on the session bus.
 - *Bounds (I9).* A recording stops by itself at `max_utterance_seconds` (default 30, at most 120): the
   cap is in bytes, in the buffer that takes the samples (`BoundedPcm`), so a device that keeps
-  delivering cannot grow memory. A tap shorter than 300 ms is not sent. The request has one timeout
-  for connecting, writing and each read plus a deadline for the whole answer (at most twice the
-  timeout in the worst case, the piece being read when the deadline passes), reads at most
+  delivering cannot grow memory. A tap shorter than 300 ms is not sent. The request has a timeout for
+  each wait (connecting 5 s, a write at most 10 s, a read the request timeout) and a deadline of the
+  request timeout, checked between pieces of the upload and of the answer; the upload ends at the
+  deadline, and the answer, which the server may take the whole timeout to begin, at most one
+  timeout after that (about twice the timeout in all). It reads at most
   `max_response_bytes` (default 64 KiB, at most 1 MiB) counted as the bytes arrive, before decoding,
   and refuses a response with any content encoding, any status but 200, any type but JSON. Redirects
   are not followed and the environment's proxies are ignored. `Accept-Encoding: identity` is asked for.

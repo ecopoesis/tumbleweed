@@ -463,7 +463,8 @@ size limits written by hand; one stack with a tested configuration was preferred
 allows `httpx2` in `voice.whisper` only. (2) *Bounds in the client:* the answer is read with `iter_raw`
 (before any decoding) and counted, `Accept-Encoding: identity` is asked for and any content encoding is
 refused, redirects and environment proxies are off, there is one timeout per wait plus a deadline for the
-request, and status, type and a strict pydantic model of the one field read are checked
+request (checked between pieces of the upload and of the answer), and status, type and a strict
+pydantic model of the one field read are checked
 (`extra="ignore"` on purpose: a newer server may add a field). (3) *Threads:* `VoiceInput` lives on the
 main thread and does no I/O; an audio worker opens, stops and cancels the capture, a speech worker makes
 the request, both daemon threads, results posted back with the utterance's generation so that an
@@ -488,8 +489,8 @@ against pinned SHA-256 hashes, and Homebrew's `whisper.cpp` formula builds witho
 README builds it from the tagged source (checked against v1.9.5 with Metal).
 **Deviations from the plan.** None in scope. The plan says "(listening -> transcribing)" and the S02
 indicator had no such state, so one was added.
-**Consequences.** A request's deadline is at most twice its timeout in the worst case (the piece being
-read when it passes). A hung audio device leaves the indicator on "transcribing" until the device returns,
+**Consequences.** A request takes about twice its timeout in the worst case (the upload ends at the
+deadline, and the answer, which the server may take the whole timeout to begin, a timeout after that). A hung audio device leaves the indicator on "transcribing" until the device returns,
 since GStreamer's state change to NULL has no timeout (#101); the main thread stays free and Esc abandons
 the utterance. The macOS and PipeWire/Pulse capture paths are not exercised in CI (no device, and no
 GStreamer on the macOS runner); the pipeline up to the source is (#102). Whisper can invent words from
