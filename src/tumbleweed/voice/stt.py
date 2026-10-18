@@ -15,8 +15,10 @@ transcript says can approve anything: prompts and pickers take keyboard and poin
 """
 
 import re
+import threading
 import unicodedata
-from typing import Final, Protocol
+from collections.abc import Callable
+from typing import Final, Protocol, final
 
 from tumbleweed.core.types import ByteCount
 from tumbleweed.voice.audio import Utterance
@@ -25,8 +27,15 @@ from tumbleweed.voice.errors import SttResponseError
 _SEPARATORS: Final = frozenset({"Cc", "Zl", "Zp"})  # controls and line and paragraph separators
 # The zero-width joiners are part of how some scripts and emoji sequences are written.
 _KEPT_FORMAT: Final = frozenset({"\N{ZERO WIDTH NON-JOINER}", "\N{ZERO WIDTH JOINER}"})
-# Whisper writes "[BLANK_AUDIO]", "(silence)", "[ Music ]" for what is not speech.
-_NON_SPEECH: Final = re.compile(r"(?:[\[(][^\[\]()]{0,60}[\])]\s*)+")
+# What whisper writes for sound that is not speech: "[BLANK_AUDIO]", "(silence)", "[ Music ]",
+# "(upbeat music)", "[background noise]". Only these, in brackets or parentheses and alone: short
+# bracketed speech ("(1)", "[sic]") is still speech.
+_NON_SPEECH_WORD: Final = (
+    r"blank[_ ]audio|silence|music|applause|laughter|laughing|noise|inaudible|crosstalk|"
+    r"no audio|no speech|pause|sigh|cough|coughing"
+)
+_ANNOTATION: Final = rf"[\[(]\s*(?:[a-z]+ ){{0,2}}(?:{_NON_SPEECH_WORD})\s*[\])]"
+_NON_SPEECH: Final = re.compile(rf"(?:{_ANNOTATION}\s*)+", re.IGNORECASE)
 _LANGUAGE: Final = re.compile(r"auto|[a-z]{2,3}")
 
 
@@ -36,13 +45,50 @@ def is_language_code(text: str) -> bool:
     return type(raw) is str and _LANGUAGE.fullmatch(text) is not None
 
 
+@final
+class AbortSignal:
+    """Set (from any thread) to abandon one request: whatever is waiting on the network for it
+    stops at once. Made per utterance by `VoiceInput`, set by its `cancel`."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._set = False
+        self._callbacks: list[Callable[[], None]] = []
+
+    @property
+    def is_set(self) -> bool:
+        return self._set
+
+    def set(self) -> None:
+        with self._lock:
+            if self._set:
+                return
+            self._set = True
+            callbacks, self._callbacks = self._callbacks, []
+        for callback in callbacks:
+            callback()
+
+    def on_set(self, callback: Callable[[], None]) -> None:
+        """Run `callback` when the signal is set: now, if it already is. Once."""
+        with self._lock:
+            if not self._set:
+                self._callbacks.append(callback)
+                return
+        callback()
+
+    def remove(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if callback in self._callbacks:
+                self._callbacks.remove(callback)
+
+
 class SttBackend(Protocol):
     """Turns an utterance into text. `transcribe` blocks, for a bounded time (the request
     timeout), and is called from a worker thread, never the GTK main thread."""
 
-    def transcribe(self, utterance: Utterance) -> str:
-        """The raw text of what was said. Raises `SttError`. The text is untrusted: the caller
-        passes it through `clean_transcript`."""
+    def transcribe(self, utterance: Utterance, abort: AbortSignal | None = None) -> str:
+        """The raw text of what was said. Raises `SttError`, `SttCancelledError` if `abort` was
+        set. The text is untrusted: the caller passes it through `clean_transcript`."""
         ...
 
     def close(self) -> None:

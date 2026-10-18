@@ -19,12 +19,13 @@ from tumbleweed.voice.input import (
     VoicePhase,
 )
 from tumbleweed.voice.limits import VoiceLimits
+from tumbleweed.voice.stt import AbortSignal
 
 
 class ExplodingStt:
     """A backend with a bug: it raises something that is not ours, with a secret in its text."""
 
-    def transcribe(self, utterance: Utterance) -> str:
+    def transcribe(self, utterance: Utterance, abort: AbortSignal | None = None) -> str:
         raise RuntimeError("SECRET-in-the-exception")
 
     def close(self) -> None:
@@ -326,20 +327,38 @@ class TestAbandoning:
 
         assert r.recorder.events == []
 
-    def test_what_a_cancelled_utterance_hears_later_never_reaches_the_chat(
+    def test_cancel_aborts_the_request_in_flight_and_the_next_utterance_does_not_wait_for_it(
         self, rig: RigFactory
     ) -> None:
         gate = threading.Event()
-        r = rig(stt=FakeStt(["old words", "new words"], gate=gate))
-        r.talk()  # first utterance, held at the server
+        r = rig(stt=FakeStt(["answer"], gate=gate))
+        r.talk()  # the first utterance, held at the server
         assert r.dispatcher.pump_until(lambda: len(r.stt.heard) == 1)  # type: ignore[union-attr]
         r.voice.cancel()
-        r.talk()  # a second one, while the first still waits
+        assert r.dispatcher.pump_until(lambda: r.stt.aborted == 1)  # type: ignore[union-attr]
+        r.talk()  # a second one: the speech worker is free at once
+        assert r.dispatcher.pump_until(lambda: len(r.stt.heard) == 2)  # type: ignore[union-attr]
         gate.set()
-        assert r.dispatcher.pump_until(lambda: "new words" in r.recorder.texts)
+        assert r.dispatcher.pump_until(lambda: r.recorder.texts == ["answer"])
         r.dispatcher.settle()
 
-        assert r.recorder.texts == ["new words"]
+        assert r.recorder.texts == ["answer"]  # the second utterance's, never the abandoned one's
+
+    def test_a_late_full_signal_of_an_old_utterance_does_not_touch_the_new_one(
+        self, rig: RigFactory
+    ) -> None:
+        r = rig(["one", "two"], voice_limits=limits(max_utterance_seconds=1))
+        r.talk()
+        assert r.settle_idle()
+        first_full = r.source.on_full_callbacks[0]
+        r.voice.press()  # a second utterance, listening
+        assert r.dispatcher.pump_until(lambda: r.source.capturing)
+
+        first_full()  # the first capture's thread reports that it was full, late
+        r.dispatcher.settle(0.2)
+
+        assert r.current_phase() is VoicePhase.LISTENING
+        assert r.recorder.problems == []
 
     def test_a_cancelled_utterance_that_waited_its_turn_is_not_even_sent(
         self, rig: RigFactory

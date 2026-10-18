@@ -14,6 +14,10 @@ dependencies = [
     # The SDK's HTTP library, imported directly by `agent.anthropic_provider` (a bounded transport,
     # no redirects, no environment proxies, its exception types), so it is declared, not borrowed.
     "httpx2>=2.13",
+    # httpx2's own transport library, imported directly by `voice.budget` and `voice.whisper`: the
+    # speech client's network backend puts one deadline on every operation of a request (D20), which
+    # httpx2's per-operation timeouts cannot. Already locked, as httpx2's dependency.
+    "httpcore2>=2.13",
     "pydantic>=2.11",
     # Built from source against the system GTK (Homebrew on macOS, apt in the Linux image).
     # >=3.50 was chosen for `gi.events` (D2); the agent runs its own loop on a worker thread
@@ -370,7 +374,7 @@ forbidden_modules = [
 # SDK's HTTP library is also the speech client's (`tumbleweed.voice.whisper`, D20): one HTTP stack
 # for the project (#43), in one module per use.
 [[tool.importlinter.contracts]]
-name = "the Anthropic SDK and its HTTP library are imported only by tumbleweed.agent.anthropic_provider (D3); httpx2 also by tumbleweed.voice.whisper (D20)"
+name = "the Anthropic SDK and its HTTP library are imported only by tumbleweed.agent.anthropic_provider (D3); httpx2 and httpcore2 also by tumbleweed.voice.whisper and .budget (D20)"
 type = "forbidden"
 source_modules = [
     "tumbleweed.agent",
@@ -380,12 +384,14 @@ source_modules = [
     "tumbleweed.ui",
     "tumbleweed.voice",
 ]
-forbidden_modules = ["anthropic", "httpx2"]
+forbidden_modules = ["anthropic", "httpx2", "httpcore2"]
 allow_indirect_imports = true
 ignore_imports = [
     "tumbleweed.agent.anthropic_provider -> anthropic",
     "tumbleweed.agent.anthropic_provider -> httpx2",
     "tumbleweed.voice.whisper -> httpx2",
+    "tumbleweed.voice.whisper -> httpcore2",
+    "tumbleweed.voice.budget -> httpcore2",
 ]
 
 # Voice (S06) is GTK-free except for its GStreamer adapter, where the stub gaps are confined (rule 7
@@ -411,6 +417,7 @@ name = "voice outside its GStreamer adapter and factory never imports the adapte
 type = "forbidden"
 source_modules = [
     "tumbleweed.voice.audio",
+    "tumbleweed.voice.budget",
     "tumbleweed.voice.config",
     "tumbleweed.voice.endpoint",
     "tumbleweed.voice.errors",
@@ -421,3 +428,13 @@ source_modules = [
     "tumbleweed.voice.whisper",
 ]
 forbidden_modules = ["tumbleweed.voice.gstreamer", "tumbleweed.voice._gst"]
+
+# The agent reads the `[voice]` table of the one configuration file (`agent.config` holds the loader,
+# S06), so it may import the voice configuration model and nothing else of the voice package;
+# `voice.factory` in turn imports `agent.config`, which is the loader and nothing more.
+[[tool.importlinter.contracts]]
+name = "agent imports voice only for its configuration model, tumbleweed.voice.config (S06)"
+type = "forbidden"
+source_modules = ["tumbleweed.agent"]
+forbidden_modules = ["tumbleweed.voice"]
+ignore_imports = ["tumbleweed.agent.config -> tumbleweed.voice.config"]

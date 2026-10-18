@@ -10,12 +10,14 @@ worker thread (`VoiceInput`), never on the GTK main thread.
 
 What a server can make us do is bounded (I9), on the bytes as they arrive:
 
-- the request timeout bounds every wait of the library (connect 5 s, each write at most 10 s, each
-  read the timeout), and a deadline of the same length for the whole request is checked between
-  pieces of the upload (`_DeadlineBody`) and as each piece of the answer arrives, so a server that
-  reads or sends a few bytes at a time cannot hold the worker for long: the upload ends at the
-  deadline, and the answer, which the server may take the whole timeout to begin, at most one
-  timeout after that (twice the timeout and a write in all);
+- `request_timeout` is the bound of the **whole exchange**, whoever is slow: every operation of it
+  (name lookup, connecting, the TLS handshake, each write, each read) runs through
+  `voice.budget.BudgetBackend`, which cuts it to what is left of one deadline and fails once there
+  is none, so a server that sends its status line, headers or body a byte at a time, or reads a few
+  kilobytes at a time, is cut off at the deadline (`SttUnavailableError`). The one exception is the
+  operating system's resolver once it has been asked: the request stops waiting for it at the
+  deadline, but the lookup's own thread ends when the resolver does;
+- the user can abandon a request (`AbortSignal`: Esc), which shuts its sockets down at once;
 - the body is read with `iter_raw` (before any decoding) and counted, at most `max_response_bytes`;
   it is asked for with `Accept-Encoding: identity` and a response with any other encoding is refused
   without reading it, because a decompressing layer would make the count meaningless;
@@ -35,24 +37,24 @@ import io
 import logging
 import time
 import wave
-from collections.abc import Iterator
 from typing import Final, final
 
+import httpcore2
 import httpx2
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.voice.audio import Utterance
+from tumbleweed.voice.budget import BudgetBackend
 from tumbleweed.voice.endpoint import SttEndpoint
-from tumbleweed.voice.errors import SttResponseError, SttUnavailableError
+from tumbleweed.voice.errors import SttCancelledError, SttResponseError, SttUnavailableError
 from tumbleweed.voice.limits import BYTES_PER_SAMPLE, CHANNELS, SAMPLE_RATE_HZ, VoiceLimits
-from tumbleweed.voice.stt import is_language_code
+from tumbleweed.voice.stt import AbortSignal, is_language_code
 
 logger = logging.getLogger(__name__)
 
 CONNECT_TIMEOUT: Final = 5.0
 POOL_TIMEOUT: Final = 5.0
-_UPLOAD_PIECE_BYTES = 16 * 1024
 _MAX_WRITE_TIMEOUT = 10.0
 _IDENTITY_ENCODINGS = frozenset({"", "identity"})
 
@@ -72,27 +74,19 @@ class _WhisperAnswer(BaseModel):
 
 
 @final
-class _DeadlineBody(httpx2.SyncByteStream):
-    """A request body that fails once the request's deadline has passed.
+class _BudgetTransport(httpx2.HTTPTransport):
+    """`httpx2`'s transport over a connection pool whose network is `BudgetBackend`, with no
+    keep-alive (one request at a time, each on a connection of its own)."""
 
-    The library's timeouts apply to each write, and a server that reads a few kilobytes at a time
-    keeps every write succeeding for as long as it likes. Checked between small pieces, the
-    deadline is what ends that, with the same error as any other timeout.
-    """
-
-    def __init__(self, inner: httpx2.SyncByteStream, deadline: float) -> None:
-        self._inner = inner
-        self._deadline = deadline
-
-    def __iter__(self) -> Iterator[bytes]:
-        for chunk in self._inner:
-            for start in range(0, len(chunk), _UPLOAD_PIECE_BYTES):
-                if time.monotonic() > self._deadline:
-                    raise httpx2.WriteTimeout("the request deadline passed while sending")
-                yield chunk[start : start + _UPLOAD_PIECE_BYTES]
-
-    def close(self) -> None:
-        self._inner.close()
+    def __init__(self, network: BudgetBackend) -> None:
+        super().__init__(verify=True, trust_env=False)
+        self._pool.close()
+        self._pool = httpcore2.ConnectionPool(
+            ssl_context=httpx2.create_ssl_context(trust_env=False),
+            max_connections=2,
+            max_keepalive_connections=0,
+            network_backend=network,
+        )
 
 
 def wav_bytes(utterance: Utterance) -> bytes:
@@ -107,10 +101,16 @@ def wav_bytes(utterance: Utterance) -> bytes:
 
 
 def build_http_client(
-    limits: VoiceLimits, *, transport: httpx2.BaseTransport | None = None
+    limits: VoiceLimits,
+    *,
+    network: BudgetBackend | None = None,
+    transport: httpx2.BaseTransport | None = None,
 ) -> httpx2.Client:
-    """The HTTP client, as the module docstring describes it. `transport` replaces the network."""
+    """The HTTP client, as the module docstring describes it: over `network`'s budgeted transport,
+    or over `transport`, which replaces the network (tests)."""
     seconds = limits.request_timeout.total_seconds()
+    if transport is None and network is not None:
+        transport = _BudgetTransport(network)
     return httpx2.Client(
         transport=transport,
         follow_redirects=False,
@@ -145,43 +145,62 @@ class WhisperServerBackend:
         self._endpoint = endpoint
         self._language = language
         self._limits = limits
-        self._client = client if client is not None else build_http_client(limits)
+        self._network = BudgetBackend() if client is None else None
+        self._client = (
+            client if client is not None else build_http_client(limits, network=self._network)
+        )
         if endpoint.sends_audio_in_clear:
             logger.warning(
                 "audio is sent to %s over plain http: anyone on that network can listen",
                 endpoint.display,
             )
 
-    def transcribe(self, utterance: Utterance) -> str:
-        deadline = time.monotonic() + self._limits.request_timeout.total_seconds()
+    def transcribe(self, utterance: Utterance, abort: AbortSignal | None = None) -> str:
+        signal = abort if abort is not None else AbortSignal()
+        if signal.is_set:
+            raise SttCancelledError("Cancelled.")
+        timeout = self._limits.request_timeout
+        deadline = time.monotonic() + timeout.total_seconds()
+        budget = self._network.begin(timeout, signal) if self._network is not None else None
         files = {"file": ("utterance.wav", wav_bytes(utterance), "audio/wav")}
         data = {"response_format": "json", "temperature": "0.0", "language": self._language}
         try:
             request = self._client.build_request(
                 "POST", self._endpoint.inference_url, files=files, data=data
             )
-            request.stream = _DeadlineBody(request.stream, deadline)  # type: ignore[arg-type]  # a multipart body is sync
             # `send(stream=True)`: the body is read by `_read_body`, counted, not buffered by the
             # library. (Not the client's `.stream()`: tests/agent/test_chokepoint.py reserves that
             # name for model calls.)
             response = self._client.send(request, stream=True)
             try:
-                body = self._read_body(response, deadline)
+                body = self._read_body(response, deadline, signal)
             finally:
                 response.close()
         except httpx2.TimeoutException:
+            self._raise_if_cancelled(signal)
             raise SttUnavailableError("The speech server did not answer in time.") from None
         except httpx2.TransportError as exc:
+            self._raise_if_cancelled(signal)
             logger.warning("speech server %s: %s", self._endpoint.display, type(exc).__name__)
             raise SttUnavailableError(
                 f"The speech server at {self._endpoint.display} could not be reached."
             ) from None
         except httpx2.HTTPError as exc:  # a decoding error, a stream that broke: nothing to show
+            self._raise_if_cancelled(signal)
             logger.warning("speech server %s: %s", self._endpoint.display, type(exc).__name__)
             raise SttResponseError("The speech server's answer could not be read.") from None
+        finally:
+            if budget is not None and self._network is not None:
+                self._network.end(budget)
+        self._raise_if_cancelled(signal)
         return self._parse(body)
 
-    def _read_body(self, response: httpx2.Response, deadline: float) -> bytes:
+    @staticmethod
+    def _raise_if_cancelled(signal: AbortSignal) -> None:
+        if signal.is_set:
+            raise SttCancelledError("Cancelled.")
+
+    def _read_body(self, response: httpx2.Response, deadline: float, signal: AbortSignal) -> bytes:
         limit = self._limits.max_response_bytes
         if response.status_code != 200:
             # Redirects included: they are not followed. The body is not read, and not shown.
@@ -204,7 +223,7 @@ class WhisperServerBackend:
             raise SttResponseError("The speech server's answer is larger than allowed.")
         body = bytearray()
         for chunk in response.iter_raw():  # as they arrive: a chunk size would batch a slow drip
-            if time.monotonic() > deadline:
+            if signal.is_set or time.monotonic() > deadline:  # (the budget does this too)
                 raise SttUnavailableError("The speech server did not answer in time.")
             body += chunk
             if len(body) > limit:

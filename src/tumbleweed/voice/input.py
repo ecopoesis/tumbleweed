@@ -9,7 +9,8 @@ Threads. Every method here, and every observer callback, belongs to the main thr
 built on it and the methods raise `WrongThreadError` anywhere else. The main thread never blocks on
 audio or on the network. Two daemon worker threads do that work: the *audio* worker opens, stops and
 cancels the capture (a device can be slow to open or to close), and the *speech* worker makes the
-HTTP request, so a slow server never delays the next recording. What they find is posted back
+HTTP request, so a slow server never delays the next *recording* (and `cancel` aborts the request
+in flight, so it does not delay the next transcription either). What they find is posted back
 through the injected `MainThreadDispatcher`, tagged with the generation of the utterance it
 belongs to; `cancel` (and the next `press`) bump the generation, so a late result of an utterance
 that was abandoned is dropped instead of reaching the chat. Every wait on a worker is bounded by
@@ -29,9 +30,9 @@ from collections.abc import Callable
 from typing import Final, Protocol, final
 
 from tumbleweed.voice.audio import AudioSource, Utterance
-from tumbleweed.voice.errors import AudioError, VoiceError, WrongThreadError
+from tumbleweed.voice.errors import AudioError, SttCancelledError, VoiceError, WrongThreadError
 from tumbleweed.voice.limits import MAX_TRANSCRIPT_BYTES, VoiceLimits
-from tumbleweed.voice.stt import SttBackend, clean_transcript
+from tumbleweed.voice.stt import AbortSignal, SttBackend, clean_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,7 @@ class VoiceInput:
         self._main_thread = threading.get_ident()
         self._phase = VoicePhase.IDLE
         self._generation = 0
+        self._abort = AbortSignal()  # of the utterance in progress
         self._closed = False
         self._observers: list[VoiceObserver] = []
         # Touched only by the audio worker:
@@ -145,6 +147,7 @@ class VoiceInput:
             return
         self._generation += 1
         generation = self._generation
+        self._abort = AbortSignal()
         self._set_phase(VoicePhase.LISTENING)
         self._audio_worker.submit(lambda: self._start_capture(generation))
 
@@ -154,8 +157,8 @@ class VoiceInput:
         if self._phase is not VoicePhase.LISTENING:
             return
         self._set_phase(VoicePhase.TRANSCRIBING)
-        generation = self._generation
-        self._audio_worker.submit(lambda: self._stop_capture(generation))
+        generation, abort = self._generation, self._abort
+        self._audio_worker.submit(lambda: self._stop_capture(generation, abort))
 
     def cancel(self) -> None:
         """Abandon the utterance, whatever it is doing: nothing of it reaches the chat."""
@@ -163,6 +166,8 @@ class VoiceInput:
         if self._phase is VoicePhase.IDLE:
             return
         self._generation += 1
+        # A request in flight stops now: the next utterance does not queue behind it.
+        self._abort.set()
         self._set_phase(VoicePhase.IDLE)
         self._audio_worker.submit(self._cancel_capture)
 
@@ -195,7 +200,7 @@ class VoiceInput:
             logger.exception("starting the capture failed")
             self._finish_later(generation, message=_AUDIO_FAILED)
 
-    def _stop_capture(self, generation: int) -> None:
+    def _stop_capture(self, generation: int, abort: AbortSignal) -> None:
         if not self._capturing or self._source is None:
             return  # the capture never started; why has been reported
         self._capturing = False
@@ -211,7 +216,7 @@ class VoiceInput:
         if utterance.byte_count < self._limits.min_utterance_bytes:
             self._finish_later(generation, message=NOTHING_HEARD)
             return
-        self._speech_worker.submit(lambda: self._transcribe(generation, utterance))
+        self._speech_worker.submit(lambda: self._transcribe(generation, utterance, abort))
 
     def _cancel_capture(self) -> None:
         if self._capturing and self._source is not None:
@@ -226,11 +231,15 @@ class VoiceInput:
 
     # Speech worker
 
-    def _transcribe(self, generation: int, utterance: Utterance) -> None:
-        if generation != self._generation:
+    def _transcribe(self, generation: int, utterance: Utterance, abort: AbortSignal) -> None:
+        if generation != self._generation or abort.is_set:
             return  # abandoned while it waited: do not send audio nobody wants
         try:
-            text = clean_transcript(self._stt.transcribe(utterance), max_bytes=MAX_TRANSCRIPT_BYTES)
+            text = clean_transcript(
+                self._stt.transcribe(utterance, abort), max_bytes=MAX_TRANSCRIPT_BYTES
+            )
+        except SttCancelledError:
+            return  # abandoned: nobody is waiting for the result
         except VoiceError as exc:
             self._finish_later(generation, message=str(exc))
             return

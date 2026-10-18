@@ -61,7 +61,17 @@ class TestCleanTranscript:
         assert clean_transcript(raw, max_bytes=CAP) is None
 
     @pytest.mark.parametrize(
-        "raw", ["[sic] he said", "hello [BLANK_AUDIO]", "(1) first", "see [1]", "a (b) c"]
+        "raw",
+        [
+            "[sic] he said",
+            "hello [BLANK_AUDIO]",
+            "(1) first",
+            "see [1]",
+            "a (b) c",
+            "(1)",
+            "[sic]",
+            "(yes)",
+        ],
     )
     def test_brackets_among_words_are_speech(self, raw: str) -> None:
         assert clean_transcript(raw, max_bytes=CAP) == raw

@@ -226,6 +226,18 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         "the Anthropic SDK and its HTTP library are imported only by",
         (),
     ),
+    "the agent imports the voice input": (
+        "agent/loop.py",
+        "import tumbleweed.voice.input",
+        "agent imports voice only for its configuration model",
+        (),
+    ),
+    "voice imports the network library outside the speech client": (
+        "voice/limits.py",
+        "import httpcore2",
+        "the Anthropic SDK and its HTTP library are imported only by",
+        (),
+    ),
     "voice imports gi outside its GStreamer adapter": (
         "voice/audio.py",
         "import gi",

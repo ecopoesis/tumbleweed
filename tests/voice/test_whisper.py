@@ -7,21 +7,27 @@ import gzip
 import io
 import logging
 import socket
+import threading
 import time
 import wave
 from collections.abc import Iterator
+from datetime import timedelta
+from pathlib import Path
 from typing import Protocol
 
+import httpcore2
 import httpx2
 import pytest
 
-from tests.voice.stub_server import JSON, Reply, StubServer
+from tests.voice.stub_server import JSON, DripServer, Reply, StubServer
 from tests.voice.support import limits, max_bytes, pcm
 from tumbleweed.core.errors import InvalidValueError
+from tumbleweed.voice import budget
 from tumbleweed.voice.audio import Utterance
 from tumbleweed.voice.endpoint import SttEndpoint
-from tumbleweed.voice.errors import SttResponseError, SttUnavailableError
+from tumbleweed.voice.errors import SttCancelledError, SttResponseError, SttUnavailableError
 from tumbleweed.voice.limits import VoiceLimits
+from tumbleweed.voice.stt import AbortSignal
 from tumbleweed.voice.whisper import WhisperServerBackend, build_http_client
 
 
@@ -350,34 +356,9 @@ class TestWhatIsLogged:
         assert caplog.text == ""
 
 
-class TestTheUploadDeadline:
-    """The library's write timeout applies to each write; a server that reads slowly keeps every
-    write succeeding. The deadline is checked between pieces of the upload."""
-
-    def test_a_body_stops_at_the_deadline_with_a_timeout_error(self) -> None:
-        from tumbleweed.voice.whisper import _DeadlineBody
-
-        class Chunks(httpx2.SyncByteStream):
-            def __iter__(self) -> Iterator[bytes]:
-                yield b"x" * 100_000
-
-        expired = _DeadlineBody(Chunks(), time.monotonic() - 1)
-
-        with pytest.raises(httpx2.WriteTimeout):
-            list(expired)
-
-    def test_a_body_before_its_deadline_is_passed_on_whole_and_in_small_pieces(self) -> None:
-        from tumbleweed.voice.whisper import _DeadlineBody
-
-        class Chunks(httpx2.SyncByteStream):
-            def __iter__(self) -> Iterator[bytes]:
-                yield b"a" * 40_000
-                yield b"b" * 5
-
-        pieces = list(_DeadlineBody(Chunks(), time.monotonic() + 60))
-
-        assert b"".join(pieces) == b"a" * 40_000 + b"b" * 5
-        assert max(len(piece) for piece in pieces) <= 16 * 1024
+class TestTheWholeExchangeIsBounded:
+    """`request_timeout` bounds the whole exchange, whoever is slow: the library's timeouts apply
+    to each operation, and a byte that arrives starts a new one."""
 
     def test_a_server_that_reads_a_few_bytes_at_a_time_cannot_hold_the_worker(
         self, make: Make, stub: StubServer
@@ -418,19 +399,6 @@ class TestWithoutANetwork:
             client=build_http_client(voice_limits, transport=transport),
         )
 
-    def test_the_upload_is_cut_off_by_the_deadline_however_well_each_write_goes(self) -> None:
-        class SlowReader(httpx2.BaseTransport):
-            def handle_request(self, request: httpx2.Request) -> httpx2.Response:
-                pieces = iter(request.stream)  # type: ignore[arg-type]  # a multipart body is sync
-                next(pieces)
-                time.sleep(1.3)  # every piece is accepted, but slowly
-                for _ in pieces:
-                    pass
-                return httpx2.Response(200, headers=JSON, content=b'{"text": "late"}')
-
-        with pytest.raises(SttUnavailableError, match="did not answer in time"):
-            self.backend(SlowReader()).transcribe(Utterance(pcm(5), max_bytes=max_bytes(30)))
-
     def test_a_content_length_of_thousands_of_digits_is_refused_not_parsed(self) -> None:
         class Hostile(httpx2.BaseTransport):
             def handle_request(self, request: httpx2.Request) -> httpx2.Response:
@@ -453,3 +421,260 @@ class TestWithoutANetwork:
                 )
 
         assert self.backend(Good()).transcribe(utterance()) == "fine"
+
+
+class TestADrippingServer:
+    @pytest.mark.parametrize("what", ["status line and headers", "body"])
+    def test_a_byte_at_a_time_is_cut_off_at_the_deadline(self, what: str) -> None:
+        body = b'{"text": "' + b"a" * 40 + b'"}'
+        head = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+        )
+        server = DripServer(head + body, drip_from=0 if what != "body" else len(head))
+        server.start()
+        try:
+            backend = WhisperServerBackend(
+                SttEndpoint(server.url), language="auto", limits=limits(request_timeout_seconds=1)
+            )
+            started = time.monotonic()
+
+            with pytest.raises(SttUnavailableError, match="did not answer in time"):
+                backend.transcribe(utterance())
+
+            # One header byte every 0.2 s would take 10 s for the head and 8 s for the body.
+            assert time.monotonic() - started < 2.5
+            backend.close()
+        finally:
+            server.close()
+
+    def test_a_wait_that_would_end_after_the_deadline_is_cut_to_it(self) -> None:
+        """One byte at 0.7 s, the next at 1.4 s: the second read starts with 0.3 s left, though the
+        library would let it wait the whole timeout."""
+        server = DripServer(b"HT", drip_from=0, interval=0.7)
+        server.start()
+        try:
+            backend = WhisperServerBackend(
+                SttEndpoint(server.url), language="auto", limits=limits(request_timeout_seconds=1)
+            )
+            started = time.monotonic()
+
+            with pytest.raises(SttUnavailableError, match="did not answer in time"):
+                backend.transcribe(utterance())
+
+            assert time.monotonic() - started < 1.35
+            backend.close()
+        finally:
+            server.close()
+
+    def test_a_name_that_never_resolves_is_cut_off_at_the_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        release = threading.Event()
+
+        def stuck(*args: object, **kwargs: object) -> list[object]:
+            release.wait(timeout=10)
+            raise OSError("never")
+
+        monkeypatch.setattr(socket, "getaddrinfo", stuck)
+        backend = WhisperServerBackend(
+            SttEndpoint("http://stt.invalid:8080"),
+            language="auto",
+            limits=limits(request_timeout_seconds=1),
+        )
+        started = time.monotonic()
+        try:
+            with pytest.raises(SttUnavailableError, match="did not answer in time"):
+                backend.transcribe(utterance())
+
+            assert time.monotonic() - started < 2.5
+        finally:
+            release.set()
+            backend.close()
+
+    @pytest.mark.parametrize("address", ["127.0.0.1", "10.0.2.2", "::1", "fe80::1"])
+    def test_an_address_needs_no_lookup(
+        self, address: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def never(*args: object, **kwargs: object) -> list[object]:
+            raise AssertionError("looked up an IP address")
+
+        monkeypatch.setattr(socket, "getaddrinfo", never)
+        spent = budget.RequestBudget(timedelta(seconds=5), AbortSignal())
+
+        assert budget._resolve(address, 80, spent) == address  # noqa: SLF001
+
+
+class TestAbandoning:
+    def test_a_request_waiting_for_the_server_stops_at_once(
+        self, stub: StubServer, make: Make
+    ) -> None:
+        stub.reply = Reply(delay=30.0)
+        backend = make(voice_limits=limits(request_timeout_seconds=30))
+        signal = AbortSignal()
+        threading.Timer(0.3, signal.set).start()
+        started = time.monotonic()
+
+        with pytest.raises(SttCancelledError):
+            backend.transcribe(utterance(), signal)
+
+        assert time.monotonic() - started < 3
+
+    def test_a_request_dripping_its_answer_stops_at_once_too(self, make: Make) -> None:
+        server = DripServer(b"HTTP/1.1 200 OK\r\n" + b"X-Pad: " + b"a" * 2000, drip_from=0)
+        server.start()
+        try:
+            backend = WhisperServerBackend(
+                SttEndpoint(server.url), language="auto", limits=limits(request_timeout_seconds=30)
+            )
+            signal = AbortSignal()
+            threading.Timer(0.3, signal.set).start()
+            started = time.monotonic()
+
+            with pytest.raises(SttCancelledError):
+                backend.transcribe(utterance(), signal)
+
+            assert time.monotonic() - started < 3
+            backend.close()
+        finally:
+            server.close()
+
+    def test_a_signal_that_is_already_set_sends_nothing(self, stub: StubServer, make: Make) -> None:
+        signal = AbortSignal()
+        signal.set()
+
+        with pytest.raises(SttCancelledError):
+            make().transcribe(utterance(), signal)
+
+        assert stub.requests == []
+
+    def test_an_abort_does_not_spoil_the_next_request(self, stub: StubServer, make: Make) -> None:
+        backend = make()
+        signal = AbortSignal()
+        signal.set()
+        with pytest.raises(SttCancelledError):
+            backend.transcribe(utterance(), signal)
+
+        assert backend.transcribe(utterance(), AbortSignal()) == " hello world\n"
+
+
+class TestConnectionsAreNotLeaked:
+    def test_more_failures_than_the_pool_holds_are_followed_by_a_success(
+        self, stub: StubServer, make: Make
+    ) -> None:
+        """A refused response is closed: a pool of a hundred would be full after a hundred."""
+        backend = make(voice_limits=limits(request_timeout_seconds=5))
+        stub.reply = Reply(status=500, body=b"no")
+        for _ in range(120):
+            with pytest.raises(SttResponseError):
+                backend.transcribe(utterance(0.1))
+        stub.reply = Reply()
+
+        assert backend.transcribe(utterance()) == " hello world\n"
+
+
+class TestTheBudget:
+    def test_it_cuts_an_operations_time_to_what_is_left(self) -> None:
+        budget_ = budget.RequestBudget(timedelta(seconds=10), AbortSignal())
+
+        assert budget_.bound(None) is not None
+        assert 9 < (budget_.bound(None) or 0) <= 10
+        assert budget_.bound(2.0) == 2.0
+
+    def test_nothing_is_left_after_the_deadline_or_an_abort(self) -> None:
+        late = budget.RequestBudget(timedelta(seconds=0), AbortSignal())
+        signal = AbortSignal()
+        early = budget.RequestBudget(timedelta(seconds=10), signal)
+        signal.set()
+
+        with pytest.raises(ValueError, match="used up"):
+            late.bound(1.0)
+        with pytest.raises(ValueError, match="used up"):
+            early.bound(1.0)
+
+
+class TestTls:
+    """The handshake and the reads and writes after it run through the budget too."""
+
+    @staticmethod
+    def certificate(directory: Path) -> tuple[Path, Path]:
+        import shutil
+        import subprocess
+
+        openssl = shutil.which("openssl")
+        if openssl is None:
+            pytest.skip("openssl makes the test certificate; there is none on this host")
+        key, cert = directory / "key.pem", directory / "cert.pem"
+        subprocess.run(  # noqa: S603  (argv list, no shell, a program found on PATH)
+            [
+                openssl,
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost",
+                "-keyout",
+                str(key),
+                "-out",
+                str(cert),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        return key, cert
+
+    def test_a_tls_exchange_works_and_a_silent_peer_is_cut_off_at_the_deadline(
+        self, tmp_path: Path
+    ) -> None:
+        import ssl
+
+        key, cert = self.certificate(tmp_path)
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(cert, key)
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(2)
+        done = threading.Event()
+
+        def serve() -> None:
+            for index in range(2):
+                connection, _ = listener.accept()
+                with server_context.wrap_socket(connection, server_side=True) as tls:
+                    if index == 0:
+                        tls.recv(1)
+                        tls.sendall(b"y")
+                    else:
+                        done.wait(timeout=10)  # says nothing
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        client_context = ssl.create_default_context(cafile=str(cert))
+        network = budget.BudgetBackend()
+        port = listener.getsockname()[1]
+        try:
+            network.begin(timedelta(seconds=1), AbortSignal())
+            stream = network.connect_tcp("127.0.0.1", port, 5.0)
+            secure = stream.start_tls(client_context, "localhost", 5.0)
+            secure.write(b"x", 5.0)
+            assert secure.read(1, 5.0) == b"y"
+            secure.close()
+
+            second = network.connect_tcp("127.0.0.1", port, 5.0).start_tls(
+                client_context, "localhost", 5.0
+            )
+            started = time.monotonic()
+            with pytest.raises(httpcore2.ReadTimeout):
+                second.read(1, 30.0)  # the library would wait 30 s
+            assert time.monotonic() - started < 2
+            second.close()
+        finally:
+            done.set()
+            listener.close()
+            thread.join(timeout=5)

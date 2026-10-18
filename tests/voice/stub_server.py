@@ -137,3 +137,53 @@ class StubServer:
         while not self.requests and time.monotonic() < deadline:
             time.sleep(0.005)
         return bool(self.requests)
+
+
+@final
+class DripServer:
+    """A server that answers with `response`, a byte at a time from `drip_from` on (the bytes
+    before it at once), `interval` seconds apart: no single wait is long, the whole is endless."""
+
+    def __init__(self, response: bytes, *, drip_from: int, interval: float = 0.2) -> None:
+        self._interval = interval
+        self._response = response
+        self._drip_from = drip_from
+        self._stop = threading.Event()
+        self._listener = socket.socket()
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(4)
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._listener.getsockname()[1]}"
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._listener.close()
+        self._thread.join(timeout=5)
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._listener.accept()
+            except OSError:
+                return
+            with connection:
+                connection.settimeout(1)
+                try:
+                    while b"\r\n\r\n" not in connection.recv(65536):  # the request's head
+                        pass
+                except OSError:
+                    continue
+                try:
+                    connection.sendall(self._response[: self._drip_from])
+                    for index in range(self._drip_from, len(self._response)):
+                        if self._stop.wait(self._interval):
+                            return
+                        connection.sendall(self._response[index : index + 1])
+                except OSError:
+                    continue  # the client gave up

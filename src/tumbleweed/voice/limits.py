@@ -40,7 +40,8 @@ class VoiceLimits(BaseModel):
     max_utterance_seconds: int = Field(default=30, ge=1, le=MAX_UTTERANCE_SECONDS_CEILING)
     """Recording stops by itself at this length."""
     request_timeout_seconds: int = Field(default=30, ge=1, le=MAX_REQUEST_TIMEOUT_SECONDS)
-    """Wall-clock time of one request to the speech server, connecting and reading included."""
+    """The whole network exchange of one request (name lookup, connecting, sending the audio,
+    reading the answer), every operation cut to what is left of this time (`voice.budget`)."""
     max_response_bytes: int = Field(
         default=64 * 1024, ge=MIN_RESPONSE_BYTES, le=MAX_RESPONSE_BYTES_CEILING
     )

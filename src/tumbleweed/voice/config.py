@@ -5,10 +5,11 @@
     stt_url = "http://127.0.0.1:8080"       # whisper-server (TUMBLEWEED_STT_URL); a VM: its host
     language = "auto"                       # or a code such as "en"
     edit_before_send = false                # true: the transcript waits in the input to be edited
+                                            # (always, over plain http to another host)
 
     [voice.limits]
     max_utterance_seconds = 30              # recording stops by itself here (up to 120)
-    request_timeout_seconds = 30            # the whole request to the speech server (up to 120)
+    request_timeout_seconds = 30            # the whole exchange with the speech server (up to 120)
     max_response_bytes = 65536              # most of the server's answer that is read
 
 It holds no secret, and the URL is validated here (`SttEndpoint`: http or https, no credentials,

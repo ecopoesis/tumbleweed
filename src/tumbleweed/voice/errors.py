@@ -20,6 +20,10 @@ class SttError(VoiceError):
     """Speech could not be turned into text."""
 
 
+class SttCancelledError(SttError):
+    """The request was abandoned by the user (Esc, or closing the shell)."""
+
+
 class SttUnavailableError(SttError):
     """The speech server could not be reached, or did not answer in time."""
 

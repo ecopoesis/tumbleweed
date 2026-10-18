@@ -4,13 +4,15 @@ scripted answers, errors, a gate to hold a call open) rather than mocking it.
 """
 
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import final
 
 from tumbleweed.core.types import ByteCount
 from tumbleweed.voice.audio import BoundedPcm, Utterance
-from tumbleweed.voice.errors import AudioError, SttError
+from tumbleweed.voice.errors import AudioError, SttCancelledError, SttError
+from tumbleweed.voice.stt import AbortSignal
 
 
 @final
@@ -35,6 +37,7 @@ class FakeAudioSource:
         self._gate = gate
         self._buffer = BoundedPcm(max_bytes)
         self._on_full: Callable[[], None] | None = None
+        self.on_full_callbacks: list[Callable[[], None]] = []
         self.capturing = False
         self.starts = 0
         self.cancels = 0
@@ -46,6 +49,7 @@ class FakeAudioSource:
         self.starts += 1
         self._buffer = BoundedPcm(self._max_bytes)
         self._on_full = on_full
+        self.on_full_callbacks.append(on_full)
         self.capturing = True
 
     def feed(self, chunk: bytes) -> None:
@@ -83,7 +87,8 @@ class FakeStt:
     """An `SttBackend` that plays a script, one answer per call: a `Heard`, a bare `str`, or an
     `SttError` to raise. It keeps what it was given (the PCM of each utterance).
 
-    `gate`, if given, makes `transcribe` wait for it (with a deadline), to play a slow server.
+    `gate`, if given, makes `transcribe` wait for it (with a deadline, and giving up at once if its
+    `abort` signal is set), to play a slow server.
     """
 
     def __init__(
@@ -95,12 +100,19 @@ class FakeStt:
         self._script = list(script)
         self._gate = gate
         self.heard: list[bytes] = []
+        self.aborted = 0
         self.closed = False
 
-    def transcribe(self, utterance: Utterance) -> str:
+    def transcribe(self, utterance: Utterance, abort: AbortSignal | None = None) -> str:
         self.heard.append(utterance.pcm)
         if self._gate is not None:
-            self._gate.wait(timeout=10)
+            deadline = time.monotonic() + 10
+            while not self._gate.wait(timeout=0.005):
+                if abort is not None and abort.is_set:
+                    self.aborted += 1
+                    raise SttCancelledError("Cancelled.")
+                if time.monotonic() > deadline:
+                    break
         if not self._script:
             raise SttError("The fake has nothing left to say.")
         answer = self._script.pop(0)
