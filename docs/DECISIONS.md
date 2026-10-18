@@ -368,3 +368,71 @@ audit log is neither fsynced, rotated nor tamper evident (#82). A tree nested mo
 cannot be deleted by the retention sweep; it is reported and retried after a pause that doubles with
 each failure, so that it does not hold up the rest (#84). S18 must extend the prompt interface (a
 `PromptId`, the picker, the requesting tool) and the wire for broker-to-shell requests.
+
+## D19 — The tool store: one canonical package, an index in the broker's database, blobs named by their hash (2026-10-18, accepted)
+
+**Context.** S23 gives the broker durable, versioned tool packages (ARCHITECTURE section 5). The
+plan fixed the shape (manifest, UI spec, code, RFC 8785 plus NFC and LF, a content hash, SQLite
+and a content-addressed blob store, immutable versions, FTS5, bundles, IPC and a CLI); it left open
+where the package model lives, what the hash covers, how an import may touch an existing tool, how
+the CLI reaches the store, what is audited, and what #62 (iterative `jcs`) and #23 (int against
+float) ask. **Decision.** (1) *The package is pure and lives in `tumbleweed.tools`*, not in the
+broker: the shell builds drafts in S24 and needs the model, and a model that imports no broker, no
+transport and no GTK can be tested and bounded on its own (an import contract keeps it so). The
+normalised bytes and the hash are in `core.canonical` on top of `core.jcs`, the one canonicaliser;
+`ui.spec.text.canonical_text` now calls the same normaliser. (2) *The hash covers the whole
+package*, not only the code: manifest, spec, modules and taint. A tool grant binds to the hash, so a
+change of what a tool declares, or of what it may embed, needs a new grant. The taint is inside the
+package for the same reason: it cannot be edited out of a stored version without breaking the hash.
+(3) *Normalise, then validate again.* Every string and key is normalised before the bytes are made,
+and the normalised package is parsed by the strict models; NFC can lengthen a text, so a draft that
+is valid as written and not as stored is refused. A bundle must *already* be in normal form and is
+refused, not repaired, when it is not: otherwise the hash it states would not be the hash stored.
+(4) *No archive.* A bundle is one canonical JSON document around the package's own bytes, so there
+is no member, path or expansion to attack; it is parsed by the same closed models as a stored
+package, which is how nothing but the declared fields (no grant, no state) can travel (I8). (5)
+*The index is in `broker.sqlite3`, the packages are files.* One database means one hardened open,
+one exact-signature check (the FTS5 shadow tables included) and one transaction for a change and
+its audit entry; a separate file would have duplicated all three. Packages are files named by their
+hash in `tool-blobs/`, opened through a directory descriptor with `O_NOFOLLOW`, verified on every
+read and never replaced (written to a temporary name and linked, which cannot overwrite); the index
+keeps copies of name, description, tags, taint and size for listing and search, and `open` refuses a
+package that disagrees with them, so editing either one is detected. (6) *Versions are immutable
+by having no operation that changes them,* and by a primary key, a unique hash and a link that
+fails if the name exists. A refinement is a save of a tool that exists: the version is the newest
+plus one, assigned where it is stored. (7) *An import never touches a lineage it does not own.* It adds a tool whose ID the store
+does not have; the same version byte for byte changes nothing; any other bundle for a known ID is
+a `conflict`. A bundle that could be the "next version" of a tool the user has would show a stranger's
+code in the place of the user's, and the alternative (renaming the ID) changes the hash the bundle
+states. Updating from a bundle is a flow of S24. (8) *A bundle's taint is its exporter's claim and is
+kept.* Taint exists because a package may embed what *this* user's task saw; a bundle from
+elsewhere has none of it, and one the user exported from their own tainted task carries the taint it
+was saved with. Lowering it by editing a stored version is detected (the taint is in the hash and
+the index is cross-checked); lowering it in a file the user edits is the user's own act. (9)
+*Saving takes the taint from the task, inside the block that stores it.* `BrokerService.save_tool`
+reads the broker's record of the task and stores the version in one synchronous section with its
+audit entry, so a grant that arrived a moment ago is in it (I12). It has no IPC request: the model's
+`save_tool` is S24's. (10) *Audit:* a saved or imported version, an export and a refused import
+have entries, written before the act in its transaction; listing, showing and searching do not (they
+are reads of the broker's own store), and importing a version the store already has changes
+nothing and has none. An export is audited because a bundle is content that leaves the broker's
+custody. (11) *The CLI is a client of the broker.* `tumbleweed-tools` talks to the running broker
+over IPC and opens no store: one writer, one audit log, one place for the checks. It does not start a
+broker, and its only waits are bounded. (12) *Search is words.* The text a user or model types is
+reduced to at most eight quoted prefix terms before FTS5 sees it, so no syntax (and no syntax error
+or costly form) is reachable; the number of tools is bounded, so is the cost of a query. (13) *Limits:*
+400 KiB a package, 256 KiB its spec, 16 modules of 48 KiB (96 KiB in all), 500 tools, 100 versions of
+one, 256 MiB in all; the biggest package and its bundle fit one IPC frame with room to spare.
+(14) *#62 and #23.* `jcs.canonicalize` walks iteratively with a budget of values and bytes (a
+hostile value costs a bounded amount and cannot reach the recursion limit), and only validated
+values are canonicalised here. Inside a `json` value an int and a float of one value are one value
+once canonicalised; the bytes and the hash are stable, and consumers must not depend on the
+difference (stated in `jcs`, `canonical` and ARCHITECTURE section 5). **Deviations from the plan.**
+No archive format; list and search are one request (`list_tools` with a query); `save` exists in the
+service and the store but has no IPC request or model tool (S24). **Consequences.** A tool is as big
+as its package: 400 KiB at most, and the broker canonicalises a few times per import
+(about 10 ms for the largest, on the event loop: #96). A stored version can never be corrected, only superseded. An import of a newer
+version of a tool the user has needs S24's flow (#95). Blobs are never garbage-collected, and nothing
+removes a tool (an orphan from a failed transaction stays and the next save of the same bytes finds
+it): #94, with the audit log's rotation (#82). A module named like a
+standard library module is a valid name; the sandbox loader keeps it from shadowing (#56).
