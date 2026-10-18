@@ -97,7 +97,7 @@ property named by a variable; a key controller made anywhere but the Vte modules
 (there are two, both reviewed and pinned by their own tests: the chat input's Enter key, and
 push-to-talk's capture controller on the window, which sees every key including the terminal's and
 so does nothing, and returns False, while the focus is in the terminal pane: section 2, "Voice
-input");
+input" and "Speech output");
 methods and signals Vte gains later, outside the Vte modules; a terminal widget handed to another
 module (it never is); and anything done by obfuscation as above.
 
@@ -574,6 +574,65 @@ generation, so what an abandoned utterance finds later is dropped.
 - *Failures* are fixed text shown next to the Mic button (never a server's or a library's words),
   and the shell keeps running; a bug in a backend is logged by type and place, not by message.
 
+### Speech output (S07, D22)
+
+`tumbleweed.voice` also reads the assistant's reply aloud as it streams. `SpeechFeed` (shell) observes
+the `Transcript` and calls `SpeechOutput` (GTK-free: `begin_reply`, `feed`, `end_reply`, `stop`,
+`set_muted`, observers); a streaming assistant message begins a reply, each growth of its text is fed
+as new text, and completion ends it. `SentenceChunker` makes the text speakable and cuts it into
+sentences; a *synthesis* worker runs the `TtsBackend` (production: `PiperBackend`) and a *playback*
+worker the `AudioPlayer` (production: `GStreamerAudioPlayer`), in order, so the first sentence is
+audible while tokens still arrive. Both are daemon threads, main-thread calls never wait on them, and
+results come back through the injected dispatcher tagged with the reply's generation.
+
+- *Trust.* The text is model output. It is made safe in one place, `voice.speakable`: fenced code
+  dropped, Markdown marks and addresses removed, controls to spaces, format characters (bidi
+  overrides, zero-width spaces), lone surrogates and unassigned code points dropped, one line of at
+  most `max_sentence_chars` (default 400, at most 1000), a reply of at most `max_reply_chars` (default
+  4000, at most 20000; the user is told once if it is cut). It is spoken, never executed or shown
+  through this path, and speaking it approves nothing (I10).
+- *Piper.* One process per sentence: argv `[piper, --model, <voice>, --output_raw]` (no shell) from
+  two configured absolute paths, never from model output: the program is resolved and must be an
+  executable regular file, the voice model must be a regular file at an already canonical path (no
+  symlink, no dots), checked at start-up and again before every process. The sentence is on **stdin**,
+  never on the command line. The environment is `PATH`, `LANG`, `LC_ALL` and nothing else (I6: the API
+  key and the broker's and shell's variables never reach it; tested). The child has no inherited
+  descriptors, its own session and process group, and `/` as its directory. *Bounds (I9):* audio is
+  capped in bytes as it arrives (`max_audio_seconds`, default 60, at most 300), error output is
+  drained and only 2 KiB kept (a child past 1 MiB is killed), and `synthesis_timeout_seconds`
+  (default 20, at most 120) bounds each sentence, every wait being a 50 ms `select`. The abort signal
+  kills the process group at once from the thread that set it; the worker always reaps (no zombie),
+  and signals only a child it has not reaped (one lock), so a reused pid is never hit. Piper's own
+  words are logged, cleaned and bounded, never shown: the UI gets fixed text. The residual: a user
+  who can replace the voice file between the check and Piper's open is the user.
+- *Playback.* GStreamer, in the adapter that also does capture: `appsrc ! audioconvert !
+  audioresample ! volume ! <sink>` from fixed element names (`osxaudiosink`; `pipewiresink`,
+  `pulsesink`, `autoaudiosink`), a pipeline per sentence, waits in 20 ms slices on EOS and the abort
+  signal, a deadline of the audio's length plus a margin. Audio is never written anywhere (the
+  voice-package scan and audit-hook proofs cover it).
+- *Barge-in.* `stop` (push-to-talk, Esc, mute, a new user message, a new reply, closing) bumps the
+  generation, sets the reply's `AbortSignal` (kills Piper, mutes the `volume` element, from the
+  calling thread) and forgets the reply: text that arrives later is dropped, queued sentences are
+  dropped by their worker, and a chunk finishing late is dropped before the player, so nothing of a
+  stopped reply starts after the stop. A failure of a worker sets the signal itself, so what is queued
+  behind it never plays. A new reply speaks again; mute keeps the current reply silent after unmuting.
+- *The microphone.* The assistant must not hear itself and send its own words as the user's. Push-to-talk
+  stops speech first: `BargeIn` stops it as `VoiceInput` enters LISTENING, which happens before the audio
+  worker is asked to open the microphone, and nothing is spoken while it is open. That is ordering
+  (the key is the only thing that opens the microphone in S06); echo through speakers is not
+  cancelled, and S08's hands-free mode must (#117).
+- *Keys and chrome.* No new key controller: the reviewed push-to-talk controller's plain Esc also takes
+  "a reply is being spoken", wherever the focus is, the terminal included (it reads the speech phase,
+  never the event; with nothing in progress Esc is left to the terminal and vim). A first Esc stops
+  the voice only; a second (the window's shortcut) stops a reply that is still streaming. **Mute** is a
+  toggle button after the Mic in the status strip: no tooltip, no focus, not a `GAction`; it stops
+  speech and keeps the rest of the reply, and unmuting speaks the next reply. The indicator says
+  "speaking" while a reply is read and gives way to listening and transcribing.
+- *Configuration and failures.* `[voice.tts]`, in the same table: nothing is spoken until both paths
+  are set and check out; otherwise the shell has no speech and no Mute button, and says why once next
+  to the Mic. A synthesis or playback failure is fixed text beside the Mic, ends that reply's speech
+  (one message, not one per sentence), and never stops the shell.
+
 ## 3. Request flow
 
 1. The user speaks (push-to-talk or wake word) or types. Speech goes through the STT backend;
@@ -925,7 +984,10 @@ Each invariant names where it is enforced. Reviews check every change against th
   `eval`/`exec`/`compile` model text, never import model-provided modules, never pass model
   text to a shell, never parse expression strings. `subprocess` only with argv lists,
   never `shell=True`. The terminal escape hatch (below) is the user's own tool: nothing the
-  model produced reaches it, and no code of the shell types into it or reads from it.
+  model produced reaches it, and no code of the shell types into it or reads from it. Speech
+  output (S07) is the one place model text goes to a child process: it is *data on Piper's stdin*
+  (cleaned, one line, bounded), never an argument and never a command, and the program and its
+  voice are named by the user's configuration (section 2, "Speech output").
 - **I2 — Grants only from policy or the user.** No code path turns model output into a grant
   without a user decision in trusted UI. Static deny rules beat every grant. The broker
   never imports LLM code (enforced by import-linter).
@@ -976,7 +1038,9 @@ Each invariant names where it is enforced. Reviews check every change against th
   provider's own words are never displayed or logged. The SDK's DEBUG and INFO logging, which would
   hold prompts and error text, is turned down to WARNING. The terminal's shell is started with an
   environment built from a fixed list of names (`tumbleweed.shell.viewmodel.terminal`), so the
-  key, or anything else the shell's environment holds, does not reach it.
+  key, or anything else the shell's environment holds, does not reach it. Piper (S07) gets a fixed
+  three-variable environment (`voice.piper.PIPER_ENVIRONMENT`) for the same reason, and a test sets
+  the API key and the broker's variables and checks that none arrives.
 - **I7 — Everything privileged is audited.** Every grant decision, sandbox run, snapshot,
   restore and revocation is appended to the broker's audit log (S17: `audit.jsonl`, section 2
   "Broker daemon"), before the act it records, so an act whose entry cannot be written does not
@@ -1024,11 +1088,13 @@ Each invariant names where it is enforced. Reviews check every change against th
   new message.
   Voice (`tumbleweed.voice`, D20): a recording is capped in bytes where the samples arrive
   (`max_utterance_seconds`, default 30, at most 120), the speech server's answer is read to at most
-  `max_response_bytes` (default 64 KiB) with a deadline that bounds the whole exchange, and a transcript is at most the transcript's own 16 KiB (section 2, "Voice input").
+  `max_response_bytes` (default 64 KiB) with a deadline that bounds the whole exchange, and a transcript is at most the transcript's own 16 KiB (section 2, "Voice input"). Speech output (D22): a spoken sentence is at most `max_sentence_chars` (default 400, at most 1000) and a reply at most `max_reply_chars` (default 4000), Piper's audio is capped in bytes as it arrives, its error output is kept to 2 KiB, and each sentence has a deadline (default 20 s) and a killed-and-reaped process (section 2, "Speech output").
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input. The
   microphone feeds the chat input only (S06): a transcript is typed-equivalent text, nothing reads
   it as an answer to a prompt, and the push-to-talk key and button are not `GAction`s (so no other
-  process can switch the microphone on through the session bus).
+  process can switch the microphone on through the session bus). Speech output (S07) is the other
+  direction and takes no input: its Mute button is a widget too, and the reply it reads is text the
+  chat already shows.
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps
   what it reads. Workspace references are relative and validated.
@@ -1062,6 +1128,8 @@ only, so it can only refuse more; and case folding is not every file system's ow
 | Chat history (SQLite), invocation log | `$XDG_DATA_HOME/tumbleweed/shell/` | Never |
 | Speech models for `whisper-server` (fetched by `scripts/whisper-model`, hash-checked) | `$XDG_DATA_HOME/tumbleweed/whisper/` | Never |
 | Recorded audio | Nowhere: held in memory from the microphone to the request, never written (S06) | n/a |
+| Piper and its voice models (installed by the user, named by absolute path in `[voice.tts]`) | Wherever the user put them | Never |
+| Synthesised speech | Nowhere: held in memory from Piper's pipe to the player, never written (S07) | n/a |
 | Broker data: grants, tasks and the tool store's index (`broker.sqlite3`), tool packages (`tool-blobs/`), audit log (`audit.jsonl`) | `$XDG_DATA_HOME/tumbleweed/broker/` | Never |
 | Copy/reflink snapshots | `$XDG_DATA_HOME/tumbleweed/broker/snapshots/` | Never |
 | btrfs snapshots | dedicated subvolume on the same filesystem, on the deny list | Never |
