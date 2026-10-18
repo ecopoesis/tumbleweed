@@ -9,6 +9,7 @@ having run them.
 
 import time
 from collections.abc import Callable, Iterator
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -200,6 +201,12 @@ class TestTheTerminalButtonDoesNotTakeTheFocus:
         assert pump_until(lambda: window.get_focus() is window.chat_panel.input_view)
 
 
+def side_shown(shell: Shell) -> bool:
+    """The side panel's visibility, read through a call (so mypy does not narrow an earlier
+    `assert not ...` of it)."""
+    return shell.window.side_panel_visible
+
+
 class TestTheFocusAfterTheShellEnds:
     """Whatever ends the shell (exit, Ctrl+D, a failed start, an immediate exit) the window must
     not be left without a focus: it goes to the chat input. A focusable stand-in plays the
@@ -251,6 +258,105 @@ class TestTheFocusAfterTheShellEnds:
 
         assert "Could not start your shell" in pane.notice_text
         assert pump_until(lambda: window.get_focus() is window.chat_panel.input_view)
+
+    def test_with_the_side_panel_hidden_the_shell_ending_shows_it_and_focuses_the_input(
+        self, terminal_shell: TerminalShellBuilder, tmp_path: Path
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        shell = terminal_shell(
+            ManualResponder(), make_settings(tmp_path, FakeSpawner(), embedded=True)
+        )
+        window, pane = shell.window, shell.window.terminal_pane
+        show(shell)
+        window.activate_action("win.toggle-side-panel", None)
+        assert not side_shown(shell)
+        standin = Gtk.Box()
+        standin.set_focusable(True)
+        pane.append(standin)
+        pane.set_visible(True)
+        window.set_focus(standin)
+        pane._terminal = cast("Vte.Terminal", standin)  # noqa: SLF001  (a stand-in)
+
+        pane._on_child_exited(cast("Vte.Terminal", standin), 0)  # noqa: SLF001
+
+        assert side_shown(shell)  # the input must be visible to take the focus
+        assert pump_until(lambda: window.get_focus() is window.chat_panel.input_view)
+
+    def test_closing_the_pane_with_f12_while_the_side_panel_is_hidden_focuses_the_input(
+        self, terminal_shell: TerminalShellBuilder, tmp_path: Path
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        shell = terminal_shell(
+            ManualResponder(), make_settings(tmp_path, FakeSpawner(), embedded=False, terminals=())
+        )
+        window, pane = shell.window, shell.window.terminal_pane
+        show(shell)
+        press_f12(shell)  # no terminal program: the pane shows a notice
+        assert pane.get_visible()
+        standin = Gtk.Box()
+        standin.set_focusable(True)
+        pane.append(standin)
+        window.set_focus(standin)
+        window.activate_action("win.toggle-side-panel", None)
+        assert not side_shown(shell)
+
+        press_f12(shell)  # closes the pane
+
+        assert not pane.get_visible()
+        assert side_shown(shell)
+        assert pump_until(lambda: window.get_focus() is window.chat_panel.input_view)
+
+    def test_a_shell_ending_during_shutdown_leaves_the_side_panel_and_focus_alone(
+        self, terminal_shell: TerminalShellBuilder, tmp_path: Path
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        shell = terminal_shell(
+            ManualResponder(), make_settings(tmp_path, FakeSpawner(), embedded=True)
+        )
+        window, pane = shell.window, shell.window.terminal_pane
+        show(shell)
+        window.activate_action("win.toggle-side-panel", None)
+        standin = Gtk.Box()
+        standin.set_focusable(True)
+        pane.append(standin)
+        pane.set_visible(True)
+        window.set_focus(standin)
+        pane._terminal = cast("Vte.Terminal", standin)  # noqa: SLF001  (a stand-in)
+        window.shutdown()
+
+        pane._on_child_exited(cast("Vte.Terminal", standin), 0)  # noqa: SLF001
+
+        pump(0.2)
+        assert not side_shown(shell)
+        assert window.get_focus() is not window.chat_panel.input_view
+
+    def test_the_main_box_shows_no_doubled_separator_while_the_pane_is_hidden(
+        self, terminal_shell: TerminalShellBuilder, tmp_path: Path
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        shell = terminal_shell(
+            ManualResponder(), make_settings(tmp_path, FakeSpawner(), embedded=False)
+        )
+        pane = shell.window.terminal_pane
+        root = pane.get_parent()
+        assert root is not None
+        assert not pane.get_visible()
+
+        shown = []
+        child = root.get_first_child()
+        while child is not None:
+            if child.get_visible():
+                shown.append(isinstance(child, Gtk.Separator))
+            child = child.get_next_sibling()
+
+        assert True in shown
+        assert not any(a and b for a, b in pairwise(shown))
+        first = pane.get_first_child()
+        assert isinstance(first, Gtk.Separator)  # the pane's own, hidden with it
 
     def test_a_focus_that_was_elsewhere_is_left_alone(
         self, terminal_shell: TerminalShellBuilder, tmp_path: Path

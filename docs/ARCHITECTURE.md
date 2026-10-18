@@ -62,8 +62,17 @@ whether or not an API key is configured and whatever state the agent is in: it d
 the responder, the configuration or the broker. It is the **user's** tool in the trusted shell, not
 a tool of the agent (I1): there is no code path from the model to it, and the pane has no method
 that types into the terminal or reads what it shows (`tests/shell/test_terminal_isolation.py`
-rejects the VTE calls that feed it text, read its text or its pty by name, and `get_text`/`feed` in
-the modules that use Vte; it sees names, not aliases, and is no boundary).
+rejects, by method name anywhere in `src/`: feeding or pasting (`feed_child*`, `paste_*`), reading text
+(`get_text_range*`, `get_text_selected*`, `get_text_format`, `get_text_include_trailing_spaces`,
+`write_contents_sync`, `copy_*`), the pty (`get_pty`, `set_pty`, `Pty.new_sync`, `new_foreign_sync`,
+`get_fd`, `spawn_sync`, `spawn_with_fds_async`), what is on screen (`match_check*`,
+`hyperlink_check_event`, `event_check_*`, `search_find_*`) and what the shell says (`get_current_*_uri`,
+`get_window_title`, `get_icon_title`); `get_text` and `feed` only in the two modules that use Vte;
+and `connect*` of the signals `commit` (every keystroke), `contents-changed`, `text-inserted`,
+`text-deleted`, `selection-changed`, `cursor-moved` when the name is a string constant. It does
+**not** see a call through an alias or `getattr`, a signal named by a variable, a terminal handed to
+a module that does not use Vte, or a method Vte gains later: it sees names, is no boundary, and
+review is the other half).
 
 - **Embedded**, where Vte 3.91 (the GTK 4 build) is installed (the Linux image, the target): a
   pane under the canvas with a VTE terminal running the user's **login shell**, taken from the
@@ -73,7 +82,9 @@ the modules that use Vte; it sees names, not aliases, and is no boundary).
   environment is built from nothing: `PATH`, the locale, the session variables (display, bus,
   `XAUTHORITY`, `XDG_*`, `SSH_AUTH_SOCK`) copied when present, `HOME`, `SHELL`, `USER`, `LOGNAME` from
   the passwd entry, and the constants `TERM` and `COLORTERM`; never the API key or any `TUMBLEWEED_*` setting (I6).
-  Hiding the pane keeps the shell; its exit closes the pane (a start that fails, or a shell that
+  Hiding the pane keeps the shell; its exit closes the pane and moves the focus to the chat input,
+  showing the side panel first if the user hid it with F9 (the input must be visible to take the
+  focus; closing the terminal is a deliberate return to the chat) (a start that fails, or a shell that
   ends within two seconds with a non-zero status, is reported in the pane instead); closing the window
   sends it SIGHUP (SIGKILL after a second), waiting at most two seconds.
 - **External**, where there is no VTE (macOS): `/usr/bin/open -b com.apple.Terminal <home>` there, elsewhere the

@@ -5,6 +5,7 @@ that no text is ever interpolated into a command. No GTK here; the pane's tests 
 `test_terminal_pane.py`.
 """
 
+import functools
 import os
 import signal
 import subprocess
@@ -272,6 +273,9 @@ class TestTheExternalTerminal:
         # A relative entry with a terminal that comes first in the list must not win over the
         # absolute entry's, nor hide it.
         make_executable(tmp_path / "here" / "konsole")
+        make_executable(
+            tmp_path / "here" / "xterm"
+        )  # the same name: only the filter tells them apart
         absolute = make_executable(tmp_path / "bin" / "xterm")
         monkeypatch.chdir(tmp_path)
 
@@ -523,6 +527,45 @@ class TestTheRealSpawner:
         # 8 sequential sequences would take 8 x (grace + kill) when each one is stubborn.
         assert time.monotonic() - started < 4
 
+    def test_close_does_not_signal_a_process_that_has_exited_nor_signal_twice(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        spawner = SubprocessSpawner()
+        spawner.spawn(ExternalCommand(argv=("/bin/sh", "-c", "exit 0"), cwd=tmp_path, env={}))
+        time.sleep(0.5)
+        signalled: list[tuple[int, int]] = []
+        monkeypatch.setattr(os, "killpg", lambda pid, number: signalled.append((pid, number)))
+        monkeypatch.setattr(os, "kill", lambda pid, number: signalled.append((pid, number)))
+
+        spawner.close()
+        spawner.close()
+
+        assert signalled == []
+
+    def test_a_second_close_signals_nothing(self, tmp_path: Path) -> None:
+        spawner = SubprocessSpawner()
+        spawner.spawn(
+            ExternalCommand(
+                argv=(sys.executable, "-I", "-c", "import time; time.sleep(60)"),
+                cwd=tmp_path,
+                env={},
+            )
+        )
+        spawner.close()
+        signalled: list[int] = []
+        original = os.killpg
+
+        def spy(pid: int, number: int) -> None:
+            signalled.append(pid)
+            original(pid, number)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(os, "killpg", spy)
+            patch.setattr(os, "kill", lambda pid, _number: signalled.append(pid))
+            spawner.close()
+
+        assert signalled == []
+
     def test_close_is_idempotent_and_finished_programs_are_reaped_on_the_next_spawn(
         self, tmp_path: Path
     ) -> None:
@@ -631,3 +674,16 @@ class TestStopGroup:
 
         assert not went
         assert time.monotonic() - started < 1.0
+
+    def test_it_is_false_when_one_of_two_never_goes_and_the_deadline_is_shared(self) -> None:
+        gone = {1_000_001: True, 1_000_002: False}  # no such processes: the signals are no-ops
+        started = time.monotonic()
+
+        went = stop_groups(
+            [(pid, functools.partial(gone.__getitem__, pid)) for pid in gone],
+            grace=0.1,
+            patience=0.1,
+        )
+
+        assert not went
+        assert 0.15 < time.monotonic() - started < 1.0  # both waits happened, once

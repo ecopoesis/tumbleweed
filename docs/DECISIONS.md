@@ -420,7 +420,7 @@ that GTK lets the key through to it.
 focus (#90). A configurable external terminal, and a check of the list against real terminals, are #91.
 A second terminal pane, tabs, copy and paste buttons and a configurable key are not in v1.
 **Consequences.** `Vte` is imported only by `tumbleweed.shell.terminal_pane` and its loader (a test
-holds the line, and also rejects `feed_child`, `get_text_range`, `copy_clipboard`, the pty and, in the modules that use Vte, `get_text` and `feed`: no code of ours types into
+holds the line, and also rejects, by name, the calls that feed or paste, read text (`get_text_range*`, `get_text_selected*`, `write_contents_sync`, `copy_*`), reach the pty (`get_pty`, `Pty.new_sync`, `get_fd`), read the screen (`match_check*`, `hyperlink_check_event`, `event_check_*`, `search_find_*`) or the shell's words (`get_window_title`, `get_current_*_uri`), `connect` to the signals `commit`, `contents-changed`, `text-inserted`, `text-deleted`, `selection-changed` and `cursor-moved` when the name is a constant, and, in the modules that use Vte, `get_text` and `feed`. Gaps, by design: a call through an alias or `getattr`, a signal named by a variable, a terminal handed to a module that does not use Vte, methods Vte adds later; review covers them. Closing the terminal shows the side panel again if F9 hid it, so that the input can take the focus (a deliberate return to the chat): no code of ours types into
 the terminal or reads it, so I1 holds by absence). The stubs have two gaps, both in that one module:
 `spawn_async` lacks the `child_setup_data` argument, and `os.waitid` is missing from the macOS stubs. A shell closed
 with the window is signalled and its exit is *seen* (`waitid` with `WNOWAIT`), not reaped by us, so that
