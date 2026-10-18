@@ -75,7 +75,7 @@ class StatusStrip(Gtk.Box):
         self.append(spacer)
         # A widget, not a GAction: actions are exported on the session bus (test_session_bus.py),
         # and starting a shell is not something another process should be able to ask for.
-        self.terminal_button = Gtk.Button(label="Terminal")
+        self.terminal_button = Gtk.Button(label="Terminal (F12)")
         self.terminal_button.set_has_frame(False)
         # Not in the tab order and no focus from a click: F12 is the keyboard way, and a button
         # that took the focus would get it when the side panel hides, and start a terminal on a
@@ -83,5 +83,5 @@ class StatusStrip(Gtk.Box):
         self.terminal_button.set_focusable(False)
         self.terminal_button.set_focus_on_click(False)
         self.terminal_button.add_css_class("caption")
-        self.terminal_button.set_tooltip_text("Terminal (F12)")
+        # No tooltip: a tooltip is a surface of its own, and none is allowed in the window (#53).
         self.append(self.terminal_button)

@@ -57,7 +57,7 @@ Running the broker and sandboxes under dedicated uids is post-v1 hardening.
 
 ### The terminal escape hatch (S05, D18)
 
-A terminal is always one keystroke (F12) or one button (the status strip's "Terminal") away,
+A terminal is always one keystroke (F12) or one button (the status strip's "Terminal (F12)") away,
 whether or not an API key is configured and whatever state the agent is in: it does not depend on
 the responder, the configuration or the broker. It is the **user's** tool in the trusted shell, not
 a tool of the agent (I1): there is no code path from the model to it, and the pane has no method

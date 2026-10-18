@@ -161,8 +161,8 @@ class TestTheShortcutAndTheButton:
         button = shell.window.status_strip.terminal_button
 
         assert button.is_ancestor(shell.window.status_strip)
-        assert button.get_label() == "Terminal"
-        assert "F12" in (button.get_tooltip_text() or "")
+        assert button.get_label() == "Terminal (F12)"  # the key is in the label: no tooltip (#53)
+        assert not button.get_has_tooltip()
 
 
 class TestTheTerminalButtonDoesNotTakeTheFocus:
