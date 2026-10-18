@@ -80,8 +80,9 @@ def _exited(pid: int) -> bool:
     try:
         if sys.platform == "linux":
             return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
-        # No `waitid` in the stubs for macOS, where VTE is not packaged: there the wait reaps.
-        return os.waitpid(pid, os.WNOHANG)[0] == pid
+        else:  # an else, so that mypy prunes it by platform and not as unreachable
+            # No `waitid` in the stubs for macOS, where VTE is not packaged: there the wait reaps.
+            return os.waitpid(pid, os.WNOHANG)[0] == pid
     except ChildProcessError:
         return True  # already reaped
 
