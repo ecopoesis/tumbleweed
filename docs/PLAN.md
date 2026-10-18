@@ -415,7 +415,9 @@ and `set` handlers.
 - Headless GTK tests rendering each golden fixture and asserting the widget tree and
   interactions: emitting a signal changes state, and bound widgets update. The tip
   calculator works with no agent round trip.
-- A malformed-node isolation test.
+- A test that a valid node that fails at render time (a builder or a binding that raises) becomes
+  a placeholder and the rest still renders. (A malformed node never reaches the renderer: validation
+  refuses the whole spec.)
 - (#53) The renderer creates no surface that can cover trusted chrome from a spec: no popovers,
   dialogs, tooltips, drag icons or other windows. A test renders every golden fixture and a
   hostile spec and asserts that the shell has no toplevel or popup but its own window.
@@ -455,7 +457,8 @@ and `set` handlers.
   untrusted data.
 - The system prompt section documenting the spec is generated from the schema and docs,
   not hand-copied.
-- `sandbox` handlers render disabled with an explanatory tooltip until S20.
+- `sandbox` handlers render disabled with an explanation shown inline in the tool (never a
+  tooltip: D14) until S20.
 - The spec `title` is shown only on the canvas, never in chrome (I5).
 
 **Acceptance.** Fake-provider end-to-end tests:

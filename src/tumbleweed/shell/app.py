@@ -6,7 +6,7 @@ import os
 import signal
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import final
+from typing import Protocol, final
 
 from tumbleweed.agent.config import shell_data_dir
 from tumbleweed.agent.factory import build_agent
@@ -96,8 +96,14 @@ def _add_signal_source(number: int, handler: Callable[[], bool]) -> int:
     return int(add(GLib.PRIORITY_HIGH, number, handler))  # int(): the stubs know no GLibUnix
 
 
+class Quittable(Protocol):
+    """An application that can be told to quit: the shell, and `tumbleweed-render`'s preview."""
+
+    def quit_shell(self) -> None: ...
+
+
 @contextmanager
-def quit_on_signals(app: ShellApplication) -> Iterator[tuple[int, ...]]:
+def quit_on_signals(app: Quittable) -> Iterator[tuple[int, ...]]:
     """Ctrl+C and SIGTERM (a service manager stopping the shell) quit `app` the way Ctrl+Q does.
 
     The handlers live as long as the block; yields their source ids.
