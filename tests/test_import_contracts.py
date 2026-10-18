@@ -196,6 +196,42 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         "the Anthropic SDK and its HTTP library are imported only by",
         (),
     ),
+    "the speech client imports the Anthropic SDK": (
+        "voice/whisper.py",
+        "import anthropic",
+        "the Anthropic SDK and its HTTP library are imported only by",
+        (),
+    ),
+    "voice outside the speech client imports the HTTP library": (
+        "voice/stt.py",
+        "import httpx2",
+        "the Anthropic SDK and its HTTP library are imported only by",
+        (),
+    ),
+    "voice imports gi outside its GStreamer adapter": (
+        "voice/audio.py",
+        "import gi",
+        "voice imports gi only in its GStreamer adapter",
+        (),
+    ),
+    "voice imports the shell": (
+        "voice/limits.py",
+        "import tumbleweed.shell.viewmodel.transcript",
+        "voice never imports the shell or the broker",
+        (),
+    ),
+    "voice imports the broker": (
+        "voice/endpoint.py",
+        "import tumbleweed.broker.errors",
+        "voice never imports the shell or the broker",
+        (),
+    ),
+    "voice's GTK-free core imports the GStreamer adapter": (
+        "voice/limits.py",
+        "import tumbleweed.voice.gstreamer",
+        "voice outside its GStreamer adapter and factory never imports the adapter",
+        (),
+    ),
 }
 
 
