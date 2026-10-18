@@ -388,12 +388,12 @@ passed to VTE. The argv is `/usr/bin/env -i NAME=value ... shell -l`, which clea
 sets exactly ours, with no Python between `fork` and `exec` (a `child_setup` callback would run
 Python in the forked child of a process with threads: D13 rejected the same for `preexec_fn`). The
 list is `PATH`, `LANG`, `LANGUAGE`, `TZ`, `LC_*`, the session (`DISPLAY`, `WAYLAND_DISPLAY`,
-`XDG_*`, `DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`: the user's own terminal should reach the
+`XDG_*`, `DBUS_SESSION_BUS_ADDRESS`, `XAUTHORITY`, `SSH_AUTH_SOCK`: the user's own terminal should reach the
 user's own session and agent) and what the passwd entry gives (`HOME`, `SHELL`, `USER`, `LOGNAME`), plus `TERM` and
 `COLORTERM`; `SECRET_ENV_VARIABLES` are removed even if the list were extended, and a value that is not plain
 printable text of at most 4096 characters is dropped. The external terminals get the same
 environment through `subprocess`, which does not merge.
-(3) *The external terminal.* Chosen from a constant: `/usr/bin/open -a Terminal <home>` on macOS (the only
+(3) *The external terminal.* Chosen from a constant: `/usr/bin/open -b com.apple.Terminal <home>` on macOS (by bundle identifier: `-a` picks by display name) (the only
 way to open a window in a directory without Apple events), elsewhere the first of `x-terminal-emulator`,
 `gnome-terminal`, `kgx`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `foot`, `xterm` that is
 executable on the *absolute* entries of `PATH` (an empty or relative entry would search the current
@@ -402,7 +402,9 @@ directory). `PATH` is the user's own, trusted as far as the shell they type into
 trust. The program gets no arguments and the home directory as its working directory, which each of
 them gives the shell it starts, so no per-terminal flag table (and no text in any argv but the home
 directory on macOS, passed as one argument). It runs in a session of its own and is ended with the
-shell (a bounded SIGTERM, then SIGKILL; at most eight at a time).
+shell: those still running as its children are signalled together (a bounded SIGTERM, then SIGKILL, one
+shared deadline), at most eight at a time. Not Terminal.app on a Mac (`open` returns at once), nor terminals
+that hand the window to a server (gnome-terminal).
 (4) *Shortcut, not GAction.* The window's and the application's actions are exported on the session bus
 (#54, `test_session_bus.py`), so any process of the user could activate one. Showing a pane is harmless, but
 this one **starts a process**, and "no way for anyone else to start a shell in the user's UI" is a
@@ -418,7 +420,7 @@ that GTK lets the key through to it.
 focus (#90). A configurable external terminal, and a check of the list against real terminals, are #91.
 A second terminal pane, tabs, copy and paste buttons and a configurable key are not in v1.
 **Consequences.** `Vte` is imported only by `tumbleweed.shell.terminal_pane` and its loader (a test
-holds the line, and also rejects `feed_child`, `get_text_range` and the pty: no code of ours types into
+holds the line, and also rejects `feed_child`, `get_text_range`, `copy_clipboard`, the pty and, in the modules that use Vte, `get_text` and `feed`: no code of ours types into
 the terminal or reads it, so I1 holds by absence). The stubs have two gaps, both in that one module:
 `spawn_async` lacks the `child_setup_data` argument, and `os.waitid` is missing from the macOS stubs. A shell closed
 with the window is signalled and its exit is *seen* (`waitid` with `WNOWAIT`), not reaped by us, so that

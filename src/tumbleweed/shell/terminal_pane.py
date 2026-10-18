@@ -36,6 +36,7 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Final, final
 
 from tumbleweed.shell._gi import Gio, GLib, Gtk
@@ -91,18 +92,27 @@ def _exited(pid: int) -> bool:
 class TerminalPane(Gtk.Box):
     """The pane. Hidden until `toggle` opens it; see the module docstring."""
 
-    def __init__(self, settings: TerminalSettings) -> None:
+    def __init__(
+        self, settings: TerminalSettings, on_focus_lost: Callable[[], None] | None = None
+    ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.set_name("tumbleweed-terminal")
         self.set_hexpand(True)
         self.set_size_request(-1, PANE_HEIGHT)
         self.set_visible(False)
         self._settings = settings
+        self._on_focus_lost = on_focus_lost
+        self.append(
+            Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        )  # its own, so it hides too
         self._terminal: Vte.Terminal | None = None
         self._pid: int | None = None
         self._cancellable: Gio.Cancellable | None = None
         self._closed = False
         self._started = 0.0
+        # Kept here, not read back from the label: `get_text` is a call the isolation lint rejects
+        # in this module, where it would be a read of the terminal.
+        self._notice_text = ""
         self._notice = plain_label("", wrap=True)
         self._notice.set_margin_start(12)
         self._notice.set_margin_end(12)
@@ -123,7 +133,7 @@ class TerminalPane(Gtk.Box):
 
     @property
     def notice_text(self) -> str:
-        return self._notice.get_text() if self._notice.get_visible() else ""
+        return self._notice_text if self._notice.get_visible() else ""
 
     def focus_terminal(self) -> None:
         if self._terminal is not None and self.get_visible():
@@ -147,7 +157,8 @@ class TerminalPane(Gtk.Box):
 
     def shutdown(self) -> None:
         """End the terminal with the window: cancel a start in progress, stop the shell and
-        whatever the spawner started. Bounded (about three seconds at worst), idempotent, and
+        whatever the spawner started. Bounded (four seconds at worst: two for the shell, two for
+        all the external terminals together), idempotent, and
         nothing escapes: it runs in `close-request`, and every step runs whatever the one before
         did."""
         if self._closed:
@@ -248,10 +259,19 @@ class TerminalPane(Gtk.Box):
 
     def _drop_terminal(self, terminal: "Vte.Terminal") -> None:
         if self._terminal is terminal:
+            root = self.get_root()
+            focus = root.get_focus() if isinstance(root, Gtk.Window) else None
+            had_focus = focus is not None and (focus is terminal or focus.is_ancestor(terminal))
             self._terminal = None
             self.remove(terminal)
+            # Removing the widget that has the focus leaves the window with none (or lets GTK pick
+            # a widget): whoever owns the window says where it goes. This runs before the pane
+            # hides, when the pane's visibility handler could no longer tell where the focus was.
+            if had_focus and self._on_focus_lost is not None:
+                self._on_focus_lost()
 
     def _show_notice(self, text: str) -> None:
-        self._notice.set_text(display_text(text[:_MAX_NOTICE_CHARS]))
+        self._notice_text = display_text(text[:_MAX_NOTICE_CHARS])
+        self._notice.set_text(self._notice_text)
         self._notice.set_visible(True)
         self.set_visible(True)

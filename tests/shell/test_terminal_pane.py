@@ -10,7 +10,7 @@ having run them.
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 import pytest
 
@@ -34,6 +34,8 @@ from tumbleweed.shell.viewmodel.terminal import (
 from tumbleweed.shell.viewmodel.transcript import MessageState
 
 if TYPE_CHECKING:
+    from gi.repository import Vte
+
     from tumbleweed.shell._gi import Gtk
     from tumbleweed.shell.terminal_pane import TerminalPane
 
@@ -160,6 +162,118 @@ class TestTheShortcutAndTheButton:
         assert button.is_ancestor(shell.window.status_strip)
         assert button.get_label() == "Terminal"
         assert "F12" in (button.get_tooltip_text() or "")
+
+
+class TestTheTerminalButtonDoesNotTakeTheFocus:
+    def test_it_is_not_focusable_and_a_click_does_not_focus_it(
+        self, terminal_shell: TerminalShellBuilder, tmp_path: Path
+    ) -> None:
+        shell = terminal_shell(
+            ManualResponder(), make_settings(tmp_path, FakeSpawner(), embedded=False)
+        )
+        button = shell.window.status_strip.terminal_button
+        show(shell)
+
+        assert not button.get_focusable()
+        assert not button.get_focus_on_click()
+        assert not button.grab_focus()  # nothing, not even code, can put the focus there
+
+    def test_hiding_the_side_panel_does_not_move_the_focus_to_it_and_space_starts_nothing(
+        self, terminal_shell: TerminalShellBuilder, tmp_path: Path
+    ) -> None:
+        spawner = FakeSpawner()
+        shell = terminal_shell(ManualResponder(), make_settings(tmp_path, spawner, embedded=False))
+        window = shell.window
+        show(shell)
+        window.set_focus(window.chat_panel.input_view)
+
+        window.activate_action("win.toggle-side-panel", None)  # hide
+        pump(0.3)  # GTK takes the focus off the widget that went away, on a later turn
+        focus = window.get_focus()
+        assert focus is not window.status_strip.terminal_button
+        assert focus is None or not focus.is_ancestor(window.status_strip)
+        if focus is not None:  # a key press goes to the focus: only a button would react
+            focus.activate()  # what Space and Enter do on a button
+        assert spawner.commands == []
+
+        window.activate_action("win.toggle-side-panel", None)  # show
+        assert pump_until(lambda: window.get_focus() is window.chat_panel.input_view)
+
+
+class TestTheFocusAfterTheShellEnds:
+    """Whatever ends the shell (exit, Ctrl+D, a failed start, an immediate exit) the window must
+    not be left without a focus: it goes to the chat input. A focusable stand-in plays the
+    terminal here, so that this runs on hosts with no VTE too."""
+
+    @pytest.mark.parametrize("status", [0, 127 << 8], ids=["exited", "ended at once"])
+    def test_the_shell_ending_returns_the_focus_to_the_input(
+        self, terminal_shell: TerminalShellBuilder, tmp_path: Path, status: int
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        shell = terminal_shell(
+            ManualResponder(), make_settings(tmp_path, FakeSpawner(), embedded=True)
+        )
+        window, pane = shell.window, shell.window.terminal_pane
+        show(shell)
+        standin = Gtk.Box()
+        standin.set_focusable(True)
+        pane.append(standin)
+        pane.set_visible(True)
+        window.set_focus(standin)
+        assert window.get_focus() is standin
+        pane._terminal = cast("Vte.Terminal", standin)  # noqa: SLF001  (a stand-in: only focus counts)
+        pane._started = time.monotonic()  # noqa: SLF001
+
+        pane._on_child_exited(cast("Vte.Terminal", standin), status)  # noqa: SLF001
+
+        assert pump_until(lambda: window.get_focus() is window.chat_panel.input_view)
+        assert standin.get_parent() is None
+
+    def test_a_start_that_fails_returns_the_focus_to_the_input(
+        self, terminal_shell: TerminalShellBuilder, tmp_path: Path
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        shell = terminal_shell(
+            ManualResponder(), make_settings(tmp_path, FakeSpawner(), embedded=True)
+        )
+        window, pane = shell.window, shell.window.terminal_pane
+        show(shell)
+        standin = Gtk.Box()
+        standin.set_focusable(True)
+        pane.append(standin)
+        pane.set_visible(True)
+        window.set_focus(standin)
+        pane._terminal = cast("Vte.Terminal", standin)  # noqa: SLF001
+
+        pane._on_spawned(cast("Vte.Terminal", standin), -1, None)  # noqa: SLF001
+
+        assert "Could not start your shell" in pane.notice_text
+        assert pump_until(lambda: window.get_focus() is window.chat_panel.input_view)
+
+    def test_a_focus_that_was_elsewhere_is_left_alone(
+        self, terminal_shell: TerminalShellBuilder, tmp_path: Path
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        shell = terminal_shell(
+            ManualResponder(), make_settings(tmp_path, FakeSpawner(), embedded=True)
+        )
+        window, pane = shell.window, shell.window.terminal_pane
+        show(shell)
+        standin = Gtk.Box()
+        pane.append(standin)
+        pane._terminal = cast("Vte.Terminal", standin)  # noqa: SLF001
+        elsewhere = Gtk.Box()
+        elsewhere.set_focusable(True)
+        window.chat_panel.append(elsewhere)
+        window.set_focus(elsewhere)
+
+        pane._on_child_exited(cast("Vte.Terminal", standin), 0)  # noqa: SLF001
+
+        pump(0.2)
+        assert window.get_focus() is elsewhere
 
 
 class TestTheFallbackPath:
@@ -569,3 +683,44 @@ class TestTheEmbeddedTerminal:
         assert pump_until(lambda: "Could not start your shell" in pane.notice_text)
         assert pane.get_visible()
         assert pane.child_pid is None
+
+    def test_a_shell_that_exits_returns_the_focus_to_the_chat_input(
+        self, vte_shell: VteShellBuilder, tmp_path: Path
+    ) -> None:
+        short = make_executable(tmp_path / "short-lived", "#!/bin/sh\nsleep 1\n")
+        shell = vte_shell(shell=short)
+        pane = shell.window.terminal_pane
+        show(shell)
+        press_f12(shell)
+        assert pump_until(lambda: focus_in(shell, pane))
+
+        assert pump_until(
+            lambda: pane.child_pid is None and not pane.get_visible(), timeout=DEADLINE
+        )
+
+        assert pump_until(lambda: shell.window.get_focus() is shell.window.chat_panel.input_view)
+
+    def test_the_shell_inherits_no_file_descriptor_but_its_terminal(
+        self, vte_shell: VteShellBuilder, tmp_path: Path
+    ) -> None:
+        import os
+
+        script = make_executable(tmp_path / "fd-shell", "#!/bin/sh\nsleep 60\n")
+        leaked = os.open(os.devnull, os.O_RDONLY)
+        os.set_inheritable(leaked, True)
+        try:
+            shell = vte_shell(shell=script)
+            pane = shell.window.terminal_pane
+            press_f12(shell)
+            assert pump_until(lambda: pane.child_pid is not None)
+            pid = child_of(pane)
+            assert pump_until(lambda: b"fd-shell" in Path(f"/proc/{pid}/cmdline").read_bytes())
+
+            links = {int(e.name): str(e.readlink()) for e in Path(f"/proc/{pid}/fd").iterdir()}
+            # The shell holds its own script open (dash: fd 10); that is not inherited.
+            descriptors = {number for number, link in links.items() if link != str(script)}
+        finally:
+            os.close(leaked)
+
+        assert leaked not in descriptors
+        assert descriptors <= {0, 1, 2}, links

@@ -62,7 +62,8 @@ whether or not an API key is configured and whatever state the agent is in: it d
 the responder, the configuration or the broker. It is the **user's** tool in the trusted shell, not
 a tool of the agent (I1): there is no code path from the model to it, and the pane has no method
 that types into the terminal or reads what it shows (`tests/shell/test_terminal_isolation.py`
-rejects the VTE calls that would).
+rejects the VTE calls that feed it text, read its text or its pty by name, and `get_text`/`feed` in
+the modules that use Vte; it sees names, not aliases, and is no boundary).
 
 - **Embedded**, where Vte 3.91 (the GTK 4 build) is installed (the Linux image, the target): a
   pane under the canvas with a VTE terminal running the user's **login shell**, taken from the
@@ -70,17 +71,20 @@ rejects the VTE calls that would).
   set; `/bin/sh` if the entry is unusable. It starts as `env -i NAME=value ... shell -l` in the
   home directory, because VTE adds this process's whole environment to any it is given. The
   environment is built from nothing: `PATH`, the locale, the session variables (display, bus,
-  `XDG_*`, `SSH_AUTH_SOCK`) copied when present, and `HOME`, `SHELL`, `USER`, `LOGNAME`, `TERM`,
-  `COLORTERM` from the passwd entry; never the API key or any `TUMBLEWEED_*` setting (I6).
+  `XAUTHORITY`, `XDG_*`, `SSH_AUTH_SOCK`) copied when present, `HOME`, `SHELL`, `USER`, `LOGNAME` from
+  the passwd entry, and the constants `TERM` and `COLORTERM`; never the API key or any `TUMBLEWEED_*` setting (I6).
   Hiding the pane keeps the shell; its exit closes the pane (a start that fails, or a shell that
   ends within two seconds with a non-zero status, is reported in the pane instead); closing the window
   sends it SIGHUP (SIGKILL after a second), waiting at most two seconds.
-- **External**, where there is no VTE (macOS): `/usr/bin/open -a Terminal <home>` there, elsewhere the
+- **External**, where there is no VTE (macOS): `/usr/bin/open -b com.apple.Terminal <home>` there, elsewhere the
   first of a fixed list of known terminals found on the absolute entries of `PATH`, started with no
   arguments, in the home directory, with the same environment and in a session of its own. Nothing
   is read from configuration to choose the program, and every program is started from an argv
   list (`subprocess.Popen`, `shell=False`), so no text is interpolated into a command line. At most
-  eight started terminals may be open; closing the window ends the ones still running.
+  eight started terminals may be open; closing the window ends those still running as its children
+  (not Terminal.app on a Mac, nor terminals that hand the window to a server), signalling every
+  group first and waiting at most two seconds in all. On macOS Terminal.app's shell gets the user's
+  login environment from LaunchServices, not ours.
 - The shortcut is a `Gtk.Shortcut` and the button a widget, **not** GActions: actions are exported
   on the session bus, where any process of the user could ask for a shell to be started. The set
   pinned by `tests/shell/test_session_bus.py` is unchanged.

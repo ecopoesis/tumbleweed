@@ -103,13 +103,16 @@ status strip. It is your tool, not the agent's: nothing the model says can type 
   shell (SIGHUP, then SIGKILL after a second). While the terminal has the focus, Ctrl+L is the shell's (clear
   screen) and not "focus the input"; Ctrl+Q and F9 still act on the shell (#90).
 - **Where there is no VTE** (macOS, whose Homebrew has no GTK 4 build of it): F12 opens an external terminal
-  window, in your home directory: Terminal.app (`open -a Terminal`) on a Mac, otherwise the first of
+  window, in your home directory: Terminal.app (`open -b com.apple.Terminal`) on a Mac, otherwise the first of
   `x-terminal-emulator`, `gnome-terminal`, `kgx`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `foot`,
   `xterm` found on your `PATH`. Every F12 opens another window (at most eight started from one shell are
-  kept track of); closing the shell closes the ones it started. If none is found the pane says which to
+  kept track of); closing the shell ends those still running as its children (not Terminal.app on a
+  Mac, nor terminals that hand the window to a server, such as gnome-terminal). If none is found the pane says which to
   install.
 - The terminal's environment is built from nothing, not copied: your `PATH`, locale, display and session
-  variables, and `HOME`, `SHELL`, `USER`, `LOGNAME`, `TERM` from your passwd entry. Your API key, and any other
+  variables (including `XAUTHORITY`), `HOME`, `SHELL`, `USER` and `LOGNAME` from your passwd entry, and
+  the constants `TERM` (`xterm-256color`) and `COLORTERM` (`truecolor`). On a Mac, Terminal.app's shell gets
+  your login environment from the system, not this one. Your API key, and any other
   variable, is not passed. Programs are started from argument lists, never through a shell, and nothing
   configures which terminal is used. Why: `docs/DECISIONS.md` D18.
 

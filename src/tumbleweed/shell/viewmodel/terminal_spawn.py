@@ -11,7 +11,7 @@ import os
 import signal
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Final, final
 
 from tumbleweed.shell.viewmodel.terminal import ExternalCommand, TerminalError
@@ -32,23 +32,40 @@ def stop_group(
     grace: float = GRACE_SECONDS,
     patience: float = KILL_SECONDS,
 ) -> bool:
-    """Signal the process group of `pid` (its own: the leader of a session of its own) with
-    `first`, wait up to `grace` seconds for `gone()`, then SIGKILL it and wait up to `patience`
-    more. True if the process went. `pid` must not have been reaped, or the number may be reused.
+    """`stop_groups` for one process."""
+    return stop_groups([(pid, gone)], first=first, grace=grace, patience=patience)
+
+
+def stop_groups(
+    targets: Sequence[tuple[int, Callable[[], bool]]],
+    *,
+    first: signal.Signals = signal.SIGTERM,
+    grace: float = GRACE_SECONDS,
+    patience: float = KILL_SECONDS,
+) -> bool:
+    """Signal the process group of every `pid` (its own: the leader of a session of its own) with
+    `first`, wait up to `grace` seconds for every `gone()`, then SIGKILL the ones left and wait up
+    to `patience` more. The waits share one deadline each, so the total is at most
+    `grace + patience` however many there are. True if every process went. A `pid` must not have
+    been reaped, or the number may be reused.
 
     A group that is not led by `pid` is not signalled by group, only the process itself is.
     """
+    pending = list(targets)
     for number, limit in ((first, grace), (signal.SIGKILL, patience)):
-        _signal(pid, number)
+        for pid, _gone in pending:
+            _signal(pid, number)
         deadline = time.monotonic() + limit
         while True:
-            if gone():
-                return True
-            if time.monotonic() >= deadline:
+            pending = [(pid, gone) for pid, gone in pending if not gone()]
+            if not pending or time.monotonic() >= deadline:
                 break
             time.sleep(_POLL_SECONDS)
-    logger.warning("process %d did not end after SIGKILL", pid)
-    return gone()
+        if not pending:
+            return True
+    for pid, _gone in pending:
+        logger.warning("process %d did not end after SIGKILL", pid)
+    return all(gone() for _pid, gone in pending)
 
 
 def _signal(pid: int, number: signal.Signals) -> None:
@@ -100,6 +117,12 @@ class SubprocessSpawner:
 
     def close(self) -> None:
         running, self._running = self._running, []
-        for process in running:
-            if process.poll() is None:
-                stop_group(process.pid, functools.partial(_exited, process))
+        # Every group is signalled first and the wait is shared: closing the window waits at most
+        # `GRACE_SECONDS + KILL_SECONDS` in all, not that much for each.
+        stop_groups(
+            [
+                (process.pid, functools.partial(_exited, process))
+                for process in running
+                if process.poll() is None
+            ]
+        )

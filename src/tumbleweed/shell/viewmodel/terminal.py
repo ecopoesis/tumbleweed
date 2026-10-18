@@ -19,8 +19,10 @@ starts. The values are chosen like this:
   happens to be set never reach the terminal; `SECRET_ENV_VARIABLES` are removed even if the list
   ever names one (I6).
 - The **external terminal** (no embedded one: macOS) is never chosen from configuration or from
-  anything typed. On macOS it is `/usr/bin/open -a Terminal <home>`, which opens a window in the
-  home directory. Elsewhere it is the first of `KNOWN_TERMINALS` found on the absolute entries of
+  anything typed. On macOS it is `/usr/bin/open -b com.apple.Terminal <home>`, which opens a
+  window in the home directory (Terminal.app's shell gets its environment from LaunchServices,
+  not ours).
+  Elsewhere it is the first of `KNOWN_TERMINALS` found on the absolute entries of
   `PATH` (the user's own `PATH`: the same trust as the shell the user types into), started with no
   arguments, in the home directory (the process's working directory, which every one of them
   uses for the shell it starts). Every program is started from an argv list, never through a
@@ -55,13 +57,15 @@ MAX_NAME_CHARS: Final = 256
 # Copied from the shell's environment when present: how programs find each other, the locale, the
 # time zone, and the session (so that a GUI program started from the terminal opens on the user's
 # display and bus). Not a secret among them but SSH_AUTH_SOCK, the user's own agent socket, which
-# the user's `ssh` would use from any terminal; the API key is not on the list.
+# the user's `ssh` would use from any terminal (XAUTHORITY is a path, and DISPLAY grants the same
+# reach); the API key is not on the list.
 INHERITED_VARIABLES: Final = (
     "PATH",
     "LANG",
     "LANGUAGE",
     "TZ",
     "DISPLAY",
+    "XAUTHORITY",
     "WAYLAND_DISPLAY",
     "XDG_RUNTIME_DIR",
     "XDG_SESSION_TYPE",
@@ -77,6 +81,8 @@ INHERITED_VARIABLES: Final = (
 INHERITED_PREFIX: Final = "LC_"
 ENV_PROGRAM: Final = "/usr/bin/env"
 MACOS_OPEN: Final = "/usr/bin/open"
+# By bundle identifier: `-a Terminal` picks by display name, which anything can share.
+MACOS_TERMINAL_BUNDLE: Final = "com.apple.Terminal"
 # In this order: the system's choice (Debian's alternatives), then the desktops' own, then others.
 KNOWN_TERMINALS: Final = (
     "x-terminal-emulator",
@@ -248,7 +254,7 @@ def external_command(
     if platform == "darwin":
         if not _executable_file(MACOS_OPEN):
             raise NoTerminalError(f"{MACOS_OPEN} is not available, so no terminal can be opened")
-        argv = (MACOS_OPEN, "-a", "Terminal", str(target.home))
+        argv = (MACOS_OPEN, "-b", MACOS_TERMINAL_BUNDLE, str(target.home))
         return ExternalCommand(argv=argv, cwd=target.home, env=environment)
     # Absolute entries only: an empty or relative one would search the current directory.
     search = os.pathsep.join(

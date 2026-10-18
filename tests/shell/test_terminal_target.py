@@ -29,7 +29,12 @@ from tumbleweed.shell.viewmodel.terminal import (
     login_argv,
     resolve_target,
 )
-from tumbleweed.shell.viewmodel.terminal_spawn import MAX_RUNNING, SubprocessSpawner, stop_group
+from tumbleweed.shell.viewmodel.terminal_spawn import (
+    MAX_RUNNING,
+    SubprocessSpawner,
+    stop_group,
+    stop_groups,
+)
 
 DEADLINE = 10.0
 
@@ -136,6 +141,23 @@ class TestTheLoginShell:
 
 
 class TestTheChildEnvironment:
+    def test_the_user_comes_from_the_passwd_entry_into_user_and_logname(
+        self, tmp_path: Path
+    ) -> None:
+        account = Account(name="alice", home=str(tmp_path), login_shell="/bin/sh")
+
+        resolved = resolve_target(account)
+        environment = child_environment({"USER": "mallory", "LOGNAME": "mallory"}, resolved)
+
+        assert resolved.user == "alice"
+        assert environment["USER"] == "alice"
+        assert environment["LOGNAME"] == "alice"
+
+    def test_xauthority_is_inherited_as_a_path(self, tmp_path: Path) -> None:
+        environment = child_environment({"XAUTHORITY": "/run/user/1/xauth"}, target(tmp_path))
+
+        assert environment["XAUTHORITY"] == "/run/user/1/xauth"
+
     def test_no_secret_reaches_it(self, tmp_path: Path) -> None:
         source = {"PATH": "/usr/bin", "LANG": "C", **SECRET_ENVIRONMENT}
 
@@ -209,7 +231,7 @@ class TestTheChildEnvironment:
 
 
 class TestTheExternalTerminal:
-    def test_on_macos_it_is_open_dash_a_terminal_with_the_home_verbatim(
+    def test_on_macos_it_is_open_by_bundle_id_with_the_home_verbatim(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         fake_open = make_executable(tmp_path / "open")
@@ -219,7 +241,7 @@ class TestTheExternalTerminal:
 
         command = external_command(target(home), SECRET_ENVIRONMENT, platform="darwin")
 
-        assert command.argv == (str(fake_open), "-a", "Terminal", str(home))
+        assert command.argv == (str(fake_open), "-b", "com.apple.Terminal", str(home))
         assert command.cwd == home
 
     def test_on_macos_without_open_there_is_no_terminal(
@@ -243,6 +265,23 @@ class TestTheExternalTerminal:
 
         assert command.argv == (str(bin_dir / "konsole"),)  # konsole comes before kitty and xterm
         assert command.cwd == home
+
+    def test_relative_entries_are_dropped_and_the_absolute_ones_still_searched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A relative entry with a terminal that comes first in the list must not win over the
+        # absolute entry's, nor hide it.
+        make_executable(tmp_path / "here" / "konsole")
+        absolute = make_executable(tmp_path / "bin" / "xterm")
+        monkeypatch.chdir(tmp_path)
+
+        command = external_command(
+            target(tmp_path),
+            {"PATH": os.pathsep.join(["here", "", ".", str(absolute.parent)])},
+            platform="linux",
+        )
+
+        assert command.argv == (str(absolute),)
 
     def test_the_first_directory_on_path_wins_for_the_same_name(self, tmp_path: Path) -> None:
         first = make_executable(tmp_path / "a" / "xterm")
@@ -441,6 +480,49 @@ class TestTheRealSpawner:
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
 
+    def test_it_runs_in_a_session_of_its_own_and_close_kills_its_whole_group(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "out"
+        script = f"sleep 60 & echo $$ $! > {out}.tmp && mv {out}.tmp {out}; wait"
+        spawner = SubprocessSpawner()
+        spawner.spawn(ExternalCommand(argv=("/bin/sh", "-c", script), cwd=tmp_path, env={}))
+        leader, grandchild = (int(n) for n in wait_for(out).split())
+
+        try:
+            assert os.getsid(leader) == leader  # its own session, so its own group
+            assert os.getpgid(grandchild) == leader
+        finally:
+            spawner.close()
+
+        for pid in (leader, grandchild):
+            deadline = time.monotonic() + DEADLINE
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)  # the grandchild is reaped by init, not by us
+            else:
+                raise AssertionError(f"{pid} is still running")
+
+    def test_close_waits_once_for_all_the_terminals_not_once_each(self, tmp_path: Path) -> None:
+        script = (
+            "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+        )
+        spawner = SubprocessSpawner()
+        for _ in range(MAX_RUNNING):
+            spawner.spawn(
+                ExternalCommand(argv=(sys.executable, "-I", "-c", script), cwd=tmp_path, env={})
+            )
+        time.sleep(0.5)  # let each one install its handler
+
+        started = time.monotonic()
+        spawner.close()
+
+        # 8 sequential sequences would take 8 x (grace + kill) when each one is stubborn.
+        assert time.monotonic() - started < 4
+
     def test_close_is_idempotent_and_finished_programs_are_reaped_on_the_next_spawn(
         self, tmp_path: Path
     ) -> None:
@@ -511,3 +593,41 @@ class TestStopGroup:
             if process.poll() is None:
                 process.kill()
                 process.wait()
+
+    def test_sigterm_gets_its_grace_period_before_sigkill(self, tmp_path: Path) -> None:
+        ready = tmp_path / "ready"
+        script = (
+            "import signal, sys, time\n"
+            "def bye(*_):\n"
+            "    time.sleep(0.2)\n"
+            "    sys.exit(7)\n"
+            "signal.signal(signal.SIGTERM, bye)\n"
+            f"open({str(ready)!r}, 'w').write('x\\n')\n"
+            "time.sleep(60)\n"
+        )
+        process = subprocess.Popen(  # noqa: S603  (our own argv)
+            [sys.executable, "-I", "-c", script], start_new_session=True
+        )
+        try:
+            wait_for(ready)
+
+            went = stop_group(process.pid, lambda: process.poll() is not None, grace=5, patience=5)
+
+            assert went
+            assert process.returncode == 7  # it exited by itself, was not SIGKILLed
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_several_processes_share_the_deadline(self) -> None:
+        started = time.monotonic()
+
+        went = stop_groups(
+            [(os.getpid() + 10_000_000 + n, lambda: False) for n in range(8)],
+            grace=0.1,
+            patience=0.1,
+        )
+
+        assert not went
+        assert time.monotonic() - started < 1.0

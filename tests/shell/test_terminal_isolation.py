@@ -32,17 +32,26 @@ FORBIDDEN = frozenset(
         "paste_primary",
         "copy_clipboard_format",
         "copy_primary",
+        "get_text_include_trailing_spaces",
+        "get_current_directory_uri",  # what the shell says its directory is: the shell's words
+        "get_current_file_uri",
+        "copy_clipboard",
+        "pty_new_sync",
         "spawn_sync",
         "spawn_with_fds_async",
     }
 )
+# Names that other widgets have too (`Gtk.Label.get_text`, our own `.feed` of text chunks), so they
+# are rejected only in the modules that use Vte, where a call is on a terminal.
+FORBIDDEN_IN_VTE_MODULES = frozenset({"get_text", "feed"})
 VTE_MODULES = {"shell/terminal_pane.py", "shell/_vte.py"}
 
 
-def offences(source: str) -> list[str]:
+def offences(source: str, *, vte_module: bool = False) -> list[str]:
+    forbidden = FORBIDDEN | FORBIDDEN_IN_VTE_MODULES if vte_module else FORBIDDEN
     found = []
     for node in ast.walk(ast.parse(source)):
-        if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN:
+        if isinstance(node, ast.Attribute) and node.attr in forbidden:
             found.append(f"line {node.lineno}: .{node.attr}")
         if isinstance(node, ast.Name) and node.id in {"feed_child", "feed_child_binary"}:
             found.append(f"line {node.lineno}: {node.id}")
@@ -74,7 +83,11 @@ def test_no_source_file_feeds_or_reads_a_terminal() -> None:
     bad = {
         str(path.relative_to(ROOT)): found
         for path in sources()
-        if (found := offences(path.read_text()))
+        if (
+            found := offences(
+                path.read_text(), vte_module=str(path.relative_to(SOURCE)) in VTE_MODULES
+            )
+        )
     }
 
     assert bad == {}
@@ -95,10 +108,24 @@ def test_vte_is_used_only_by_the_pane_and_its_loader() -> None:
         "pty = terminal.get_pty()",
         "terminal.paste_text('x')",
         "terminal.get_text_selected()",
+        "terminal.get_text_include_trailing_spaces()",
+        "terminal.get_current_directory_uri()",
+        "terminal.copy_clipboard()",
+        "Vte.pty_new_sync(0)",
     ],
 )
 def test_the_lint_catches_what_it_is_for(snippet: str) -> None:
     assert offences(snippet) != []
+
+
+@pytest.mark.parametrize("snippet", ["terminal.get_text()", "self._terminal.feed(b'x')"])
+def test_get_text_and_feed_are_caught_in_the_modules_that_use_vte_only(snippet: str) -> None:
+    assert offences(snippet, vte_module=True) != []
+    assert offences(snippet) == []  # `Gtk.Label.get_text` and our own `feed` are not the terminal
+
+
+# What it does not see, by design: a call through an alias or `getattr`, and `get_text` or `feed`
+# on a terminal handed to a module that does not use Vte (the widget is never handed on: review).
 
 
 @pytest.mark.parametrize(
