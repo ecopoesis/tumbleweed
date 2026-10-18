@@ -341,10 +341,15 @@ class TestShortcuts:
         window.set_focus(window.chat_panel.input_view)
 
         window.activate_action("win.toggle-side-panel", None)  # hide: the input is unmapped
-        # GTK clears the focus of a widget that goes away, on the next turn of the main loop.
-        lost = pump_until(lambda: window.get_focus() is None, timeout=1.0)
+        # GTK takes the focus from a widget that goes away, on the next turn of the main loop: it
+        # drops it, or moves it to the next widget that can have it (the terminal button).
+        terminal_button = window.status_strip.terminal_button
+        lost = pump_until(
+            lambda: window.get_focus() is None or window.get_focus() is terminal_button,
+            timeout=1.0,
+        )
         if sys.platform.startswith("linux"):
-            assert lost, "this host no longer drops the focus: the check below proves nothing"
+            assert lost, "this host no longer moves the focus: the check below proves nothing"
         window.activate_action("win.toggle-side-panel", None)  # show
 
         assert side_panel_visible(echo_shell)
