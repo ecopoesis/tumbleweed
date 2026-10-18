@@ -201,6 +201,17 @@ class TestTheTerminalButtonDoesNotTakeTheFocus:
         assert pump_until(lambda: window.get_focus() is window.chat_panel.input_view)
 
 
+def open_descriptors(pid: int) -> dict[int, str]:
+    """The open descriptors of `pid` and what they point at; one that closes while it is read (a
+    child still starting) is retried."""
+    for _attempt in range(20):
+        try:
+            return {int(e.name): str(e.readlink()) for e in Path(f"/proc/{pid}/fd").iterdir()}
+        except FileNotFoundError:
+            time.sleep(0.05)
+    raise AssertionError(f"the descriptors of {pid} kept changing")
+
+
 def side_shown(shell: Shell) -> bool:
     """The side panel's visibility, read through a call (so mypy does not narrow an earlier
     `assert not ...` of it)."""
@@ -822,7 +833,8 @@ class TestTheEmbeddedTerminal:
             pid = child_of(pane)
             assert pump_until(lambda: b"fd-shell" in Path(f"/proc/{pid}/cmdline").read_bytes())
 
-            links = {int(e.name): str(e.readlink()) for e in Path(f"/proc/{pid}/fd").iterdir()}
+            pump(0.5)  # exec has finished: a descriptor open only while the child starts is gone
+            links = open_descriptors(pid)
             # The shell holds its own script open (dash: fd 10); that is not inherited.
             descriptors = {number for number, link in links.items() if link != str(script)}
         finally:
