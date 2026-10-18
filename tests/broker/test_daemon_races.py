@@ -32,9 +32,10 @@ class SlowCreate:
 
         def slow(workspaces: Workspaces, task: TaskId) -> object:
             self.calls += 1
+            made = real(workspaces, task)  # the directory exists, and nothing records it yet
             self.entered.set()
             self.release.wait(30)
-            return real(workspaces, task)
+            return made
 
         monkeypatch.setattr(Workspaces, "create", slow)
 
@@ -186,6 +187,7 @@ class TestLimitsHoldWhenRequestsOverlap:
                 refused = [r for r in results if isinstance(r, BrokerRefused)]
                 assert len(made) == 2
                 assert {r.reason for r in refused} == {"busy"}
+                assert slow.calls == 2  # the others were refused before a directory was made
                 assert len(list(rig.workspaces.iterdir())) == 2  # the others made no directory
 
         run(scenario)

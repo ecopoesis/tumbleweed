@@ -374,6 +374,37 @@ class TestRefusedRunsAreRecorded:
 
         run(scenario)
 
+    def test_a_run_cancelled_before_it_was_authorised(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await granted(rig, client)
+                entered, proceed = threading.Event(), threading.Event()
+                real_open = open_granted
+
+                def held(stored: object, *, rules: object) -> object:
+                    opened = real_open(stored, rules=rules)  # type: ignore[arg-type]  # a stand-in takes object
+                    entered.set()
+                    proceed.wait(10)
+                    return opened
+
+                monkeypatch.setattr("tumbleweed.broker.service.open_granted", held)
+                call = asyncio.ensure_future(client.run_in_sandbox(task, RunId.new(), COMMAND))
+                assert await asyncio.to_thread(entered.wait, 10)
+
+                await client.end_task(task)  # the run is not yet authorised: it is stopped
+                proceed.set()
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await call
+                assert caught.value.reason == "unknown_task"
+                assert await self.reasons(rig) == ["cancelled"]
+                assert rig.sandbox.policies == []
+
+        run(scenario)
+
     def test_busy(self) -> None:
         async def scenario() -> None:
             sandbox = FakeSandbox()
@@ -477,6 +508,27 @@ class TestRefusedReadsAreRecordedAfterTheyWereAllowed:
                 assert caught.value.reason == "unsafe"
                 outcomes = [(e.outcome, e.reason) for e in rig.audit_of(FileAccess)]
                 assert outcomes == [("allowed", None), ("refused", "identity_mismatch")]
+
+        run(scenario)
+
+
+class TestTheClockIsTheBrokers:
+    def test_every_entry_is_stamped_by_the_clock_the_broker_was_given(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await granted(rig, client)
+                run_id = RunId.new()
+                await client.read_file(task, run_id, str(rig.home / PHOTO))
+                with pytest.raises(BrokerRefused):
+                    await client.read_file(task, run_id, str(rig.home / "Documents/notes.txt"))
+                rig.prompts.allow("task")
+                await client.request_read(task, RunId.new(), str(rig.home / ".ssh"), "x")  # denied
+                await client.run_in_sandbox(task, RunId.new(), COMMAND)
+
+                stamps = {entry.at for entry in rig.audit()}
+
+                assert stamps == {rig.clock.now}  # never the machine's own time
 
         run(scenario)
 
