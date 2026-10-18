@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Fetch a whisper.cpp model for scripts/whisper-server, and check it against a pinned SHA-256.
+#
+#   scripts/whisper-model             base.en (English, 142 MiB, a good start)
+#   scripts/whisper-model tiny.en     the smallest and fastest (75 MiB)
+#   scripts/whisper-model base        multilingual (142 MiB); set `language` in config.toml
+#
+# The file goes to $XDG_DATA_HOME/tumbleweed/whisper/ggml-<name>.bin (WHISPER_MODEL_DIR changes the
+# directory). It is downloaded to a temporary name beside it, checked, and only then moved into
+# place, so a download that is cut short or tampered with never becomes a model. The hashes below
+# are of the files at https://huggingface.co/ggerganov/whisper.cpp on 2026-10-18; their SHA-1s
+# match the table in whisper.cpp's models/README.md. A model that upstream replaces later fails the
+# check here until the hash is updated in a reviewed commit: that is the point.
+set -euo pipefail
+
+name="${1:-base.en}"
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+dir="${WHISPER_MODEL_DIR:-$data/tumbleweed/whisper}"
+
+fail() { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 1; }
+
+case "$name" in
+    tiny.en) sha256=921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f ;;
+    base.en) sha256=a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002 ;;
+    base)    sha256=60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe ;;
+    *) fail "unknown model '$name' (known: tiny.en, base.en, base)" ;;
+esac
+
+if command -v sha256sum >/dev/null 2>&1; then
+    checksum() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    checksum() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+    fail "neither sha256sum nor shasum is installed"
+fi
+
+url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$name.bin"
+target="$dir/ggml-$name.bin"
+
+mkdir -p "$dir"
+if [ -f "$target" ] && [ "$(checksum "$target")" = "$sha256" ]; then
+    echo "$target is already here and matches its hash."
+    exit 0
+fi
+
+partial="$(mktemp "$dir/.ggml-$name.XXXXXX")"
+trap 'rm -f "$partial"' EXIT
+
+# https only (also for redirects), a ceiling on the size and on the time.
+curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --max-filesize 300000000 --max-time 1800 --progress-bar \
+    --output "$partial" -- "$url"
+
+actual="$(checksum "$partial")"
+[ "$actual" = "$sha256" ] || fail "the download does not match the pinned hash (got $actual); not installed"
+
+chmod 0644 "$partial"
+mv -f "$partial" "$target"
+trap - EXIT
+echo "Installed $target"
