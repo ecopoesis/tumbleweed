@@ -88,6 +88,10 @@ def parse_ui_spec(text: str | bytes) -> UiSpec:
         return UiSpec.model_validate_json(decoded)
     except ValidationError as error:
         raise SpecError(problems_of(error)) from None
+    except RecursionError:
+        # The validators of an expression recurse (at most 16 deep), so a caller within about 14
+        # frames of the limit can run out of stack here: a refusal, not a crash (#62).
+        raise SpecError(["the spec could not be checked: too little stack is left"]) from None
 
 
 def _check_is_json(data: object) -> None:

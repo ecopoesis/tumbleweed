@@ -1,4 +1,4 @@
-"""The main canvas: where generated tools render (S10), with an empty-state placeholder.
+"""The main canvas: where generated tools render, with an empty-state placeholder.
 
 The canvas is the one part of the window that will hold content derived from model output, so
 it is built to stay inside its own allocation (I5): the content sits in a scrolled window whose
@@ -6,12 +6,20 @@ minimum size does not follow the content (a huge tool cannot grow the window or 
 and status strip out of it), and the canvas and its scrolled window clip what is drawn and picked
 to their bounds. `tests/shell/test_chrome_isolation.py` proves it with a widget that tries to paint
 over the chrome region.
+
+`show_spec` is the canvas host of the renderer (S10): it renders a validated spec with
+`tumbleweed.ui.gtk` and shows it, closing the tool that was there. The renderer creates no popup,
+dialog, tooltip or drag icon from a spec (clipping cannot contain those, #53), and the canvas holds
+only what it renders or what trusted code gives `set_content`.
 """
 
 from typing import final
 
 from tumbleweed.shell._gi import Gtk
 from tumbleweed.shell._widgets import plain_label
+from tumbleweed.ui.gtk import RenderedTool
+from tumbleweed.ui.runtime import UiRuntime
+from tumbleweed.ui.spec import UiSpec
 
 _EMPTY_PAGE = "empty"
 _CONTENT_PAGE = "content"
@@ -45,6 +53,7 @@ class CanvasView(Gtk.Box):
         self.set_vexpand(True)
         self.set_overflow(Gtk.Overflow.HIDDEN)
         self._content: Gtk.Widget | None = None
+        self._tool: RenderedTool | None = None
         self._scrolled = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
             vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
@@ -65,8 +74,26 @@ class CanvasView(Gtk.Box):
     def placeholder_visible(self) -> bool:
         return self._stack.get_visible_child_name() == _EMPTY_PAGE
 
+    @property
+    def tool(self) -> RenderedTool | None:
+        """The tool `show_spec` rendered, if that is what the canvas shows."""
+        return self._tool
+
+    def show_spec(self, spec: UiSpec, *, runtime: UiRuntime | None = None) -> RenderedTool:
+        """Render `spec` and show it, in place of whatever the canvas showed.
+
+        `runtime` lets the caller connect sinks for `sandbox` and `agent` handlers (S12, S20).
+        """
+        tool = RenderedTool(spec, runtime=runtime)
+        self.set_content(tool.widget)
+        self._tool = tool
+        return tool
+
     def set_content(self, widget: Gtk.Widget | None) -> None:
         """Show `widget` on the canvas, or the placeholder again when it is None."""
+        if self._tool is not None:
+            self._tool.close()
+            self._tool = None
         self._content = widget
         self._scrolled.set_child(widget)
         self._stack.set_visible_child_name(_EMPTY_PAGE if widget is None else _CONTENT_PAGE)

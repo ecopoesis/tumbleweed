@@ -22,8 +22,9 @@ string, a bool and a number, or a float and an int (`round` is how a float becom
 entry of kind `image`, `file`, `table`, `list` or `json` cannot be read by an expression.
 Comparing an enum entry with a string literal also checks that the literal is one of its options
 (a literal reached through the branches of an `if` counts too), and comparing two enum entries
-needs an option in common, because `eq(ref(size), "Large")` with no such option, or `eq` of two
-enums with no option in common, would be silently always false (and `ne` always true).
+needs an option in common (an enum entry that an `if` can produce counts as compared too), because
+`eq(ref(size), "Large")` with no such option, or `eq` of two enums with no option in common, would
+be silently always false (and `ne` always true).
 
 Computed state is evaluated in dependency order; `computed_order` finds that order, and refuses
 a cycle (including an entry that refers to itself).
@@ -158,16 +159,19 @@ class _Checker:
 
     def _enum_comparison(self, left: Expr, right: Expr, name: str) -> None:
         """An enum entry compared with literals it cannot have, or with another enum."""
-        if isinstance(left, Ref) and isinstance(right, Ref):
-            first, second = self._decls[left.key], self._decls[right.key]
-            if (
-                isinstance(first, EnumState)
-                and isinstance(second, EnumState)
-                and set(first.options).isdisjoint(second.options)
-            ):
-                raise InvalidValueError(
-                    f"{name}: {left.key} and {right.key} are enums with no option in common"
-                )
+        # Through `if` as well: `eq(e1, if(c, e2, "a"))` is as hopeless as `eq(e1, e2)` when
+        # the two enums share no option, as the `set` check of an enum target is.
+        for left_key in referenced_keys(left):
+            for right_key in referenced_keys(right):
+                first, second = self._decls[left_key], self._decls[right_key]
+                if (
+                    isinstance(first, EnumState)
+                    and isinstance(second, EnumState)
+                    and set(first.options).isdisjoint(second.options)
+                ):
+                    raise InvalidValueError(
+                        f"{name}: {left_key} and {right_key} are enums with no option in common"
+                    )
         for reference, other in ((left, right), (right, left)):
             if not isinstance(reference, Ref):
                 continue

@@ -55,6 +55,75 @@ In v1 the broker runs as a separate process under the same uid as the shell (sys
 service on the target; started on demand by the shell in development, with reconnect).
 Running the broker and sandboxes under dedicated uids is post-v1 hardening.
 
+### The terminal escape hatch (S05, D18)
+
+A terminal is always one keystroke (F12) or one button (the status strip's "Terminal (F12)") away,
+whether or not an API key is configured and whatever state the agent is in: it does not depend on
+the responder, the configuration or the broker. It is the **user's** tool in the trusted shell, not
+a tool of the agent (I1): there is no code path from the model to it, and the pane has no method
+that types into the terminal or reads what it shows. I1 holds because no code of ours does either,
+which review and the import contracts check (the agent cannot import the shell at all).
+`tests/shell/test_terminal_isolation.py` is a **tripwire** for accidental or casual use, not a
+security boundary: a static check of Python cannot stop deliberate obfuscation (`exec` of a computed
+string, `ctypes`, a C extension, a monkeypatch from another module), and that is what code review and
+the import contracts are for. What it checks:
+
+- In the two modules that use Vte (`shell/terminal_pane.py`, `shell/_vte.py`): every attribute name
+  (single-underscore private names apart) is on a list of exactly the names those modules use today;
+  the imports are pinned to the exact (module, name) pairs used today, with no `as` rename; only the
+  constant signal name `child-exited` may be connected or emitted; no dunder attribute but `__init__`
+  and `__name__`; no call of a bare name that is neither defined there, imported from the pinned set,
+  nor one of a few builtins; none of `getattr`, `setattr`, `delattr`, `vars`, `eval`, `exec`,
+  `compile`, `globals`, `locals`, `__import__`, `attrgetter`, `methodcaller`; no class derived from
+  anything of Vte and no `do_*` virtual function; and no key controller (`Gtk.EventControllerKey` or
+  `EventControllerLegacy`), also in `window.py`, where `key-pressed`, `key-released` and `event`
+  connects are rejected too.
+- In the rest of `src/` it is a denylist of names: feeding and pasting (`feed_child*`, `paste_*`),
+  reading text (`get_text_range*`, `get_text_selected*`, `get_text_format`,
+  `get_text_include_trailing_spaces`, `write_contents_sync`, `copy_clipboard*`, `copy_primary`), the
+  pty (`get_pty`, `set_pty`, `Pty.new_sync`, `new_foreign_sync`, `get_fd`, `spawn_sync`,
+  `spawn_with_fds_async`), the screen (`match_check*`, `check_match_at`, `check_regex_simple_at`,
+  `check_hyperlink_at`, `hyperlink_check_event`, `event_check_*`, `search_find_*`), what the shell says
+  (`get_current_*_uri`, `get_window_title`, `get_icon_title`, `get_hyperlink_hover_uri`, any `.props`
+  access, and `get_property` or `set_property` of `window-title`, `icon-title`,
+  `current-directory-uri`, `current-file-uri`, `hyperlink-hover-uri`, `pty`, and `notify::` of those),
+  connecting to the signals `commit` (every keystroke), `contents-changed`, `text-inserted`,
+  `text-deleted`, `text-modified`, `text-scrolled`, `selection-changed`, `cursor-moved` and the
+  `*-changed` ones for the title and URIs, `emit` or `signal_emit_by_name` of those and of
+  `paste-clipboard` and `copy-clipboard`, and subclassing `Vte.*`.
+
+What it does not see: outside the Vte modules, a call through an alias or `getattr`, or a signal or
+property named by a variable; a key controller made anywhere but the Vte modules and `window.py`;
+methods and signals Vte gains later, outside the Vte modules; a terminal widget handed to another
+module (it never is); and anything done by obfuscation as above.
+
+- **Embedded**, where Vte 3.91 (the GTK 4 build) is installed (the Linux image, the target): a
+  pane under the canvas with a VTE terminal running the user's **login shell**, taken from the
+  passwd database (`pwd.getpwuid`), not from `$SHELL`, which is whatever started the shell
+  set; `/bin/sh` if the entry is unusable. It starts as `env -i NAME=value ... shell -l` in the
+  home directory, because VTE adds this process's whole environment to any it is given. The
+  environment is built from nothing: `PATH`, the locale, the session variables (display, bus,
+  `XAUTHORITY`, `XDG_*`, `SSH_AUTH_SOCK`) copied when present, `HOME`, `SHELL`, `USER`, `LOGNAME` from
+  the passwd entry, and the constants `TERM` and `COLORTERM`; never the API key or any `TUMBLEWEED_*` setting (I6).
+  Hiding the pane keeps the shell; its exit closes the pane (a start that fails, or a shell that
+  ends within two seconds with a non-zero status, is reported in the pane instead); closing the window
+  sends it SIGHUP (SIGKILL after a second), waiting at most two seconds. Whether the shell exits or
+  F12 closes the pane, the focus moves to the chat input, and the side panel is shown first if the
+  user hid it with F9: the input must be visible to take the focus, and closing the terminal is a
+  deliberate return to the chat.
+- **External**, where there is no VTE (macOS): `/usr/bin/open -b com.apple.Terminal <home>` there, elsewhere the
+  first of a fixed list of known terminals found on the absolute entries of `PATH`, started with no
+  arguments, in the home directory, with the same environment and in a session of its own. Nothing
+  is read from configuration to choose the program, and every program is started from an argv
+  list (`subprocess.Popen`, `shell=False`), so no text is interpolated into a command line. At most
+  eight started terminals may be open; closing the window ends those still running as its children
+  (not Terminal.app on a Mac, nor terminals that hand the window to a server), signalling every
+  group first and waiting at most two seconds in all. On macOS Terminal.app's shell gets the user's
+  login environment from LaunchServices, not ours.
+- The shortcut is a `Gtk.Shortcut` and the button a widget, **not** GActions: actions are exported
+  on the session bus, where any process of the user could ask for a shell to be started. The set
+  pinned by `tests/shell/test_session_bus.py` is unchanged.
+
 ### Tasks and workspace agents (see D7)
 
 A **task** (`TaskId`) is a unit of work with its own workspace directory, its own grants, and
@@ -534,9 +603,14 @@ contains:
 `patch_state` from the model changes state and recomputes computed entries, but never
 triggers `sandbox` or `agent` handlers. Handlers fire only from user input events.
 
-The renderer is split into a GTK-free runtime (state store, expression interpreter, binding
-resolution, handler dispatch; unit-tested without a display) and a thin GTK adapter. Unknown
-or invalid nodes render as an error placeholder; nothing in a spec can crash the shell.
+The renderer is split into a GTK-free runtime (`tumbleweed.ui.runtime`: state store,
+expression interpreter, binding resolution, handler dispatch; unit-tested without a display)
+and a thin GTK adapter (`tumbleweed.ui.gtk`). A spec that does not validate is never rendered, so
+a malformed node cannot reach the renderer; a node that is valid and still cannot be built (or
+cannot show its entry) renders as an error placeholder and the rest of the tool renders, so
+nothing in a spec can crash the shell. Every change of state carries its origin (user, handler,
+patch, sandbox, computed), and only a user's action on a widget fires a handler. Until S11 an
+image, table, text view, tabs or expander renders as a placeholder.
 
 ## 5. Saved tools
 
@@ -822,7 +896,8 @@ Each invariant names where it is enforced. Reviews check every change against th
 - **I1 — No execution of model output outside a sandbox.** The shell and broker never
   `eval`/`exec`/`compile` model text, never import model-provided modules, never pass model
   text to a shell, never parse expression strings. `subprocess` only with argv lists,
-  never `shell=True`.
+  never `shell=True`. The terminal escape hatch (below) is the user's own tool: nothing the
+  model produced reaches it, and no code of the shell types into it or reads from it.
 - **I2 — Grants only from policy or the user.** No code path turns model output into a grant
   without a user decision in trusted UI. Static deny rules beat every grant. The broker
   never imports LLM code (enforced by import-linter).
@@ -848,8 +923,15 @@ Each invariant names where it is enforced. Reviews check every change against th
   hostile widget in the canvas can neither paint over the region, nor take clicks meant for it,
   nor push it out of the window (`tumbleweed.shell.canvas`; proven with real layout and
   rendering in `tests/shell/test_chrome_isolation.py`). Clipping does not reach other surfaces:
-  popovers, dialogs, tooltips and drag icons are separate windows, so the renderer must not
-  create them from a spec (tracked in #53, S10).
+  popovers, dialogs, tooltips and drag icons are separate windows, so the renderer creates none
+  from a spec (#53): a `dropdown` is a list in place and not a `Gtk.DropDown` (D14), a text entry or
+  spin button cannot open its context menu or emoji chooser or start a drag
+  (`tumbleweed.ui.gtk.guard`; touchscreen sequences are claimed too, so no selection bubble or
+  handles), no tooltip is ever set, and `tests/ui/gtk/test_no_surfaces.py`
+  looks for any toplevel, native surface, popover-bearing widget, tooltip or drag source besides
+  the shell's own window after every golden spec and a hostile one has been rendered and used.
+  Whatever later adds a widget to the renderer (S11) or a tooltip (S12's disabled `sandbox`
+  handlers) keeps to this, or says why a surface is contained.
   **Every model-supplied string** shown in chrome (reasons, task titles, tool names and
   descriptions, spec titles) is plain, length-capped, and labelled as coming from the
   assistant. What is being granted is rendered from the structured capability. While a
@@ -864,7 +946,9 @@ Each invariant names where it is enforced. Reviews check every change against th
   inherits it), reads a key file only if it is a regular file of the user's with mode 0600 and not a
   symlink, holds it in an object that cannot print, and shows the user only fixed error texts: a
   provider's own words are never displayed or logged. The SDK's DEBUG and INFO logging, which would
-  hold prompts and error text, is turned down to WARNING.
+  hold prompts and error text, is turned down to WARNING. The terminal's shell is started with an
+  environment built from a fixed list of names (`tumbleweed.shell.viewmodel.terminal`), so the
+  key, or anything else the shell's environment holds, does not reach it.
 - **I7 — Everything privileged is audited.** Every grant decision, sandbox run, snapshot,
   restore and revocation is appended to the broker's audit log (S17: `audit.jsonl`, section 2
   "Broker daemon"), before the act it records, so an act whose entry cannot be written does not
@@ -888,6 +972,13 @@ Each invariant names where it is enforced. Reviews check every change against th
   `regex`, D10), which breaks the grapheme clusters and the unbroken runs that would make a label
   wider than the window or quadratic to measure, and a long message is shown as a column of small
   labels.
+  The renderer bounds the total as well (`tumbleweed.ui.gtk.budget`): a label shows at most 8,192
+  characters then ` (cut)`, a tool at most 65,536 characters in all (`MAX_SHOWN_PER_TOOL`, a renderer
+  constant, not a spec limit; labels, buttons, options and entries all count), what does not fit is
+  replaced by a mark or left out until room appears (the one entry that has the focus, or is
+  being edited, may pass the total by its own cap, 8,192 characters, until the focus leaves), and text updates are applied once per frame
+  with the latest value (an 80 KB spec of 441 labels bound to one 64K string used to take minutes
+  to lay out, with the chrome frozen; a test holds it to seconds).
   The agent's limits are enforced in three places: `agent.limits` holds the values and refuses
   out-of-range settings; `agent.loop` enforces iterations per reply, output tokens per reply, the
   bytes of reply text (`MAX_REPLY_BYTES`, the hard guarantee that a reply fits a transcript message;
@@ -1048,7 +1139,7 @@ src/tumbleweed/
   ui/runtime/ state store, expression interpreter, bindings, handler dispatch (no GTK)
   ui/gtk/     GTK4 adapter that renders specs
   shell/      Adw application, window, chat panel, trusted prompts, terminal pane
-  shell/viewmodel/  transcript view-model and chat controller (no GTK)
+  shell/viewmodel/  transcript view-model, chat controller, terminal choices and spawner (no GTK)
   agent/      agent loop, tool registry, LLM providers, invocation recorder, prompts, config;
               the `Responder` interface the shell is built against (`agent/responder.py`)
   voice/      audio capture, STT, TTS, VAD, wake word
@@ -1069,7 +1160,8 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   policy core, storage and audit modules never do, nor do they import the daemon layer; `ipc` never
   imports `broker`.
 - `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
-  import `gi`. `voice` imports it only in `voice._gst`, the pin of the GStreamer adapter, which
+  import `gi`; `ui.runtime` also never imports `ui.gtk` or the shell, so it cannot reach GTK
+  through them. `voice` imports it only in `voice._gst`, the pin of the GStreamer adapter, which
   only `voice.gstreamer` and `voice.factory` (lazily) import; the rest of `voice` cannot import
   either, and `voice` never imports `shell` or `broker` (the shell depends on it).
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
@@ -1090,7 +1182,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   nothing of that runs on Linux. whisper.cpp and Piper run natively (Metal) and are
   reachable over HTTP from a VM. Linux-only parts (bubblewrap, Landlock, seccomp, btrfs) are
   exercised through the Docker harness `scripts/test-linux`.
-- **Docker harness**: runs as a non-root user with `--security-opt seccomp=unconfined
+- **Docker harness**: has the GTK 4, libadwaita and VTE (`gir1.2-vte-3.91`) typelibs, so the
+  terminal pane's embedded path runs there and in CI (macOS has no VTE: the fallback path runs
+  there). It runs as a non-root user with `--security-opt seccomp=unconfined
   --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device
   /dev/net/tun`, so bubblewrap can create user namespaces and mount a fresh `/proc`, and
   slirp4netns can create its tap device. GTK tests run under weston's headless

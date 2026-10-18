@@ -104,7 +104,7 @@ def indicator(v: Voiced) -> str:
 def key(v: Voiced, name: str, keyval: int, *, ctrl: bool = True) -> bool:
     from tumbleweed.shell._gi import Gdk
 
-    keys = v.shell.window.voice_keys
+    keys = controls(v).keys
     assert keys is not None
     state = Gdk.ModifierType.CONTROL_MASK if ctrl else Gdk.ModifierType(0)
     return bool(keys.emit(name, keyval, 0, state))
@@ -369,7 +369,6 @@ class TestWithoutVoice:
         shell = build_shell(EchoResponder())
 
         assert shell.window.voice_controls is None
-        assert shell.window.voice_keys is None
         toggles = [
             w for w in descendants(shell.window.status_strip) if isinstance(w, Gtk.ToggleButton)
         ]

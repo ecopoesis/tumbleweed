@@ -20,8 +20,9 @@ from gi.repository import (  # type: ignore[attr-defined]  # noqa: E402  (pygobj
     Gio,
     GLib,
     GLibUnix,
+    GObject,
     Gtk,
     Pango,
 )
 
-__all__ = ["Adw", "GLib", "GLibUnix", "Gdk", "Gio", "Gtk", "Pango"]
+__all__ = ["Adw", "GLib", "GLibUnix", "GObject", "Gdk", "Gio", "Gtk", "Pango"]

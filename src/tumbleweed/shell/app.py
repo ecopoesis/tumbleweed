@@ -6,7 +6,7 @@ import os
 import signal
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import final
+from typing import Protocol, final
 
 from tumbleweed.agent.config import shell_data_dir
 from tumbleweed.agent.factory import build_agent
@@ -15,6 +15,7 @@ from tumbleweed.history.store import HistoryStore
 from tumbleweed.shell._gi import Adw, Gdk, Gio, GLib, GLibUnix
 from tumbleweed.shell.dispatch import GlibDispatcher
 from tumbleweed.shell.viewmodel.session import HistoryOpener
+from tumbleweed.shell.viewmodel.terminal import TerminalSettings
 from tumbleweed.shell.window import ShellWindow
 from tumbleweed.voice.factory import VoiceSetup, build_voice
 
@@ -42,7 +43,9 @@ class ShellApplication(Adw.Application):
     non-unique application, so any process of the same user that can reach the bus can activate
     them (`quit`, `focus-input`, `toggle-side-panel`: low harm). The bus cannot be turned off,
     because GTK's portals need it. So nothing security-relevant (a permission prompt, a picker
-    result, a grant change) may ever be a GAction (I5, I10), and
+    result, a grant change) may ever be a GAction (I5, I10), nor anything that starts a process:
+    the terminal (F12, a button in the status strip) is a shortcut and a widget for that reason
+    (DECISIONS D18), and
     `tests/shell/test_session_bus.py` pins the exported set against a real bus (#54).
     """
 
@@ -53,11 +56,13 @@ class ShellApplication(Adw.Application):
         flags: Gio.ApplicationFlags = Gio.ApplicationFlags.NON_UNIQUE,
         open_history: HistoryOpener | None = None,
         voice: VoiceSetup | None = None,
+        terminal: TerminalSettings | None = None,
     ) -> None:
         super().__init__(application_id=APPLICATION_ID, flags=flags)
         self._responder = responder
         self._open_history = open_history
         self._voice = voice
+        self._terminal = terminal
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
@@ -70,7 +75,13 @@ class ShellApplication(Adw.Application):
     def do_activate(self) -> None:
         window = self.get_active_window()
         if window is None:
-            window = ShellWindow(self, self._responder, self._open_history, self._voice)
+            window = ShellWindow(
+                self,
+                self._responder,
+                self._open_history,
+                voice=self._voice,
+                terminal=self._terminal,
+            )
             logger.info("shell window created")
         window.present()
 
@@ -99,8 +110,14 @@ def _add_signal_source(number: int, handler: Callable[[], bool]) -> int:
     return int(add(GLib.PRIORITY_HIGH, number, handler))  # int(): the stubs know no GLibUnix
 
 
+class Quittable(Protocol):
+    """An application that can be told to quit: the shell, and `tumbleweed-render`'s preview."""
+
+    def quit_shell(self) -> None: ...
+
+
 @contextmanager
-def quit_on_signals(app: ShellApplication) -> Iterator[tuple[int, ...]]:
+def quit_on_signals(app: Quittable) -> Iterator[tuple[int, ...]]:
     """Ctrl+C and SIGTERM (a service manager stopping the shell) quit `app` the way Ctrl+Q does.
 
     The handlers live as long as the block; yields their source ids.

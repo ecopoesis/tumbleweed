@@ -8,11 +8,11 @@ FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Runtime: GTK 4 and libadwaita typelibs, weston (headless display), fonts for Pango,
-# bubblewrap, slirp4netns and libseccomp (the sandbox, S14-S22), dbus-daemon (a private session
-# bus for the test that lists what the shell exports on it), sudo (for the second user below) and
-# git (the lock-file tests that build scratch repositories; the image has no history of its own, so
-# the lock-age check runs on the macOS jobs).
+# Runtime: GTK 4, libadwaita and VTE (the terminal pane, S05) typelibs, weston (headless display),
+# fonts for Pango, bubblewrap, slirp4netns and libseccomp (the sandbox, S14-S22), dbus-daemon (a
+# private session bus for the test that lists what the shell exports on it), sudo (for the second
+# user below) and git (the lock-file tests that build scratch repositories; the image has no
+# history of its own, so the lock-age check runs on the macOS jobs).
 # GStreamer (S06): the typelibs and the base plugins (audiotestsrc, audioconvert, audioresample,
 # capsfilter, appsink), so that the capture adapter is tested with a test tone, never a microphone;
 # the Pulse and PipeWire source plugins are not installed on purpose (no device in the container).
@@ -28,6 +28,7 @@ RUN apt-get update \
         gir1.2-gst-plugins-base-1.0 \
         gir1.2-gstreamer-1.0 \
         gir1.2-gtk-4.0 \
+        gir1.2-vte-3.91 \
         git \
         gstreamer1.0-plugins-base \
         libcairo2-dev \

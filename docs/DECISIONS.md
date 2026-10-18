@@ -223,6 +223,33 @@ rejected: bwrap's first fork is counted against all of the uid's processes) and 
 no user manager: its command lines and the probe's decision are unit-tested, the wrapper is
 exercised with a stand-in `systemd-run`, and S27's VM test is where the real thing runs (#73).
 
+## D14 — Spec content never creates a surface of its own: dropdowns are lists in place (2026-10-16, accepted)
+
+**Context.** Clipping the canvas contains what is drawn in the window's own surface (I5), and
+nothing else: a popover, a dialog, a tooltip and a drag icon are windows of their own, which can
+cover the trusted chrome whatever the canvas clips (verified in S02, #53). A spec makes the renderer
+build widgets, so each widget that can open one is a way for a spec to reach the chrome. `Gtk.DropDown`
+opens a popover; a `Gtk.Entry` and a `Gtk.SpinButton` can open a context menu or an emoji chooser (a
+right click, Menu, Shift+F10, a long press, Ctrl+.) and can start a drag of selected text.
+**Decision.** The renderer builds no widget that creates a surface. A `dropdown` is a `Gtk.ListBox`
+of the enum's options in a scrolled window of bounded height (`ChoiceList`); selecting a row chooses
+the option. Text entries and spin buttons are hardened (`tumbleweed.ui.gtk.guard`): the actions that
+open a popover are disabled, the long-press gesture is removed, a capture-phase click denies the
+secondary button to the text's own gestures, and any other press first drops the selection, since a
+drag starts only from a press inside one, and a touch-only click claims every touchscreen
+sequence (the selection bubble, handles and magnifier are popups too). No tooltip is set anywhere. Containment was considered
+instead (a popover constrained to the canvas) and rejected: GTK offers no way to bound a popover to
+a region, so nothing could be proved about it.
+**Consequences.** A dropdown takes room in the layout (up to about 180 px, then it scrolls) where a
+`Gtk.DropDown` takes one line, which is acceptable for at most 64 options. Selecting text in an
+entry and dragging it out is not possible, Shift-click does not extend a selection, and a touch
+can focus an entry but not place its cursor or select. The pointer
+path (a right click) is covered by the structure of the controllers and by the keyboard and touch
+paths' tests, not by a synthesised click, because the headless compositor has no way to inject one.
+`tests/ui/gtk/test_no_surfaces.py` enumerates the toplevels and native widgets under the window
+after every golden spec and a hostile one, with a control that shows the search is not blind. S18
+still closes or blocks non-chrome surfaces while a prompt is pending, as defence in depth.
+
 ## D15 — Seccomp refuses how a program gets a unix socket, not `connect`; the launcher is shipped as data (2026-10-17, accepted)
 
 **Context.** S15 must stop `connect()` to a unix socket in a granted directory (#15: a read-only
@@ -368,6 +395,82 @@ audit log is neither fsynced, rotated nor tamper evident (#82). A tree nested mo
 cannot be deleted by the retention sweep; it is reported and retried after a pause that doubles with
 each failure, so that it does not hold up the rest (#84). S18 must extend the prompt interface (a
 `PromptId`, the picker, the requesting tool) and the wire for broker-to-shell requests.
+
+## D18 — The terminal escape hatch: the passwd shell, an environment made with `env -i`, a shortcut that is not a GAction (2026-10-17, accepted)
+
+**Context.** S05 gives the user a terminal that works when the agent is broken. It is also the
+one place in the shell where a process the user controls is started, so what it runs, with what, and who
+can ask for it matter (I1, I6). Four things were not obvious.
+**Decision.** (1) *Which shell.* The passwd entry (`pwd.getpwuid(os.getuid())`), not `$SHELL`: `$SHELL`
+is set by whatever started the shell (a launcher, a parent a user did not write), and the passwd entry
+is what `login(1)` and `chsh(1)` use. A shell that is not an absolute path to an executable regular
+file (or has an `=` in the path, which `env` would read as an assignment) falls back to `/bin/sh`, logged;
+a uid with no passwd entry gets `/bin/sh` in `/`. The working directory is the passwd home if it is a
+directory, `/` otherwise. It is not a `CanonicalPath`: no decision about access is made from it and
+nothing is opened through it by the shell (I11 is about workspaces).
+(2) *The environment, and `env -i`.* VTE's `spawn_async` documents `envv` as "variables to add"; it adds them to a copy
+of the *parent's* environment (measured: the first test run saw `GSK_RENDERER`, `UV` and
+`PYTEST_CURRENT_TEST` in a shell that had been given a short list). So an explicit list cannot be
+passed to VTE. The argv is `/usr/bin/env -i NAME=value ... shell -l`, which clears what VTE added and
+sets exactly ours, with no Python between `fork` and `exec` (a `child_setup` callback would run
+Python in the forked child of a process with threads: D13 rejected the same for `preexec_fn`). The
+list is `PATH`, `LANG`, `LANGUAGE`, `TZ`, `LC_*`, the session (`DISPLAY`, `WAYLAND_DISPLAY`,
+`XDG_*`, `DBUS_SESSION_BUS_ADDRESS`, `XAUTHORITY`, `SSH_AUTH_SOCK`: the user's own terminal should reach the
+user's own session and agent) and what the passwd entry gives (`HOME`, `SHELL`, `USER`, `LOGNAME`), plus `TERM` and
+`COLORTERM`; `SECRET_ENV_VARIABLES` are removed even if the list were extended, and a value that is not plain
+printable text of at most 4096 characters is dropped. The external terminals get the same
+environment through `subprocess`, which does not merge.
+(3) *The external terminal.* Chosen from a constant: `/usr/bin/open -b com.apple.Terminal <home>` on macOS (by bundle identifier: `-a` picks by display name) (the only
+way to open a window in a directory without Apple events), elsewhere the first of `x-terminal-emulator`,
+`gnome-terminal`, `kgx`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `foot`, `xterm` that is
+executable on the *absolute* entries of `PATH` (an empty or relative entry would search the current
+directory). `PATH` is the user's own, trusted as far as the shell they type into is. No configuration, no
+`$TERMINAL`, no `$TERM_PROGRAM`: a file or a variable that names the program is a command line to
+trust. The program gets no arguments and the home directory as its working directory, which each of
+them gives the shell it starts, so no per-terminal flag table (and no text in any argv but the home
+directory on macOS, passed as one argument). It runs in a session of its own and is ended with the
+shell: those still running as its children are signalled together (a bounded SIGTERM, then SIGKILL, one
+shared deadline), at most eight at a time. Not Terminal.app on a Mac (`open` returns at once), nor terminals
+that hand the window to a server (gnome-terminal).
+(4) *Shortcut, not GAction.* The window's and the application's actions are exported on the session bus
+(#54, `test_session_bus.py`), so any process of the user could activate one. Showing a pane is harmless, but
+this one **starts a process**, and "no way for anyone else to start a shell in the user's UI" is a
+property worth the one line of code: F12 is a `Gtk.Shortcut` in the capture phase (VTE would take
+the key if it came later, and the pane could never be closed from the keyboard) and the button a plain
+widget, as the Esc key and the "New session" button already are. The pinned set is unchanged, and
+`tests/shell/test_terminal_pane.py` checks that no action of the window or application mentions the
+terminal. F12 because it is the key of the drop-down terminals (Guake, Yakuake), no application the
+shell shows uses it, and a Ctrl chord would take one from the shell itself; and Ctrl+L, which *is* a
+chord the shell uses (clear screen), is a GAction that is disabled while the terminal has the focus, so
+that GTK lets the key through to it.
+**Not done.** Ctrl+Q (quit the shell) and F9 (the side panel) still take their keys while the terminal has the
+focus (#90). A configurable external terminal, and a check of the list against real terminals, are #91.
+A second terminal pane, tabs, copy and paste buttons and a configurable key are not in v1.
+**Consequences.** `Vte` is imported only by `tumbleweed.shell.terminal_pane` and its loader, and a test
+holds the line (`tests/shell/test_terminal_isolation.py`). That test is a tripwire against accidental or
+casual use, not a security boundary: a static check of Python cannot stop deliberate obfuscation (`exec`
+of a computed string, `ctypes`, a C extension, a monkeypatch from another module), which is what code
+review and the import contracts are for. I1 holds because no code of ours types into the terminal or
+reads it. In the two Vte modules the test allows only the attribute names they use today (private
+single-underscore names apart), pins the imports to the exact (module, name) pairs with no `as`, allows
+only the constant signal `child-exited`, no dunder but `__init__` and `__name__`, no call of an unknown
+bare name, none of `getattr`, `setattr`, `vars`, `eval`, `exec`, `compile`, `globals`, `locals`,
+`__import__`, `attrgetter`, `methodcaller`, no class derived from Vte and no `do_*` override, and no key
+controller (`EventControllerKey`, `EventControllerLegacy`), which it also rejects in `window.py`. In the
+rest of `src/` it is a denylist by name of the calls that feed or paste, read text, match or search the
+screen or reach the pty, of any `.props` access, of the properties and signals that carry what the shell
+says or what is typed, of `emit` of those and of the clipboard signals, and of subclassing `Vte.*`.
+Gaps: outside the Vte modules an alias, `getattr` or a variable signal or property name; a key
+controller made elsewhere; methods Vte adds later (outside those modules); a widget handed to another
+module; deliberate obfuscation.
+Closing the terminal moves the focus to the chat input. That shows the side panel again if F9 hid
+it, because the input must be visible to take the focus; it applies whether the shell exits or F12
+closes the pane, and it is deliberate: closing the terminal is a return to the chat.
+The stubs have two gaps, both in that one module:
+`spawn_async` lacks the `child_setup_data` argument, and `os.waitid` is missing from the macOS stubs. A shell closed
+with the window is signalled and its exit is *seen* (`waitid` with `WNOWAIT`), not reaped by us, so that
+we never reap behind VTE's GLib child watch (which would make GLib warn about `ECHILD`); when the main loop is
+ending, init reaps it. The image gets `gir1.2-vte-3.91`.
 
 ## D19 — The tool store: one canonical package, an index in the broker's database, blobs named by their hash (2026-10-18, accepted)
 

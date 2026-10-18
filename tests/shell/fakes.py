@@ -3,6 +3,7 @@
 from typing import final
 
 from tumbleweed.agent.responder import ReplyEvent, ReplyHandle, ReplyRequest, ReplySink
+from tumbleweed.shell.viewmodel.terminal import ExternalCommand
 
 
 @final
@@ -74,3 +75,29 @@ class ManualResponder:
         handle = FakeHandle(raises=self._cancel_raises)
         self.handles.append(handle)
         return handle
+
+
+@final
+class FakeSpawner:
+    """An `ExternalTerminalSpawner` that starts nothing and keeps the commands it was given.
+
+    `raises` is raised by `spawn` after the command is recorded; `close_raises` by `close`.
+    """
+
+    def __init__(
+        self, *, raises: BaseException | None = None, close_raises: BaseException | None = None
+    ) -> None:
+        self.commands: list[ExternalCommand] = []
+        self.close_calls = 0
+        self._raises = raises
+        self._close_raises = close_raises
+
+    def spawn(self, command: ExternalCommand) -> None:
+        self.commands.append(command)
+        if self._raises is not None:
+            raise self._raises
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self._close_raises is not None:
+            raise self._close_raises

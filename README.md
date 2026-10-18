@@ -10,8 +10,9 @@ together, and [`docs/handoff.md`](docs/handoff.md) for the original vision. What
 far is the typed foundation in `src/tumbleweed/core`, the build and test setup around it, and the
 GTK4 shell skeleton (`tumbleweed-shell`: a window with a canvas, a chat panel that talks to Claude,
 and a status strip; see [Running the shell](#running-the-shell) and
-[Talking to Claude](#talking-to-claude)) and push-to-talk voice input to a local whisper.cpp
-([Voice input](#voice-input)).
+[Talking to Claude](#talking-to-claude)), the renderer core that turns a UI spec into live
+widgets (`tumbleweed-render`; see [UI spec](#ui-spec)), and push-to-talk voice input to a local
+whisper.cpp ([Voice input](#voice-input)).
 
 ## Development setup (macOS)
 
@@ -61,17 +62,19 @@ uv run tumbleweed-shell --version  # answered at once, with no window and no GTK
 
 One window opens, with no desktop around it:
 
-- the **canvas** (left), where generated tools will render (S10); it shows a placeholder for now;
+- the **canvas** (left), where generated tools render (`CanvasView.show_spec`); it shows a placeholder
+  until a tool is shown, and nothing in the shell shows one yet (S12 connects the agent);
 - the **side panel** (right): the chat transcript, a multi-line input and a Send button. Messages are
   answered by Claude, streamed in as they are written (with no key configured the chat says how to
   set one; `responder = "echo"` brings back the S02 placeholder that echoes). While a reply streams
   the Send button waits, and the input stays editable; **Esc** stops the reply;
 - the **status strip** (bottom) with the voice indicator (idle, listening, transcribing; thinking and
-  speaking arrive with S07) and the **Mic** button ([Voice input](#voice-input));
+  speaking arrive with S07), the **Mic** button ([Voice input](#voice-input)) and a **Terminal** button;
+- a **terminal pane** (above the status strip, hidden until you open it), see "The terminal" below;
 - a **reserved strip for trusted prompts** along the top, outside the canvas, which is empty until S18.
 
 Enter sends, Shift+Enter inserts a newline. Ctrl+L focuses the input (and shows the side panel if it
-is hidden), F9 shows or hides the side panel, Ctrl+Q quits. (Ctrl, also on a Mac.) SIGTERM and Ctrl+C
+is hidden), F9 shows or hides the side panel, F12 or the Terminal button opens the terminal, Ctrl+Q quits. (Ctrl, also on a Mac.) SIGTERM and Ctrl+C
 in the terminal quit the same way. Text from the chat is shown as plain text, never as markup, and
 very long or hostile text (a 5000-character grapheme cluster, 64 KiB with no spaces) cannot widen the
 window or freeze it: it is shown with zero-width spaces added. Ctrl+C and Copy in a message's menu put
@@ -85,9 +88,36 @@ well-known name on the session bus, and a second `tumbleweed-shell` is a second 
 to the first. That does **not** keep it off the bus: GLib still exports the application's and the
 window's actions (`quit`, `focus-input`, `toggle-side-panel`) there, so any process of your user that
 can reach the session bus can activate them. A test starts a private bus and pins that list (#54);
-nothing security-relevant, such as a permission prompt or a grant, is ever to be an action. Without a
+nothing security-relevant, such as a permission prompt or a grant, is ever to be an action, nor is
+anything that starts a process: the terminal's key and button are not actions. Without a
 display (no `WAYLAND_DISPLAY` or `DISPLAY` that works) the command says so in one line and exits
 with status 1.
+
+### The terminal
+
+A terminal is one keystroke away whether or not an API key is configured, and whatever state the agent
+is in (no key, an unreadable config file, a failed reply): **F12** or the **Terminal** button in the
+status strip. It is your tool, not the agent's: nothing the model says can type into it or read it.
+
+- **Where VTE (the GTK 4 build, `gir1.2-vte-3.91` on Debian and Ubuntu) is installed**, which includes the
+  Linux image: the terminal is a pane under the canvas running your **login shell** as the passwd database
+  (`getent passwd`) has it, not `$SHELL`, in your home directory. F12 or the button again hides the pane and
+  keeps the shell; `exit` closes the pane and the next F12 starts a new shell; closing the window ends the
+  shell (SIGHUP, then SIGKILL after a second). While the terminal has the focus, Ctrl+L is the shell's (clear
+  screen) and not "focus the input"; Ctrl+Q and F9 still act on the shell (#90).
+- **Where there is no VTE** (macOS, whose Homebrew has no GTK 4 build of it): F12 opens an external terminal
+  window, in your home directory: Terminal.app (`open -b com.apple.Terminal`) on a Mac, otherwise the first of
+  `x-terminal-emulator`, `gnome-terminal`, `kgx`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `foot`,
+  `xterm` found on your `PATH`. Every F12 opens another window (at most eight started from one shell are
+  kept track of); closing the shell ends those still running as its children (not Terminal.app on a
+  Mac, nor terminals that hand the window to a server, such as gnome-terminal). If none is found the pane says which to
+  install.
+- The terminal's environment is built from nothing, not copied: your `PATH`, locale, display and session
+  variables (including `XAUTHORITY`), `HOME`, `SHELL`, `USER` and `LOGNAME` from your passwd entry, and
+  the constants `TERM` (`xterm-256color`) and `COLORTERM` (`truecolor`). On a Mac, Terminal.app's shell gets
+  your login environment from the system, not this one. Your API key, and any other
+  variable, is not passed. Programs are started from argument lists, never through a shell, and nothing
+  configures which terminal is used. Why: `docs/DECISIONS.md` D18.
 
 **On macOS** the command works from any shell, with or without the `DYLD_FALLBACK_LIBRARY_PATH` line
 above. Homebrew's libraries are not on dyld's search path, and the variable is read when a process
@@ -496,3 +526,19 @@ reference; the tests fail until you do:
 uv run python -m tumbleweed.ui.spec.schema --write
 uv run python -m tests.ui.spec.docgen --write
 ```
+
+#### Previewing a spec
+
+```sh
+uv run tumbleweed-render tests/ui/spec/golden/tip_calculator.json
+```
+
+opens a window with the spec rendered on a canvas, by the renderer the shell uses and with nothing
+behind it: computed state and `set` handlers work (the tip calculator needs no agent), `sandbox` and
+`agent` handlers do nothing yet (S20, S12). A file that is not a valid spec is printed as the model
+would be told, one problem per line, with exit status 1 and no window. The renderer is
+`tumbleweed.ui.runtime` (state, expressions, handlers; no GTK, unit-tested without a display) and
+`tumbleweed.ui.gtk` (the thin adapter; `pytest -m gtk` in the container). It creates no popover,
+dialog, tooltip or drag icon from a spec, so that the canvas can never cover the trusted chrome
+(a `dropdown` is a list in place; DECISIONS D14), and images, tables, text views, tabs and expanders
+show as a placeholder until S11.

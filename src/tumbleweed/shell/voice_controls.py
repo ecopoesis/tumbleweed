@@ -33,7 +33,6 @@ from tumbleweed.voice.input import VoiceInput, VoicePhase
 
 logger = logging.getLogger(__name__)
 
-PUSH_TO_TALK_KEY = "Ctrl+Space"
 _RELEASE_KEYS = frozenset({Gdk.KEY_space, Gdk.KEY_Control_L, Gdk.KEY_Control_R})
 _MESSAGE_WIDTH_CHARS = 60
 
@@ -69,12 +68,11 @@ class VoiceControls(Gtk.Box):
         self._chat_panel = chat_panel
         self._edit_before_send = edit_before_send
         self._syncing = False  # the button is being set from the phase, not clicked
+        self.keys: Gtk.EventControllerKey | None = None
 
         self.mic_button = Gtk.ToggleButton(label="Mic")
         self.mic_button.add_css_class("flat")
-        self.mic_button.set_tooltip_text(
-            f"Click to start talking, click again to send. Or hold {PUSH_TO_TALK_KEY}."
-        )
+        # No tooltip: a tooltip is a surface of its own, and none is allowed in the window (#53).
         self.mic_button.connect("toggled", self._on_toggled)
         self.message = plain_label("", css_classes=["caption", "error"])
         self.message.set_ellipsize(Pango.EllipsizeMode.END)
@@ -83,6 +81,10 @@ class VoiceControls(Gtk.Box):
         self.append(self.mic_button)
         self.append(self.message)
         voice.subscribe(self)
+
+    def install_keys(self, window: Gtk.Window) -> None:
+        """Hold Ctrl+Space to talk, anywhere in `window`."""
+        self.keys = install_push_to_talk(window, self._voice)
 
     # VoiceObserver
 
