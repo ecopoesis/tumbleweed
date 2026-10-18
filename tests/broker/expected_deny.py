@@ -120,11 +120,11 @@ EXPECTED_SYSTEM_DENY = (
     "/sys",
     "/dev",
     "/run/user",
-    "/tmp/.X11-unix",  # noqa: S108
-    "/tmp/.ICE-unix",  # noqa: S108
-    "/tmp/.XIM-unix",  # noqa: S108
-    "/tmp/.font-unix",  # noqa: S108
-    "/var/tmp",  # noqa: S108
+    "/tmp/.X11-unix",
+    "/tmp/.ICE-unix",
+    "/tmp/.XIM-unix",
+    "/tmp/.font-unix",
+    "/var/tmp",
     "/run/dbus",
     "/run/docker.sock",
     "/var/run/docker.sock",

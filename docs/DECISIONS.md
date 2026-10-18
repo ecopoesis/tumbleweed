@@ -252,17 +252,17 @@ launcher reports on a pipe it passes as a number and closes at its `exec`, as JS
 with strict models; it writes to stderr, which the program shares, only for a command line it
 cannot parse, which only a bug in the runner can produce. It runs with an empty environment and
 is given the program's variables as arguments, applied at the `exec`, so that `LD_PRELOAD` in a
-policy cannot run code in it before Landlock; the policy refuses loader variables as well. It reads its
-environment from `/proc/self/environ`, because Python adds `LC_CTYPE` to its own. (4) The Landlock
-ruleset is computed from the policy's mounts by a pure function and given as arguments, so the
-mounts and the ruleset are one fact. `require_landlock` is a policy field that defaults to true, and
+policy cannot run code in it before Landlock; the policy refuses loader variables as well. It
+reads its environment from `/proc/self/environ`, because Python adds `LC_CTYPE` to its own. (4) The
+Landlock ruleset is computed from the policy's mounts by a pure function and given as arguments,
+so the mounts and the ruleset are one fact. `require_landlock` is a policy field that defaults to true, and
 a missing Landlock is `SandboxUnavailable` before the program starts; false records "unavailable"
 in every result. (5) Tests prove each denial against a control run in the namespaces alone, since
 the sandbox has no capabilities and many denials would otherwise look the same.
 (6) A grant may not be or sit inside `/tmp`: Landlock rights add up down a path, so it would
 inherit the write rule of the sandbox's own tmpfs.
 **Consequences.** Every sandbox run costs a Python start (about 20 ms). A kernel without Landlock
-needs `require_landlock=False`, and the broker (S17) must decide where that is allowed. The filter
+needs `require_landlock=False`, and the broker decides where that is allowed (D17). The filter
 is a deny list; a new dangerous syscall is allowed until it is added, and `DENIED_SYSCALLS` is
 where to add it. Landlock's scope covers abstract unix sockets only; pathname sockets rest on
 seccomp and the mounts. The 32-bit ARM check cannot be run on Apple silicon or in CI, so it is
@@ -306,3 +306,65 @@ real tokens of history, not the window's worth; the budget is `history_budget` i
 configuration allows and a reserve, never more than 120,000. A crash in the middle of
 a reply loses that reply. A session claimed by a shell that hangs stays claimed until it ends. The oldest sessions
 are deleted (20 kept, 1000 messages each). There is no way yet to browse older sessions: S04 restores the last one only. What is deferred is in #80.
+
+## D17 — The broker is layers over one service; a decision is audited in the transaction that records it (2026-10-17, accepted)
+
+**Context.** S17 turns S16's pure decisions into a service: tasks and workspaces, a grant store,
+reads and listings, sandbox runs, an audit log. Several choices were open, and several earlier steps
+left a duty to it: where `require_landlock=False` is allowed (D15), what to do about hosts that
+cannot enforce `pids` and total memory (#74), who owns the sandbox environment (#74), the sandbox's
+refusal of grants in `/tmp` (#79), what S16 asked of the daemon (#71), and S13's heartbeat and
+per-request deadline (#59, #60, #61). **Decision.** (1) *Layers.* The policy core, the storage
+(`audit`, `store`, `workspaces`) and `config`/`compose` know nothing of the transport. `service` is
+what a request does, `daemon` the server and `client` the shell's side; only those import
+`tumbleweed.ipc`, which imports nothing of the broker, and import-linter keeps it so (a module below
+`service` importing `service` would reach `ipc` through it, so a second contract forbids that, and a
+test checks the contract names every module). The broker's messages live in
+`tumbleweed.ipc.broker_messages` and name IDs and plain text, never broker types. (2) *One
+transaction, one audit.* A decision, the consumption of a once grant, the new taint and the audit
+entries are one synchronous block: the entries are written just before the database commits, so an
+entry that cannot be written rolls the act back and the request is refused, and there is no `await`
+between deciding and recording, which makes a lock unnecessary (two requests racing for a once grant
+cannot both win). A run has two entries, `sandbox_run` before it starts and `sandbox_run_result`
+after, because a crash in between must not leave a run that started unrecorded. If the commit fails
+after the entries were written, a `rolled_back` entry follows them. Every refusal once the task is
+known is recorded too (a refused run is a `sandbox_run` entry with outcome `refused`), the taint a
+new task inherits is read where it is recorded, and what a request reserves (a place under a cap, a
+`RunId`) is reserved before its first `await`. (3) *Owners.* A task belongs to the connection that
+made it and ends with it; a broker that starts ends what a dead one left (grants revoked, workspaces
+kept 7 days, taint kept for the task that replaces it). The daemon, not the caller, owns taint. (4)
+*The two host requirements are the daemon's settings, on by default, never a request's.*
+`--no-landlock` and `--allow-unenforced-limits` are for a development host (Docker Desktop's kernel
+has no Landlock; the container and CI have no systemd user manager); the audit log's start entry
+records them, and every result says what was not enforced. Where required, a run on a host whose
+runner reports `pids` or total memory as unenforced is refused before anything is opened. (5) *The
+sandbox's own paths are deny entries.* `/tmp`, `/workspace`, `/inputs`, the launcher's file and the
+runtime's paths are added to the deny list, so a grant the sandbox would refuse is refused when it
+is asked for (a prompt is never shown for what cannot run), instead of remapped: a remap would show
+the user a different path from the one that is granted. The directory of `$SSH_AUTH_SOCK` joins them
+(#71). (6) *The broker owns the environment* of a run: five fixed variables, and a request may add
+only `LANG`, `LC_ALL` and `TZ`; any other name is refused, not dropped. (7) *Filesystem calls can be
+abandoned.* Anything that walks or opens a path runs on a four-thread pool of its own with a
+deadline, because a hung mount blocks a thread for as long as it likes; a late result is discarded
+and a descriptor it opened is closed. (8) *The prompt is an interface the broker asks, with
+`AutoDeny` until S18.* Its answer is checked against the scopes offered and re-checked by
+`issue_grant`; a timeout, an exception and a malformed answer are denials. (9) *Heartbeat, not
+deadlines.* `BrokerClient` pings every 30 s and the daemon closes a connection that is silent for 90
+s while nothing is in progress (#59). The per-request deadline and cancel frame (#60) and
+per-direction unions (#61) are not done here: nothing in S17 needs them (a run ends at its own limit
+and the connection ending cancels it), and S18's prompts do. (10) *The store is accepted only after
+one read snapshot shows it is exactly ours*, including the automatic index rows of `sqlite_master`,
+and is not touched before (not even switched to WAL). **Deviations from the plan.** The broker's IPC
+handler timeout is 170 s (the longest run, its setup and 30 s), not the connection default of 25 s.
+`read_file`, `list_dir` and `request_grant` take the `RunId` from the caller instead of the broker
+allocating one for non-run operations (S16's note): a once grant binds to a run the caller names,
+and a caller that names a fresh one gets nothing from a once grant. The wire has no tool binding or
+trigger yet, so tool grants are modelled and stored but never apply (S24 adds them). The
+start-on-demand connector is in `tumbleweed.broker.client`, not wired into the shell (S19). Reads of
+a task's own workspace are not audited (they are not decisions). **Consequences.** Every request
+does at least one path walk on a worker and rebuilds the deny rules (about a hundred walks: 15 ms on
+a Mac, 8 ms in the container, measured), and the rules must be fresh at each decision (S16). The
+audit log is neither fsynced, rotated nor tamper evident (#82). A tree nested more than 128 levels
+cannot be deleted by the retention sweep; it is reported and retried after a pause that doubles with
+each failure, so that it does not hold up the rest (#84). S18 must extend the prompt interface (a
+`PromptId`, the picker, the requesting tool) and the wire for broker-to-shell requests.

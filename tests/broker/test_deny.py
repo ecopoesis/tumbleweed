@@ -746,7 +746,7 @@ class TestSharedPlacesUnderTmp:
 
     @pytest.mark.parametrize(
         "path",
-        ["/tmp/.X11-unix", "/tmp/.ICE-unix", "/tmp/.XIM-unix", "/tmp/.font-unix"],  # noqa: S108
+        ["/tmp/.X11-unix", "/tmp/.ICE-unix", "/tmp/.XIM-unix", "/tmp/.font-unix"],
     )
     def test_the_desktop_socket_directories(self, world: World, path: str) -> None:
         for spelled in (path, f"{path}/X0", f"{path}/a/b"):
@@ -760,11 +760,11 @@ class TestSharedPlacesUnderTmp:
         rules = DenyRules.build(context_for(tmp_path, uid=4242))
         identity = FsIdentity(fsid=1, ino=2)
 
-        mine = rules.check_text(StoredPath(path="/tmp/tmux-4242/default", identity=identity))  # noqa: S108
-        other = rules.check_text(StoredPath(path="/tmp/tmux-4243", identity=identity))  # noqa: S108
+        mine = rules.check_text(StoredPath(path="/tmp/tmux-4242/default", identity=identity))
+        other = rules.check_text(StoredPath(path="/tmp/tmux-4243", identity=identity))
 
         assert mine is not None
-        assert (mine.entry, mine.relation) == ("/tmp/tmux-<uid>", INSIDE)  # noqa: S108
+        assert (mine.entry, mine.relation) == ("/tmp/tmux-<uid>", INSIDE)
         assert other is None
 
     def test_tmux_tmpdir_when_set(self, tmp_path: Path) -> None:
@@ -793,15 +793,15 @@ class TestSharedPlacesUnderTmp:
 
     def test_tmp_itself_is_never_grantable(self, world: World) -> None:
         """By the ancestor rule (it holds protected entries) and as a shared directory."""
-        for path in ("/tmp", "/var/tmp"):  # noqa: S108
+        for path in ("/tmp", "/var/tmp"):
             match = world.rules.check(resolve(path))
             assert match is not None, path
 
     def test_var_tmp_and_what_is_in_it(self, world: World) -> None:
-        stored = StoredPath(path="/var/tmp/anything/at/all", identity=FsIdentity(fsid=1, ino=2))  # noqa: S108
+        stored = StoredPath(path="/var/tmp/anything/at/all", identity=FsIdentity(fsid=1, ino=2))
 
         assert world.rules.check_text(stored) is not None
-        assert world.rules.check(resolve("/var/tmp")) is not None  # noqa: S108
+        assert world.rules.check(resolve("/var/tmp")) is not None
 
     def test_ancestor_rule_makes_tmp_ungrantable_without_the_sticky_rule(self) -> None:
         """Which of the two refuses /tmp: the entries under it do, whatever its mode."""
@@ -815,7 +815,7 @@ class TestSharedPlacesUnderTmp:
             )
         )
 
-        match = rules.check_text(StoredPath(path="/tmp", identity=FsIdentity(fsid=1, ino=2)))  # noqa: S108
+        match = rules.check_text(StoredPath(path="/tmp", identity=FsIdentity(fsid=1, ino=2)))
 
         assert match is not None
         assert match.relation is ANCESTOR
@@ -869,7 +869,7 @@ class TestSharedDirectories:
         assert match.entry == SHARED_DIRECTORY
 
     def test_the_host_tmp_directories_are_shared_directories(self) -> None:
-        for path in ("/tmp", "/var/tmp"):  # noqa: S108
+        for path in ("/tmp", "/var/tmp"):
             resolved = resolve(path)
             if Path(path).stat().st_mode & 0o1002 != 0o1002:
                 continue  # a host where it is not (a container with a private /tmp)

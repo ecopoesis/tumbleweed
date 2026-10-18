@@ -15,6 +15,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 LINT = "from importlinter.cli import lint_imports_command; lint_imports_command()"
 
+BROKER_IPC = "the broker imports ipc only in its daemon layer"
+BROKER_LAYER = "the broker's policy core, store and audit log never import its daemon layer"
+IPC_BROKER = "ipc never imports the broker"
 SANDBOX = "sandbox never imports broker, agent, shell, voice, ui.gtk, gi or an LLM SDK"
 
 # (file to append to, the import to plant, the contract that must report BROKEN, and modules that
@@ -72,6 +75,42 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         "agent/echo.py",
         "import tumbleweed.shell.viewmodel.transcript",
         "agent never imports shell",
+        (),
+    ),
+    "the policy core imports the transport": (
+        "broker/policy.py",
+        "import tumbleweed.ipc.messages",
+        BROKER_IPC,
+        (),
+    ),
+    "the audit log imports the transport": (
+        "broker/audit.py",
+        "import tumbleweed.ipc.wire",
+        BROKER_IPC,
+        (),
+    ),
+    "the store reaches the transport through the daemon layer": (
+        "broker/store.py",
+        "import tumbleweed.broker.service",
+        BROKER_LAYER,
+        (),
+    ),
+    "the transport imports the broker": (
+        "ipc/wire.py",
+        "import tumbleweed.broker.errors",
+        IPC_BROKER,
+        (),
+    ),
+    "the broker's service imports the agent (I2)": (
+        "broker/service.py",
+        "import tumbleweed.agent.responder",
+        "broker never imports agent, shell, voice, ui.gtk, gi or an LLM SDK",
+        (),
+    ),
+    "the broker's daemon imports an LLM SDK (I2)": (
+        "broker/daemon.py",
+        "import anthropic",
+        "broker never imports agent, shell, voice, ui.gtk, gi or an LLM SDK",
         (),
     ),
     "the sandbox imports gi": ("sandbox/policy.py", "import gi", SANDBOX, ()),

@@ -158,10 +158,13 @@ shell, voice or `gi` (section 10).
   mount *sources*; a mount point's parents are another matter, below). bwrap closes the
   descriptors before the program runs. A grant may be, contain or be inside none of `/proc`,
   `/dev`, `/sys`, `/workspace`, `/inputs`, `/tmp`, another grant or a runtime path (a grant inside
-  `/tmp` would inherit Landlock's write rule for it). No nesting, because bwrap makes the mount point of an inner grant by walking the live
-  directory of the outer one, which the program can write to: a symlink planted there
+  `/tmp` would inherit Landlock's write rule for it; the broker refuses such a request when it is
+  made, section 7). No nesting, because bwrap makes the mount point of an inner grant by walking
+  the live directory of the outer one, which the program can write to: a symlink planted there
   (`/oldroot`, which bwrap itself uses to reach the host while it builds the sandbox) would send
-  that `mkdir` to the host, outside every grant. The broker keeps its grants apart (S17).
+  that `mkdir` to the host, outside every grant. The broker keeps its grants apart (S17): of two
+  grants where one is the other or inside it, only the outer is mounted
+  (`tumbleweed.broker.compose.disjoint_mounts`).
 - **Flags.** `--unshare-all --unshare-user --disable-userns --die-with-parent --new-session
   --clearenv --cap-drop ALL`, plus a hostname of its own. There is no network option until S22:
   the sandbox's `lo` is its own, and no host interface, host loopback or host abstract socket is
@@ -169,8 +172,10 @@ shell, voice or `gi` (section 10).
 - **Environment.** Empty, plus the variables the policy lists, each of which must be on the
   policy's allowlist (otherwise the policy is refused, not trimmed). A name that looks like a
   secret (`key`, `token`, `secret`, `passw`, `credential`, `auth`, `anthropic`) is refused even on
-  the allowlist (I6). bwrap adds `PWD`. The fixed allowlist of a real run is S17's (the launcher
-  only enforces the one it is given).
+  the allowlist (I6). bwrap adds `PWD`. The environment of a real run is the broker's (S17,
+  `tumbleweed.broker.compose`; the launcher only enforces the allowlist it is given): `PATH`,
+  `HOME` (`/workspace`), `TMPDIR`, `LANG` and `PYTHONDONTWRITEBYTECODE`, to which a request may add
+  only `LANG`, `LC_ALL` and `TZ`. Any other name is refused, not dropped.
 - **Limits (I9).** Wall time and output are the launcher's: stdout and stderr are read
   concurrently, each cut at `max_output_bytes`, and exceeding the cap or the wall clock `SIGKILL`s
   bwrap, which takes the sandbox's PID namespace down with it (`--die-with-parent`). CPU time, file
@@ -187,7 +192,8 @@ shell, voice or `gi` (section 10).
   in `detail`). The container and CI have no user manager, so they run the rlimit path; the scope
   path is tested against a stand-in for `systemd-run` there (it cannot show a kernel enforcing the
   limits), and on the target (S27) the scope is expected; its real verification is #73. The probe
-  is repeated every 60 s while the plan has no scope, and the scope is run by the absolute path
+  is repeated every 60 s while the plan has no scope, in the background while the old plan stays in
+  use so that a probe that hangs stalls no run, and the scope is run by the absolute path
   of the `systemd-run` the probe ran (a bare name is looked up on `PATH`, never in the current
   directory).
 - **Seccomp (S15).** bwrap loads a filter built with libseccomp through ctypes
@@ -219,9 +225,11 @@ shell, voice or `gi` (section 10).
   through a stream socketpair). **Integer arguments are compared masked to 32 bits**: the kernel
   truncates an `int`, a filter sees the whole register, so `(1 << 32) | AF_UNIX` was `AF_UNIX` to
   the kernel and a different number to a 64-bit compare (the first round's live escape). Every
-  rule on an `int` uses `MASKED_EQ` with `0xFFFFFFFF`, and a family with any high bit, or at or
-  above the kernel's `AF_MAX`, is refused whole. `personality` is allowed only as `PER_LINUX`
-  (0), and `kcmp`, `memfd_secret` and `process_madvise` are denied.
+  equality rule on an `int` uses `MASKED_EQ` with `0xFFFFFFFF`; the range rules (the family limit
+  and `personality`) compare the whole register on purpose, because a high bit only makes the
+  value larger. A family with any high bit, or at or above the kernel's `AF_MAX`, is refused
+  whole. `personality` is allowed only as `PER_LINUX` (0), and `kcmp`, `memfd_secret` and
+  `process_madvise` are denied.
   The filter is a deny list, so what it does not name is allowed; that is not an escape because the
   program also has no capabilities, no nested user namespaces, a read-only root and Landlock.
 - **The in-sandbox launcher and Landlock (S15).** The first process in the sandbox is
@@ -256,11 +264,15 @@ shell, voice or `gi` (section 10).
   needs. With it true, a kernel that has no usable Landlock (`ENOSYS`, `EOPNOTSUPP`, or `EPERM`,
   which is an outer seccomp filter refusing the call; any other answer is a refusal, not "no
   Landlock") makes the run raise `SandboxUnavailable` before the program starts, and so does a
-  report that does not say Landlock was applied (the runner checks it, it does not trust it), so a weaker sandbox is never what runs
-  by accident. A dev kernel without it (Docker Desktop's, #44) sets it false, and then every
+  report that does not say Landlock was applied (the runner checks it, it does not trust it), so a
+  weaker sandbox is never what runs by accident. A dev kernel without it (Docker Desktop's, #44)
+  sets it false, and then every
   result says so: `SandboxResult.hardening.landlock` is `unavailable`, with the kernel's answer in
   `detail`. Where Landlock is there it is always applied, whatever the flag says. Any other failure
   of the launcher (a missing mount path, `no_new_privs` unset, a filter not loaded) refuses too.
+  The broker decides where it may be false (S17, D17): only by the daemon's own setting
+  (`tumbleweed-broker --no-landlock`, for a development host), never by anything a request says;
+  the setting is on by default and is written to the audit log when the daemon starts.
 - **Failure.** A program that fails is a result. A sandbox that could not be set up (a mount
   source gone, a program that does not exist, user namespaces refused, a scope that cannot be
   started, a launcher that refused) raises `SandboxLaunchError` with the message of whoever
@@ -273,8 +285,144 @@ shell, voice or `gi` (section 10).
   `RLIMIT_AS` (the scope's memory limit covers them; without one, the open-file limit and the wall
   clock are what bound them); a fork bomb is bounded only by the wall clock (and the memory its
   processes use) without a scope; and nothing bounds the disk a program writes to its workspace
-  beyond the per-file limit. S17 must refuse, on the target, runs on a host that lacks the pids or
-  memory-total limit; these and the other gaps are tracked in #74.
+  beyond the per-file limit. The broker refuses, unless told otherwise
+  (`--allow-unenforced-limits`, for a development host), a run on a host whose runner reports the
+  pids or memory-total limit as unenforced (S17); these and the other gaps are tracked in #74.
+
+### Broker daemon
+
+`tumbleweed-broker` (`tumbleweed.broker.daemon`, S17, D17) serves the broker over the IPC of this
+section. It is built in layers that the import contracts keep apart: the policy core of section 7
+and the storage (`audit`, `store`, `workspaces`, `privatefs`) know nothing of the transport;
+`service` is what each request does, `daemon` is the server and `client` is the shell's side
+(`BrokerClient`, typed calls), and only those three import `tumbleweed.ipc`, which imports nothing
+of the broker. Nothing in the broker imports the agent or an LLM (I2).
+
+- **Requests and answers.** `start_task`, `end_task`, `request_grant`, `revoke_grant`,
+  `read_workspace_file`, `list_workspace`, `read_file`, `list_dir` and `run_in_sandbox`
+  (`tumbleweed.ipc.broker_messages`). Every body is a strict model with bounded fields before the
+  service sees it, so a request the schema refuses ends the connection like any malformed frame.
+  A request the broker declines is *answered* with `Refused`: a closed reason (`unknown_task`,
+  `invalid_request`, `denied`, `not_granted`, `not_found`, `unsafe`, `too_large`, `busy`,
+  `unavailable`, `timeout`, `failed`) and fixed text that never repeats a path, a command or the
+  model's reason. A denied grant is an ordinary answer (`GrantOutcome(granted=false)`).
+- **Tasks.** `start_task(previous, fresh_context)` ends `previous` and makes the new task, with a
+  private workspace (`<workspaces>/<TaskId>`, mode 0700), copying `previous`'s taint unless
+  `fresh_context`: the broker owns taint and the caller only says whether the model's context
+  carries over (I12). A task belongs to the connection that made it: any other connection is
+  answered `unknown_task`. When a connection ends its tasks end, and a broker that starts ends
+  whatever a stopped one left live (their once and task grants are revoked, their workspaces are
+  kept and their taint stays on record). At most 16 tasks are live, counted (with the ones being
+  made) before the workspace is, so tasks started together cannot all pass the cap. The taint a
+  new task inherits is read where the new task is recorded, after the workspace exists, with no
+  `await` in between: a grant or read on the task it replaces that completed while the workspace
+  was being made is inherited, as is the taint of one that ended meanwhile (I12).
+- **Grants and prompts.** `request_grant` canonicalises the path once, decides with
+  `policy.decide`, and only when no grant covers it and policy allows one asks a
+  `PromptInterface`. Until S18 that is `AutoDeny`, so nothing can be granted without a user. A
+  prompt gets the structured capability, the scopes it may offer (`once`, `task`: `tool` needs
+  S24's saved tools) and the model's reason as text to be quoted. Its answer is checked against
+  what was offered; a timeout (60 s), an exception, a scope not offered and an answer that is not
+  one of the two kinds are all a denial. The grant is issued by `policy.issue_grant` after the
+  deny rules are rebuilt, against the path as it was resolved *before* the prompt, so what the user
+  saw is what is recorded. Beyond S16's rules the broker refuses, at decision time and without
+  asking, what the sandbox would refuse to mount (section 7). A once grant that has been used up is
+  dropped at that moment (and marked revoked in the database), so the grants a task holds, at most
+  64, are the ones that can still be used; an audit entry that lists grant IDs holds the first 64
+  and says how many there were, so that no task is too big to end.
+- **Files.** `read_file` and `list_dir` take an absolute path and a `RunId`; they never prompt. The
+  decision (`decide`), the consumption of a once grant, the task's taint and the audit entry are
+  one transaction, written before anything is opened; then the grant is opened with
+  `open_granted` and the part below it with `open_below(expect=<what the decision saw>)`, so a
+  swap after the decision refuses instead of redirecting (I11). A read is at most 512 KiB and
+  refused, not cut, beyond the limit; a listing has at most 1000 entries, reports a symlink as a
+  symlink and leaves out names with control or format characters (and says how many). The same
+  without a decision, for the task's own workspace, with `read_workspace_file` and
+  `list_workspace`; those are not audited (they are not decisions). A read or listing that the
+  decision allowed (and recorded as `allowed`) but that opening refused (a swapped file, a
+  vanished one, a hung mount) gets a second `file_access` entry, `refused`, with the reason.
+- **Runs.** `run_in_sandbox(task, run, command, env, wall/cpu seconds, output limit)` is composed
+  from the task's grants as `select_grants` selects them for that run: every applicable `fs.read`
+  grant is opened by `open_granted` (any failure, a swapped or vanished path, refuses the whole
+  run), kept disjoint, and bound read-only at its host path by descriptor, with the task's
+  workspace read-write at `/workspace`. Writes are not offered (S16's gate), and a `net.full`
+  grant is held but gives no network until S22. The once grants the run uses are consumed, the
+  task's taint raised and a `sandbox_run` audit entry written in one transaction *before* the
+  program starts; `sandbox_run_result` follows when it ends. A `RunId` can be used once, and
+  it and the run's place under the task's cap are reserved before the first `await`, so requests
+  that arrive together cannot all pass; at most 4 runs are in progress (a fifth is refused, not
+  queued) and 1000 per task. Every refusal once the task is known (a forbidden variable, a reused
+  ID, a cap, a granted path that was swapped, grants that changed while the run was set up, a
+  timeout, the host's limits; except when the audit log or the database itself fails) is recorded
+  as a `sandbox_run` entry with outcome `refused` and a reason; a run cancelled before it was
+  authorised is recorded the same way. The limits a request may set are bounded (at most 120 s of
+  wall clock, 256 KiB of output per stream) and the rest are the broker's. **The host must be able
+  to enforce what I3 requires:** unless the daemon was told otherwise (`--allow-unenforced-limits`)
+  a run is refused, before anything is opened, when the runner reports the `pids` or total-memory
+  limit as unenforced; and Landlock is required unless `--no-landlock` (above). Both settings are
+  the daemon's and are written to the audit log at start. Ending a task, or its connection ending,
+  cancels its runs: the sandbox is killed and the run's result entry says `cancelled`.
+- **The audit log (I7).** `<broker>/audit.jsonl`: append-only JSONL, one typed entry
+  (`tumbleweed.broker.audit`, a pydantic model with a `kind` and a format version `v`) per daemon
+  start, task start and end, grant decision (covered, granted, denied, with the model's reason
+  quoted and cut; a grant the user allowed but the broker then refused, because the task ended,
+  the grant cap was reached or the file system hung, is a denied entry with that reason, and the
+  cap is checked before the user is asked), read or listing under a grant (allowed, refused, or
+  allowed and then refused at the open), revocation, run (authorised or refused, then its
+  result) and workspace deletion. It is opened `O_APPEND |
+  O_NOFOLLOW` as a regular file of ours, mode 0600, in a 0700 directory; an entry goes out in one
+  write and a failed one is cut back, so the file never holds half a line. The whole file is
+  ASCII (non-ASCII text is `\u` escaped), so that no character a reader might take for a line
+  break (U+0085, U+2028, U+2029 included) can start a second entry. An entry is written before
+  the act it records, inside the act's database transaction; if it cannot be written the act does
+  not happen and the request is answered `unavailable`. If the commit itself fails after the
+  entries were written, a `rolled_back` entry follows them, naming their kinds: the log never
+  keeps saying that something happened which did not. It is not fsynced (it survives a
+  crash of the broker, not a loss of power), not tamper evident and not rotated: anything running
+  as the user can edit it, which section 8 puts out of scope, and rotation is a follow-up (#82).
+  Later steps add fields with defaults or kinds of entry; this step hashes no content.
+- **The store.** `<broker>/broker.sqlite3` holds tasks (taint, when they ended, the identity of
+  their workspace) and grants (their JSON, validated strictly when read back; a record that
+  cannot be read grants nothing and is skipped). It is accepted only after one read snapshot shows
+  it is exactly ours (`application_id`, `user_version` and every row of `sqlite_master`, the
+  automatic indexes included, compared with what the migrations produce); anything else, a newer
+  version too, is refused with the file untouched, not even switched to WAL. Directory and file
+  are opened through descriptors with `O_NOFOLLOW`; `FsIdentity` is kept as text because SQLite's
+  integers are signed.
+- **Workspaces and retention.** A workspace is opened by the identity recorded when it was made
+  (`StoredPath.open`), never by name. Seven days after its task ended (`BrokerConfig.retention`,
+  checked in the background as soon as the broker has started, and every hour) it is deleted
+  through descriptors only: nothing a symlink in it
+  points at is touched, a directory the program made unreadable is given a mode first, and a tree
+  nested deeper than 128 levels is left in place and reported as failed. A workspace that cannot
+  be deleted is tried again after a pause that doubles with every failure (an hour, up to a day;
+  the count and the time are in the database), so that a few undeletable ones do not hold up the
+  rest of the queue. A directory in the workspaces directory named like a task that the database
+  does not know (a crash between making it and recording it) is removed in the same first sweep;
+  one whose task is being made is not an orphan, and any other name is left alone. A workspace
+  whose creation was abandoned (the request was cancelled or timed out) is removed when the
+  creation finally returns.
+- **The file system can hang.** Every decision-time and run-time open, walk, read and deletion
+  runs on a pool of four threads of its own (`FsWorker`) with a deadline (5 s; 60 s to delete); on
+  timeout the request is answered `timeout`, whatever the abandoned call finally returns is
+  discarded and a descriptor it opened is closed. If every thread is stuck the requests that need
+  the file system time out and the others are still answered.
+- **Connections (#59, #60, #61).** The daemon serves at most 8 connections. A request may take as
+  long as the longest run plus its setup (`handler_timeout` 170 s). A connection that receives
+  nothing for 90 s while nothing is in progress is closed, and `BrokerClient` pings every 30 s,
+  so a quiet shell is not idle and a dead one does not keep its slot. What S17 does *not* do: the
+  caller's deadline does not travel with a request and a caller that gives up cannot cancel it
+  (#60: a run ends at its own limit, and the connection ending cancels it; S18's prompts need
+  this); and request bodies still share one union for both directions (#61: S18 adds the first
+  broker-to-shell requests). `BrokerClient` gives the typed request-to-response pairing at the API
+  a caller uses.
+- **Development.** `BrokerConnector` connects and, if nobody is there, starts `python -I -m
+  tumbleweed.broker.daemon` detached, from `/`, with a minimal environment of its own (never the
+  shell's: the API key is not passed on, I6; `-I` and the working directory keep a module planted
+  where the shell runs from out of the broker) and retries with backoff for at most 30 s; on the
+  target a systemd user service starts the daemon (S27). The shell wires it in S19 (#89, and
+  S19's scope in the plan). `BrokerClient`'s heartbeat stops only when the connection ends; a ping
+  that times out or is refused is logged and the next is tried.
 
 ## 3. Request flow
 
@@ -368,8 +516,9 @@ audited.
 - **Capabilities** (v1): `fs.read(path)`, `fs.write(path)` (implies read), `net.full`.
   Host-scoped egress needs a filtering proxy and is post-v1.
 - **Grant scopes**:
-  - `once`: bound to the specific pending run (or handler call) whose request caused the
-    prompt, and consumed by it. No other run can use it.
+  - `once`: bound to the one run (or handler call) whose `RunId` the request named (the caller
+    chooses it: `request_grant`, `read_file`, `list_dir` and `run_in_sandbox` all carry one), and
+    consumed by it. No other run can use it.
   - `task`: lasts until the task ends.
   - `tool`: persisted, bound to a ToolId **and** the exact version content hash. A new
     version must be granted again. Tool grants apply **only** to sandbox handler runs
@@ -392,7 +541,15 @@ audited.
   sockets of the user's desktop and shell under `/tmp` (`.X11-unix`, `.ICE-unix`, `tmux-<uid>`,
   `$TMUX_TMPDIR`) are entries, which makes `/tmp` ungrantable by the ancestor rule, and so is
   `/var/tmp`: a read-only bind still lets a sandbox `connect()` to a socket. Any directory that
-  is world-writable and sticky is refused as a grant target too.
+  is world-writable and sticky is refused as a grant target too. The daemon adds what only it
+  knows (`BrokerConfig.deny_context`): its own data, workspaces and socket directories wherever
+  they are; the paths the sandbox builds itself, `/tmp` (so nothing at or inside `/tmp` can be
+  granted: the sandbox refuses it, because a grant there would inherit Landlock's write rule for
+  the sandbox's own tmpfs, and refusing at decision time means the user is never prompted for
+  what cannot run), `/workspace`, `/inputs` and the launcher's file; the runtime's own paths; and
+  the directory of `$SSH_AUTH_SOCK` when the daemon's environment has one. A systemd user service
+  does not have `TMUX_TMPDIR` or `SSH_AUTH_SOCK` from the user's login shell, so there the
+  defaults are what protects (`/tmp/tmux-<uid>` and anything under `/tmp`, `$XDG_RUNTIME_DIR`).
 - **Path handling.** At decision time the broker canonicalises the path once (absolute,
   `..` and symlinks resolved), checks it against the deny rules, and stores the canonical
   path together with its identity `(statfs f_fsid, st_ino)` (`st_dev` is not stable across
@@ -406,8 +563,11 @@ audited.
   the identity of each directory on the way and of the target), and `StoredPath`, what a grant
   keeps (canonical text and the target's identity), which is opened by `StoredPath.open` and
   never resolved again. Opens, at decision time and at run time, can wait as long as the file
-  system takes to answer (a hung network or FUSE mount); the daemon decides on a worker it can
-  abandon (S17).
+  system takes to answer (a hung network or FUSE mount); the daemon runs them on a worker it can
+  abandon, with a deadline (S17, section 2 "Broker daemon").
+  The decision-time walk reads the directories on the way, and the run-time open only searches them
+  (`O_PATH`, Linux), so a directory that can be searched but not read makes what is below it
+  ungrantable: that refuses more, never less, and is kept (#71).
 - **Network.** `net.full` gives the sandbox its own network namespace connected through
   `slirp4netns --disable-host-loopback` (no host loopback, no host abstract sockets),
   never `--share-net`. The payload is held with bwrap `--block-fd` until the network is
@@ -472,9 +632,10 @@ Each invariant names where it is enforced. Reviews check every change against th
   explicit grants, no host sockets (Wayland, X11, D-Bus, PipeWire, broker, shell, host
   loopback), user namespace with nested userns disabled, `no_new_privs`, all capabilities
   dropped, a seccomp filter (architecture-checked, non-native ABIs killed; no keyring calls and
-  no unix sockets or families beyond inet), a Landlock ruleset and a pids limit (both required on the target; on dev/CI
-  hosts without them the run reports their absence), CPU/memory/time/output limits, killed with
-  its parent.
+  no unix sockets or families beyond inet), a Landlock ruleset and a pids limit (both required on
+  the target: the broker refuses a run without them unless a development host's daemon was started
+  with `--no-landlock` or `--allow-unenforced-limits`, and every result and the audit log's start
+  entry say so), CPU/memory/time/output limits, killed with its parent.
 - **I4 — Generated UI is inert data.** The renderer accepts only the schema. No Pango markup
   from model text (plain text only; the shell puts untrusted text into labels through
   `tumbleweed.shell._widgets.plain_label`, and `tests/shell/test_markup_lint.py` rejects the GTK
@@ -507,7 +668,12 @@ Each invariant names where it is enforced. Reviews check every change against th
   provider's own words are never displayed or logged. The SDK's DEBUG and INFO logging, which would
   hold prompts and error text, is turned down to WARNING.
 - **I7 — Everything privileged is audited.** Every grant decision, sandbox run, snapshot,
-  restore and revocation is appended to the broker's audit log.
+  restore and revocation is appended to the broker's audit log (S17: `audit.jsonl`, section 2
+  "Broker daemon"), before the act it records, so an act whose entry cannot be written does not
+  happen (if a commit fails after its entries were written, a `rolled_back` entry follows them).
+  Refusals are logged too: a refused run, a refused read or listing, a grant the user allowed and
+  the broker then refused. Also logged: starts and ends of tasks and deleted workspaces. Reads of
+  a task's own workspace are not decisions and are not logged.
 - **I8 — Tools don't carry privilege.** Tool packages never contain grants or user state.
   Tool-scoped grants bind to (ToolId, content hash) and apply only to user-triggered runs
   (§7). Imported or modified tools must be granted again. For saved tools the broker runs
@@ -554,6 +720,12 @@ caps); the broker shares the shell's uid; full network grants are coarse; assist
 can carry injected content across tasks (but never into a net-tainted task from an
 fs-tainted one); prompt injection can still mislead the model
 within the grants a task already holds (which is why grants are narrow and snapshots exist).
+The deny rules (section 7) have documented limits, accepted for v1 (#66): a hard link, placed
+inside a granted directory, to a file inside a protected directory is not recognised (only the
+same uid can make one, and a sandbox sees none of the protected directories); a bind mount of a
+protected directory below a granted one would be exposed by bwrap's recursive bind (making one
+needs root, which is out of scope); the run-time re-check of a stored grant compares folded text
+only, so it can only refuse more; and case folding is not every file system's own equality.
 
 ## 9. Persistence layout
 
@@ -561,10 +733,10 @@ within the grants a task already holds (which is why grants are narrow and snaps
 |---|---|---|
 | Shell config (TOML), API key file (0600) | `$XDG_CONFIG_HOME/tumbleweed/` | Never |
 | Chat history (SQLite), invocation log | `$XDG_DATA_HOME/tumbleweed/shell/` | Never |
-| Broker data: grants, tool store, audit log | `$XDG_DATA_HOME/tumbleweed/broker/` | Never |
+| Broker data: grants and tasks (`broker.sqlite3`), tool store, audit log (`audit.jsonl`) | `$XDG_DATA_HOME/tumbleweed/broker/` | Never |
 | Copy/reflink snapshots | `$XDG_DATA_HOME/tumbleweed/broker/snapshots/` | Never |
 | btrfs snapshots | dedicated subvolume on the same filesystem, on the deny list | Never |
-| Workspaces | `$XDG_DATA_HOME/tumbleweed/workspaces/<TaskId>/` | Only their own, at `/workspace` |
+| Workspaces (kept 7 days after their task ends) | `$XDG_DATA_HOME/tumbleweed/workspaces/<TaskId>/` | Only their own, at `/workspace` |
 | Sockets | `$XDG_RUNTIME_DIR/tumbleweed/` (mode 0700) | Never |
 
 **Sockets.** `$XDG_RUNTIME_DIR/tumbleweed/` is created with mode 0700 and owned by the user. An
@@ -669,7 +841,8 @@ src/tumbleweed/
               the `Responder` interface the shell is built against (`agent/responder.py`)
   voice/      audio capture, STT, TTS, VAD, wake word
   history/    chat persistence
-  broker/     daemon, policy, grants, paths, tasks, workspaces, tool store, snapshots, audit
+  broker/     daemon, service, client, policy, grants, paths, tasks, workspaces, store, audit,
+              tool store and snapshots (later steps)
   sandbox/    sandbox policy, bwrap argv builder, seccomp filter, runner, sandbox-exec
 ```
 
@@ -677,6 +850,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
 
 - `broker` and `sandbox` never import `agent`, `shell`, `voice`, `ui.gtk` or any LLM SDK.
 - `sandbox` never imports `broker`.
+- `broker` imports `ipc` only in its daemon layer (`service`, `daemon`, `client`); the policy core,
+  storage and audit modules never do, nor do they import the daemon layer; `ipc` never imports
+  `broker`.
 - `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
   import `gi`.
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.

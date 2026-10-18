@@ -30,6 +30,7 @@ dependencies = [
 [project.scripts]
 tumbleweed-shell = "tumbleweed.shell.launch:main"
 tumbleweed-sandbox-exec = "tumbleweed.sandbox.sandbox_exec:main"
+tumbleweed-broker = "tumbleweed.broker.daemon:main"
 
 [dependency-groups]
 dev = [
@@ -114,6 +115,7 @@ exclude = ["tests/type_safety/fixtures/*.py"]
     "D104",
     "S101",  # assert is how tests assert
 ]
+"tests/broker/**" = ["S108"]  # the paths a sandbox is denied are the subject: /tmp
 "tests/sandbox/**" = ["S108"]  # the paths of a sandbox are the subject: /tmp, /dev/shm, /workspace
 "tests/type_safety/fixtures/*.py" = [
     "E501",    # marker comments make lines long
@@ -208,13 +210,61 @@ forbidden_modules = [
     "litellm",
 ]
 
-# S16 is the policy core, which has no IPC; S17 builds the daemon on it and replaces this contract
-# with the one that lets the daemon (and only it) use `tumbleweed.ipc`.
+# The policy core, the store and the audit log know nothing of the transport (S16, S17). Only the
+# daemon layer does: `service` (which answers IPC requests), `daemon` (the server) and `client`
+# (the shell's side). Indirect imports count, so nothing else may reach `ipc` through them either.
 [[tool.importlinter.contracts]]
-name = "broker policy core never imports ipc (S16; S17 lifts this for the daemon)"
+name = "the broker imports ipc only in its daemon layer: service, daemon and client (S17)"
 type = "forbidden"
 source_modules = ["tumbleweed.broker"]
 forbidden_modules = ["tumbleweed.ipc"]
+ignore_imports = [
+    "tumbleweed.broker.service -> tumbleweed.ipc.**",
+    "tumbleweed.broker.daemon -> tumbleweed.ipc.**",
+    "tumbleweed.broker.client -> tumbleweed.ipc.**",
+]
+
+# `service` is exempt from the contract above, so something below it importing `service` would
+# reach `ipc` through it. The modules below the daemon layer may not import it. A test
+# (tests/broker/test_layering.py) checks that this list names every module of the package.
+[[tool.importlinter.contracts]]
+name = "the broker's policy core, store and audit log never import its daemon layer (S17)"
+type = "forbidden"
+source_modules = [
+    "tumbleweed.broker.audit",
+    "tumbleweed.broker.capabilities",
+    "tumbleweed.broker.compose",
+    "tumbleweed.broker.config",
+    "tumbleweed.broker.deny",
+    "tumbleweed.broker.errors",
+    "tumbleweed.broker.fdio",
+    "tumbleweed.broker.fsworker",
+    "tumbleweed.broker.grants",
+    "tumbleweed.broker.identity",
+    "tumbleweed.broker.model",
+    "tumbleweed.broker.paths",
+    "tumbleweed.broker.policy",
+    "tumbleweed.broker.privatefs",
+    "tumbleweed.broker.prompts",
+    "tumbleweed.broker.service",
+    "tumbleweed.broker.store",
+    "tumbleweed.broker.task",
+    "tumbleweed.broker.workspace",
+    "tumbleweed.broker.workspaces",
+]
+forbidden_modules = [
+    "tumbleweed.broker.service",
+    "tumbleweed.broker.daemon",
+    "tumbleweed.broker.client",
+]
+
+# The transport is the broker's and the shell's, and depends on neither: messages name IDs and
+# plain text, and the broker maps them onto its own types.
+[[tool.importlinter.contracts]]
+name = "ipc never imports the broker (S17)"
+type = "forbidden"
+source_modules = ["tumbleweed.ipc"]
+forbidden_modules = ["tumbleweed.broker"]
 
 [[tool.importlinter.contracts]]
 name = "core never imports gi (ARCHITECTURE section 10)"
