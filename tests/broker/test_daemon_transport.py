@@ -17,7 +17,6 @@ from tests.ipc.bounded import run
 from tests.ipc.creds import FixedUid, other_uid
 from tests.ipc.helpers import RawPeer
 from tests.ipc.test_real_uid import (
-    CLIENT,
     HELLO_HEX,
     PYTHON,
     SecondUser,
@@ -34,6 +33,38 @@ from tumbleweed.ipc.limits import MAX_FRAME_BYTES, IpcLimits
 from tumbleweed.ipc.peercred import SupportsGetsockopt, Uid
 from tumbleweed.ipc.sockdir import SocketPath
 from tumbleweed.ipc.wire import ErrorFrame
+
+# Like the CLIENT of the real-uid tests, but it stays until the broker has answered the request
+# (the hello frame, then the response), so the broker has handled it before this side closes.
+SERVED_CLIENT = """
+import socket, struct, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(30)
+try:
+    s.connect(sys.argv[1])
+except OSError as error:
+    print("connect-failed", error.errno)
+    sys.exit(0)
+print("connected", flush=True)
+try:
+    s.sendall(bytes.fromhex(sys.argv[2]))
+    data = b""
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+        frames, at = 0, 0
+        while len(data) - at >= 4 and len(data) - at >= 4 + struct.unpack(">I", data[at:at + 4])[0]:
+            at += 4 + struct.unpack(">I", data[at:at + 4])[0]
+            frames += 1
+        if frames >= 2:
+            break
+except OSError as error:
+    print("error", error.errno)
+else:
+    print("data" if data else "eof", len(data))
+"""
 
 START_TASK = {"kind": "start_task", "previous": None, "fresh_context": False}
 
@@ -108,7 +139,7 @@ def test_a_real_second_user_is_closed_out_of_the_broker_while_we_are_served(
 
             ours = await asyncio.to_thread(
                 subprocess.run,
-                [PYTHON, "-c", CLIENT, str(rig.socket), HELLO_HEX + request],
+                [PYTHON, "-c", SERVED_CLIENT, str(rig.socket), HELLO_HEX + request],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -116,7 +147,14 @@ def test_a_real_second_user_is_closed_out_of_the_broker_while_we_are_served(
             )
             theirs = await asyncio.to_thread(
                 subprocess.run,
-                [*second_user.sudo, PYTHON, "-c", CLIENT, str(rig.socket), HELLO_HEX + request],
+                [
+                    *second_user.sudo,
+                    PYTHON,
+                    "-c",
+                    SERVED_CLIENT,
+                    str(rig.socket),
+                    HELLO_HEX + request,
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
