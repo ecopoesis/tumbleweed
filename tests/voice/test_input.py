@@ -392,7 +392,7 @@ class TestTheLengthLimit:
 
         assert r.recorder.texts == ["hello there"]
         assert len(r.stt.heard[0]) == 32_000  # type: ignore[union-attr]  # one second, no more
-        assert r.recorder.problems == ["Stopped listening: a recording is limited to 1 seconds."]
+        assert r.recorder.problems == ["Stopped listening: a recording is limited to 1 second."]
 
     def test_the_key_released_after_the_cap_changes_nothing(self, rig: RigFactory) -> None:
         r = rig(voice_limits=limits(max_utterance_seconds=1))

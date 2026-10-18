@@ -20,7 +20,7 @@ from tumbleweed.voice.input import VoicePhase
 
 
 def parse(text: str, **env: str) -> VoiceConfig:
-    return agent_config.parse_config(text, env, source="test").voice
+    return agent_config.parse_voice_config(text, env, source="test")
 
 
 @pytest.fixture
@@ -107,7 +107,7 @@ class TestTheTable:
             parse(text)
 
     def test_a_bad_override_is_refused(self) -> None:
-        with pytest.raises(ConfigError, match=r"voice\.stt_url"):
+        with pytest.raises(ConfigError, match="stt_url"):
             parse("", TUMBLEWEED_STT_URL="file:///etc/passwd")
 
     def test_the_override_is_refused_if_voice_is_not_a_table(self) -> None:
@@ -124,12 +124,30 @@ class TestTheTable:
 
             assert "hunter2" not in str(raised.value)
 
-    def test_the_agent_table_still_works_beside_it(self) -> None:
-        config = agent_config.parse_config(
-            '[agent]\nresponder = "echo"\n[voice]\nenabled = false\n', {}, source="t"
-        )
+    def test_a_mistake_in_the_voice_table_does_not_disable_the_agent(self, home: Path) -> None:
+        text = '[agent]\nresponder = "echo"\n[voice]\nstt_url = "ftp://nope.example"\n'
+        write_config(home, text)
+        environ = environ_for(home)
 
-        assert (config.agent.responder.value, config.voice.enabled) == ("echo", False)
+        assert agent_config.load_config(environ).agent.responder.value == "echo"
+        with pytest.raises(ConfigError, match="voice"):
+            agent_config.load_voice_config(environ)
+
+    def test_a_mistake_in_the_agent_table_does_not_disable_voice(self, home: Path) -> None:
+        write_config(home, '[agent]\nresponder = "nonsense"\n[voice]\nlanguage = "de"\n')
+        environ = environ_for(home)
+
+        with pytest.raises(ConfigError):
+            agent_config.load_config(environ)
+        assert agent_config.load_voice_config(environ).language == "de"
+
+    def test_a_syntax_error_in_the_file_is_both_their_problem(self, home: Path) -> None:
+        write_config(home, "this is not toml\n")
+
+        with pytest.raises(ConfigError):
+            agent_config.load_config(environ_for(home))
+        with pytest.raises(ConfigError):
+            agent_config.load_voice_config(environ_for(home))
 
 
 class TestBuildVoice:
@@ -172,7 +190,6 @@ class TestBuildVoice:
             "[voice]\nenabled = false\n",
             '[voice]\nstt_url = "ftp://nope.example"\n',
             "this is not toml\n",
-            "[agent]\nresponder = 5\n",
         ],
     )
     def test_when_there_is_nothing_to_give_there_is_none(

@@ -686,3 +686,61 @@ def test_the_window_module_uses_a_shortcut_controller_not_a_key_controller() -> 
 # does not use Vte (it never is: review), a key controller made outside the Vte modules and
 # `window.py`, and methods and signals Vte gains later outside them (the denylists are of the 3.91
 # stubs and of VTE 0.76; in the Vte modules the allowlist covers them).
+
+
+# Key controllers outside the terminal's own modules. The chat panel's is on its input only (Enter
+# sends). Push-to-talk (S06, D20) is the reviewed exception: a capture controller on the window,
+# which sees every key the window gets, the terminal's included. It is pinned to what it does: it
+# reads the key value and the modifiers of a press or release, passes nothing on, and does nothing
+# at all (returns False, the event goes on to the terminal) while the focus is in the terminal pane.
+PUSH_TO_TALK_MODULE = "shell/voice_controls.py"
+OTHER_KEY_CONTROLLER_MODULES = ["shell/chat_panel.py"]
+PUSH_TO_TALK_HANDLER_NAMES = frozenset(
+    {
+        "Gdk", "Gtk", "keyval", "state", "in_terminal", "held", "voice", "_RELEASE_KEYS",
+        "KEY_space", "accelerator_get_default_mod_mask", "ModifierType", "CONTROL_MASK",
+    }
+)  # fmt: skip
+
+
+def _function(tree: ast.AST, name: str) -> ast.FunctionDef:
+    (found,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name]
+    return found
+
+
+def test_push_to_talk_is_the_only_window_key_controller_outside_the_terminal_modules() -> None:
+    users = sorted(
+        str(path.relative_to(SOURCE))
+        for path in sources()
+        if str(path.relative_to(SOURCE)) not in KEY_CONTROLLER_MODULES
+        and any(name in path.read_text() for name in KEY_CONTROLLERS)
+    )
+
+    assert users == sorted([*OTHER_KEY_CONTROLLER_MODULES, PUSH_TO_TALK_MODULE])
+
+
+def test_the_push_to_talk_controller_reads_nothing_but_the_key_and_the_modifiers() -> None:
+    tree = ast.parse((SOURCE / PUSH_TO_TALK_MODULE).read_text())
+    install = _function(tree, "install_push_to_talk")
+    connected = sorted(
+        str(_constant(call.args[0]))
+        for call in ast.walk(install)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "connect"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "keys"
+    )
+    assert connected == ["key-pressed", "key-released"]
+
+    for handler in ("on_pressed", "on_released"):
+        function = _function(install, handler)
+        assert [a.arg for a in function.args.args][1:3] == ["keyval", "_keycode"]
+        loaded = {
+            node.id if isinstance(node, ast.Name) else node.attr
+            for statement in function.body
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Name | ast.Attribute)
+            and not (isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store))
+        } - {"press", "release"}
+        assert loaded <= PUSH_TO_TALK_HANDLER_NAMES, (handler, loaded - PUSH_TO_TALK_HANDLER_NAMES)

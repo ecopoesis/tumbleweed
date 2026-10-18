@@ -272,9 +272,10 @@ class VoiceInput:
         if generation != self._generation or self._phase is not VoicePhase.LISTENING:
             return
         seconds = self._limits.max_utterance_seconds
+        unit = "second" if seconds == 1 else "seconds"
         self._notify(
             lambda observer: observer.problem(
-                f"Stopped listening: a recording is limited to {seconds} seconds."
+                f"Stopped listening: a recording is limited to {seconds} {unit}."
             )
         )
         self.release()

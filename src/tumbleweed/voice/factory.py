@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import final
 
-from tumbleweed.agent.config import load_config
+from tumbleweed.agent.config import load_voice_config
 from tumbleweed.agent.errors import AgentError
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.voice.audio import AudioSource
@@ -50,9 +50,10 @@ def _gstreamer_source(config: VoiceConfig) -> AudioSource:
 def build_voice(environ: Mapping[str, str], dispatcher: MainThreadDispatcher) -> VoiceSetup | None:
     """The voice input the configuration asks for, or None if there is none to give."""
     try:
-        config = load_config(environ).voice
+        config = load_voice_config(environ)
     except AgentError as exc:
-        logger.warning("voice is off: the configuration cannot be used (%s)", type(exc).__name__)
+        # Our own bounded text (it names the keys that are wrong, never their values).
+        logger.warning("voice is off: %s", str(exc)[:300])
         return None
     if not config.enabled:
         logger.info("voice input is disabled in the configuration")

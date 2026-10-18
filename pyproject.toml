@@ -438,3 +438,13 @@ type = "forbidden"
 source_modules = ["tumbleweed.agent"]
 forbidden_modules = ["tumbleweed.voice"]
 ignore_imports = ["tumbleweed.agent.config -> tumbleweed.voice.config"]
+
+[[tool.importlinter.contracts]]
+name = "voice imports the agent only in its factory, for the configuration loader and the errors (S06)"
+type = "forbidden"
+source_modules = ["tumbleweed.voice"]
+forbidden_modules = ["tumbleweed.agent"]
+ignore_imports = [
+    "tumbleweed.voice.factory -> tumbleweed.agent.config",
+    "tumbleweed.voice.factory -> tumbleweed.agent.errors",
+]

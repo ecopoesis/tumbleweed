@@ -55,6 +55,10 @@ class TestCleanTranscript:
             "[ Silence ]",
             "[MUSIC] [MUSIC]",
             "(upbeat music) [applause]",
+            "[MUSIC PLAYING]",
+            "(soft gentle music)",
+            "[ Background noise ]",
+            "[Blank_Audio]",
         ],
     )
     def test_nothing_said_is_none(self, raw: str) -> None:

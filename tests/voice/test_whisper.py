@@ -95,6 +95,7 @@ class TestTheRequest:
         headers = stub.requests[0].headers
         assert headers["accept-encoding"] == "identity"
         assert headers["accept"] == "application/json"
+        assert headers["connection"] == "close"
         assert "authorization" not in headers
         assert "cookie" not in headers
 
@@ -268,6 +269,40 @@ class TestSizeLimits:
         stub.reply = Reply(headers={**JSON, "Content-Encoding": "identity"})
 
         assert make().transcribe(utterance()) == " hello world\n"
+
+
+class TestTheLimitIsExactWhateverTheFraming:
+    """`max_response_bytes` is accepted exactly and refused one byte over, with a Content-Length and
+    without one (the end of the answer is the close, and each piece is counted as it comes)."""
+
+    @staticmethod
+    def body_of(size: int) -> bytes:
+        text = b'{"text": "' + b"a" * (size - 12) + b'"}'
+        assert len(text) == size
+        return text
+
+    @pytest.mark.parametrize("framed", ["content-length", "until-close"])
+    def test_exactly_the_limit_is_read(self, stub: StubServer, make: Make, framed: str) -> None:
+        body = self.body_of(2048)
+        if framed == "content-length":
+            stub.reply = Reply(body=body)
+        else:
+            stub.reply = Reply(chunks=[body[:1000], body[1000:]], length=False)
+
+        text = make(voice_limits=limits(max_response_bytes=2048)).transcribe(utterance())
+
+        assert text == "a" * 2036
+
+    @pytest.mark.parametrize("framed", ["content-length", "until-close"])
+    def test_one_byte_over_is_refused(self, stub: StubServer, make: Make, framed: str) -> None:
+        body = self.body_of(2049)
+        if framed == "content-length":
+            stub.reply = Reply(body=body)
+        else:
+            stub.reply = Reply(chunks=[body[:1000], body[1000:]], length=False)
+
+        with pytest.raises(SttResponseError, match="larger than allowed"):
+            make(voice_limits=limits(max_response_bytes=2048)).transcribe(utterance())
 
 
 class TestWaiting:
@@ -502,7 +537,7 @@ class TestADrippingServer:
         monkeypatch.setattr(socket, "getaddrinfo", never)
         spent = budget.RequestBudget(timedelta(seconds=5), AbortSignal())
 
-        assert budget._resolve(address, 80, spent) == address  # noqa: SLF001
+        assert budget._resolve(address, 80, spent) == [address]  # noqa: SLF001
 
 
 class TestAbandoning:
@@ -678,3 +713,281 @@ class TestTls:
             done.set()
             listener.close()
             thread.join(timeout=5)
+
+
+class TestSeveralAddresses:
+    """`localhost` is `::1` and `127.0.0.1`, and the server listens on one of them."""
+
+    @staticmethod
+    def answers(monkeypatch: pytest.MonkeyPatch, port: int, *addresses: str) -> None:
+        real = socket.getaddrinfo
+
+        def fake(host: str, *args: object, **kwargs: object) -> list[tuple[object, ...]]:
+            if host != "stt.test":  # an address: the library's own connect looks it up too
+                return real(host, *args, **kwargs)  # type: ignore[arg-type,return-value]
+            return [
+                (
+                    socket.AF_INET6 if ":" in address else socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    6,
+                    "",
+                    (address, port, 0, 0) if ":" in address else (address, port),
+                )
+                for address in addresses
+            ]
+
+        monkeypatch.setattr(socket, "getaddrinfo", fake)
+
+    def test_a_name_whose_first_answer_is_not_listening_reaches_the_second(
+        self, stub: StubServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        port = int(stub.url.rsplit(":", 1)[1])
+        self.answers(monkeypatch, port, "::1", "127.0.0.1")  # the stub listens on IPv4 only
+        backend = WhisperServerBackend(
+            SttEndpoint(f"http://stt.test:{port}"), language="auto", limits=limits()
+        )
+        try:
+            assert backend.transcribe(utterance()) == " hello world\n"
+        finally:
+            backend.close()
+
+    def test_the_resolver_may_answer_the_same_address_twice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.answers(monkeypatch, 80, "127.0.0.1", "127.0.0.1", "::1")
+        spent = budget.RequestBudget(timedelta(seconds=5), AbortSignal())
+
+        assert budget._resolve("stt.test", 80, spent) == ["127.0.0.1", "::1"]  # noqa: SLF001
+
+    def test_when_every_address_refuses_the_last_error_is_the_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]  # closed again: nothing listens there
+        self.answers(monkeypatch, port, "::1", "127.0.0.1")
+        backend = WhisperServerBackend(
+            SttEndpoint(f"http://stt.test:{port}"), language="auto", limits=limits()
+        )
+        try:
+            with pytest.raises(SttUnavailableError, match="could not be reached"):
+                backend.transcribe(utterance())
+        finally:
+            backend.close()
+
+    def test_a_real_localhost_is_reached(self, stub: StubServer) -> None:
+        """On a Mac `localhost` is `::1` first, and the stub listens on 127.0.0.1."""
+        port = stub.url.rsplit(":", 1)[1]
+        backend = WhisperServerBackend(
+            SttEndpoint(f"http://localhost:{port}"), language="auto", limits=limits()
+        )
+        try:
+            assert backend.transcribe(utterance()) == " hello world\n"
+        finally:
+            backend.close()
+
+
+class TestTheRequestGoesThroughTheBudget:
+    def test_every_connection_is_made_by_the_budgeted_backend(
+        self, stub: StubServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        connects: list[str] = []
+        original = budget.BudgetBackend.connect_tcp
+
+        def spy(self: budget.BudgetBackend, host: str, *args: object, **kwargs: object) -> object:
+            connects.append(host)
+            return original(self, host, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(budget.BudgetBackend, "connect_tcp", spy)
+        backend = WhisperServerBackend(SttEndpoint(stub.url), language="auto", limits=limits())
+        try:
+            backend.transcribe(utterance())
+        finally:
+            backend.close()
+
+        assert connects == ["127.0.0.1"]
+
+
+class TestAbortingEveryStage:
+    """Esc ends the request wherever it is: looking a name up, connecting, sending, waiting."""
+
+    @staticmethod
+    def abort_soon(signal: AbortSignal, after: float = 0.2) -> None:
+        threading.Timer(after, signal.set).start()
+
+    def test_during_a_name_lookup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        release = threading.Event()
+
+        def stuck(*args: object, **kwargs: object) -> list[object]:
+            release.wait(timeout=10)
+            raise OSError("never")
+
+        monkeypatch.setattr(socket, "getaddrinfo", stuck)
+        backend = WhisperServerBackend(
+            SttEndpoint("http://stt.invalid:8080"),
+            language="auto",
+            limits=limits(request_timeout_seconds=10),
+        )
+        signal = AbortSignal()
+        self.abort_soon(signal)
+        started = time.monotonic()
+        try:
+            with pytest.raises(SttCancelledError):
+                backend.transcribe(utterance(), signal)
+
+            assert time.monotonic() - started < 2
+        finally:
+            release.set()
+            backend.close()
+
+    def test_during_a_connect(self, stub: StubServer, monkeypatch: pytest.MonkeyPatch) -> None:
+        release = threading.Event()
+
+        def slow(self: httpcore2.SyncBackend, *args: object, **kwargs: object) -> object:
+            release.wait(timeout=10)
+            raise httpcore2.ConnectError("never")
+
+        monkeypatch.setattr(httpcore2.SyncBackend, "connect_tcp", slow)
+        backend = WhisperServerBackend(
+            SttEndpoint(stub.url), language="auto", limits=limits(request_timeout_seconds=10)
+        )
+        signal = AbortSignal()
+        self.abort_soon(signal)
+        started = time.monotonic()
+        try:
+            with pytest.raises(SttCancelledError):
+                backend.transcribe(utterance(), signal)
+
+            assert time.monotonic() - started < 2
+        finally:
+            release.set()
+            backend.close()
+
+    def test_a_connect_that_succeeds_after_the_abort_is_closed_and_unused(
+        self, stub: StubServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        made: list[httpcore2.NetworkStream] = []
+        original = httpcore2.SyncBackend.connect_tcp
+        late = threading.Event()
+
+        def delayed(
+            self: httpcore2.SyncBackend, *args: object, **kwargs: object
+        ) -> httpcore2.NetworkStream:
+            late.wait(timeout=10)
+            stream = original(self, *args, **kwargs)  # type: ignore[arg-type]
+            made.append(stream)
+            return stream
+
+        monkeypatch.setattr(httpcore2.SyncBackend, "connect_tcp", delayed)
+        backend = WhisperServerBackend(
+            SttEndpoint(stub.url), language="auto", limits=limits(request_timeout_seconds=10)
+        )
+        signal = AbortSignal()
+        self.abort_soon(signal)
+        try:
+            with pytest.raises(SttCancelledError):
+                backend.transcribe(utterance(), signal)
+            late.set()  # the connect finishes now, after the request was given up
+            deadline = time.monotonic() + 5
+            while not made and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            assert made
+            assert stub.requests == []  # nothing was sent on it
+        finally:
+            late.set()
+            backend.close()
+
+    def test_just_after_the_last_byte_is_a_cancellation_not_a_transcript(self) -> None:
+        signal = AbortSignal()
+
+        class SetsTheSignalAtTheEnd(httpx2.SyncByteStream):
+            def __iter__(self) -> Iterator[bytes]:
+                yield b'{"text": "fine"}'
+                signal.set()  # the user pressed Esc as the last byte arrived
+
+        class Transport(httpx2.BaseTransport):
+            def handle_request(self, request: httpx2.Request) -> httpx2.Response:
+                request.read()
+                return httpx2.Response(200, headers=JSON, stream=SetsTheSignalAtTheEnd())
+
+        voice_limits = limits(request_timeout_seconds=5)
+        backend = WhisperServerBackend(
+            SttEndpoint("http://127.0.0.1:1"),
+            language="auto",
+            limits=voice_limits,
+            client=build_http_client(voice_limits, transport=Transport()),
+        )
+
+        with pytest.raises(SttCancelledError):
+            backend.transcribe(utterance(), signal)
+
+
+class TestTheBudgetIsReleased:
+    def test_each_request_ends_its_budget_and_unhooks_its_abort_and_opens_its_own_connection(
+        self, stub: StubServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ended: list[object] = []
+        aborted: list[bool] = []
+        connected: list[str] = []
+        end, abort_all, connect = (
+            budget.BudgetBackend.end,
+            budget.BudgetBackend.abort_all,
+            budget.BudgetBackend.connect_tcp,
+        )
+
+        def spy_end(self: budget.BudgetBackend, spent: budget.RequestBudget) -> None:
+            ended.append(spent)
+            end(self, spent)
+
+        def spy_abort_all(self: budget.BudgetBackend) -> None:
+            aborted.append(True)
+            abort_all(self)
+
+        def spy_connect(
+            self: budget.BudgetBackend, host: str, *args: object, **kw: object
+        ) -> object:
+            connected.append(host)
+            return connect(self, host, *args, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(budget.BudgetBackend, "end", spy_end)
+        monkeypatch.setattr(budget.BudgetBackend, "abort_all", spy_abort_all)
+        monkeypatch.setattr(budget.BudgetBackend, "connect_tcp", spy_connect)
+        backend = WhisperServerBackend(SttEndpoint(stub.url), language="auto", limits=limits())
+        signals = [AbortSignal(), AbortSignal()]
+        try:
+            for signal in signals:
+                assert backend.transcribe(utterance(), signal) == " hello world\n"
+            for signal in signals:
+                signal.set()  # after the requests: nothing is listening any more
+        finally:
+            backend.close()
+
+        assert len(ended) == 2
+        assert aborted == []
+        assert len(connected) == 2  # no keep-alive: a connection each
+
+
+class TestOneBigWrite:
+    def test_a_large_write_is_sent_in_pieces_and_stops_at_the_deadline(self) -> None:
+        """The library applies its timeout to every `send` of one write, so a peer that takes 16
+        KiB each 0.3 s would hold a 960 KB write for 18 s."""
+        written: list[int] = []
+
+        class SlowPeer(httpcore2.NetworkStream):
+            def write(self, buffer: bytes, timeout: float | None = None) -> None:
+                for _ in range(0, len(buffer), 16 * 1024):
+                    time.sleep(0.3)
+                written.append(len(buffer))
+
+        owner = budget.BudgetBackend()
+        owner.begin(timedelta(seconds=1), AbortSignal())
+        stream = budget._BudgetStream(SlowPeer(), owner)  # noqa: SLF001
+        started = time.monotonic()
+
+        with pytest.raises(httpcore2.WriteTimeout):
+            stream.write(b"x" * 960_000, 30.0)
+
+        assert time.monotonic() - started < 2
+        assert 3 <= len(written) <= 5
+        assert max(written) <= 16 * 1024

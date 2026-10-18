@@ -132,12 +132,13 @@ class AgentConfig(BaseModel):
 
 @final
 class TumbleweedConfig(BaseModel):
-    """The whole file. Other components add their tables as they arrive."""
+    """The whole file as the agent reads it. Other components add their tables as they arrive; the
+    `[voice]` table is read apart (`load_voice_config`), so that a mistake in it disables voice
+    and not the agent."""
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     agent: AgentConfig = AgentConfig()
-    voice: VoiceConfig = VoiceConfig()
 
 
 @final
@@ -278,11 +279,7 @@ def parse_config(text: str, environ: Mapping[str, str], *, source: str) -> Tumbl
             raise ConfigError(f"In {source}: [agent] must be a table.")
         for key, value in _env_overrides(environ).items():
             agent[key] = value
-        if stt_url := environ.get("TUMBLEWEED_STT_URL"):
-            voice = data.setdefault("voice", {})
-            if not isinstance(voice, dict):
-                raise ConfigError(f"In {source}: [voice] must be a table.")
-            voice["stt_url"] = stt_url
+        data.pop("voice", None)  # read apart: `parse_voice_config`
         return TumbleweedConfig.model_validate_json(json.dumps(data))
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{source} is not valid TOML: {str(exc)[:200]}") from None
@@ -292,18 +289,50 @@ def parse_config(text: str, environ: Mapping[str, str], *, source: str) -> Tumbl
         raise ConfigError(f"{source} holds a value that cannot be used.") from None
 
 
-def load_config(environ: Mapping[str, str]) -> TumbleweedConfig:
-    """The configuration: the file if there is one, then the environment's overrides."""
+def _config_text(environ: Mapping[str, str]) -> tuple[str, str]:
+    """The text of the configuration file and what to call it in a message ("the environment" if
+    there is no file). Raises `ConfigError` for a file that cannot be used."""
     path = config_dir(environ) / "config.toml"
     try:
         data = _read_regular_file(path, limit=MAX_CONFIG_BYTES, private=False, what="config file")
     except FileNotFoundError:
-        return parse_config("", environ, source="the environment")
+        return "", "the environment"
     try:
-        text = data.decode("utf-8")
+        return data.decode("utf-8"), str(path)
     except UnicodeDecodeError:
         raise ConfigError(f"The config file must be UTF-8 text: {path}") from None
-    return parse_config(text, environ, source=str(path))
+
+
+def load_config(environ: Mapping[str, str]) -> TumbleweedConfig:
+    """The configuration: the file if there is one, then the environment's overrides."""
+    text, source = _config_text(environ)
+    return parse_config(text, environ, source=source)
+
+
+def parse_voice_config(text: str, environ: Mapping[str, str], *, source: str) -> VoiceConfig:
+    """The `[voice]` table of TOML `text`, with `TUMBLEWEED_STT_URL` applied. Raises `ConfigError`
+    (a message that never repeats a value: a URL may hold credentials)."""
+    try:
+        voice = tomllib.loads(text).get("voice", {})
+        if not isinstance(voice, dict):
+            raise ConfigError(f"In {source}: [voice] must be a table.")
+        if stt_url := environ.get("TUMBLEWEED_STT_URL"):
+            voice["stt_url"] = stt_url
+        return VoiceConfig.model_validate_json(json.dumps(voice))
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{source} is not valid TOML: {str(exc)[:200]}") from None
+    except (TypeError, ValueError) as exc:
+        if isinstance(exc, ValidationError):
+            raise ConfigError(
+                f"Invalid [voice] configuration in {source}: {_problems(exc)}"
+            ) from None
+        raise ConfigError(f"{source} holds a value that cannot be used.") from None
+
+
+def load_voice_config(environ: Mapping[str, str]) -> VoiceConfig:
+    """The voice configuration, apart from the agent's: an error here is voice's alone."""
+    text, source = _config_text(environ)
+    return parse_voice_config(text, environ, source=source)
 
 
 def _key_from_text(raw: str, *, source: str) -> ApiKey:

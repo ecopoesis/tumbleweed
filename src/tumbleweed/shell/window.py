@@ -79,7 +79,7 @@ class ShellWindow(Adw.ApplicationWindow):
                 edit_before_send=voice.edit_before_send,
             )
             self.status_strip.insert_child_after(self.voice_controls, self.status_strip.voice)
-            self.voice_controls.install_keys(self)
+            self.voice_controls.install_keys(self, self._terminal_has_focus)
 
         # The separator and the panel hide together.
         self._side = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -180,6 +180,12 @@ class ShellWindow(Adw.ApplicationWindow):
         if self._side.get_visible() and self.get_focus() is None:
             # Hiding the panel took the focus with it; do not leave the window with none.
             self.chat_panel.focus_input()
+
+    def _terminal_has_focus(self) -> bool:
+        focus = self.get_focus()
+        return focus is not None and (
+            focus is self.terminal_pane or focus.is_ancestor(self.terminal_pane)
+        )
 
     def _on_escape(self, _widget: Gtk.Widget, _args: object) -> bool:
         if self.voice_controls is not None and self.voice_controls.cancel_listening():

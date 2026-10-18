@@ -20,6 +20,7 @@ from tests.shell.gtk_support import (
     input_text,
     pump_until,
     rows,
+    show,
     type_text,
 )
 from tests.voice.support import limits, pcm
@@ -206,6 +207,91 @@ class TestHoldingTheKey:
         v.shell.window.notify("is-active")
 
         assert indicator(v) == "Voice: transcribing"
+
+
+class TestAHeldKey:
+    def test_holding_past_the_length_cap_records_once_and_sends_one_message(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        v = build_voiced()
+        hold_and_speak(v, 3.0)  # the cap is 2 seconds: the recording stops by itself
+        assert pump_until(lambda: indicator(v) == "Voice: idle" and len(rows(v.shell)) == 2)
+
+        for _ in range(10):  # the key is still down, and repeats
+            assert key(v, "key-pressed", Gdk.KEY_space) is True
+        pump_until(lambda: False, timeout=0.3)
+
+        assert v.source.starts == 1
+        assert len(rows(v.shell)) == 2  # one message and its reply
+        key(v, "key-released", Gdk.KEY_space)
+        key(v, "key-pressed", Gdk.KEY_space)  # a new press, after the release, starts again
+        assert pump_until(lambda: v.source.starts == 2)
+
+    def test_a_start_that_fails_is_not_retried_by_key_repeat(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+        from tumbleweed.voice.errors import AudioError
+
+        v = build_voiced()
+        v.source.start_error = AudioError("No mic.")
+        key(v, "key-pressed", Gdk.KEY_space)
+        assert pump_until(lambda: controls(v).message.get_visible())
+        for _ in range(5):
+            key(v, "key-pressed", Gdk.KEY_space)
+        pump_until(lambda: False, timeout=0.3)
+
+        assert v.source.start_attempts == 1
+
+
+class TestAClickStartedRecording:
+    def test_a_space_or_ctrl_typed_meanwhile_does_not_end_it(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        v = build_voiced(hold_stt=True)
+        controls(v).mic_button.set_active(True)
+        assert pump_until(lambda: v.source.capturing)
+
+        key(v, "key-released", Gdk.KEY_space)  # a space typed in the input
+        key(v, "key-released", Gdk.KEY_Control_L, ctrl=False)  # Ctrl+C
+
+        assert indicator(v) == "Voice: listening"
+        controls(v).mic_button.set_active(False)
+        assert indicator(v) == "Voice: transcribing"
+
+
+class TestInsideTheTerminal:
+    def test_ctrl_space_with_the_terminal_focused_is_the_terminals_and_records_nothing(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk, Gtk
+
+        v = build_voiced()
+        window = v.shell.window
+        show(v.shell)
+        pane = window.terminal_pane
+        inside = Gtk.Box()  # stands for the terminal: anything focusable inside its pane
+        inside.set_focusable(True)
+        pane.append(inside)
+        pane.set_visible(True)
+        window.set_focus(inside)
+        assert window.get_focus() is inside
+
+        pressed = key(v, "key-pressed", Gdk.KEY_space)
+        released = key(v, "key-released", Gdk.KEY_space)
+
+        assert pressed is False  # not consumed: it goes on to the terminal
+        assert released is False
+        assert indicator(v) == "Voice: idle"
+        assert v.source.starts == 0
+        window.set_focus(window.chat_panel.input_view)  # and outside it the key works again
+        assert pump_until(lambda: window.get_focus() is window.chat_panel.input_view)
+        assert key(v, "key-pressed", Gdk.KEY_space) is True
+        assert indicator(v) == "Voice: listening"
 
 
 class TestTheMicButton:

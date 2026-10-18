@@ -32,7 +32,7 @@ class FakeAudioSource:
         gate: threading.Event | None = None,
     ) -> None:
         self._max_bytes = max_bytes
-        self._start_error = start_error
+        self.start_error = start_error
         self._stop_error = stop_error
         self._gate = gate
         self._buffer = BoundedPcm(max_bytes)
@@ -40,12 +40,14 @@ class FakeAudioSource:
         self.on_full_callbacks: list[Callable[[], None]] = []
         self.capturing = False
         self.starts = 0
+        self.start_attempts = 0
         self.cancels = 0
         self.closed = False
 
     def start(self, on_full: Callable[[], None]) -> None:
-        if self._start_error is not None:
-            raise self._start_error
+        self.start_attempts += 1
+        if self.start_error is not None:
+            raise self.start_error
         self.starts += 1
         self._buffer = BoundedPcm(self._max_bytes)
         self._on_full = on_full

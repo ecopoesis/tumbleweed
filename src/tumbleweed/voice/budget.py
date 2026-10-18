@@ -35,6 +35,7 @@ _SocketOption = (
     tuple[int, int, int] | tuple[int, int, bytes | bytearray] | tuple[int, int, None, int]
 )
 _NO_TIME: Final = "the request's time is used up"
+_WRITE_PIECE_BYTES: Final = 16 * 1024
 
 
 @final
@@ -57,34 +58,37 @@ class RequestBudget:
         return left if per_operation is None else min(per_operation, left)
 
 
-def _resolve(host: str, port: int, budget: RequestBudget) -> str:
-    """The address `host` names, found within the budget. Raises `TimeoutError`."""
-    try:
-        socket.inet_pton(socket.AF_INET, host)
-        return host
-    except OSError:
-        pass
-    try:
-        socket.inet_pton(socket.AF_INET6, host)
-        return host
-    except OSError:
-        pass
+def _resolve(host: str, port: int, budget: RequestBudget) -> list[str]:
+    """Every address `host` names, in the resolver's order, found within the budget. An address
+    is its own answer. Raises `TimeoutError` if there is no answer in time, or none at all."""
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, host)
+            return [host]
+        except OSError:
+            continue
     found: list[str] = []
-    done = threading.Event()
+    done = threading.Event()  # set by the lookup finishing, or by the user abandoning the request
 
     def look_up() -> None:
         try:
-            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-            found.append(str(infos[0][4][0]))
-        except (OSError, IndexError):
+            for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+                address = str(info[4][0])
+                if address not in found:
+                    found.append(address)
+        except OSError:
             pass
         done.set()
 
     threading.Thread(target=look_up, name="tumbleweed-dns", daemon=True).start()
-    left = budget.bound(None)
-    if not done.wait(timeout=left) or not found:
-        raise TimeoutError(host)  # no answer in time, or none at all: the connect fails either way
-    return found[0]
+    budget.abort.on_set(done.set)
+    try:
+        waited = done.wait(timeout=budget.bound(None))
+    finally:
+        budget.abort.remove(done.set)
+    if not waited or budget.abort.is_set or not found:
+        raise TimeoutError(host)  # no answer in time, abandoned, or none at all: the connect fails
+    return list(found)
 
 
 @final
@@ -101,11 +105,14 @@ class _BudgetStream(httpcore2.NetworkStream):
         return self._inner.read(max_bytes, bounded)
 
     def write(self, buffer: bytes, timeout: float | None = None) -> None:
-        try:
-            bounded = self._owner.budget().bound(timeout)
-        except ValueError:
-            raise httpcore2.WriteTimeout(_NO_TIME) from None
-        self._inner.write(buffer, bounded)
+        # In pieces, each cut to what is left: the library sends a whole buffer with its timeout
+        # applied again to every `send`, so one big write could outlast the deadline.
+        for start in range(0, max(len(buffer), 1), _WRITE_PIECE_BYTES):
+            try:
+                bounded = self._owner.budget().bound(timeout)
+            except ValueError:
+                raise httpcore2.WriteTimeout(_NO_TIME) from None
+            self._inner.write(buffer[start : start + _WRITE_PIECE_BYTES], bounded)
 
     def close(self) -> None:
         self._owner.forget(self)
@@ -194,15 +201,73 @@ class BudgetBackend(httpcore2.NetworkBackend):
     ) -> httpcore2.NetworkStream:
         budget = self.budget()
         try:
-            address = _resolve(host, port, budget)
-            bounded = budget.bound(timeout)
+            addresses = _resolve(host, port, budget)
         except (ValueError, TimeoutError):
             raise httpcore2.ConnectTimeout(_NO_TIME) from None
-        stream = _BudgetStream(
-            self._inner.connect_tcp(address, port, bounded, local_address, socket_options), self
-        )
-        self.track(stream)
-        return stream
+        # Every address in turn, as `socket.create_connection` does: `localhost` is `::1` and
+        # `127.0.0.1`, and a server may listen on only one of them. Each try gets what is left.
+        last: Exception | None = None
+        for address in addresses:
+            try:
+                bounded = budget.bound(timeout)
+            except ValueError:
+                raise httpcore2.ConnectTimeout(_NO_TIME) from None
+            try:
+                inner = self._connect(budget, address, port, bounded, local_address, socket_options)
+            except (httpcore2.ConnectError, httpcore2.ConnectTimeout) as exc:
+                last = exc
+                continue
+            stream = _BudgetStream(inner, self)
+            self.track(stream)
+            return stream
+        raise last if last is not None else httpcore2.ConnectError("no address to connect to")
+
+    def _connect(
+        self,
+        budget: RequestBudget,
+        address: str,
+        port: int,
+        bounded: float | None,
+        local_address: str | None,
+        socket_options: Iterable[_SocketOption] | None,
+    ) -> httpcore2.NetworkStream:
+        """One connect, on a throwaway thread so that the user's abort can end the wait at once.
+
+        The connect itself ends within `bounded` (the library's timeout); if the request was
+        abandoned by then, the stream it made is closed by that thread and nobody uses it."""
+        lock = threading.Lock()
+        outcome: list[httpcore2.NetworkStream | Exception] = []
+        abandoned = False
+        finished = threading.Event()
+
+        def run() -> None:
+            try:
+                made: httpcore2.NetworkStream | Exception = self._inner.connect_tcp(
+                    address, port, bounded, local_address, socket_options
+                )
+            except (httpcore2.ConnectError, httpcore2.ConnectTimeout) as exc:
+                made = exc
+            with lock:
+                if abandoned and not isinstance(made, Exception):
+                    made.close()
+                else:
+                    outcome.append(made)
+            finished.set()
+
+        threading.Thread(target=run, name="tumbleweed-connect", daemon=True).start()
+        budget.abort.on_set(finished.set)
+        try:
+            finished.wait(timeout=(bounded or 0) + 1.0)
+        finally:
+            budget.abort.remove(finished.set)
+        with lock:
+            if not outcome:
+                abandoned = True
+                raise httpcore2.ConnectTimeout(_NO_TIME)
+            result = outcome[0]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     def connect_unix_socket(
         self,

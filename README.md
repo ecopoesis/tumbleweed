@@ -104,7 +104,9 @@ status strip. It is your tool, not the agent's: nothing the model says can type 
   (`getent passwd`) has it, not `$SHELL`, in your home directory. F12 or the button again hides the pane and
   keeps the shell; `exit` closes the pane and the next F12 starts a new shell; closing the window ends the
   shell (SIGHUP, then SIGKILL after a second). While the terminal has the focus, Ctrl+L is the shell's (clear
-  screen) and not "focus the input"; Ctrl+Q and F9 still act on the shell (#90).
+  screen) and not "focus the input"; Ctrl+Q and F9 still act on the shell (#90). Ctrl+Space is the
+  shell's too (set-mark in Emacs and readline): push-to-talk ([Voice input](#voice-input)) does nothing,
+  and lets the key through untouched, while the terminal has the focus; use the Mic button there.
 - **Where there is no VTE** (macOS, whose Homebrew has no GTK 4 build of it): F12 opens an external terminal
   window, in your home directory: Terminal.app (`open -b com.apple.Terminal`) on a Mac, otherwise the first of
   `x-terminal-emulator`, `gnome-terminal`, `kgx`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `foot`,
@@ -247,7 +249,7 @@ browser, and others) are in #80.
 
 ### Voice input
 
-Hold **Ctrl+Space** and speak; let go and the words are transcribed and sent as your message (or click
+Hold **Ctrl+Space** (anywhere but the terminal) and speak; let go and the words are transcribed and sent as your message (or click
 **Mic** in the status strip to start, and click again to stop). The voice indicator shows
 *listening* while you talk and *transcribing* while the speech server works; **Esc** abandons the
 utterance. Speech-to-text is whisper.cpp's `whisper-server`, which the shell reaches over HTTP, so
@@ -358,7 +360,9 @@ few small pure-Python packages, all locked for the three platforms, and 1.13 is 
 inside the cooldown today) and `httpx2`, the SDK's HTTP library, which is a direct dependency because
 `agent.anthropic_provider` imports it: for the transport that bounds a response, for refusing
 redirects and environment proxies, and for its exception types, and by `voice.whisper`, the speech
-server's client (one HTTP stack for the project, not two: DECISIONS D20, #43). A new one needs its justification in the PR and a lock for macOS and Linux.
+server's client (one HTTP stack for the project, not two: DECISIONS D20, #43). `httpcore2`, httpx2's own
+transport library, is declared too (it was already locked as httpx2's dependency): `voice.budget` and
+`voice.whisper` use it to put one deadline on every operation of a speech request. A new one needs its justification in the PR and a lock for macOS and Linux.
 
 - To update: `uv lock --upgrade`, which re-resolves with the window as of today.
 - To take a newer release of one package before its week is up (a security fix), add

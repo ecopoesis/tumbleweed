@@ -28,14 +28,33 @@ _SEPARATORS: Final = frozenset({"Cc", "Zl", "Zp"})  # controls and line and para
 # The zero-width joiners are part of how some scripts and emoji sequences are written.
 _KEPT_FORMAT: Final = frozenset({"\N{ZERO WIDTH NON-JOINER}", "\N{ZERO WIDTH JOINER}"})
 # What whisper writes for sound that is not speech: "[BLANK_AUDIO]", "(silence)", "[ Music ]",
-# "(upbeat music)", "[background noise]". Only these, in brackets or parentheses and alone: short
-# bracketed speech ("(1)", "[sic]") is still speech.
-_NON_SPEECH_WORD: Final = (
-    r"blank[_ ]audio|silence|music|applause|laughter|laughing|noise|inaudible|crosstalk|"
-    r"no audio|no speech|pause|sigh|cough|coughing"
-)
-_ANNOTATION: Final = rf"[\[(]\s*(?:[a-z]+ ){{0,2}}(?:{_NON_SPEECH_WORD})\s*[\])]"
-_NON_SPEECH: Final = re.compile(rf"(?:{_ANNOTATION}\s*)+", re.IGNORECASE)
+# "(upbeat music)", "[MUSIC PLAYING]", "[background noise]". A text that is only bracketed or
+# parenthesised groups, each made only of words from this vocabulary, is no speech. The trade-off:
+# a spoken "(music)" alone is lost; short bracketed speech ("(1)", "[sic]", "(yes)") is kept.
+_ANNOTATION_WORDS: Final = frozenset(
+    {
+        "blank", "audio", "silence", "silent", "music", "playing", "plays", "applause",
+        "clapping", "laughter", "laughing", "noise", "noises", "inaudible", "crosstalk", "no",
+        "speech", "pause", "sigh", "sighs", "cough", "coughing", "upbeat", "soft", "gentle",
+        "dramatic", "background", "light", "loud", "sad", "calm", "static", "sound", "sounds",
+        "typing", "breathing",
+    }
+)  # fmt: skip
+_GROUP: Final = r"[\[(]([^\[\]()]{0,60})[\])]"
+_ONLY_GROUPS: Final = re.compile(rf"(?:{_GROUP}\s*)+")
+_GROUPS: Final = re.compile(_GROUP)
+
+
+def _is_annotation_only(text: str) -> bool:
+    if _ONLY_GROUPS.fullmatch(text) is None:
+        return False
+    for inner in _GROUPS.findall(text):
+        words = inner.lower().replace("_", " ").split()
+        if not words or not set(words) <= _ANNOTATION_WORDS:
+            return False
+    return True
+
+
 _LANGUAGE: Final = re.compile(r"auto|[a-z]{2,3}")
 
 
@@ -121,6 +140,6 @@ def clean_transcript(raw: str, *, max_bytes: ByteCount) -> str | None:
         else:
             kept.append(char)
     text = " ".join("".join(kept).split())
-    if not text or _NON_SPEECH.fullmatch(text) is not None:
+    if not text or _is_annotation_only(text):
         return None
     return text

@@ -12,9 +12,11 @@ the session bus (`tests/shell/test_session_bus.py` pins the set), and another pr
 able to switch the microphone on (ARCHITECTURE I10, section 8).
 
 - **Hold Ctrl+Space** to talk and let go to send (`install_push_to_talk`: a capture-phase key
-  controller on the window, so the key works wherever the focus is). Releasing Space or Ctrl ends
-  it, and so does the window losing focus, so a key release that is never delivered cannot leave the
-  microphone open (the recording also stops by itself at its length limit).
+  controller on the window, so the key works wherever the focus is **except in the terminal pane**,
+  where Ctrl+Space is the shell's and the event is not touched). The key is latched: repeat while it
+  is held does nothing. Releasing Space or Ctrl ends the recording the key started, and so does the
+  window losing focus, so a key release that is never delivered cannot leave the microphone open
+  (the recording also stops by itself at its length limit).
 - **Click the mic** to start and click again to stop; the button shows pressed while listening.
 - **Esc** while listening or transcribing abandons the utterance (`ShellWindow`).
 
@@ -22,6 +24,7 @@ Nothing here blocks: `VoiceInput` does the audio and the network on worker threa
 """
 
 import logging
+from collections.abc import Callable
 from typing import assert_never, final
 
 from tumbleweed.shell._gi import Gdk, Gtk, Pango
@@ -82,9 +85,9 @@ class VoiceControls(Gtk.Box):
         self.append(self.message)
         voice.subscribe(self)
 
-    def install_keys(self, window: Gtk.Window) -> None:
-        """Hold Ctrl+Space to talk, anywhere in `window`."""
-        self.keys = install_push_to_talk(window, self._voice)
+    def install_keys(self, window: Gtk.Window, in_terminal: Callable[[], bool]) -> None:
+        """Hold Ctrl+Space to talk, anywhere in `window` but the terminal pane."""
+        self.keys = install_push_to_talk(window, self._voice, in_terminal)
 
     # VoiceObserver
 
@@ -142,34 +145,59 @@ class VoiceControls(Gtk.Box):
         self.message.set_visible(bool(text))
 
 
-def install_push_to_talk(window: Gtk.Window, voice: VoiceInput) -> Gtk.EventControllerKey:
-    """Hold Ctrl+Space to talk, anywhere in `window`; see the module docstring."""
+def install_push_to_talk(
+    window: Gtk.Window, voice: VoiceInput, in_terminal: Callable[[], bool]
+) -> Gtk.EventControllerKey:
+    """Hold Ctrl+Space to talk, anywhere in `window` but the terminal; see the module docstring.
+
+    This is the one key controller in the shell outside the terminal's own modules, and it is
+    reviewed as such (`tests/shell/test_terminal_isolation.py`): it looks at the key value and the
+    modifiers of a press or release, nothing else, and it does nothing at all, letting the event
+    through untouched, while `in_terminal()` says the focus is in the terminal pane (Ctrl+Space is
+    the shell's own key there: set-mark in Emacs and readline).
+
+    The key is *latched*: only the first Ctrl+Space press starts a recording, key repeat is consumed
+    and ignored, and only the release of Space or Ctrl (or the window losing focus) ends what the
+    keyboard started. A recording the mic button started is not ended by a space typed in the
+    input, and a held key cannot record again when its utterance ends.
+    """
     keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+    held = (
+        False  # the keyboard has an utterance in hand: set by the first press, cleared by release
+    )
 
     def on_pressed(
         _controller: Gtk.EventControllerKey, keyval: int, _keycode: int, state: Gdk.ModifierType
     ) -> bool:
+        nonlocal held
         if keyval != Gdk.KEY_space:
             return False
         if state & Gtk.accelerator_get_default_mod_mask() != Gdk.ModifierType.CONTROL_MASK:
             return False
-        voice.press()  # key repeat arrives as more presses: ignored while listening
-        return True
+        if in_terminal():
+            return False  # the terminal's key: untouched, and no latch
+        if not held:
+            held = True
+            voice.press()
+        return True  # key repeat is consumed: it never types spaces, it never records again
 
     def on_released(
         _controller: Gtk.EventControllerKey, keyval: int, _keycode: int, _state: Gdk.ModifierType
     ) -> None:
-        if keyval in _RELEASE_KEYS:
+        nonlocal held
+        if keyval in _RELEASE_KEYS and held:
+            held = False
+            voice.release()
+
+    def on_focus_changed(_window: Gtk.Window, _pspec: object) -> None:
+        # A window that is no longer active gets no key release.
+        nonlocal held
+        if not window.is_active() and held:
+            held = False
             voice.release()
 
     keys.connect("key-pressed", on_pressed)
     keys.connect("key-released", on_released)
     window.add_controller(keys)
-    window.connect("notify::is-active", lambda _w, _p: _on_focus_changed(window, voice))
+    window.connect("notify::is-active", on_focus_changed)
     return keys
-
-
-def _on_focus_changed(window: Gtk.Window, voice: VoiceInput) -> None:
-    """A window that is no longer active gets no key release: stop listening."""
-    if not window.is_active():
-        voice.release()

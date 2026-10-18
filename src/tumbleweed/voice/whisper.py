@@ -33,10 +33,12 @@ headers: only the status code, the exception's type and the endpoint's `display`
 credentials) are.
 """
 
+import contextlib
 import io
 import logging
 import time
 import wave
+from collections.abc import Iterable, Iterator
 from typing import Final, final
 
 import httpcore2
@@ -73,20 +75,81 @@ class _WhisperAnswer(BaseModel):
     text: str
 
 
+@contextlib.contextmanager
+def _mapped(request: httpx2.Request) -> Iterator[None]:
+    """`httpcore2`'s exceptions as `httpx2`'s, by family (the client's callers look at these)."""
+    try:
+        yield
+    except httpcore2.TimeoutException as exc:
+        raise httpx2.TimeoutException(str(exc), request=request) from exc
+    except httpcore2.NetworkError as exc:
+        raise httpx2.NetworkError(str(exc), request=request) from exc
+    except httpcore2.ProtocolError as exc:
+        raise httpx2.ProtocolError(str(exc), request=request) from exc
+    except (httpcore2.UnsupportedProtocol, httpcore2.ConnectionNotAvailable) as exc:
+        raise httpx2.TransportError(str(exc), request=request) from exc
+
+
 @final
-class _BudgetTransport(httpx2.HTTPTransport):
-    """`httpx2`'s transport over a connection pool whose network is `BudgetBackend`, with no
-    keep-alive (one request at a time, each on a connection of its own)."""
+class _ResponseStream(httpx2.SyncByteStream):
+    def __init__(self, inner: Iterable[bytes], request: httpx2.Request) -> None:
+        self._inner = inner
+        self._request = request
+
+    def __iter__(self) -> Iterator[bytes]:
+        with _mapped(self._request):
+            yield from self._inner
+
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            close()
+
+
+@final
+class _BudgetTransport(httpx2.BaseTransport):
+    """An `httpx2` transport over an `httpcore2` connection pool whose network is `BudgetBackend`
+    (the documented way to give the pool one), with no keep-alive: one request at a time, each on
+    a connection of its own (the client asks the server to close it: `Connection: close`)."""
 
     def __init__(self, network: BudgetBackend) -> None:
-        super().__init__(verify=True, trust_env=False)
-        self._pool.close()
         self._pool = httpcore2.ConnectionPool(
             ssl_context=httpx2.create_ssl_context(trust_env=False),
             max_connections=2,
             max_keepalive_connections=0,
             network_backend=network,
         )
+
+    def handle_request(self, request: httpx2.Request) -> httpx2.Response:
+        stream = request.stream
+        if not isinstance(stream, httpx2.SyncByteStream):
+            raise httpx2.TransportError("a request body must be a synchronous stream")
+        sent = httpcore2.Request(
+            method=request.method,
+            url=httpcore2.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=stream,
+            extensions=request.extensions,
+        )
+        with _mapped(request):
+            received = self._pool.handle_request(sent)
+        body = received.stream
+        if not isinstance(body, Iterable):
+            raise httpx2.TransportError("the response body is not a synchronous stream")
+        return httpx2.Response(
+            status_code=received.status,
+            headers=received.headers,
+            stream=_ResponseStream(body, request),
+            extensions=received.extensions,
+        )
+
+    def close(self) -> None:
+        self._pool.close()
 
 
 def wav_bytes(utterance: Utterance) -> bytes:
@@ -121,7 +184,11 @@ def build_http_client(
             write=min(seconds, _MAX_WRITE_TIMEOUT),
             pool=POOL_TIMEOUT,
         ),
-        headers={"Accept": "application/json", "Accept-Encoding": "identity"},
+        headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "Connection": "close",  # one request, one connection: nothing is kept for later
+        },
     )
 
 

@@ -71,6 +71,8 @@ class StubServer:
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"  # keep-alive is possible: a client that reuses shows it
+
             def do_POST(self) -> None:
                 length = int(self.headers.get("Content-Length", "0"))
                 if stub.read_slowly:
@@ -123,6 +125,10 @@ class StubServer:
                 handler.send_header(name, value)
             if reply.length:
                 handler.send_header("Content-Length", str(sum(len(chunk) for chunk in chunks)))
+            else:
+                handler.close_connection = True  # no length: the end of the answer is the close
+                if "Connection" not in reply.headers:
+                    handler.send_header("Connection", "close")
             handler.end_headers()
             for chunk in chunks:
                 handler.wfile.write(chunk)

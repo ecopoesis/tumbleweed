@@ -461,7 +461,8 @@ rest of `src/` it is a denylist by name of the calls that feed or paste, read te
 screen or reach the pty, of any `.props` access, of the properties and signals that carry what the shell
 says or what is typed, of `emit` of those and of the clipboard signals, and of subclassing `Vte.*`.
 Gaps: outside the Vte modules an alias, `getattr` or a variable signal or property name; a key
-controller made elsewhere; methods Vte adds later (outside those modules); a widget handed to another
+controller made elsewhere (S06's push-to-talk is one, reviewed and pinned by test: it does nothing
+while the terminal has the focus, D20); methods Vte adds later (outside those modules); a widget handed to another
 module; deliberate obfuscation.
 Closing the terminal moves the focus to the chat input. That shows the side panel again if F9 hid
 it, because the input must be visible to take the focus; it applies whether the shell exits or F12
@@ -595,8 +596,13 @@ built from fixed elements none of which writes, a Python audit hook sees no writ
 utterance (it cannot see native writes, so a Linux test runs a real capture and checks that no file
 appears). (7) *Push-to-talk is a key and a button,
 not `GAction`s,* which the session bus would export. The key is Ctrl+Space, fixed (#100); the button
-toggles. (8) *The indicator gains `TRANSCRIBING`* (S08's state machine names it); `THINKING` and `SPEAKING`
-stay for S07. (9) *Config:* a `[voice]` table beside `[agent]`, the URL validated by `SttEndpoint` when the
+toggles. The key is a capture controller on the window, so it is the reviewed exception to S05's
+rule that the terminal's keystrokes are nobody's (D18): in the terminal pane it returns False and
+keeps no state (Ctrl+Space is the shell's: set-mark), and a test pins what its handlers read. It is
+latched, so key repeat records nothing more and a space typed during a click-started recording does
+not end it. (8) *The indicator gains `TRANSCRIBING`* (S08's state machine names it); `THINKING` and `SPEAKING`
+stay for S07. (9) *Config:* a `[voice]` table beside `[agent]`, read apart from it (a mistake in one does not
+disable the other; a syntax error in the file is both's), the URL validated by `SttEndpoint` when the
 file is read; `TUMBLEWEED_STT_URL` overrides it. (10) *Models* are fetched by `scripts/whisper-model`
 against pinned SHA-256 hashes, and Homebrew's `whisper.cpp` formula builds without the server, so the
 README builds it from the tagged source (checked against v1.9.5 with Metal).
@@ -606,7 +612,7 @@ indicator had no such state, so one was added.
 leaves the audio worker stuck, since GStreamer's state change to NULL has no timeout: the indicator
 says "transcribing", or "idle" after Esc while the device may still be open, until the device returns
 (#101, deferred: the fix is a disposable thread with a bounded join and a visible "device busy" state);
-the main thread stays free. `agent.config` imports `voice.config` and `voice.factory` imports
-`agent.config`, nothing more between the packages (a contract). The macOS and PipeWire/Pulse capture paths are not exercised in CI (no device, and no
+the main thread stays free. `agent.config` imports `voice.config`, and `voice.factory` imports `agent.config` (the loader)
+and `agent.errors`, nothing more between the packages (two contracts). The macOS and PipeWire/Pulse capture paths are not exercised in CI (no device, and no
 GStreamer on the macOS runner); the pipeline up to the source is (#102). Whisper can invent words from
 silence; only a tap under 300 ms and a bare annotation are dropped until S08's VAD (#103).

@@ -93,7 +93,11 @@ the import contracts are for. What it checks:
   `paste-clipboard` and `copy-clipboard`, and subclassing `Vte.*`.
 
 What it does not see: outside the Vte modules, a call through an alias or `getattr`, or a signal or
-property named by a variable; a key controller made anywhere but the Vte modules and `window.py`;
+property named by a variable; a key controller made anywhere but the Vte modules and `window.py`
+(there are two, both reviewed and pinned by their own tests: the chat input's Enter key, and
+push-to-talk's capture controller on the window, which sees every key including the terminal's and
+so does nothing, and returns False, while the focus is in the terminal pane: section 2, "Voice
+input");
 methods and signals Vte gains later, outside the Vte modules; a terminal widget handed to another
 module (it never is); and anything done by obfuscation as above.
 
@@ -551,6 +555,18 @@ generation, so what an abandoned utterance finds later is dropped.
   which writes (checked by name), and an utterance run under a Python audit hook writes nothing
   (`tests/voice/test_no_audio_on_disk.py`; an audit hook cannot see native writes, so a Linux test
   also runs a real GStreamer capture and checks that no file appears).
+- *Keys.* Push-to-talk is a capture-phase key controller on the window, the one place the
+  terminal's lint cannot see (S05's "key controller made elsewhere" gap), so it is reviewed and pinned
+  (`tests/shell/test_terminal_isolation.py`: it connects only `key-pressed` and `key-released`, reads
+  only the key value and the modifiers, and has no other name in its handlers). While the focus is
+  in the terminal pane it returns False at once and keeps no state: Ctrl+Space is the shell's
+  (set-mark), and no keystroke typed there is looked at beyond its key value. Elsewhere the key is
+  *latched*: the first press starts a recording, repeat is consumed and ignored (a held or stuck key
+  cannot record again when its utterance ends), the release of Space or Ctrl ends what the keyboard
+  started (not a recording the Mic button started), and so does the window losing focus.
+- *Configuration.* `[voice]` is read apart from `[agent]` (`agent.config.load_voice_config`): a
+  mistake in it turns voice off, with a logged message, and leaves the agent working, and the other
+  way round; a syntax error in the file is both's.
 - *Failures* are fixed text shown next to the Mic button (never a server's or a library's words),
   and the shell keeps running; a bug in a backend is logged by type and place, not by message.
 
@@ -1177,8 +1193,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
 - `history` never imports `shell` or `agent`; the shell depends on it through `ChatHistory`.
 - The Anthropic SDK is imported only by `agent.anthropic_provider`; the rest of the agent, and
-  everything else, uses the `LlmProvider` interface (D3). Its HTTP library, `httpx2`, is also
-  imported by `voice.whisper`, the speech server's client, and by nothing else (D20, #43). `agent` runs its asyncio loop on its own
+  everything else, uses the `LlmProvider` interface (D3). Its HTTP library, `httpx2`, and that
+  library's transport, `httpcore2`, are also imported by `voice.whisper`, the speech server's client,
+  and `voice.budget` (`httpcore2` only), and by nothing else (D20, #43). `agent` runs its asyncio loop on its own
   worker thread and reaches the GTK main thread only through a dispatcher the shell injects (D11).
 - `shell.viewmodel` never imports `gi`, directly or through another module, so it cannot import
   the GTK adapter modules of `shell` either. `tests/test_import_contracts.py` plants each
