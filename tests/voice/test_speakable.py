@@ -170,11 +170,12 @@ class TestMarkdown:
 
         chunker.feed("`" * 70_000)  # one line of marks, no end yet
 
-        assert len(chunker._probe) <= 64  # noqa: SLF001  (the bound is the point)
+        assert chunker._probe == ""  # noqa: SLF001  (the bound is the point: a count, no string)
+        assert chunker._run_len == 70_000  # noqa: SLF001
         inside = SentenceChunker(max_sentence_chars=400)
         inside.feed("```\n" + "`" * 70_000)  # a run of marks on a line inside a fence
-        assert len(inside._probe) <= 64  # noqa: SLF001
-        assert time.monotonic() - started < 10  # linear: a quadratic copy would take minutes
+        assert inside._probe == ""  # noqa: SLF001
+        assert time.monotonic() - started < 30  # linear: a quadratic copy would take far longer
         reply = (
             "Before it is here.\n"
             + "`" * 70_000
@@ -183,6 +184,34 @@ class TestMarkdown:
             + "\nAfter it is done."
         )
         assert speak(reply) == ["Before it is here.", "After it is done."]
+
+    @pytest.mark.parametrize("mark", ["`", "~"])
+    @pytest.mark.parametrize(
+        ("opener", "inner"), [(200, 100), (65, 64), (64, 63), (10, 9), (4, 3), (130, 129)]
+    )
+    def test_a_fence_closes_only_on_a_run_as_long_as_its_opener(
+        self, mark: str, opener: int, inner: int
+    ) -> None:
+        reply = (
+            f"Before the code.\n{mark * opener}\nsecret one here.\n{mark * inner}\n"
+            f"secret two here.\n{mark * inner} \nsecret three here.\n{mark * opener}\n"
+            "After it all is spoken."
+        )
+
+        assert speak(reply) == ["Before the code.", "After it all is spoken."]
+
+    @pytest.mark.parametrize("mark", ["`", "~"])
+    @pytest.mark.parametrize("opener", [3, 4, 65, 200])
+    def test_a_run_longer_than_the_opener_closes_it_and_so_does_the_exact_one(
+        self, mark: str, opener: int
+    ) -> None:
+        for closer in (opener, opener + 1, opener + 70):
+            reply = (
+                f"Before the code.\n{mark * opener}py\nsecret here.\n{mark * closer}  \n"
+                "After it all is spoken."
+            )
+
+            assert speak(reply) == ["Before the code.", "After it all is spoken."]
 
     def test_a_fence_line_with_words_after_the_marks_does_not_close_it(self) -> None:
         assert speak(

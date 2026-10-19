@@ -17,8 +17,10 @@ A reply is untrusted model output. Before any of it reaches a synthesiser it goe
   end, so the first sentence can be spoken while the rest is still arriving. A sentence is at most
   `max_sentence_chars` (cut at a space where there is one), and one shorter than `MIN_CHUNK_CHARS`
   waits for the next so that the synthesiser is not started for "Sure." alone. Memory is bounded:
-  a text with no boundary is cut at `max_sentence_chars`, and the block-level state is bounded (the
-  first characters of a line, and a run of fence marks counted up to `_MAX_RUN`).
+  a text with no boundary is cut at `max_sentence_chars`, and the block-level state is bounded: the
+  first few characters of a line, and a run of fence marks held as a character and a count (an
+  integer, O(1) however long the run, and exact: a fence closes only on a run at least as long as
+  its opener).
 
 It takes the stream as it comes, in pieces of any size: block syntax is decided at the start of a
 line from the first few characters, so a fence split across two deltas is still a fence.
@@ -46,7 +48,6 @@ _DROPPED: Final = frozenset({"Cf", "Cs", "Co", "Cn"})
 _BLANKS: Final = frozenset({"Cc", "Zl", "Zp"})
 _FENCE_CHARS: Final = "`~"
 _FENCE_MIN: Final = 3
-_MAX_RUN: Final = 64  # a longer run of fence marks is counted as this long: bounded, linear
 _BULLET_CHARS: Final = "-*+"
 
 
@@ -102,6 +103,8 @@ class SentenceChunker:
         self._max = max_sentence_chars
         self._line = _Line.START
         self._probe = ""  # the first characters of a line, while they are not yet understood
+        self._run_char = ""  # a run of fence marks at the start of a line: its character...
+        self._run_len = 0  # ...and its length, exactly (a count, not a growing string)
         self._fence: tuple[str, int] | None = None  # the character and length of the open fence
         self._skip_space = False  # one space after a quote mark or bullet is part of the mark
         self._text = ""  # prose since the last sentence boundary
@@ -117,7 +120,10 @@ class SentenceChunker:
         out: list[str] = []
         if self._probe and self._fence is None:
             self._text += self._probe  # a line that ended while it was still being understood
+        if 0 < self._run_len < _FENCE_MIN and self._fence is None:
+            self._text += self._run_char * self._run_len
         self._probe = ""
+        self._run_len = 0
         self._cut(out, final=True)
         return out
 
@@ -125,11 +131,12 @@ class SentenceChunker:
 
     def _char(self, char: str, out: list[str]) -> None:
         if char == "\n":
-            if self._line is _Line.START and self._probe:
+            if self._line is _Line.START and (self._probe or self._run_len):
                 self._probe_ended_by_newline()
             elif self._line is _Line.CLOSE:
                 self._fence = None  # nothing but blanks followed the closing fence
             self._probe = ""
+            self._run_len = 0
             self._skip_space = False
             self._cut(out)
             self._line = _Line.START
@@ -147,41 +154,43 @@ class SentenceChunker:
 
     def _probe_ended_by_newline(self) -> None:
         """A line ended while it was still being understood: a fence line, or short prose."""
-        probe = self._probe
-        run = probe == probe[0] * len(probe)
-        if self._fence is None:
-            if run and probe[0] in _FENCE_CHARS and len(probe) >= _FENCE_MIN:
-                self._fence = (probe[0], len(probe))  # an opening fence with no info string
-            else:
-                self._text += probe
-        elif run and probe[0] == self._fence[0] and len(probe) >= self._fence[1]:
-            self._fence = None  # a closing fence
+        if self._run_len:
+            if self._fence is None:
+                if self._run_len >= _FENCE_MIN:
+                    self._fence = (self._run_char, self._run_len)  # an opener with no info string
+                else:
+                    self._text += self._run_char * self._run_len
+            elif self._run_char == self._fence[0] and self._run_len >= self._fence[1]:
+                self._fence = None  # a closing fence
+        elif self._fence is None:
+            self._text += self._probe
 
     def _start(self, char: str, out: list[str]) -> None:
         probe = self._probe
-        if not probe and char in " \t":
+        if not probe and not self._run_len and char in " \t":
             return  # indentation
         if self._fence is not None:
-            self._start_in_fence(probe, char)
+            self._start_in_fence(char)
             return
-        if probe and probe[0] in _FENCE_CHARS and probe == probe[0] * len(probe):
-            if char == probe[0]:
-                self._probe = probe if len(probe) >= _MAX_RUN else probe + char  # how long a fence?
+        if self._run_len:
+            if char == self._run_char:
+                self._run_len += 1  # the run goes on: how long is the fence?
                 return
-            if len(probe) >= _FENCE_MIN:
-                self._fence = (probe[0], len(probe))  # the rest of the line is its info string
-                self._probe = ""
+            run_char, run_len = self._run_char, self._run_len
+            self._run_len = 0
+            if run_len >= _FENCE_MIN:
+                self._fence = (run_char, run_len)  # the rest of the line is its info string
                 self._line = _Line.DROP
                 self._cut(out)  # the prose before a fence is a sentence of its own
                 return
-            self._begin_prose(probe)  # `code` or ``two``: prose after all
+            self._begin_prose(run_char * run_len)  # `code` or ``two``: prose after all
             self._prose(char, out)
+            return
+        if not probe and char in _FENCE_CHARS:
+            self._run_char, self._run_len = char, 1
             return
         probe += char
         first = probe[0]
-        if first in _FENCE_CHARS and len(probe) == 1:
-            self._probe = probe
-            return
         if first == "#" and probe == "#" * len(probe) and len(probe) <= 6:
             self._probe = probe
             return
@@ -202,19 +211,22 @@ class SentenceChunker:
         self._begin_prose(probe[:-1])
         self._prose(char, out)
 
-    def _start_in_fence(self, probe: str, char: str) -> None:
+    def _start_in_fence(self, char: str) -> None:
         """Inside a fence every line is dropped, except one that closes it: a run of the opening
         character at least as long as the opening run, and nothing else on the line."""
         assert self._fence is not None  # noqa: S101  (the caller checked)
         mark, length = self._fence
-        if char == mark and probe == mark * len(probe):
-            self._probe = probe if len(probe) >= _MAX_RUN else probe + char
+        if char == mark and self._run_len == 0:
+            self._run_char, self._run_len = mark, 1
             return
-        if probe and char in " \t" and probe == mark * len(probe) and len(probe) >= length:
-            self._probe = ""
+        if char == mark and self._run_char == mark:
+            self._run_len += 1
+            return
+        if self._run_len >= length and self._run_char == mark and char in " \t":
+            self._run_len = 0
             self._line = _Line.CLOSE  # a closing fence if only blanks follow
             return
-        self._probe = ""
+        self._run_len = 0
         self._line = _Line.DROP
 
     def _begin_prose(self, held: str) -> None:

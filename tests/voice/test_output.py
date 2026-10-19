@@ -695,9 +695,12 @@ class TestFailures:
         class Buggy:
             def __init__(self) -> None:
                 self.calls = 0
+                self.second = threading.Event()
 
             def synthesize(self, text: str, abort: AbortSignal) -> SpeechAudio:
                 self.calls += 1
+                if self.calls == 2:
+                    self.second.set()
                 if self.calls == 1:
                     raise RuntimeError("secret detail")
                 return SpeechAudio(b"\x00\x00", sample_rate_hz=22_050, max_bytes=ByteCount(10))
@@ -717,7 +720,8 @@ class TestFailures:
         deadline = time.monotonic() + 5
         while backend.calls == 0 and time.monotonic() < deadline:
             time.sleep(0.002)
-        time.sleep(0.5)  # an absence cannot be waited for: a leak would show in a few milliseconds
+        # An absence cannot be waited for: a leak would show within a few milliseconds.
+        assert not backend.second.wait(timeout=0.5)
 
         assert backend.calls == 1  # the other two were never synthesised
         assert player.played == []

@@ -68,7 +68,8 @@ One window opens, with no desktop around it:
 - the **side panel** (right): the chat transcript, a multi-line input and a Send button. Messages are
   answered by Claude, streamed in as they are written (with no key configured the chat says how to
   set one; `responder = "echo"` brings back the S02 placeholder that echoes). While a reply streams
-  the Send button waits, and the input stays editable; **Esc** stops the reply;
+  the Send button waits, and the input stays editable; **Esc** stops the reply (while it is being read
+  aloud, the first Esc stops the voice and a second the reply: [Speech output](#speech-output));
 - the **status strip** (bottom) with the voice indicator (idle, listening, transcribing, speaking; thinking
   arrives with S08), the **Mic** button ([Voice input](#voice-input)), the **Mute** button
   ([Speech output](#speech-output), there when Piper is set up) and a **Terminal** button;

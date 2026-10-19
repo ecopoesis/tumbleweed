@@ -648,8 +648,9 @@ and lose their address, bare addresses become "link", and the words of an inline
 pass (controls to spaces, format characters, surrogates and unassigned code points dropped,
 whitespace collapsed to one line), sentences end at `.`, `!`, `?` or a line end, a run with no boundary
 is cut at 400 characters, a sentence under 12 characters waits for the next so Piper is not started for
-"Sure." alone, and the block-level state is bounded (a few characters; the run of fence marks is counted up to 64), so
-memory is bounded. The reply speaks at
+"Sure." alone, and the block-level state is bounded (a few characters, and a run of fence marks held as a character and an
+exact count, with no cap: a fence closes only on a run at least as long as its opener), so memory is
+bounded. The reply speaks at
 most `max_reply_chars` (default 4000); the user is told once that the rest is dropped. (3) *Two workers,
 a generation and an abort signal per reply* (`voice.output.SpeechOutput`, the same shape as
 `VoiceInput`): the synthesis worker and the playback worker run in order, so sentence N+1 is made
