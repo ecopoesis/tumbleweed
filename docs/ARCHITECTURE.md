@@ -30,7 +30,7 @@ this document in the same PR, with a reason.
  │                   file picker, grants list, terminal                                    │
  │ Canvas: generated tools, rendered from UI specs by the fixed renderer                   │
  │ Agent runtime: conversation loop, tool dispatch, LLM chokepoint, invocation log         │
- │ Voice: audio capture → STT backend · TTS backend → playback                             │
+ │ Voice: audio capture (key, or wake word + VAD) → STT backend · TTS backend → playback   │
  │ Chat history (SQLite)                                                                    │
  └──────────┬──────────────────────────────────────────────────────────┬──────────────────┘
             │ IPC: Unix socket, framed typed JSON, same-uid peers only │ HTTPS
@@ -97,7 +97,7 @@ property named by a variable; a key controller made anywhere but the Vte modules
 (there are two, both reviewed and pinned by their own tests: the chat input's Enter key, and
 push-to-talk's capture controller on the window, which sees every key including the terminal's and
 so does nothing, and returns False, while the focus is in the terminal pane: section 2, "Voice
-input" and "Speech output");
+input", "Speech output" and "Hands-free voice"; hands-free mode adds no key controller);
 methods and signals Vte gains later, outside the Vte modules; a terminal widget handed to another
 module (it never is); and anything done by obfuscation as above.
 
@@ -621,7 +621,7 @@ results come back through the injected dispatcher tagged with the reply's genera
   stops speech first: `BargeIn` stops it as `VoiceInput` enters LISTENING, which happens before the audio
   worker is asked to open the microphone, and nothing is spoken while it is open. That is ordering
   (the key is the only thing that opens the microphone in S06); echo through speakers is not
-  cancelled, and S08's hands-free mode must (#117).
+  cancelled, which hands-free mode (S08) meets differently: "Hands-free voice" below (#117).
 - *Keys and chrome.* No new key controller: the reviewed push-to-talk controller's plain Esc also takes
   "a reply is being spoken", **but not while the terminal has the focus** (it reads the speech
   phase and `in_terminal()`, never the event): speech lasts as long as the model's text, and a user in
@@ -639,6 +639,82 @@ results come back through the injected dispatcher tagged with the reply's genera
   spoken until both paths are set and check out (a path that does not has the same effect), and
   there is no Mute button without speech. `[voice] enabled = false` turns speech off too. A synthesis or playback failure is fixed text beside the Mic, ends that reply's speech
   (one message, not one per sentence), and never stops the shell.
+
+### Hands-free voice (S08, D23)
+
+`tumbleweed.voice` also listens for a wake word, which starts the same pipeline as push-to-talk.
+`HandsFree` (GTK-free: `set_enabled`, `cancel`, observers) runs `OFF -> WAITING -> LISTENING ->
+TRANSCRIBING -> WAITING` (`PAUSED` while push-to-talk has the microphone); the **Hands-free** toggle
+turns it on and off. Four things run it. The *audio worker* opens and closes the microphone
+(`AudioStream`, in production `GStreamerAudioStream`: the capture pipeline of push-to-talk kept open),
+GStreamer's streaming thread copies each buffer into a *mailbox* (2 s at most, the oldest dropped
+first, never blocking) and does nothing else, and the *inference thread* takes audio and commands
+from the mailbox, in order, and runs `HandsFreeEngine`; its events come back through the main-thread
+dispatcher. The engine is a synchronous machine with no threads and no clock: WAITING feeds 80 ms
+chunks to the wake-word detector, LISTENING feeds 32 ms windows to Silero VAD and keeps them (at most
+`max_utterance_seconds`), the endpointer ends the turn after speech and `end_silence_ms` of quiet (or
+gives up after `wait_for_speech_seconds`), and the engine emits the speech with a 256 ms margin each side.
+The turn is handed to `VoiceInput.transcribe_utterance`: the same speech worker, the same
+`clean_transcript`, the same observers, so the words enter the chat as the user's own, and
+`edit_before_send` (and its forcing over plain http) applies.
+
+- *Models.* Silero VAD v5 and openWakeWord's melspectrogram, embedding and wake-word models (a closed
+  set of names in the configuration: `hey_jarvis`, `alexa`, `hey_mycroft`) run directly on
+  `onnxruntime`, CPU, one thread; the `openwakeword` package is not used (D23). They are fetched by
+  `scripts/wake-models` against pinned SHA-256 hashes (https only, size and time ceilings, a partial file
+  never becomes a model), and `voice.modelfile.read_verified` checks the same hashes (`voice.models`;
+  a test keeps the script's list equal) every time a file is loaded: the directory text must already be
+  canonical, the path is walked down from `/` with `O_NOFOLLOW` (a symlink anywhere is refused), the
+  file is opened without blocking, must be a regular file of at most 8 MiB, and is read whole; the
+  bytes are hashed and are what `onnxruntime` is given, never a path, so the file cannot change between
+  the check and the load, and nothing is written. `voice.modelfile` is the one voice module besides
+  `piper` that imports `os`, and a test pins every `os` call and open flag it has.
+- *Abandoning.* Every change the user makes (off, Esc, Mute, push-to-talk, a finished turn) bumps a
+  generation and sends the engine `set_mode` with it, which makes it forget all audio and every
+  detector's state; every event carries the engine's generation and an older one is dropped on the main
+  thread. A wake word or endpoint found after the user moved on never starts listening, never reaches
+  the speech server and never posts. Commands and audio reach the inference thread in one order, so audio
+  from before a command is never taken for audio after it.
+- *The microphone indicator.* `HandsFree.microphone_open` is True from the moment the stream is asked for
+  until the audio worker has confirmed it closed (a count of open and close jobs not yet done), so it
+  is never off while audio is captured: waiting, listening, speaking, thinking, a slow device. The
+  status strip shows "Microphone on" separately from the voice state, because the state can say
+  "speaking" while the microphone is open. Push-to-talk's recording has the same rule
+  (`VoiceInput.microphone_open`: from `press` until the audio worker confirms the device closed, one
+  confirmation per press), so after Esc the state says idle at once and the label stays until the
+  device is closed. Turning hands-free off closes the microphone.
+- *The assistant's own voice (#117).* The microphone stays open while a reply is spoken, because the
+  wake word is how the user interrupts it, and speakers can be heard by it. There is no acoustic echo
+  cancellation. Instead: (1) while a reply is spoken and for `speaking_holdoff_ms` after, the wake
+  word needs `speaking_threshold` (default 0.9) instead of `threshold`; (2) nothing is transcribed
+  except after a wake word, so the assistant's speech is never a user turn by itself; (3) a wake word
+  stops the speech *before* listening starts (`SpeechOutput.set_microphone_open`, as push-to-talk
+  does) and nothing is spoken while a turn is recorded; (4) a turn that began while speaking drops its
+  first 250 ms, in which the speakers are still dying away. Residual: a loud speaker, or a reply that
+  contains the wake word, can pass (1); headphones, or `speaking_threshold = 1`, close it.
+- *Push-to-talk wins.* A push-to-talk press pauses hands-free and abandons what the wake word began;
+  when push-to-talk is idle again hands-free resets and waits for the wake word. Turning hands-free off
+  while it transcribes cancels that transcription. Esc abandons a hands-free turn being recorded,
+  anywhere (the capture controller reads `hands_free.phase`, never the event; with the turn only
+  waiting for the wake word Esc is not taken and goes to the terminal or vim as before), and Mute
+  abandons a turn and any wake word not yet acted on.
+- *VAD for push-to-talk (#103).* When `[voice.vad]` is set up, `VoiceInput`'s speech worker cuts the
+  silence off a recording (`VadTrimmer`: speech plus 256 ms each side) before the request and sends
+  nothing, saying "No speech was recognised.", when it holds none; a detector that fails is logged and
+  the recording is sent as it is. The 300 ms minimum and the annotation list stay: they still cover a
+  host without VAD, and annotations still come from silence the VAD thought was speech.
+- *The indicator.* `THINKING` (#117) is set by the shell, from the moment a dictated message is sent (by
+  either kind of voice turn) until the reply is being spoken, is complete or has failed, or the
+  conversation is replaced; `WAKE` ("waiting for the wake word") is hands-free's idle. Most pressing
+  first: transcribing and listening (push-to-talk or hands-free), speaking, thinking, waiting for the
+  wake word, idle.
+- *Configuration and failures.* `[voice.vad]` and `[voice.wake]`, judged together and apart from the
+  rest: a mistake in either turns hands-free and the trimming off, keeps push-to-talk, speech and the
+  speech server, logs the details and shows one fixed message beside the Mic. Nothing is set up until
+  `models_dir` is named (in `[voice.wake]` for hands-free, in `[voice.vad]` for the trimming); files that
+  are missing or not as pinned have the same effect and message. The models are loaded on first use, on
+  the inference thread, never on the main thread; a failure (models, microphone, or a model that fails
+  to run) turns hands-free off with fixed text, closes the microphone and never stops the shell.
 
 ## 3. Request flow
 
@@ -976,7 +1052,7 @@ integrity; the user's attention and trust in the UI.
 | Malicious generated code | Code that tries to escape the sandbox, exfiltrate data or exhaust resources |
 | Malicious tool packages | An imported or tampered tool bundle |
 | Hostile workspace contents | Symlinks, huge files or crafted images written by a sandbox |
-| Ambient audio | A video or another person saying "allow" or issuing commands |
+| Ambient audio | A video or another person saying "allow" or issuing commands, or the wake word (S08) |
 | UI timing tricks | A prompt appearing under a click or keystroke meant for something else |
 
 Out of scope for v1: other malicious processes running as the same uid (they already have
@@ -1095,13 +1171,22 @@ Each invariant names where it is enforced. Reviews check every change against th
   new message.
   Voice (`tumbleweed.voice`, D20): a recording is capped in bytes where the samples arrive
   (`max_utterance_seconds`, default 30, at most 120), the speech server's answer is read to at most
-  `max_response_bytes` (default 64 KiB) with a deadline that bounds the whole exchange, and a transcript is at most the transcript's own 16 KiB (section 2, "Voice input"). Speech output (D22): a spoken sentence is at most `max_sentence_chars` (default 400, at most 1000) and a reply at most `max_reply_chars` (default 4000), Piper's audio is capped in bytes as it arrives, its error output is kept to 2 KiB, and each sentence has a deadline (default 20 s) and a killed-and-reaped process (section 2, "Speech output").
+  `max_response_bytes` (default 64 KiB) with a deadline that bounds the whole exchange, and a transcript is at most the transcript's own 16 KiB (section 2, "Voice input"). Speech output (D22): a spoken sentence is at most `max_sentence_chars` (default 400, at most 1000) and a reply at most `max_reply_chars` (default 4000), Piper's audio is capped in bytes as it arrives, its error output is kept to 2 KiB, and each sentence has a deadline (default 20 s) and a killed-and-reaped process (section 2, "Speech output"). Hands-free (D23): the mailbox between the
+  microphone and the models holds at most 2 s of audio (the oldest dropped first), an utterance at most
+  `max_utterance_seconds`, a turn in which nothing is said is given up after `wait_for_speech_seconds`, a
+  model file is at most 8 MiB, and every wait of the inference thread is at most half a second
+  (section 2, "Hands-free voice").
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input. The
   microphone feeds the chat input only (S06): a transcript is typed-equivalent text, nothing reads
   it as an answer to a prompt, and the push-to-talk key and button are not `GAction`s (so no other
   process can switch the microphone on through the session bus). Speech output (S07) is the other
   direction and takes no input: its Mute button is a widget too, and the reply it reads is text the
-  chat already shows.
+  chat already shows. Hands-free mode (S08) opens the microphone by itself, on the wake word, and
+  changes none of this: what it records goes through the same transcript path (`VoiceInput`) into the
+  chat input, its toggle is a widget and not a `GAction`, and the wake word, VAD and models have no
+  access to a prompt or picker. Ambient audio can say the wake word, so a hands-free turn can send a
+  message the user did not mean (`edit_before_send` holds it for review); it still cannot answer a
+  prompt.
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps
   what it reads. Workspace references are relative and validated.
@@ -1134,7 +1219,8 @@ only, so it can only refuse more; and case folding is not every file system's ow
 | Shell config (TOML), API key file (0600) | `$XDG_CONFIG_HOME/tumbleweed/` | Never |
 | Chat history (SQLite), invocation log | `$XDG_DATA_HOME/tumbleweed/shell/` | Never |
 | Speech models for `whisper-server` (fetched by `scripts/whisper-model`, hash-checked) | `$XDG_DATA_HOME/tumbleweed/whisper/` | Never |
-| Recorded audio | Nowhere: held in memory from the microphone to the request, never written (S06) | n/a |
+| Recorded audio | Nowhere: held in memory from the microphone to the request, never written (S06, hands-free S08) | n/a |
+| Speech-detection models (Silero VAD, openWakeWord; fetched by `scripts/wake-models`, hash-checked again before every load) | `$XDG_DATA_HOME/tumbleweed/wake/` (named by `models_dir`) | Never |
 | Piper and its voice models (installed by the user, named by absolute path in `[voice.tts]`) | Wherever the user put them | Never |
 | Synthesised speech | Nowhere: held in memory from Piper's pipe to the player, never written (S07) | n/a |
 | Broker data: grants, tasks and the tool store's index (`broker.sqlite3`), tool packages (`tool-blobs/`), audit log (`audit.jsonl`) | `$XDG_DATA_HOME/tumbleweed/broker/` | Never |
@@ -1276,6 +1362,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   library's transport, `httpcore2`, are also imported by `voice.whisper`, the speech server's client,
   and `voice.budget` (`httpcore2` only), and by nothing else (D20, #43). `agent` runs its asyncio loop on its own
   worker thread and reaches the GTK main thread only through a dispatcher the shell injects (D11).
+- `onnxruntime` is imported only by `voice.onnx`, and `numpy` only by `voice.onnx`, `voice.vad` and
+  `voice.wake` (D23): the rest sees the `OnnxModel` protocol, so nothing untyped leaks out of the
+  one module that narrows it.
 - `shell.viewmodel` never imports `gi`, directly or through another module, so it cannot import
   the GTK adapter modules of `shell` either. `tests/test_import_contracts.py` plants each
   forbidden import in a copy of the tree and checks that its contract breaks.

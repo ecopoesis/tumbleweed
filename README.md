@@ -257,8 +257,8 @@ Hold **Ctrl+Space** (anywhere but the terminal) and speak; let go and the words 
 *listening* while you talk and *transcribing* while the speech server works; **Esc** abandons the
 utterance. Speech-to-text is whisper.cpp's `whisper-server`, which the shell reaches over HTTP, so
 it can run natively on a Mac (with Metal, which a VM does not have) while the shell runs anywhere.
-Replies are read aloud when Piper is set up ([Speech output](#speech-output)); hands-free listening is
-a later step (S08). On a Mac, Ctrl+Space may be
+Replies are read aloud when Piper is set up ([Speech output](#speech-output)), and a wake word can
+start a turn without any key ([Hands-free voice](#hands-free-voice)). On a Mac, Ctrl+Space may be
 taken by the system's input-source shortcut (System Settings, Keyboard, Keyboard Shortcuts, Input
 Sources); the Mic button works regardless (a configurable key is #100).
 
@@ -374,8 +374,10 @@ sentence says what is missing; on a Mac `brew install gstreamer` has `osxaudiosi
 for `autoaudiosink`) next to the packages the microphone needs. A new process per sentence means Piper
 loads the voice each time (a fraction of a second on a Mac): a long-lived Piper is #112.
 
-The assistant must not hear itself: nothing is spoken while the microphone is open, and holding the key
-stops speech first. Headphones are still a good idea; echo cancellation is not attempted.
+The assistant must not hear itself: nothing is spoken while the microphone is open for you, and holding
+the key stops speech first. Hands-free mode keeps the microphone open while a reply is spoken (how else
+would the wake word interrupt it), and so asks for a much surer wake word then ([Hands-free
+voice](#hands-free-voice)); headphones are still a good idea, and echo cancellation is not attempted.
 
 A **real Piper** is exercised by the `live` test (never run in CI):
 
@@ -383,6 +385,75 @@ A **real Piper** is exercised by the `live` test (never run in CI):
 TUMBLEWEED_LIVE=1 TUMBLEWEED_PIPER=/usr/local/bin/piper TUMBLEWEED_PIPER_MODEL=/path/to/voice.onnx \
     uv run pytest -m live tests/voice/test_live.py -k piper -v
 ```
+
+### Hands-free voice
+
+**Hands-free** mode listens for a wake word and needs no key: say "hey jarvis" (or the word you chose),
+then your request; speech detection (VAD) hears when you have finished and the words are sent exactly as
+if you had held the key (the same speech server, the same checks, `edit_before_send` applies). The
+**Hands-free** toggle beside Mute turns it on and off (it is off when the shell starts, and turning it
+off really closes the microphone). The voice indicator says *waiting for the wake word* while it
+listens, then *listening*, *transcribing*, *thinking* (a voice turn, hands-free or key, has been sent
+and the assistant has not yet started speaking or finished) and *speaking*; and **Microphone on**
+is shown next to it whenever audio may be being captured, in every one of those states and for a
+recording held with the key too: it comes on when the microphone is asked for and goes off only
+when it is confirmed closed (after Esc the state says idle at once, and the label stays until the
+device is closed). Say the wake word while a
+reply is being read and the speech stops before the shell listens, as with the key; **Esc** abandons a
+turn being recorded (anywhere, the terminal included, as it does an utterance held with the key; while
+only waiting for the wake word Esc is not taken) and so does **Mute**; holding Ctrl+Space takes the
+microphone back.
+
+**Models.** Silero VAD (about 2 MiB) and openWakeWord's melspectrogram, embedding and wake-word models
+(about 3 MiB) are not part of the repository: `scripts/wake-models [hey_jarvis|alexa|hey_mycroft]`
+downloads them over https (a ceiling on size and time, redirects https only) to
+`~/.local/share/tumbleweed/wake/`, each checked against a pinned SHA-256 and installed only if it
+matches; the shell checks the same hashes again, byte for byte, before it loads a file, refuses a symlink
+anywhere on the path and a file that is not an ordinary file, and gives `onnxruntime` the checked bytes, never
+a path. Licences: **Silero VAD is MIT**; **openWakeWord's code is Apache-2.0**, its melspectrogram and
+embedding models derive from Google's Apache-2.0 speech-embedding model, and **its pre-trained wake words
+(`hey_jarvis`, `alexa`, `hey_mycroft`) are CC BY-NC-SA 4.0: non-commercial use only**. Train your own
+wake word with openWakeWord if that does not suit you (using a model of your own needs a new pinned entry,
+`src/tumbleweed/voice/models.py`).
+
+```toml
+[voice.vad]                          # also trims push-to-talk recordings (#103)
+models_dir = "/home/me/.local/share/tumbleweed/wake"   # absolute, no symlink; nothing happens until it is set
+threshold = 0.5                      # how likely a 32 ms window must be speech (0.1 to 0.95)
+end_silence_ms = 800                 # this much quiet after speech ends a turn (200 to 3000)
+min_speech_ms = 128                  # less speech than this is a click, not speech
+wait_for_speech_seconds = 6          # a turn in which nothing is said is given up (1 to 30)
+
+[voice.wake]                         # hands-free mode itself: opt in by naming the directory
+enabled = true
+models_dir = "/home/me/.local/share/tumbleweed/wake"
+model = "hey_jarvis"                 # "alexa" or "hey_mycroft"
+threshold = 0.5                      # how sure the model must be (0.1 to 0.99)
+speaking_threshold = 0.9             # ... while a reply is spoken, and for speaking_holdoff_ms after
+speaking_holdoff_ms = 500
+```
+
+A mistake in either table turns hands-free off (and the trimming) with one fixed message next to the Mic
+(the log has the details) and nothing else: push-to-talk, speech and the speech server go on. So do model
+files that are missing or not as pinned. A recording is capped at `[voice.limits] max_utterance_seconds`,
+as with the key. Hands-free needs GStreamer, like the Mic (see "The microphone" above).
+
+**Audio and the assistant's own voice.** Audio is never written anywhere (a test runs a whole turn under
+an audit hook), the buffers between the microphone and the models have fixed caps, and everything that
+waits has a timeout. The wake word and VAD run on an inference thread, never the GTK main thread, with
+`onnxruntime` on one CPU thread. The assistant's voice through the speakers is *not* cancelled
+acoustically: while a reply is spoken, and for half a second after, the wake word needs
+`speaking_threshold` instead of `threshold`, and nothing is transcribed except after a wake word. A loud
+enough speaker, or a reply that says the wake word, can still get through that: use headphones, or
+`speaking_threshold = 1`. Anyone or anything that says the wake word near the microphone (a video, a
+person) starts a turn, and what it says is sent as your message (so with `edit_before_send = true` it
+waits for you); it still cannot approve anything: prompts take the keyboard and pointer only (I10).
+
+**Performance.** `uv run python scripts/measure_hands_free_cpu.py` runs the real pipeline on the
+real models for a minute, paced in real time on a quiet room's noise, and prints idle CPU as a share of
+one core (the target is 15% on Apple Silicon; `--microphone` includes the real capture). The numbers
+are in the PR. Real models, heard on speech made by macOS's `say`, are exercised by the `live` tests (never
+run in CI): `scripts/wake-models && TUMBLEWEED_LIVE=1 uv run pytest -m live tests/voice/test_live.py -k "silero or wake or whole_turn"`.
 
 ### Checks
 
@@ -418,7 +489,11 @@ inside the cooldown today) and `httpx2`, the SDK's HTTP library, which is a dire
 redirects and environment proxies, and for its exception types, and by `voice.whisper`, the speech
 server's client (one HTTP stack for the project, not two: DECISIONS D20, #43). `httpcore2`, httpx2's own
 transport library, is declared too (it was already locked as httpx2's dependency): `voice.budget` and
-`voice.whisper` use it to put one deadline on every operation of a speech request. A new one needs its justification in the PR and a lock for macOS and Linux.
+`voice.whisper` use it to put one deadline on every operation of a speech request. `onnxruntime` and
+`numpy` run hands-free mode's speech-detection and wake-word models (DECISIONS D23: not the
+`openwakeword` package, whose Linux build needs `tflite-runtime`, which has no wheels for Python 3.12
+and up, #42); both have wheels for Python 3.12 to 3.14 on every platform in the lock, and
+`tests/test_lock_hands_free.py` checks it. A new one needs its justification in the PR and a lock for macOS and Linux.
 
 - To update: `uv lock --upgrade`, which re-resolves with the window as of today.
 - To take a newer release of one package before its week is up (a security fix), add
