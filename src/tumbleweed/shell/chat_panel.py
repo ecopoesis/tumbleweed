@@ -351,13 +351,14 @@ class ChatPanel(Gtk.Box):
         buffer.set_text("")
         self._show_notice("")
 
-    def dictate(self, text: str, *, send: bool) -> None:
+    def dictate(self, text: str, *, send: bool, take_focus: bool = True) -> None:
         """Put what was said (S06) in the input, and send it if `send` and nothing was drafted.
 
         A draft that is already there is never sent by a transcript, nor replaced: the words are
         added after it (one space between) and left for the user to review and send. A reply still
         streaming, or any refusal, is handled by `send` as for typed text: a notice, and the text
-        stays in the input.
+        stays in the input. The input takes the keyboard focus unless `take_focus` is False (a
+        hands-free turn, which any sound can start, must never move it: S08, D23).
         """
         buffer = self.input_view.get_buffer()
         draft = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
@@ -366,7 +367,8 @@ class ChatPanel(Gtk.Box):
             buffer.insert(buffer.get_end_iter(), separator + text)
         else:
             buffer.set_text(text)
-        self.input_view.grab_focus()
+        if take_focus:
+            self.input_view.grab_focus()
         if send and not draft.strip():
             self.send()
 

@@ -36,7 +36,9 @@ bounded by the reply's cap. Errors are fixed text for the UI, and a failure ends
 
 import enum
 import logging
+import re
 import threading
+import unicodedata
 from collections.abc import Callable
 from typing import Final, Protocol, final
 
@@ -50,6 +52,7 @@ from tumbleweed.voice.worker import Worker
 
 logger = logging.getLogger(__name__)
 
+SILENCED_PHRASE: Final = "the wake word"
 REPLY_TOO_LONG: Final = "Only the start of this reply is read aloud: it is too long to speak."
 _TTS_FAILED: Final = "Speech synthesis failed."
 _PLAYBACK_FAILED: Final = "Audio playback failed."
@@ -74,6 +77,60 @@ class SpeechObserver(Protocol):
         ...
 
 
+def _phrase_pattern(phrases: tuple[str, ...]) -> "re.Pattern[str] | None":
+    """A pattern for any of `phrases`, whatever the case and whatever stands between the words or
+    their letters (`Hey, Jarvis!`, `hey-jarvis`, `HEY_JARVIS`, `Jar-vis`), and only as whole words
+    (a letter beside it makes it another word; a digit does not). It is for text after `_fold`."""
+    gap = r"[\W_]*"
+    forms = [
+        gap.join(gap.join(re.escape(letter) for letter in word) for word in phrase.split("_"))
+        for phrase in phrases
+        if phrase.strip()
+    ]
+    if not forms:
+        return None
+    return re.compile(r"(?<![^\W\d_])(?:" + "|".join(forms) + r")(?![^\W\d_])", re.IGNORECASE)
+
+
+def _fold(text: str) -> tuple[str, list[int]]:
+    """`text` as the pattern looks at it, and for each character of that, where it came from.
+
+    Each character is folded on its own (compatibility forms such as full-width letters, then its
+    combining marks dropped), so that an accented or full-width spelling of the phrase is the
+    phrase to the pattern. The folded text is *only* for finding the phrase: what is spoken is
+    always `text`, with the phrase's own span replaced and every other character as it was. A
+    look-alike letter of another script is not folded: that can pass, and the speaking threshold,
+    or headphones, are the control for it."""
+    folded: list[str] = []
+    origin: list[int] = []
+    for index, character in enumerate(text):
+        for part in unicodedata.normalize("NFKD", character):
+            if not unicodedata.combining(part):
+                folded.append(part)
+                origin.append(index)
+    return "".join(folded), origin
+
+
+def _cut_at_word(text: str, limit: int) -> str:
+    """`text` if it fits in `limit`, else its words that fit whole; nothing if not even one does.
+    A cut inside a word could make a new one (`Jarvisson` cut to `Jarvis`), so it is never made."""
+    if len(text) <= limit:
+        return text
+    if text[limit] == " ":
+        return text[:limit]
+    head = text[:limit]
+    return head.rsplit(" ", 1)[0] if " " in head else ""
+
+
+def _original_end(text: str, origin: list[int], folded_end: int) -> int:
+    """Where in `text` a match that ends before `folded_end` in the folded text ends: after the
+    character it ends in and the combining marks that belong to it."""
+    end = origin[folded_end - 1] + 1
+    while end < len(text) and unicodedata.combining(text[end]):
+        end += 1
+    return end
+
+
 @final
 class SpeechOutput:
     """Spoken replies over a `TtsBackend` and an `AudioPlayer` (see the module docstring)."""
@@ -85,7 +142,10 @@ class SpeechOutput:
         player: Callable[[], AudioPlayer],
         dispatcher: MainThreadDispatcher,
         config: TtsConfig,
+        avoid: tuple[str, ...] = (),
     ) -> None:
+        self._avoid = _phrase_pattern(avoid)
+        self._previous = ""  # the sentence before the one being scrubbed
         self._backend = backend
         self._player_factory = player
         self._dispatcher = dispatcher
@@ -133,6 +193,7 @@ class SpeechOutput:
         self._reset()
         if self._closed:
             return
+        self._previous = ""
         self._chunker = SentenceChunker(max_sentence_chars=self._config.max_sentence_chars)
         self._accepting = not (self._muted or self._microphone_open)
 
@@ -201,15 +262,71 @@ class SpeechOutput:
 
     def _enqueue(self, sentences: list[str]) -> None:
         for sentence in sentences:
+            if (pattern := self._avoid) is not None:
+                # Model output must not be able to say the wake word: that would wake the
+                # assistant through its own speakers (S08, D23 (7)). Said as "the wake word".
+                sentence = self._scrub(sentence, pattern)
             room = self._config.max_reply_chars - self._spoken_chars
             if room <= 0 or len(sentence) > room:
-                sentence = sentence[:room].rsplit(" ", 1)[0] if room > 0 else ""
+                if room <= 0:
+                    sentence = ""
+                elif pattern is not None:
+                    sentence = _cut_at_word(sentence, room)  # never mid-word: see `_cut_at_word`
+                else:
+                    sentence = sentence[:room].rsplit(" ", 1)[0]
                 self._cap_reached()
+            if pattern is not None and sentence:
+                sentence = self._final_check(sentence, pattern)
             if sentence:
+                if pattern is not None:
+                    # What the next sentence is checked against is what is really spoken, after
+                    # every cut; a sentence that came to nothing leaves it as it was.
+                    self._previous = _fold(sentence)[0]
                 self._spoken_chars += len(sentence)
                 self._submit(sentence)
             if not self._accepting:
                 break
+
+    def _scrub(self, sentence: str, pattern: "re.Pattern[str]") -> str:
+        """`sentence` with the wake phrase replaced and nothing else changed (not one character of
+        it, if the phrase is not there), also where the phrase would be said across the end of the
+        sentence before it: that sentence is already on its way, so what the phrase takes from
+        this one is dropped, and the two are never the phrase in a row.
+
+        The phrase is looked for in a folded copy and cut out of the original, by the position
+        each folded character came from. The result is at most `max_sentence_chars` long (the
+        replacement is longer than a short phrase), which keeps Piper's stdin bounded."""
+        folded, origin = _fold(sentence)
+        # The reach across a sentence end assumes phrases of at most two words ("hey jarvis"): a
+        # match that straddles the boundary loses only its second part to this sentence. Again and
+        # again until nothing straddles ("hey. Jarvis Jarvis, ..."): each cut shortens the sentence.
+        while (found := pattern.search(f"{self._previous} {folded}")) is not None and (
+            found.start() < len(self._previous) + 1 < found.end()
+        ):
+            cut = _original_end(sentence, origin, found.end() - len(self._previous) - 1)
+            sentence = sentence[cut:].lstrip(" ,.;:!?-")
+            folded, origin = _fold(sentence)
+        pieces: list[str] = []
+        taken = 0
+        for match in pattern.finditer(folded):
+            pieces.append(sentence[taken : origin[match.start()]])
+            pieces.append(SILENCED_PHRASE)
+            taken = _original_end(sentence, origin, match.end())
+        scrubbed = "".join(pieces) + sentence[taken:] if pieces else sentence
+        return _cut_at_word(scrubbed, self._config.max_sentence_chars)
+
+    def _final_check(self, sentence: str, pattern: "re.Pattern[str]") -> str:
+        """The last step before a sentence is submitted, after every cut: if the phrase is in it
+        (a cut can rebuild one from a word it made short), everything from the phrase on is
+        dropped, never replaced, so the sentence cannot grow. With the loop in `_scrub` that makes
+        it true by construction that no submitted sentence matches the pattern, and none does
+        together with the sentence submitted before it in the same reply (a reply starts afresh:
+        `begin_reply` forgets the last, and a user turn sits between two replies)."""
+        folded, origin = _fold(sentence)
+        match = pattern.search(folded)
+        if match is not None:
+            sentence = sentence[: origin[match.start()]].rstrip()
+        return sentence
 
     def _cap_reached(self) -> None:
         self._accepting = False

@@ -463,8 +463,9 @@ class TestBargeIn:
         assert pump_until(lambda: s.source.capturing)
         s.source.feed(pcm(1.0))
         key(s, "key-released", Gdk.KEY_space)
-        assert pump_until(lambda: indicator(s) == "Voice: idle")
         # the transcript "hello there" was sent as a message by the fake speech server: its reply
+        # is awaited, which the indicator says (S08, #117)
+        assert pump_until(lambda: indicator(s) == "Voice: thinking")
         assert pump_until(lambda: len(s.responder.sinks) == 1)
 
         s.responder.sink.emit(ReplyDelta(text=f"{FIRST} "))

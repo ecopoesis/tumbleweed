@@ -54,3 +54,30 @@ def test_the_voice_package_imports_without_gstreamer_or_gtk() -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_onnxruntime_is_not_loaded_until_a_model_is() -> None:
+    """It loads CoreML and other frameworks on macOS: not for a shell that has no use for it, and
+    not at collection, where, as GTK does, it changes how the system's SQLite treats a moved
+    database (#132)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; import tumbleweed.voice.factory, tumbleweed.voice.hands_free, "
+        "tumbleweed.voice.vad, tumbleweed.voice.wake, tumbleweed.voice.store; "
+        "assert 'onnxruntime' not in sys.modules, 'loaded by an import'; "
+        "from tests.voice.tiny_onnx import tiny_identity_model; "
+        "from tumbleweed.voice.onnx import load_model; load_model(tiny_identity_model()); "
+        "assert 'onnxruntime' in sys.modules, 'not loaded by load_model'"
+    )
+    result = subprocess.run(  # noqa: S603  (argv list, our own interpreter)
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+        cwd=ROOT,
+    )
+
+    assert result.returncode == 0, result.stderr

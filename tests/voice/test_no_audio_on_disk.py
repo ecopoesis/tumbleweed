@@ -7,6 +7,10 @@
   audio, the player) makes no Python write either; what Piper and GStreamer do natively is, as
   above, out of an audit hook's sight (a Linux test plays through a real pipeline and checks that
   no file appears);
+- *hands-free mode* (S08): a whole turn, from the wake word through VAD to the transcript, makes no
+  Python write either; and reading a speech-detection model (`voice.modelfile`) and running it
+  (`voice.onnx`) writes nothing, which `onnxruntime` would do if given an optimised-model path
+  (it is given the bytes, never a path);
 - *structure*: the voice package's sources contain no call that could write a file (an AST scan);
 - *GStreamer*: the pipeline is built from a fixed list of elements, none of which writes (a file
   sink would be the way audio could reach a disk without a line of Python saying so), checked
@@ -162,6 +166,98 @@ def test_a_whole_spoken_reply_writes_nothing_to_the_file_system(
     assert sorted(tmp_path.rglob("*")) == before
 
 
+def hands_free_turn_through_everything(stub: StubServer) -> list[str]:
+    from tests.voice.support import chunk, windows
+    from tumbleweed.voice.config import VadConfig, WakeConfig
+    from tumbleweed.voice.engine import HandsFreeEngine
+    from tumbleweed.voice.fake import FakeAudioStream, FakeVad, FakeWake
+    from tumbleweed.voice.hands_free import HandsFree, HandsFreePhase
+
+    dispatcher = ManualDispatcher()
+    voice_limits = limits(request_timeout_seconds=5)
+    voice = VoiceInput(
+        audio=lambda: FakeAudioSource(voice_limits.max_utterance_bytes),
+        stt=WhisperServerBackend(SttEndpoint(stub.url), language="auto", limits=voice_limits),
+        dispatcher=dispatcher,
+        limits=voice_limits,
+    )
+    recorder = Recorder()
+    voice.subscribe(recorder)
+    stream = FakeAudioStream()
+    hands_free = HandsFree(
+        stream=lambda: stream,
+        engine=lambda: HandsFreeEngine(
+            wake=FakeWake(),
+            vad=FakeVad(),
+            wake_config=WakeConfig(),
+            vad_config=VadConfig(end_silence_ms=320, min_speech_ms=64),
+            max_utterance_bytes=voice_limits.max_utterance_bytes,
+        ),
+        voice=voice,
+        speech=None,
+        dispatcher=dispatcher,
+        limits=voice_limits,
+    )
+    try:
+        hands_free.set_enabled(True)
+        assert dispatcher.pump_until(lambda: stream.capturing)
+        stream.feed(chunk(950))
+        assert dispatcher.pump_until(lambda: hands_free.phase is HandsFreePhase.LISTENING)
+        stream.feed(windows(*([900] * 12), *([0] * 14)))
+        assert dispatcher.pump_until(lambda: bool(recorder.texts))
+        hands_free.set_enabled(False)
+        assert dispatcher.pump_until(lambda: not stream.capturing)
+    finally:
+        hands_free.close()
+        voice.close()
+    return recorder.texts
+
+
+def test_a_whole_hands_free_turn_writes_nothing_to_the_file_system(
+    stub: StubServer, writes: list[tuple[str, tuple[object, ...]]], tmp_path: Path
+) -> None:
+    hands_free_turn_through_everything(stub)  # a first run imports everything
+    before = sorted(tmp_path.rglob("*"))
+
+    _recording.set()
+    texts = hands_free_turn_through_everything(stub)
+    _recording.clear()
+
+    assert texts == ["hello world"]
+    assert writes == []
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+def test_reading_and_running_a_model_writes_nothing(
+    writes: list[tuple[str, tuple[object, ...]]], tmp_path: Path
+) -> None:
+    import hashlib
+
+    import numpy as np
+
+    from tests.voice.tiny_onnx import tiny_identity_model
+    from tumbleweed.core.types import ContentHash
+    from tumbleweed.voice.modelfile import check_models_directory
+    from tumbleweed.voice.models import ModelFile
+    from tumbleweed.voice.store import ModelStore
+
+    data = tiny_identity_model()
+    (tmp_path / "m.onnx").write_bytes(data)
+    model = ModelFile("m.onnx", ContentHash(hashlib.sha256(data).hexdigest()), "https://x.test/")
+    store = ModelStore(check_models_directory(str(tmp_path)))
+    store.get(model).run({"x": np.zeros(4, dtype=np.float32)})  # a first run imports everything
+    before = sorted(tmp_path.rglob("*"))
+
+    _recording.set()
+    ModelStore(check_models_directory(str(tmp_path))).get(model).run(
+        {"x": np.zeros(4, dtype=np.float32)}
+    )
+    _recording.clear()
+
+    assert writes == []
+    assert sorted(tmp_path.rglob("*")) == before
+
+
 def test_the_audit_hook_would_have_noticed_a_write(
     writes: list[tuple[str, tuple[object, ...]]], tmp_path: Path
 ) -> None:
@@ -212,7 +308,9 @@ def test_no_voice_module_can_write_a_file() -> None:
                     if isinstance(function, ast.Name)
                     else (function.attr if isinstance(function, ast.Attribute) else "")
                 )
-                if called in forbidden_calls:
+                if called in forbidden_calls and not (
+                    name == "modelfile.py" and ast.unparse(node.func) == "os.open"
+                ):  # modelfile's read-only opens are pinned by their own test below
                     problems.append(f"{name}:{node.lineno}: calls {called}")
 
     # The one `open` there is: the WAV wrapper writes to an in-memory buffer.
@@ -222,7 +320,7 @@ def test_no_voice_module_can_write_a_file() -> None:
 # Piper (S07) is the one module that may import `os`: it checks the voice model's file type, kills
 # a process group and reads and writes the child's pipes. The next test pins everything it does
 # with it, so the exception cannot grow into a way to write a file.
-_ALLOWED_IMPORTS = {"piper.py": frozenset({"os"})}
+_ALLOWED_IMPORTS = {"piper.py": frozenset({"os"}), "modelfile.py": frozenset({"os"})}
 _PIPER_OS_CALLS = {"stat", "access", "killpg", "set_blocking", "read", "write"}
 
 
@@ -238,6 +336,55 @@ def test_piper_uses_os_only_for_file_types_process_groups_and_pipes() -> None:
 
     assert used <= _PIPER_OS_CALLS | {"X_OK"}
     assert {"killpg", "set_blocking"} <= used
+
+
+# `modelfile` (S08) is the other: it opens the speech-detection models, read-only, with the
+# symlink-proof walk, and reads them. The test below pins every `os` name it uses and the flags of
+# every open, so the exception cannot become a way to write a file.
+_MODELFILE_OS = {"open", "close", "fstat", "read"}
+_MODELFILE_FLAGS = {
+    "O_RDONLY",
+    "O_CLOEXEC",
+    "O_NOFOLLOW",
+    "O_NOCTTY",
+    "O_DIRECTORY",
+    "O_NONBLOCK",
+}
+
+
+def test_modelfile_opens_files_read_only_and_nothing_else() -> None:
+    tree = _sources()["modelfile.py"]
+    used = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    }
+    opens = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "os.open"
+    ]
+
+    assert used <= _MODELFILE_OS | _MODELFILE_FLAGS
+    assert {name for name in used if name.startswith("O_")} == _MODELFILE_FLAGS
+    assert len(opens) == 3
+    assert sorted(ast.unparse(call.args[1]) for call in opens) == [
+        "_DIRECTORY",
+        "_DIRECTORY",
+        "_FILE",
+    ]
+    flags = {
+        node.target.id: ast.unparse(node.value)
+        for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.value is not None
+    }
+    assert flags["_COMMON"] == "os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NOCTTY"
+    assert flags["_DIRECTORY"] == "_COMMON | os.O_DIRECTORY"
+    assert flags["_FILE"] == "_COMMON | os.O_NONBLOCK"
 
 
 def _wave_open_line() -> int:

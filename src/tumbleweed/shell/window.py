@@ -82,9 +82,11 @@ class ShellWindow(Adw.ApplicationWindow):
                 edit_before_send=voice.edit_before_send,
                 speech=voice.speech,
                 notice=voice.notice,
+                hands_free=voice.hands_free,
             )
             self.status_strip.insert_child_after(self.voice_controls, self.status_strip.voice)
             self.voice_controls.install_keys(self, self._terminal_has_focus)
+            self.voice_controls.observe(self.transcript)
             if voice.speech is not None:
                 self._speech_feed = SpeechFeed(voice.speech)
                 self.transcript.subscribe(self._speech_feed)
@@ -217,6 +219,7 @@ class ShellWindow(Adw.ApplicationWindow):
             if self._speech_feed is not None:
                 self.transcript.unsubscribe(self._speech_feed)
             if self.voice_controls is not None:
+                self.transcript.unsubscribe(self.voice_controls.reply_watch)
                 self.voice_controls.shutdown()
         finally:
             try:
