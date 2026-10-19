@@ -94,11 +94,11 @@ class DirfdResolver:
             child = os.open(name, flags, dir_fd=directory)
         except OSError as exc:
             raise ImageNotAllowedError("the directory could not be opened safely") from exc
-        os.close(directory)
         opened = os.fstat(child)
         if (opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino):
             os.close(child)
             raise ImageNotAllowedError("the directory was swapped while it was opened")
+        os.close(directory)  # only now: on a failure above the caller still owns, and closes, it
         return child
 
     def _read_file(self, directory: int, name: str, limit: ByteCount) -> bytes:
