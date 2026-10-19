@@ -205,11 +205,16 @@ def _progress(component: Progress, ctx: BuildContext) -> Gtk.Widget:
 
 def _image(component: Image, ctx: BuildContext) -> Gtk.Widget:
     key, _decl = _bound(component, ctx, ImageState)
-    view = ImageView(component.alt, ctx.images, ctx.decoder, ctx.budget)
+    view = ImageView(component.alt, ctx.images, ctx.decoder, ctx.budget, ctx.pixels)
     ctx.on_close(view.release)
 
     def update(value: StateValue, stale: bool) -> None:
-        view.set_ref(value if isinstance(value, ImageRef) else None, stale=stale)
+        # (an equal ref assigned again is read again, but not when the widgets are put back)
+        view.set_ref(
+            value if isinstance(value, ImageRef) else None,
+            stale=stale,
+            refresh=not ctx.resyncing,
+        )
 
     ctx.bind(key, view, update)
     return view

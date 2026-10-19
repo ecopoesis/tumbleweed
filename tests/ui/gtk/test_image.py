@@ -5,6 +5,7 @@ a recording decoder stands in to prove that a refused image never reaches one. E
 ends as a fixed line of ours in the image's place, never as a decode.
 """
 
+import functools
 import logging
 import threading
 from typing import TYPE_CHECKING
@@ -73,6 +74,28 @@ def settled(view: "ImageView") -> bool:
     from tumbleweed.ui.gtk.imageview import LOADING
 
     return view.texture is not None or view.notice not in ("", LOADING)
+
+
+def drain() -> None:
+    """Wait until every job queued so far has been run by a worker and its result handled.
+
+    Each worker is made to wait at a barrier behind everything that was queued, so when both
+    are there nothing earlier is still running, and the results they posted are then delivered
+    by the main loop. (A test that asserts that something did NOT happen waits with this, not
+    for a time.)"""
+    from tumbleweed.ui.gtk.imageview import WORKERS, submit
+
+    barrier = threading.Barrier(WORKERS, timeout=10)
+    done = [threading.Event() for _ in range(WORKERS)]
+
+    def sentinel(event: threading.Event) -> None:
+        barrier.wait()
+        event.set()
+
+    for event in done:
+        submit(functools.partial(sentinel, event))
+    assert pump_until(lambda: all(event.is_set() for event in done), timeout=15)
+    pump(0.05)  # the results are posted already: let the main loop take them
 
 
 def wait_for(view: "ImageView") -> None:
@@ -274,7 +297,7 @@ class TestItNeverBlocksTheMainThread:
         point_at(tool, "c.png")  # replaces b.png: it is never read
         resolver.gate.set()
         wait_for(view)
-        pump(0.1)
+        drain()
 
         assert [path for path, _limit in resolver.reads] == ["a.png", "c.png"]
         assert size(view.texture) == (5, 2)  # c.png's; a.png's result was dropped
@@ -288,8 +311,9 @@ class TestItNeverBlocksTheMainThread:
         point_at(tool, "a.png")
         assert resolver.started.wait(5)
         point_at(tool, "b.png")
-        pump(0.2)
 
+        # (b.png must not be read while a.png is: were it, a second read would begin at once)
+        assert not pump_until(lambda: resolver.most_active > 1, timeout=0.5)
         assert resolver.most_active == 1
         resolver.gate.set()
         wait_for(view)
@@ -313,7 +337,7 @@ class TestItNeverBlocksTheMainThread:
 
         tool = RenderedTool(spec, images=resolver)
         tool.runtime.patch_state({"img": {"path": "a.png"}})
-        pump(0.3)
+        assert pump_until(lambda: resolver.most_active == WORKERS)  # both workers are in a read
 
         workers = [t for t in threading.enumerate() if t.name.startswith("tumbleweed-image-")]
         assert 1 <= len(workers) <= WORKERS
@@ -333,7 +357,7 @@ class TestItNeverBlocksTheMainThread:
 
         tool.close()
         resolver.gate.set()
-        pump(0.3)
+        drain()  # the worker has finished the read and posted what it found
 
         assert view.closed
         assert view.texture is None
@@ -375,7 +399,7 @@ class TestItNeverBlocksTheMainThread:
 
         point_at(tool, None)
         resolver.gate.set()
-        pump(0.3)
+        drain()
 
         assert view.texture is None
         assert view.notice == ""
@@ -395,6 +419,16 @@ HOSTILE: list[tuple[str, bytes, str]] = [
     ),
     ("a GIF", b"GIF89a" + bytes(30), "Only PNG, JPEG and WebP images can be shown."),
     ("an animated WebP", WEBP_ANIMATED_3X2, "Only PNG, JPEG and WebP images can be shown."),
+    (
+        "an animated WebP with its flag cleared",
+        WEBP_ANIMATED_3X2[:20] + bytes([WEBP_ANIMATED_3X2[20] & ~0x02]) + WEBP_ANIMATED_3X2[21:],
+        "Only PNG, JPEG and WebP images can be shown.",
+    ),
+    (
+        "a JPEG of 200 scans",
+        jpeg_header(3, 2) + b"\xff\xda\x00\x02" * 200,
+        "Only PNG, JPEG and WebP images can be shown.",
+    ),
     ("nothing at all", b"", "Only PNG, JPEG and WebP images can be shown."),
     ("a PNG too wide", png_header(SIDE + 1, 1), "The image is too large."),
     ("a PNG too tall", png_header(1, SIDE + 1), "The image is too large."),
@@ -658,3 +692,185 @@ class TestThePinnedDecoder:
         texture = PixbufDecoder().decode(data, inspect_image(data))
 
         assert (texture.get_width(), texture.get_height()) == (7, 5)
+
+
+class TestWhatAToolsImagesCost:
+    """Decoded pixels are bounded per image (display size) and per tool (a budget)."""
+
+    def test_an_image_is_kept_at_the_display_size_and_a_small_one_exactly_as_it_is(self) -> None:
+        from tumbleweed.ui.gtk.imageview import MAX_DISPLAY, PixbufDecoder
+        from tumbleweed.ui.images import inspect_image
+
+        decoder = PixbufDecoder()
+
+        def decoded(width: int, height: int) -> tuple[int, int]:
+            data = png(width, height)
+            return size(decoder.decode(data, inspect_image(data)))
+
+        assert decoded(1000, 600) == (MAX_DISPLAY, 288)  # scaled down, aspect kept
+        assert decoded(400, 3000) == (64, MAX_DISPLAY)
+        assert decoded(3, 2) == (3, 2)  # unchanged
+        assert decoded(MAX_DISPLAY, MAX_DISPLAY) == (MAX_DISPLAY, MAX_DISPLAY)  # at the limit
+        assert decoded(MAX_DISPLAY + 1, 1) == (MAX_DISPLAY, 1)
+
+    def test_an_image_at_or_under_the_display_size_has_the_pixels_it_was_given(self) -> None:
+        from tumbleweed.shell._gi import Gdk
+        from tumbleweed.ui.gtk.imageview import PixbufDecoder
+        from tumbleweed.ui.images import inspect_image
+
+        data = png(5, 4, (10, 200, 30))
+
+        texture = PixbufDecoder().decode(data, inspect_image(data))
+        downloader = Gdk.TextureDownloader.new(texture)
+        downloader.set_format(Gdk.MemoryFormat.R8G8B8A8)
+        pixels, stride = downloader.download_bytes()
+        raw = pixels.get_data()
+
+        assert stride == 5 * 4
+        assert raw == bytes([10, 200, 30, 255]) * (5 * 4)  # every pixel, as it was
+
+    def test_the_tools_images_together_hold_at_most_the_pixel_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tumbleweed.ui.gtk import RenderedTool, imageview
+        from tumbleweed.ui.gtk.imageview import MAX_DISPLAY, ImageView
+
+        each = MAX_DISPLAY * (MAX_DISPLAY // 2) * 4  # an image of 2000 x 1000 is kept at 480 x 240
+        monkeypatch.setattr(imageview, "MAX_TOOL_PIXEL_BYTES", each * 3 + 10)
+        spec = spec_of(
+            {"kind": "box", "children": [{"kind": "image", "bind": "img"}] * 8},
+            [{"kind": "image", "key": "img"}],
+        )
+        tool = RenderedTool(spec, images=FakeResolver({"big.png": png(2000, 1000)}))
+        views = of_type(tool, ImageView)
+
+        tool.runtime.patch_state({"img": {"path": "big.png"}})
+        assert pump_until(lambda: all(settled(v) for v in views), timeout=30)
+
+        shown = [v for v in views if v.texture is not None]
+        refused = [v for v in views if v.texture is None]
+        assert len(shown) == 3  # what the budget holds
+        assert {v.notice for v in refused} == {"The image is too large."}
+        held = sum(v.texture.get_width() * v.texture.get_height() * 4 for v in shown if v.texture)
+        assert held <= each * 3 + 10
+        assert tool._context.pixels.total == held  # noqa: SLF001  (what the budget says it holds)
+
+    def test_pixels_come_back_when_an_image_is_replaced_cleared_or_the_tool_closed(self) -> None:
+        resolver = FakeResolver({"a.png": png(3, 2), "b.png": png(5, 4)})
+        tool = render_with(resolver)
+        view = view_of(tool)
+        pixels = tool._context.pixels  # noqa: SLF001
+        point_at(tool, "a.png")
+        wait_for(view)
+        assert pixels.total == 3 * 2 * 4
+
+        point_at(tool, "b.png")  # the old image goes at once, and so does its claim
+        assert pixels.total == 0
+        wait_for(view)
+        assert pixels.total == 5 * 4 * 4
+        point_at(tool, None)
+        assert pixels.total == 0
+        point_at(tool, "a.png")
+        wait_for(view)
+        assert pixels.total == 3 * 2 * 4
+        tool.close()
+
+        assert pixels.total == 0
+
+    def test_a_result_that_is_dropped_or_failed_holds_nothing(self) -> None:
+        resolver = FakeResolver({"a.png": png(3, 2), "bad.png": png(3, 2)[:40]})
+        resolver.gate = threading.Event()
+        tool = render_with(resolver)
+        view = view_of(tool)
+        pixels = tool._context.pixels  # noqa: SLF001
+        point_at(tool, "a.png")
+        assert resolver.started.wait(5)
+        point_at(tool, "bad.png")  # a.png's result is no longer wanted
+        resolver.gate.set()
+        wait_for(view)
+        drain()
+
+        assert view.notice == "The image could not be read."  # bad.png was refused by the decoder
+        assert pixels.total == 0
+
+    def test_the_budget_itself_replaces_a_reservation_and_refuses_what_does_not_fit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tumbleweed.ui.gtk import imageview
+        from tumbleweed.ui.gtk.imageview import PixelBudget
+
+        monkeypatch.setattr(imageview, "MAX_TOOL_PIXEL_BYTES", 100)
+        budget = PixelBudget()
+        one, two = object(), object()
+
+        assert budget.reserve(one, 60) is True
+        assert budget.reserve(two, 41) is False  # 101
+        assert budget.reserve(two, 40) is True  # exactly the budget
+        assert budget.reserve(one, 60) is True  # the same owner again replaces its claim
+        assert budget.total == 100
+        budget.release(one)
+        budget.release(one)  # twice is harmless
+        assert budget.total == 40
+
+
+class TestSettingTheSameRefAgain:
+    def test_putting_the_widgets_back_does_not_read_a_shown_image_again(self) -> None:
+        resolver = FakeResolver({"a.png": png(3, 2)})
+        tool = render_with(resolver)
+        view = view_of(tool)
+        point_at(tool, "a.png")
+        wait_for(view)
+        before = view.texture
+
+        tool._context.resync()  # noqa: SLF001  (what a failed handler does)
+        drain()
+
+        assert view.texture is before  # not cleared, not decoded again
+        assert len(resolver.reads) == 1
+
+    def test_but_a_ref_assigned_again_is_still_read_again(self) -> None:
+        resolver = FakeResolver({"a.png": png(3, 2)})
+        tool = render_with(resolver)
+        view = view_of(tool)
+        point_at(tool, "a.png")
+        wait_for(view)
+
+        point_at(tool, "a.png")
+        wait_for(view)
+
+        assert len(resolver.reads) == 2
+
+
+class TestAClosedToolsQueuedJobsDoNothing:
+    def test_a_job_that_waited_for_a_worker_never_calls_the_resolver_once_its_tool_is_closed(
+        self,
+    ) -> None:
+        from tumbleweed.ui.gtk import RenderedTool
+        from tumbleweed.ui.gtk.imageview import WORKERS
+
+        resolver = FakeResolver({"busy.png": png(3, 2), "waiting.png": png(3, 2)})
+        resolver.gate = threading.Event()
+        busy = spec_of(
+            {"kind": "box", "children": [{"kind": "image", "bind": "img"}] * WORKERS},
+            [{"kind": "image", "key": "img"}],
+        )
+        first = RenderedTool(busy, images=resolver)
+        first.runtime.patch_state({"img": {"path": "busy.png"}})
+        assert pump_until(lambda: resolver.most_active == WORKERS)  # every worker is in a read
+        second = render_with(resolver)
+        point_at(second, "waiting.png")  # queued behind them
+
+        second.close()
+        resolver.gate.set()
+        drain()
+
+        assert [path for path, _limit in resolver.reads] == ["busy.png"] * WORKERS
+        first.close()
+
+
+class TestInstalledLoaders:
+    def test_they_are_looked_for_once(self) -> None:
+        from tumbleweed.ui.gtk.imageview import installed_loaders
+
+        assert installed_loaders() is installed_loaders()
+        assert {"png", "jpeg"} <= installed_loaders()

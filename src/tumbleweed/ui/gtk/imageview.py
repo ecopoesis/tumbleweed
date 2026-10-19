@@ -25,6 +25,7 @@ Workers touch no widget: they build a `Gdk.Texture` (a plain, immutable pixel bu
 thread) or an `ImageError`.
 """
 
+import functools
 import logging
 import queue
 import threading
@@ -44,6 +45,7 @@ from tumbleweed.ui.images import (
     ImageFormat,
     ImageInfo,
     ImageResolver,
+    ImageTooLargeError,
     UnsupportedImageError,
     inspect_image,
 )
@@ -54,6 +56,7 @@ logger = logging.getLogger(__name__)
 LOADING: Final = "Loading the image..."
 MAX_DISPLAY: Final = 480  # pixels: a bigger image is shown scaled down to fit, never scaled up
 WORKERS: Final = 2  # images decoded at once, in the whole process
+MAX_TOOL_PIXEL_BYTES: Final = 64 * 1024 * 1024  # decoded pixels a tool keeps, all its images
 ERROR_CLASS: Final = "error"
 
 _LOADERS: Final = {ImageFormat.PNG: "png", ImageFormat.JPEG: "jpeg", ImageFormat.WEBP: "webp"}
@@ -65,8 +68,11 @@ class ImageDecoder(Protocol):
     def decode(self, data: bytes, info: ImageInfo) -> Gdk.Texture: ...
 
 
+@functools.cache
 def installed_loaders() -> frozenset[str]:
-    """The names of the gdk-pixbuf loaders this system has (WebP's is a separate package)."""
+    """The names of the gdk-pixbuf loaders this system has (WebP's is a separate package).
+
+    Found once (`submit` does it on the main thread before any worker starts)."""
     return frozenset(
         name for fmt in GdkPixbuf.Pixbuf.get_formats() if (name := fmt.get_name()) is not None
     )
@@ -85,13 +91,18 @@ class PixbufDecoder:
         if name not in installed_loaders():
             raise UnsupportedImageError(f"this system has no {name} loader")
         sizes: list[tuple[int, int]] = []
+        native = (int(info.width), int(info.height))
+        shown = fit(*native)  # what is kept: the display size, so a tool's pixels stay bounded
 
         def prepared(loader: GdkPixbuf.PixbufLoader, width: int, height: int) -> None:
             # Called before the loader allocates the pixels. Whatever it says that the header did
-            # not: have it make one pixel instead, and refuse the image below.
+            # not: have it make one pixel instead, and refuse the image below. An image over the
+            # display size is scaled to it (a size at or under it is left exactly as it is).
             sizes.append((width, height))
-            if (width, height) != (info.width, info.height):
+            if (width, height) != native:
                 loader.set_size(1, 1)
+            elif shown != native:
+                loader.set_size(*shown)
 
         try:
             loader = GdkPixbuf.PixbufLoader.new_with_type(name)
@@ -103,11 +114,11 @@ class PixbufDecoder:
             pixbuf = loader.get_pixbuf()
         except GLib.Error as exc:
             raise ImageDecodeError(f"the {name} loader refused the image") from exc
-        if sizes != [(info.width, info.height)]:
+        if sizes != [native]:
             raise ImageDecodeError(f"the {name} loader saw another size than the header said")
         if (
             pixbuf is None
-            or (pixbuf.get_width(), pixbuf.get_height()) != (info.width, info.height)
+            or (pixbuf.get_width(), pixbuf.get_height()) != shown
             or pixbuf.get_bits_per_sample() != 8
             or pixbuf.get_n_channels() not in (3, BYTES_PER_PIXEL)
         ):
@@ -115,13 +126,50 @@ class PixbufDecoder:
         return Gdk.Texture.new_for_pixbuf(pixbuf)
 
 
-def load_image(resolver: ImageResolver, decoder: ImageDecoder, ref: ImageRef) -> Gdk.Texture:
-    """Resolve, inspect, decode: the whole pipeline, which runs on a worker thread."""
+def load_image(
+    resolver: ImageResolver,
+    decoder: ImageDecoder,
+    ref: ImageRef,
+    reserve: Callable[[ImageInfo], None] = lambda info: None,
+) -> Gdk.Texture:
+    """Resolve, inspect, reserve the pixels, decode: the whole pipeline, on a worker thread."""
     data = resolver.read(ref, MAX_IMAGE_BYTES)
     if len(data) > MAX_IMAGE_BYTES:  # the resolver was to stop at the limit; check, don't trust
         raise ImageDecodeError("the resolver returned more bytes than the limit")
     info = inspect_image(data)  # raises before any decoder sees the bytes
+    reserve(info)  # raises ImageTooLargeError if the tool has no room for the pixels
     return decoder.decode(data, info)
+
+
+@final
+class PixelBudget:
+    """The decoded pixels one tool keeps (I9): reserved before a decode, by the display size.
+
+    Each image view holds one texture at most `MAX_DISPLAY` pixels a side (4 bytes a pixel); all
+    of a tool's together are at most `MAX_TOOL_PIXEL_BYTES`, so a spec of hundreds of image views
+    cannot ask for gigabytes. Used from the workers, so it takes a lock.
+    """
+
+    def __init__(self) -> None:
+        self._held: dict[object, int] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def total(self) -> int:
+        with self._lock:
+            return sum(self._held.values())
+
+    def reserve(self, owner: object, wanted: int) -> bool:
+        with self._lock:
+            held = sum(self._held.values()) - self._held.get(owner, 0)
+            if held + wanted > MAX_TOOL_PIXEL_BYTES:
+                return False
+            self._held[owner] = wanted
+            return True
+
+    def release(self, owner: object) -> None:
+        with self._lock:
+            self._held.pop(owner, None)
 
 
 # --- the workers ------------------------------------------------------------------------------
@@ -175,10 +223,15 @@ class ImageView(Gtk.Box):
         resolver: ImageResolver,
         decoder: ImageDecoder,
         budget: TextBudget,
+        pixels: PixelBudget,
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self._resolver = resolver
         self._decoder = decoder
+        self._pixels = pixels
+        self._held: object | None = None  # what this view holds of the pixel budget
+        self._ref: ImageRef | None = None  # what was asked for last
+        self._stale = False
         self._picture = Gtk.Picture(
             can_shrink=True, content_fit=Gtk.ContentFit.CONTAIN, halign=Gtk.Align.START
         )
@@ -214,9 +267,15 @@ class ImageView(Gtk.Box):
         self._wanted = None
         self._clear()
 
-    def set_ref(self, ref: ImageRef | None, *, stale: bool) -> None:
+    def set_ref(self, ref: ImageRef | None, *, stale: bool, refresh: bool = True) -> None:
         """Show what `ref` names, once it is loaded (the old image goes at once, so that the
-        widget never shows an image the state no longer holds)."""
+        widget never shows an image the state no longer holds).
+
+        The same ref again is read again (a handler that rewrote the file assigns an equal ref),
+        unless `refresh` is False, which is what putting the widgets back to the state is."""
+        if not refresh and ref == self._ref and stale == self._stale:
+            return
+        self._ref, self._stale = ref, stale
         self._generation += 1
         self._wanted = None
         self._clear()
@@ -228,9 +287,15 @@ class ImageView(Gtk.Box):
             self._start()
 
     def _clear(self) -> None:
+        self._release_pixels()
         self._picture.set_paintable(None)
         self._picture.set_visible(False)
         self._hide_notice()
+
+    def _release_pixels(self) -> None:
+        if self._held is not None:
+            self._pixels.release(self._held)
+            self._held = None
 
     def _hide_notice(self) -> None:
         self._notice.set_text("")  # which gives back what the line had claimed of the budget
@@ -256,28 +321,38 @@ class ImageView(Gtk.Box):
         # for a worker must not keep the widgets of a tool that was closed meanwhile alive.
         cancelled = self._cancelled
         target = weakref.ref(self)
+        pixels = self._pixels
+        token = object()  # what this job holds of the pixel budget, until a view takes it over
+
+        def reserve(info: ImageInfo) -> None:
+            width, height = fit(info.width, info.height)
+            if not pixels.reserve(token, width * height * BYTES_PER_PIXEL):
+                raise ImageTooLargeError("the tool's images would hold too many pixels")
 
         def job() -> None:  # on a worker: no widget is touched
             if cancelled.is_set():  # nobody waits for it any more
                 return
             outcome: Gdk.Texture | ImageError
             try:
-                outcome = load_image(resolver, decoder, ref)
+                outcome = load_image(resolver, decoder, ref, reserve)
             except ImageError as error:
                 logger.warning("image %s not shown: %s", excerpt(str(ref.path)), error)
                 outcome = error
             except Exception:
                 logger.exception("image %s not shown", excerpt(str(ref.path)))
                 outcome = ImageError("unexpected failure")
-            GLib.idle_add(_deliver, target, generation, outcome)
+            GLib.idle_add(_deliver, target, generation, outcome, pixels, token)
 
         submit(job)
 
-    def arrived(self, generation: int, outcome: Gdk.Texture | ImageError) -> None:
-        """A worker's result, on the main thread (`_deliver`)."""
+    def arrived(self, generation: int, outcome: Gdk.Texture | ImageError, token: object) -> None:
+        """A worker's result, on the main thread (`_deliver`). `token` is what the job reserved
+        of the pixel budget: this view keeps it if it shows the image, else it is given back."""
         self._inflight = False
         if self.closed:
             return
+        if generation != self._generation or isinstance(outcome, ImageError):
+            self._pixels.release(token)
         if generation != self._generation:
             self._start()  # a newer ref has been waiting
             return
@@ -287,6 +362,7 @@ class ImageView(Gtk.Box):
                 self._say(outcome.shown, failed=True)
             else:
                 self._hide_notice()
+                self._held = token
                 self._picture.set_paintable(outcome)
                 self._picture.set_size_request(*fit(outcome.get_width(), outcome.get_height()))
                 self._picture.set_visible(True)
@@ -297,9 +373,15 @@ class ImageView(Gtk.Box):
 
 
 def _deliver(
-    target: "weakref.ReferenceType[ImageView]", generation: int, outcome: Gdk.Texture | ImageError
+    target: "weakref.ReferenceType[ImageView]",
+    generation: int,
+    outcome: Gdk.Texture | ImageError,
+    pixels: PixelBudget,
+    token: object,
 ) -> bool:
     view = target()
-    if view is not None:
-        view.arrived(generation, outcome)
+    if view is None:
+        pixels.release(token)
+    else:
+        view.arrived(generation, outcome, token)
     return GLib.SOURCE_REMOVE
