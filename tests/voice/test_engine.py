@@ -453,7 +453,7 @@ class TestGivingUp:
         (ended,) = waiting.give_up()
 
         assert isinstance(ended, TurnEnded)
-        assert ended.reason is EndReason.MAX_LENGTH
+        assert ended.reason is EndReason.TIMED_OUT  # not the cap: the capture stopped
         assert ended.pcm is not None
         assert waiting.mode is EngineMode.PAUSED
 

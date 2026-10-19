@@ -74,6 +74,7 @@ from tumbleweed.voice.worker import Worker
 logger = logging.getLogger(__name__)
 
 NOTHING_AFTER_WAKE: Final = "Nothing was said after the wake word."
+TIMED_OUT: Final = "Stopped listening: the microphone stopped delivering audio."
 AUDIO_LOST: Final = "Some audio was lost, so that turn was dropped. Please say it again."
 _AUDIO_FAILED: Final = "Audio capture failed."
 _DETECTION_FAILED: Final = "Hands-free stopped: speech detection failed."
@@ -569,6 +570,8 @@ class HandsFree:
                     f"Stopped listening: a recording is limited to {seconds} {unit}."
                 )
             )
+        if event.reason is EndReason.TIMED_OUT:
+            self._notify(lambda observer: observer.problem(TIMED_OUT))
         self._generation += 1
         self._mailbox.command(_SetMode(EngineMode.PAUSED, self._generation))
         self._set_phase(HandsFreePhase.TRANSCRIBING)

@@ -712,6 +712,14 @@ class TestFocus:
         elsewhere = Gtk.Entry()
         window.chrome.append(elsewhere)
         window.set_focus(elsewhere)
+        assert pump_until(
+            lambda: (
+                window.get_focus() is not None
+                and (
+                    window.get_focus() is elsewhere or window.get_focus().is_ancestor(elsewhere)  # type: ignore[union-attr]
+                )
+            )
+        )  # the focus really is there before the test begins
         turn_on(h)
 
         wake_up(h)
@@ -736,6 +744,32 @@ class TestFocus:
 
         assert pump_until(lambda: len(h.responder.requests) == 1)
         assert h.shell.window.get_focus() is inside
+
+    def test_a_mic_turn_after_a_wake_turn_puts_the_focus_in_the_input_again(
+        self, build: HandsfreeBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        h = build()
+        window = h.shell.window
+        show(h.shell)
+        elsewhere = Gtk.Entry()
+        window.chrome.append(elsewhere)
+        window.set_focus(elsewhere)
+        turn_on(h)
+        wake_up(h)
+        say(h)
+        assert pump_until(lambda: len(h.responder.requests) == 1)
+        h.responder.sink.emit(ReplyFinished())
+        assert not window.chat_panel.input_view.has_focus()  # the wake turn left it alone
+
+        controls(h).mic_button.set_active(True)
+        assert pump_until(lambda: h.source.capturing)
+        h.source.feed(pcm(1.0))
+        controls(h).mic_button.set_active(False)
+
+        assert pump_until(lambda: len(h.responder.requests) == 2)
+        assert window.get_focus() is window.chat_panel.input_view
 
     def test_a_push_to_talk_turn_still_puts_the_focus_in_the_input(
         self, build: HandsfreeBuilder

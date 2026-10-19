@@ -38,6 +38,7 @@ import enum
 import logging
 import re
 import threading
+import unicodedata
 from collections.abc import Callable
 from typing import Final, Protocol, final
 
@@ -77,16 +78,29 @@ class SpeechObserver(Protocol):
 
 
 def _phrase_pattern(phrases: tuple[str, ...]) -> "re.Pattern[str] | None":
-    """A pattern for any of `phrases`, whatever the case and whatever stands between the words
-    (`Hey, Jarvis!`, `hey-jarvis`, `HEY_JARVIS`), and only as whole words."""
+    """A pattern for any of `phrases`, whatever the case and whatever stands between the words or
+    their letters (`Hey, Jarvis!`, `hey-jarvis`, `HEY_JARVIS`, `Jar-vis`), and only as whole words
+    (a letter beside it makes it another word; a digit does not). It is for text after `_fold`."""
+    gap = r"[\W_]*"
     forms = [
-        r"[\W_]*".join(re.escape(word) for word in phrase.replace("_", " ").split())
+        gap.join(gap.join(re.escape(letter) for letter in word) for word in phrase.split("_"))
         for phrase in phrases
         if phrase.strip()
     ]
     if not forms:
         return None
-    return re.compile(r"(?<![^\W_])(?:" + "|".join(forms) + r")(?![^\W_])", re.IGNORECASE)
+    return re.compile(r"(?<![^\W\d_])(?:" + "|".join(forms) + r")(?![^\W\d_])", re.IGNORECASE)
+
+
+def _fold(text: str) -> str:
+    """`text` with compatibility forms folded (full-width letters, ligatures) and combining marks
+    dropped, so that an accented or full-width spelling of the phrase is the phrase to the pattern.
+    A look-alike letter of another script is not folded: that can pass, and the speaking threshold,
+    or headphones, are the control for it."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    return unicodedata.normalize(
+        "NFC", "".join(c for c in decomposed if not unicodedata.combining(c))
+    )
 
 
 @final
@@ -238,7 +252,10 @@ class SpeechOutput:
         """`sentence` without the wake phrase, also where the phrase would be said across the end
         of the sentence before it: that sentence is already on its way, so what the phrase takes
         from this one is dropped, and the two are never the phrase in a row."""
+        sentence = _fold(sentence)
         previous, self._previous = self._previous, sentence
+        # The reach across a sentence end assumes phrases of at most two words ("hey jarvis"): a
+        # match that straddles the boundary loses only its second part to this sentence.
         found = pattern.search(f"{previous} {sentence}")
         if found is not None and found.start() < len(previous) + 1 < found.end():
             sentence = sentence[found.end() - len(previous) - 1 :].lstrip(" ,.;:!?-")

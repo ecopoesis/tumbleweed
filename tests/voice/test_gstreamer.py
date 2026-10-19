@@ -253,6 +253,20 @@ class TestTheStream:
 
         assert reported == ["The microphone stopped delivering audio."]
 
+    def test_a_microphone_that_cannot_be_opened_is_refused_in_start_and_not_reported_after(
+        self,
+    ) -> None:
+        """No device in the container: `autoaudiosrc` posts an ERROR during the state change. That
+        is `start`'s to refuse with (fixed text), not a capture that "stopped delivering"."""
+        reported: list[str] = []
+        stream = GStreamerAudioStream(platform="linux")  # the real microphone elements
+
+        with pytest.raises(AudioError, match="could not be opened"):
+            stream.start(lambda _chunk: None, reported.append)
+        time.sleep(0.3)
+
+        assert reported == []
+
     def test_stopping_it_reports_nothing(self) -> None:
         reported: list[str] = []
         stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)

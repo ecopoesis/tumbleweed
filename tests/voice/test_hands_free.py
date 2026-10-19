@@ -1314,6 +1314,51 @@ class TestADeadCapture:
         assert rig.hands.problems == []
 
 
+class TestEdgesOfTheWatch:
+    def test_an_old_error_callback_cannot_turn_off_a_later_turn_on(self, build: Builder) -> None:
+        rig = build()
+        rig.start()
+        old = rig.stream._on_error  # noqa: SLF001  (the callback the first open was given)
+        assert old is not None
+        rig.hf.set_enabled(False)
+        assert rig.until(lambda: not rig.stream.capturing)
+        rig.start()
+
+        old("The microphone stopped delivering audio.")  # a late report of the first capture
+        rig.flush()
+
+        assert rig.hf.enabled
+        assert rig.hands.problems == []
+
+    def test_the_time_spent_off_does_not_count_against_a_new_turn_on(self, build: Builder) -> None:
+        clock = Clock()
+        rig = build(clock=clock)
+        clock.advance(60)  # a minute with hands-free off and no audio at all
+
+        rig.start()
+        wait_for_inference(rig)
+        clock.advance(5)
+        wait_for_inference(rig)
+
+        assert rig.hf.phase is HandsFreePhase.WAITING  # five seconds since it was turned on
+        assert rig.hands.problems == []
+
+    def test_a_turn_stalled_with_speech_heard_says_why_and_is_transcribed(
+        self, build: Builder
+    ) -> None:
+        clock = Clock()
+        rig = build(clock=clock)
+        rig.start()
+        rig.wake_up()
+        wait_for_inference(rig)
+        rig.stream.feed(windows(*([900] * 14)))  # speech, and then the capture stops
+        clock.advance(2 + 3 + 1)
+        wait_for_inference(rig)
+
+        assert rig.until(lambda: rig.heard.texts == [HELLO])
+        assert rig.hands.problems == ["Stopped listening: the microphone stopped delivering audio."]
+
+
 class TestStaleFaults:
     def test_a_fault_found_after_esc_does_not_turn_hands_free_off(self, build: Builder) -> None:
         rig = build(wake_error=RuntimeError("boom"))

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.voice.fake_piper import make_fake_piper
 from tests.voice.support import ManualDispatcher, environ_for, write_config
 from tests.voice.tiny_onnx import tiny_identity_model
 from tumbleweed.agent import config as agent_config
@@ -364,6 +365,61 @@ class TestBuildVoice:
         write_config(home, '[voice]\nlanguage = "English"\n[voice.wake]\nthreshold = 2\n')
 
         assert build_voice(environ_for(home), ManualDispatcher()) is None
+
+    def test_a_reply_that_says_the_wake_phrase_reaches_the_synthesiser_without_it(
+        self, home: Path, models: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Through `build_voice`, with hands-free set up: Piper (a stand-in that makes
+        `len(sentence) * 10` samples) is asked for the sentence with the phrase replaced."""
+        from tumbleweed.voice.fake import FakeAudioPlayer
+
+        player = FakeAudioPlayer()
+        monkeypatch.setattr(factory, "_gstreamer_player", lambda: player)
+        program, voice = make_fake_piper(tmp_path)
+        write_config(
+            home,
+            f'[voice.vad]\nmodels_dir = "{models}"\n[voice.wake]\nmodels_dir = "{models}"\n'
+            f'[voice.tts]\npiper_path = "{program}"\nvoice_model = "{voice}"\n',
+        )
+        dispatcher = ManualDispatcher()
+        setup = build_voice(environ_for(home), dispatcher)
+        assert setup is not None
+        assert setup.speech is not None
+        try:
+            setup.speech.begin_reply()
+            setup.speech.feed("Please say hey jarvis now.")
+            setup.speech.end_reply()
+            assert dispatcher.pump_until(lambda: len(player.played) == 1)
+        finally:
+            setup.speech.close()
+            setup.input.close()
+
+        # "Please say the wake word now." is 29 characters: ten samples each, two bytes a sample
+        assert len(player.played[0].pcm) == 29 * 10 * 2
+
+    def test_without_hands_free_the_phrase_is_not_touched(
+        self, home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tumbleweed.voice.fake import FakeAudioPlayer
+
+        player = FakeAudioPlayer()
+        monkeypatch.setattr(factory, "_gstreamer_player", lambda: player)
+        program, voice = make_fake_piper(tmp_path)
+        write_config(home, f'[voice.tts]\npiper_path = "{program}"\nvoice_model = "{voice}"\n')
+        dispatcher = ManualDispatcher()
+        setup = build_voice(environ_for(home), dispatcher)
+        assert setup is not None
+        assert setup.speech is not None
+        try:
+            setup.speech.begin_reply()
+            setup.speech.feed("Please say hey jarvis now.")
+            setup.speech.end_reply()
+            assert dispatcher.pump_until(lambda: len(player.played) == 1)
+        finally:
+            setup.speech.close()
+            setup.input.close()
+
+        assert len(player.played[0].pcm) == 26 * 10 * 2  # as written: 26 characters
 
     def test_without_gstreamer_turning_it_on_says_so_and_stays_off(
         self, home: Path, models: Path, monkeypatch: pytest.MonkeyPatch

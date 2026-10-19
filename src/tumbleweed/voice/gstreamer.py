@@ -294,14 +294,20 @@ class GStreamerAudioStream:
         self._pipeline = pipeline
         bus = pipeline.get_bus()
 
+        armed = threading.Event()  # set once the microphone is open: errors of opening are start's
+
         def on_message(_bus: Gst.Bus, message: Gst.Message) -> Gst.BusSyncReply:
-            # Called on the thread that posts the message: it only passes the news on. An error
-            # or the end of the stream means the microphone has stopped delivering audio.
+            # Called on the thread that posts the message: it only passes the news on. Until the
+            # microphone is open an error is left on the bus for `start` to log and refuse with;
+            # once it is, an error or the end of the stream means it has stopped delivering audio.
+            # Nothing else reads this bus, so every message is dropped, not queued for ever.
+            if not armed.is_set():
+                return Gst.BusSyncReply.PASS
             if message.type in (Gst.MessageType.ERROR, Gst.MessageType.EOS):
                 if message.type == Gst.MessageType.ERROR:
                     _log_bus_error(pipeline, message)
                 on_error(_STOPPED)
-            return Gst.BusSyncReply.PASS
+            return Gst.BusSyncReply.DROP
 
         bus.set_sync_handler(on_message)
         result = pipeline.set_state(Gst.State.PLAYING)
@@ -311,6 +317,7 @@ class GStreamerAudioStream:
             _log_bus_error(pipeline)
             self.stop()
             raise AudioError(_OPEN_FAILED)
+        armed.set()
 
     def stop(self) -> None:
         """Setting the pipeline to NULL joins the streaming thread, so `on_audio` is not called

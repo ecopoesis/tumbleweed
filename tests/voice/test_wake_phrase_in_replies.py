@@ -39,6 +39,12 @@ def speak(text: str, *, avoid: tuple[str, ...]) -> list[str]:
         "Sure thing, hey-jarvis is what you say to me.",
         "Sure thing, hey_jarvis is what you say to me.",
         "Sure thing, heyjarvis is what you say to me.",
+        "Sure thing, hey Jar-vis is what you say to me.",
+        "Sure thing, hey Jarvis2 is what you say to me.",
+        "Sure thing, hey J\u00e0rvis is what you say to me.",
+        "Sure thing, hey Ja\u0301rvis is what you say to me.",
+        "Sure thing, \uff28\uff45\uff59 \uff2a\uff41\uff52\uff56\uff49\uff53 is what you say.",
+        "Sure thing, hey j a r v i s is what you say to me.",
     ],
 )
 def test_the_phrase_is_not_spoken_in_any_spelling(text: str) -> None:
@@ -47,7 +53,7 @@ def test_the_phrase_is_not_spoken_in_any_spelling(text: str) -> None:
     spoken = " ".join(sentences)
     assert "jarvis" not in spoken.lower()
     assert SILENCED_PHRASE in spoken
-    assert spoken.endswith("is what you say to me.")
+    assert " is what you say" in spoken
 
 
 def test_nor_across_the_end_of_a_sentence() -> None:
@@ -90,3 +96,11 @@ def test_the_phrase_in_the_text_that_is_not_the_configured_one_is_left() -> None
     (sentence,) = speak("Say hey mycroft if that is the word you set up.", avoid=("hey_jarvis",))
 
     assert "hey mycroft" in sentence
+
+
+def test_a_look_alike_letter_of_another_script_is_not_folded_and_can_pass() -> None:
+    """The known limit, said by a test: a Cyrillic \u0430 is not a Latin a. The speaking
+    threshold, or headphones, are the control for respellings that fool the pattern."""
+    sentences = speak("Sure thing, hey J\u0430rvis is what you say to me.", avoid=("hey_jarvis",))
+
+    assert SILENCED_PHRASE not in " ".join(sentences)

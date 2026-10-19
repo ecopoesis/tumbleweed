@@ -60,6 +60,7 @@ class EndReason(enum.StrEnum):
     ENDPOINT = "endpoint"  # speech, then silence
     MAX_LENGTH = "max-length"  # the utterance reached its byte cap
     NO_SPEECH = "no-speech"  # nothing was said
+    TIMED_OUT = "timed-out"  # real time ran out before the audio did: the capture stopped
     AUDIO_LOST = "audio-lost"  # the inference thread fell behind and audio of the turn was dropped
 
 
@@ -149,7 +150,7 @@ class HandsFreeEngine:
         (the capture may have stopped delivering): end it with what was heard, if any."""
         if self._mode is not EngineMode.LISTENING:
             return []
-        return [self._end(EndReason.MAX_LENGTH)]
+        return [self._end(EndReason.TIMED_OUT)]
 
     def feed(self, pcm: bytes) -> list[EngineEvent]:
         """Take more audio (16 kHz mono S16LE); return what happened, in order."""
