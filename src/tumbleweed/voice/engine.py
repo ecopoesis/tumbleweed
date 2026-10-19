@@ -144,6 +144,13 @@ class HandsFreeEngine:
         if self._mode is EngineMode.LISTENING:
             self._lost = True
 
+    def give_up(self) -> list[EngineEvent]:
+        """The turn has lasted as long as any turn may in real time, whatever audio was counted
+        (the capture may have stopped delivering): end it with what was heard, if any."""
+        if self._mode is not EngineMode.LISTENING:
+            return []
+        return [self._end(EndReason.MAX_LENGTH)]
+
     def feed(self, pcm: bytes) -> list[EngineEvent]:
         """Take more audio (16 kHz mono S16LE); return what happened, in order."""
         if self._mode is EngineMode.PAUSED:
@@ -152,6 +159,7 @@ class HandsFreeEngine:
         if len(self._pending) > RING_BYTES:  # never more than the capture's own ring holds
             del self._pending[: len(self._pending) - RING_BYTES]
             del self._pending[: len(self._pending) % 2]
+            self.note_gap()  # audio was thrown away: a turn in progress has a hole in it
         events: list[EngineEvent] = []
         while True:
             mode = self.mode  # read each time: a step can change it
@@ -179,7 +187,12 @@ class HandsFreeEngine:
         if self._holdoff:
             self._holdoff -= 1
         threshold = self._wake_config.speaking_threshold if guarded else self._wake_config.threshold
-        if self._wake.score(chunk) < threshold:
+        score = self._wake.score(chunk)
+        # A saturated score is exactly 1.0, so "at least 1" would let it through: a speaking
+        # threshold of 1 means no wake word is accepted while a reply is spoken.
+        if guarded and threshold >= 1.0:
+            return None
+        if score < threshold:
             return None
         self._mode = EngineMode.LISTENING
         self._vad.reset()

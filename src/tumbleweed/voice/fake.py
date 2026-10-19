@@ -249,18 +249,20 @@ class FakeAudioStream:
         self._gate = gate
         self._on_state = on_state
         self._on_audio: Callable[[bytes], None] | None = None
+        self._on_error: Callable[[str], None] | None = None
         self.capturing = False
         self.starts = 0
         self.stops = 0
         self._lock = threading.Lock()
 
-    def start(self, on_audio: Callable[[bytes], None]) -> None:
+    def start(self, on_audio: Callable[[bytes], None], on_error: Callable[[str], None]) -> None:
         if self._gate is not None:
             self._gate.wait(timeout=10)
         if self.start_error is not None:
             raise self.start_error
         with self._lock:
             self._on_audio = on_audio
+            self._on_error = on_error
             self.capturing = True
             self.starts += 1
         if self._on_state is not None:
@@ -272,6 +274,13 @@ class FakeAudioStream:
             deliver = self._on_audio if self.capturing else None
         if deliver is not None:
             deliver(chunk)
+
+    def fail(self, message: str) -> None:
+        """The device reports that the capture has failed, as a bus error would."""
+        with self._lock:
+            report = self._on_error if self.capturing else None
+        if report is not None:
+            report(message)
 
     def stop(self) -> None:
         if self._gate is not None:

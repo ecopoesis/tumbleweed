@@ -125,6 +125,7 @@ class VoiceInput:
         self._session = 0  # one per press: the recording whose device must be confirmed closed
         self._open_sessions: set[int] = set()
         self._microphone_reported = False
+        self._wake_turn = False
         # Touched only by the audio worker:
         self._source: AudioSource | None = None
         self._capturing = False
@@ -144,6 +145,13 @@ class VoiceInput:
         self._require_main_thread()
         if observer in self._observers:
             self._observers.remove(observer)
+
+    @property
+    def wake_turn(self) -> bool:
+        """Whether the utterance in progress, or the last one, came from hands-free mode (a wake
+        word) and not from the key or the Mic: the shell never lets such a turn move the keyboard
+        focus."""
+        return self._wake_turn
 
     @property
     def microphone_open(self) -> bool:
@@ -172,6 +180,7 @@ class VoiceInput:
         generation = self._generation
         self._abort = AbortSignal()
         self._session += 1
+        self._wake_turn = False
         session = self._session
         self._open_sessions.add(session)
         self._notify_microphone()
@@ -188,6 +197,7 @@ class VoiceInput:
         generation = self._generation
         self._abort = AbortSignal()
         abort = self._abort
+        self._wake_turn = True
         self._set_phase(VoicePhase.TRANSCRIBING)
         if utterance.byte_count < self._limits.min_utterance_bytes:
             self._finish_later(generation, message=NO_SPEECH)

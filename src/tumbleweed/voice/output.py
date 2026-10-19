@@ -36,6 +36,7 @@ bounded by the reply's cap. Errors are fixed text for the UI, and a failure ends
 
 import enum
 import logging
+import re
 import threading
 from collections.abc import Callable
 from typing import Final, Protocol, final
@@ -50,6 +51,7 @@ from tumbleweed.voice.worker import Worker
 
 logger = logging.getLogger(__name__)
 
+SILENCED_PHRASE: Final = "the wake word"
 REPLY_TOO_LONG: Final = "Only the start of this reply is read aloud: it is too long to speak."
 _TTS_FAILED: Final = "Speech synthesis failed."
 _PLAYBACK_FAILED: Final = "Audio playback failed."
@@ -74,6 +76,19 @@ class SpeechObserver(Protocol):
         ...
 
 
+def _phrase_pattern(phrases: tuple[str, ...]) -> "re.Pattern[str] | None":
+    """A pattern for any of `phrases`, whatever the case and whatever stands between the words
+    (`Hey, Jarvis!`, `hey-jarvis`, `HEY_JARVIS`), and only as whole words."""
+    forms = [
+        r"[\W_]*".join(re.escape(word) for word in phrase.replace("_", " ").split())
+        for phrase in phrases
+        if phrase.strip()
+    ]
+    if not forms:
+        return None
+    return re.compile(r"(?<![^\W_])(?:" + "|".join(forms) + r")(?![^\W_])", re.IGNORECASE)
+
+
 @final
 class SpeechOutput:
     """Spoken replies over a `TtsBackend` and an `AudioPlayer` (see the module docstring)."""
@@ -85,7 +100,10 @@ class SpeechOutput:
         player: Callable[[], AudioPlayer],
         dispatcher: MainThreadDispatcher,
         config: TtsConfig,
+        avoid: tuple[str, ...] = (),
     ) -> None:
+        self._avoid = _phrase_pattern(avoid)
+        self._previous = ""  # the sentence before the one being scrubbed
         self._backend = backend
         self._player_factory = player
         self._dispatcher = dispatcher
@@ -133,6 +151,7 @@ class SpeechOutput:
         self._reset()
         if self._closed:
             return
+        self._previous = ""
         self._chunker = SentenceChunker(max_sentence_chars=self._config.max_sentence_chars)
         self._accepting = not (self._muted or self._microphone_open)
 
@@ -201,6 +220,10 @@ class SpeechOutput:
 
     def _enqueue(self, sentences: list[str]) -> None:
         for sentence in sentences:
+            if (pattern := self._avoid) is not None:
+                # Model output must not be able to say the wake word: that would wake the
+                # assistant through its own speakers (S08, D23 (7)). Said as "the wake word".
+                sentence = self._scrub(sentence, pattern)
             room = self._config.max_reply_chars - self._spoken_chars
             if room <= 0 or len(sentence) > room:
                 sentence = sentence[:room].rsplit(" ", 1)[0] if room > 0 else ""
@@ -210,6 +233,18 @@ class SpeechOutput:
                 self._submit(sentence)
             if not self._accepting:
                 break
+
+    def _scrub(self, sentence: str, pattern: "re.Pattern[str]") -> str:
+        """`sentence` without the wake phrase, also where the phrase would be said across the end
+        of the sentence before it: that sentence is already on its way, so what the phrase takes
+        from this one is dropped, and the two are never the phrase in a row."""
+        previous, self._previous = self._previous, sentence
+        found = pattern.search(f"{previous} {sentence}")
+        if found is not None and found.start() < len(previous) + 1 < found.end():
+            sentence = sentence[found.end() - len(previous) - 1 :].lstrip(" ,.;:!?-")
+        scrubbed = pattern.sub(SILENCED_PHRASE, sentence)
+        self._previous = scrubbed
+        return scrubbed
 
     def _cap_reached(self) -> None:
         self._accepting = False

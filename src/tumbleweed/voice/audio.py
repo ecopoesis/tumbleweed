@@ -129,9 +129,11 @@ class AudioStream(Protocol):
     Implementations: `GStreamerAudioStream` (`voice.gstreamer`) and `FakeAudioStream`.
     """
 
-    def start(self, on_audio: Callable[[bytes], None]) -> None:
+    def start(self, on_audio: Callable[[bytes], None], on_error: Callable[[str], None]) -> None:
         """Open the microphone. `on_audio(chunk)` is then called from any thread, with whole
-        16 kHz mono S16LE samples, and must return at once. Raises `AudioError`."""
+        16 kHz mono S16LE samples, and must return at once; `on_error(message)` is called, from
+        any thread and at most a few times, with fixed text, if the capture fails or ends
+        afterwards (the device went away, the pipeline ended). Raises `AudioError`."""
         ...
 
     def stop(self) -> None:

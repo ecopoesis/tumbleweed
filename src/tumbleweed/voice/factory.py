@@ -104,7 +104,7 @@ def _gstreamer_player() -> AudioPlayer:
 
 
 def _build_speech(
-    config: VoiceConfig, dispatcher: MainThreadDispatcher
+    config: VoiceConfig, dispatcher: MainThreadDispatcher, avoid: tuple[str, ...] = ()
 ) -> tuple[SpeechOutput | None, str | None]:
     """Speech output and the notice for the user, if `[voice.tts]` asks for any."""
     if config.tts_problem is not None:
@@ -123,7 +123,7 @@ def _build_speech(
         logger.warning("speech output is off: %s", exc)
         return None, f"Speech output is off: {exc}"
     speech = SpeechOutput(
-        backend=backend, player=_gstreamer_player, dispatcher=dispatcher, config=tts
+        backend=backend, player=_gstreamer_player, dispatcher=dispatcher, config=tts, avoid=avoid
     )
     logger.info("speech output: piper with a configured voice model")
     return speech, None
@@ -224,7 +224,9 @@ def build_voice(environ: Mapping[str, str], dispatcher: MainThreadDispatcher) ->
             endpoint.display,
         )
     logger.info("voice input: speech server %s", endpoint.display)
-    speech, notice = _build_speech(config, dispatcher)
+    # The reply must not be able to say the wake word through the speakers (D23 (7)).
+    avoid = (config.wake.model,) if wake_store is not None else ()
+    speech, notice = _build_speech(config, dispatcher, avoid)
     hands_free = None
     if wake_store is not None:
         hands_free = HandsFree(

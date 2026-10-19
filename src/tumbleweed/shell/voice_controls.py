@@ -287,7 +287,11 @@ class VoiceControls(Gtk.Box):
         # seconds") is still news. The next LISTENING phase clears it.
         self.dictating = not self._edit_before_send
         try:
-            self._chat_panel.dictate(text, send=not self._edit_before_send)
+            # A hands-free turn can be started by any sound, so it never moves the keyboard focus
+            # (a password typed in the terminal must not land in the chat); nor does a turn
+            # finishing while the terminal has it.
+            take_focus = not self._voice.wake_turn and not self._in_terminal()
+            self._chat_panel.dictate(text, send=not self._edit_before_send, take_focus=take_focus)
         except Exception:
             logger.exception("putting a transcript in the chat failed")
             self._show_message("The transcript could not be added to the chat.")

@@ -50,6 +50,7 @@ import collections
 import enum
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final, Protocol, final
@@ -77,6 +78,14 @@ AUDIO_LOST: Final = "Some audio was lost, so that turn was dropped. Please say i
 _AUDIO_FAILED: Final = "Audio capture failed."
 _DETECTION_FAILED: Final = "Hands-free stopped: speech detection failed."
 _WAIT_SECONDS: Final = 0.5  # the inference thread's longest wait for audio or a command
+# A capture that has delivered nothing for this long (counted from when it was asked to listen) is
+# dead: GStreamer does not always say so. The microphone may be answering a permission prompt at
+# first, which `GStreamerAudioStream.start` bounds at 5 s.
+_STALL_SECONDS: Final = 8.0
+# A turn may last at most `max_utterance_seconds` of audio, and audio arrives in real time, so a
+# turn that has lasted this much longer in wall-clock time (the capture stopped) is over.
+_LISTEN_GRACE_SECONDS: Final = 3.0
+_STOPPED: Final = "The microphone stopped delivering audio."
 
 
 class HandsFreePhase(enum.StrEnum):
@@ -126,7 +135,10 @@ class _Mailbox:
     from any thread (the capture thread) and never blocks; audio beyond `max_bytes` drops the
     oldest chunks (never a command: they are tiny and say what the user did)."""
 
-    def __init__(self, max_bytes: int) -> None:
+    def __init__(self, max_bytes: int, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self.last_push = clock()
+        """When audio last arrived (the clock's time): a capture that has died stops it."""
         self._max = max_bytes - max_bytes % 2
         self._condition = threading.Condition()
         self._chunks: collections.deque[tuple[int, bytes]] = collections.deque()
@@ -144,6 +156,7 @@ class _Mailbox:
         with self._condition:
             if self._closed:
                 return
+            self.last_push = self._clock()
             self._sequence += 1
             self._chunks.append((self._sequence, chunk))
             self._size += len(chunk)
@@ -203,7 +216,14 @@ class _Inference:
         engine: Callable[[], HandsFreeEngine],
         on_events: Callable[[list[EngineEvent]], None],
         on_fault: Callable[[int, str], None],
+        *,
+        listen_limit: float,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        self._clock = clock
+        self._listen_limit = listen_limit
+        self._active_since: float | None = None  # since when it has been asked to listen
+        self._listening_since: float | None = None
         self._mailbox = mailbox
         self._factory = engine
         self._on_events = on_events
@@ -214,7 +234,15 @@ class _Inference:
         self._faulted = False
         self._dropped = 0  # what the mailbox had dropped when this thread last looked
         self._thread = threading.Thread(target=self._run, name="tumbleweed-hands-free", daemon=True)
-        self._thread.start()
+
+    def start(self) -> None:
+        """Start the thread, once: hands-free that is never turned on has no thread."""
+        if not self._thread.is_alive() and self._thread.ident is None:
+            self._thread.start()
+
+    @property
+    def thread(self) -> threading.Thread:
+        return self._thread
 
     def _run(self) -> None:
         while (items := self._mailbox.take(_WAIT_SECONDS)) is not None:
@@ -230,6 +258,38 @@ class _Inference:
                 except Exception:
                     logger.exception("hands-free inference failed")
                     self._fault(_DETECTION_FAILED)
+            try:
+                self._watch()
+            except Exception:
+                logger.exception("hands-free inference failed")
+                self._fault(_DETECTION_FAILED)
+
+    def _watch(self) -> None:
+        """Wall-clock bounds, which counting audio cannot give: a capture that has stopped
+        delivering audio is reported, and a turn that has lasted longer than audio can fill is
+        ended, so neither leaves hands-free deaf, or every reply silenced, for ever."""
+        engine = self._engine
+        if engine is None or self._faulted:
+            return
+        now = self._clock()
+        if engine.mode is EngineMode.PAUSED:
+            self._listening_since = None
+            return
+        if self._active_since is not None and (
+            now - max(self._active_since, self._mailbox.last_push) > _STALL_SECONDS
+        ):
+            self._active_since = None
+            self._fault(_STOPPED)
+            return
+        if engine.mode is not EngineMode.LISTENING:
+            self._listening_since = None
+        elif self._listening_since is None:
+            self._listening_since = now
+        elif now - self._listening_since > self._listen_limit:
+            self._listening_since = None
+            events = engine.give_up()
+            if events:
+                self._on_events(events)
 
     def _look_for_a_gap(self) -> None:
         """Audio the mailbox dropped (this thread fell behind by more than its cap) is a hole in any
@@ -255,6 +315,8 @@ class _Inference:
             case _SetMode(mode=mode, generation=generation):
                 self._generation = generation
                 self._faulted = False
+                self._active_since = None if mode is EngineMode.PAUSED else self._clock()
+                self._listening_since = None
                 if self._engine is None and mode is not EngineMode.PAUSED:
                     self._engine = (
                         self._factory()
@@ -316,6 +378,7 @@ class HandsFree:
         speech: SpeechOutput | None,
         dispatcher: MainThreadDispatcher,
         limits: VoiceLimits,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._stream_factory = stream
         self._voice = voice
@@ -336,8 +399,15 @@ class HandsFree:
         # Touched only by the audio worker:
         self._stream: AudioStream | None = None
         self._audio_worker = Worker("tumbleweed-hands-free-audio")
-        self._mailbox = _Mailbox(RING_BYTES)
-        self._inference = _Inference(self._mailbox, engine, self._events_from_thread, self._fault)
+        self._mailbox = _Mailbox(RING_BYTES, clock)
+        self._inference = _Inference(
+            self._mailbox,
+            engine,
+            self._events_from_thread,
+            self._fault,
+            listen_limit=limits.max_utterance_seconds + _LISTEN_GRACE_SECONDS,
+            clock=clock,
+        )
         voice.subscribe(self._voice_view)
         if speech is not None:
             speech.subscribe(self._speech_view)
@@ -422,6 +492,7 @@ class HandsFree:
     # Main thread: internals
 
     def _enable(self) -> None:
+        self._inference.start()
         self._enabled = True
         self._epoch += 1
         epoch = self._epoch
@@ -565,7 +636,9 @@ class HandsFree:
             if epoch == self._epoch:  # not turned off again while this waited
                 if self._stream is None:
                     self._stream = self._stream_factory()
-                self._stream.start(self._mailbox.push)
+                self._stream.start(
+                    self._mailbox.push, lambda message: self._stream_died(epoch, message)
+                )
         except AudioError as exc:
             problem = str(exc)
         except Exception:
@@ -577,6 +650,10 @@ class HandsFree:
             message = problem
             self._dispatcher.post(lambda: self._stream_failed(epoch, message))
         self._dispatcher.post(self._job_done)
+
+    def _stream_died(self, epoch: int, message: str) -> None:
+        """From any thread: the capture reports that it has failed or ended."""
+        self._dispatcher.post(lambda: self._stream_failed(epoch, message))
 
     def _close_stream(self) -> None:
         if self._stream is not None:

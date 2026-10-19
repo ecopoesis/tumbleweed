@@ -80,6 +80,7 @@ _POLL: Final = 20 * Gst.MSECOND
 _PLAYBACK_MARGIN: Final = 5.0  # seconds a sentence may take beyond its own length
 _PLAY_OPEN_FAILED: Final = "The speaker could not be opened. Check that audio output is available."
 _PLAY_FAILED: Final = "The speaker stopped working while speaking."
+_STOPPED: Final = "The microphone stopped delivering audio."
 _init_lock = threading.Lock()
 _initialised = False
 
@@ -287,10 +288,22 @@ class GStreamerAudioStream:
         self._platform = platform
         self._pipeline: Gst.Pipeline | None = None
 
-    def start(self, on_audio: Callable[[bytes], None]) -> None:
+    def start(self, on_audio: Callable[[bytes], None], on_error: Callable[[str], None]) -> None:
         self.stop()
         pipeline = _capture_pipeline(self._kind, self._platform, on_audio)
         self._pipeline = pipeline
+        bus = pipeline.get_bus()
+
+        def on_message(_bus: Gst.Bus, message: Gst.Message) -> Gst.BusSyncReply:
+            # Called on the thread that posts the message: it only passes the news on. An error
+            # or the end of the stream means the microphone has stopped delivering audio.
+            if message.type in (Gst.MessageType.ERROR, Gst.MessageType.EOS):
+                if message.type == Gst.MessageType.ERROR:
+                    _log_bus_error(pipeline, message)
+                on_error(_STOPPED)
+            return Gst.BusSyncReply.PASS
+
+        bus.set_sync_handler(on_message)
         result = pipeline.set_state(Gst.State.PLAYING)
         if result != Gst.StateChangeReturn.FAILURE:
             result, _current, _pending = pipeline.get_state(START_TIMEOUT)
@@ -304,6 +317,8 @@ class GStreamerAudioStream:
         again afterwards."""
         pipeline, self._pipeline = self._pipeline, None
         if pipeline is not None:
+            bus = pipeline.get_bus()
+            bus.set_sync_handler(None)  # tearing it down is not a failure to report
             pipeline.set_state(Gst.State.NULL)
 
 
