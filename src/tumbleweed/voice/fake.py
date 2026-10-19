@@ -310,16 +310,25 @@ class FakeWake:
 @final
 class FakeVad:
     """A `VoiceActivity` whose probability for a window is read from the window itself: the first
-    sample divided by 1000 (a window that starts with 900 is 0.9 speech; silence is 0)."""
+    sample divided by 1000 (a window that starts with 900 is 0.9 speech; silence is 0). `gate`, if
+    given, makes `probability` wait for it (with a deadline) to play a model that is slow, and
+    `entered` is set when a call begins to wait."""
 
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(
+        self, *, error: Exception | None = None, gate: threading.Event | None = None
+    ) -> None:
         self.error = error
+        self._gate = gate
+        self.entered = threading.Event()
         self.windows = 0
         self.resets = 0
 
     def probability(self, window: bytes) -> float:
         if self.error is not None:
             raise self.error
+        if self._gate is not None:
+            self.entered.set()
+            self._gate.wait(timeout=10)
         self.windows += 1
         return int.from_bytes(window[:2], "little", signed=True) / 1000
 

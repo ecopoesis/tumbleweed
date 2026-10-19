@@ -73,6 +73,7 @@ from tumbleweed.voice.worker import Worker
 logger = logging.getLogger(__name__)
 
 NOTHING_AFTER_WAKE: Final = "Nothing was said after the wake word."
+AUDIO_LOST: Final = "Some audio was lost, so that turn was dropped. Please say it again."
 _AUDIO_FAILED: Final = "Audio capture failed."
 _DETECTION_FAILED: Final = "Hands-free stopped: speech detection failed."
 _WAIT_SECONDS: Final = 0.5  # the inference thread's longest wait for audio or a command
@@ -211,11 +212,13 @@ class _Inference:
         self._generation = 0
         self._speaking = False
         self._faulted = False
+        self._dropped = 0  # what the mailbox had dropped when this thread last looked
         self._thread = threading.Thread(target=self._run, name="tumbleweed-hands-free", daemon=True)
         self._thread.start()
 
     def _run(self) -> None:
         while (items := self._mailbox.take(_WAIT_SECONDS)) is not None:
+            self._look_for_a_gap()
             for index, item in enumerate(items):
                 try:
                     if isinstance(item, bytes):
@@ -227,6 +230,15 @@ class _Inference:
                 except Exception:
                     logger.exception("hands-free inference failed")
                     self._fault(_DETECTION_FAILED)
+
+    def _look_for_a_gap(self) -> None:
+        """Audio the mailbox dropped (this thread fell behind by more than its cap) is a hole in any
+        turn being recorded: the engine is told, and gives that turn up."""
+        dropped = self._mailbox.dropped_bytes
+        if dropped != self._dropped:
+            self._dropped = dropped
+            if self._engine is not None:
+                self._engine.note_gap()
 
     def _feed(self, audio: bytes) -> None:
         if self._engine is not None and not self._faulted:
@@ -475,7 +487,8 @@ class HandsFree:
         utterance = self._utterance(event.pcm)
         if utterance is None:
             self._restart()
-            self._notify(lambda observer: observer.problem(NOTHING_AFTER_WAKE))
+            message = AUDIO_LOST if event.reason is EndReason.AUDIO_LOST else NOTHING_AFTER_WAKE
+            self._notify(lambda observer: observer.problem(message))
             return
         if event.reason is EndReason.MAX_LENGTH:
             seconds = self._limits.max_utterance_seconds

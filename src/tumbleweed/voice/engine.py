@@ -60,6 +60,7 @@ class EndReason(enum.StrEnum):
     ENDPOINT = "endpoint"  # speech, then silence
     MAX_LENGTH = "max-length"  # the utterance reached its byte cap
     NO_SPEECH = "no-speech"  # nothing was said
+    AUDIO_LOST = "audio-lost"  # the inference thread fell behind and audio of the turn was dropped
 
 
 @final
@@ -112,6 +113,7 @@ class HandsFreeEngine:
         self._endpointer: Endpointer | None = None
         self._utterance = bytearray()
         self._skip = 0  # windows still to drop at the start of a turn
+        self._lost = False  # audio of the turn in progress was dropped
 
     @property
     def mode(self) -> EngineMode:
@@ -134,6 +136,13 @@ class HandsFreeEngine:
         elif self._speaking:
             self._speaking = False
             self._holdoff = self._holdoff_chunks
+
+    def note_gap(self) -> None:
+        """Audio was dropped before what comes next (the mailbox's cap: this thread fell behind). A
+        turn in progress has a hole in it and is given up, not sent as it is: a garbled transcript
+        is worse than asking again."""
+        if self._mode is EngineMode.LISTENING:
+            self._lost = True
 
     def feed(self, pcm: bytes) -> list[EngineEvent]:
         """Take more audio (16 kHz mono S16LE); return what happened, in order."""
@@ -163,6 +172,7 @@ class HandsFreeEngine:
         self._endpointer = None
         self._utterance.clear()
         self._skip = 0
+        self._lost = False
 
     def _wait(self, chunk: bytes) -> WakeHeard | None:
         guarded = self._speaking or self._holdoff > 0
@@ -179,6 +189,8 @@ class HandsFreeEngine:
         return WakeHeard(self._generation, guarded)
 
     def _listen(self, window: bytes) -> TurnEnded | None:
+        if self._lost:
+            return self._end(EndReason.AUDIO_LOST)
         if self._skip:
             self._skip -= 1
             return None
@@ -198,9 +210,11 @@ class HandsFreeEngine:
 
     def _end(self, reason: EndReason) -> TurnEnded:
         pcm = None
-        if self._endpointer is not None and reason is not EndReason.NO_SPEECH:
+        if self._lost:
+            reason = EndReason.AUDIO_LOST
+        elif self._endpointer is not None and reason is not EndReason.NO_SPEECH:
             pcm = speech_slice(bytes(self._utterance), self._endpointer.tracker)
-        if pcm is None:
+        if pcm is None and reason is not EndReason.AUDIO_LOST:
             reason = EndReason.NO_SPEECH
         self._mode = EngineMode.PAUSED
         self._clear()
