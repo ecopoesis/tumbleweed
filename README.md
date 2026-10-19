@@ -699,5 +699,5 @@ the real one is the broker's, S19), checked as bytes (PNG, JPEG or still WebP, n
 MiB and 16 million pixels) and only then decoded, on a worker thread. `tumbleweed-render` has no
 workspace, so its images say so. `uv run pytest tests/ui/test_image_contract.py` is the contract
 every resolver passes. WebP decoding needs gdk-pixbuf's WebP loader (`webp-pixbuf-loader` on Linux,
-which the test image has); without it a WebP shows the line "Only PNG, JPEG and WebP images can be
-shown."
+which the test image has); without it a WebP shows the line
+"Only PNG, JPEG and WebP images can be shown."
