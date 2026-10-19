@@ -28,6 +28,8 @@ from tumbleweed.ui.images import (
     MAX_DECODED_BYTES,
     MAX_IMAGE_BYTES,
     MAX_IMAGE_SIDE,
+    MAX_JPEG_SCANS,
+    MAX_WEBP_CHUNKS,
     ImageError,
     ImageFormat,
     ImageTooLargeError,
@@ -184,6 +186,49 @@ class TestWhatIsRefused:
         ):
             with pytest.raises(UnsupportedImageError, match="no pixels"):
                 inspect_image(bad)
+
+
+class TestScansAndChunks:
+    SCAN = b"\xff\xda\x00\x02"
+
+    def test_a_jpeg_may_have_a_progressive_images_worth_of_scans_and_not_one_more(self) -> None:
+        one_scan_in_the_header = jpeg_header(3, 2)  # (it has none: only the frame)
+
+        assert sizes(one_scan_in_the_header + self.SCAN * MAX_JPEG_SCANS)[1:] == (3, 2)
+        with pytest.raises(UnsupportedImageError, match="too many scans"):
+            inspect_image(one_scan_in_the_header + self.SCAN * (MAX_JPEG_SCANS + 1))
+
+    def test_a_real_jpeg_with_one_scan_repeated_a_thousand_times_is_refused_by_its_bytes(
+        self,
+    ) -> None:
+        # Each repeated scan is another pass of the decoder over the image: minutes for 8 MiB.
+        bomb = JPEG_3X2[:-2] + JPEG_3X2[JPEG_3X2.index(b"\xff\xda") :] * 1000
+
+        with pytest.raises(UnsupportedImageError, match="too many scans"):
+            inspect_image(bomb)
+
+    def test_the_count_cannot_be_dodged_by_entropy_coded_bytes(self) -> None:
+        # 0xFF in the entropy-coded data is escaped as FF 00, so FF DA there is no marker: a
+        # scan marker is always seen, wherever it is.
+        escaped = b"\xff\x00\xda" * 500
+        assert sizes(jpeg_header(3, 2) + escaped)[1:] == (3, 2)
+
+    def test_a_webp_with_an_animation_chunk_is_refused_whatever_its_flag_says(self) -> None:
+        cleared = WEBP_ANIMATED_3X2[:20] + bytes([WEBP_ANIMATED_3X2[20] & ~0x02])
+        cleared += WEBP_ANIMATED_3X2[21:]
+
+        assert b"ANMF" in cleared
+        with pytest.raises(UnsupportedImageError, match="animated"):
+            inspect_image(cleared)
+
+    def test_a_still_webp_with_other_chunks_is_fine_and_one_with_too_many_is_not(self) -> None:
+        def chunk(kind: bytes, size: int) -> bytes:
+            return kind + size.to_bytes(4, "little") + bytes(size + (size & 1))
+
+        base = webp_header("extended", 3, 2)
+        assert sizes(base + chunk(b"EXIF", 5) + chunk(b"XMP ", 4))[1:] == (3, 2)  # odd size: padded
+        with pytest.raises(UnsupportedImageError, match="too many chunks"):
+            inspect_image(base + chunk(b"JUNK", 0) * (MAX_WEBP_CHUNKS + 1))
 
 
 class TestTheCapsAreCheckedFromTheHeader:

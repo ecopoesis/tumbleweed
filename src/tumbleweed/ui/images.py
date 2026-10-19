@@ -52,6 +52,8 @@ from tumbleweed.ui.spec import ImageRef
 MAX_IMAGE_BYTES: Final = ByteCount(8 * 1024 * 1024)  # the file, before anything looks inside
 MAX_IMAGE_SIDE: Final = PixelCount(8_192)  # width and height, each
 MAX_DECODED_BYTES: Final = ByteCount(64 * 1024 * 1024)  # width * height * 4: 16 million pixels
+MAX_JPEG_SCANS: Final = 64  # start-of-scan markers: a progressive JPEG has a dozen or so
+MAX_WEBP_CHUNKS: Final = 64  # chunks looked at in a WebP, for the ones that mean animation
 BYTES_PER_PIXEL: Final = 4  # what a decoder may allocate per pixel (RGBA, 8 bits)
 
 _PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
@@ -187,9 +189,23 @@ def _jpeg(data: bytes) -> tuple[int, int]:
     raise UnsupportedImageError("a JPEG with no usable frame header")
 
 
+def _no_animation_chunks(data: bytes) -> None:
+    """Refuse a WebP that has an animation or a frame chunk, whatever its header flag says."""
+    at = 12
+    for _ in range(MAX_WEBP_CHUNKS):
+        if at + 8 > len(data):
+            return
+        if data[at : at + 4] in (b"ANIM", b"ANMF"):
+            raise UnsupportedImageError("an animated WebP")
+        size = int.from_bytes(data[at + 4 : at + 8], "little")
+        at += 8 + size + (size & 1)  # chunks are padded to an even length
+    raise UnsupportedImageError("a WebP with too many chunks")
+
+
 def _webp(data: bytes) -> tuple[int, int]:
     if len(data) < 30:
         raise UnsupportedImageError("a WebP too short for a header")
+    _no_animation_chunks(data)
     kind = data[12:16]
     if kind == b"VP8X":  # extended: flags, then the canvas size less one, 24 bits each
         if data[20] & _WEBP_ANIMATION:
@@ -227,6 +243,11 @@ def inspect_image(data: bytes) -> ImageInfo:
         image_format, (width, height) = ImageFormat.WEBP, _webp(data)
     else:
         raise UnsupportedImageError("not a PNG, JPEG or WebP image")
+    if image_format is ImageFormat.JPEG and data.count(b"\xff\xda") > MAX_JPEG_SCANS:
+        # Every scan is a pass of the decoder over the whole image, so a file that repeats one
+        # thousands of times costs minutes of decoding for a few kilobytes. (An 0xFF in the
+        # entropy-coded data is always escaped, so this never counts fewer scans than there are.)
+        raise UnsupportedImageError("a JPEG with too many scans")
     if width < 1 or height < 1:
         raise UnsupportedImageError("an image with no pixels")
     if width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE:
