@@ -646,99 +646,106 @@ results come back through the injected dispatcher tagged with the reply's genera
 `HandsFree` (GTK-free: `set_enabled`, `cancel`, observers) runs `OFF -> WAITING -> LISTENING ->
 TRANSCRIBING -> WAITING` (`PAUSED` while push-to-talk has the microphone); the **Hands-free** toggle
 turns it on and off. Four things run it. The *audio worker* opens and closes the microphone
-(`AudioStream`, in production `GStreamerAudioStream`: the capture pipeline of push-to-talk kept open),
-GStreamer's streaming thread copies each buffer into a *mailbox* (2 s at most, the oldest dropped
-first, never blocking) and does nothing else, and the *inference thread* takes audio and commands
-from the mailbox, in order, and runs `HandsFreeEngine`; its events come back through the main-thread
-dispatcher. The engine is a synchronous machine with no threads and no clock: WAITING feeds 80 ms
-chunks to the wake-word detector, LISTENING feeds 32 ms windows to Silero VAD and keeps them (at most
-`max_utterance_seconds`), the endpointer ends the turn after speech and `end_silence_ms` of quiet (or
-gives up after `wait_for_speech_seconds`), and the engine emits the speech with a 256 ms margin each side.
-The turn is handed to `VoiceInput.transcribe_utterance`: the same speech worker, the same
-`clean_transcript`, the same observers, so the words enter the chat as the user's own, and
-`edit_before_send` (and its forcing over plain http) applies.
+(`AudioStream`, in production `GStreamerAudioStream`: the capture pipeline of push-to-talk kept
+open), GStreamer's streaming thread copies each buffer into a *mailbox* (2 s at most, the oldest
+dropped first, never blocking) and does nothing else, and the *inference thread* takes audio and
+commands from the mailbox, in order, and runs `HandsFreeEngine`; its events come back through the
+main-thread dispatcher. The engine is a synchronous machine with no threads and no clock: WAITING
+feeds 80 ms chunks to the wake-word detector, LISTENING feeds 32 ms windows to Silero VAD and keeps
+them (at most `max_utterance_seconds`), the endpointer ends the turn after speech and
+`end_silence_ms` of quiet (or gives up after `wait_for_speech_seconds`), and the engine emits the
+speech with a 256 ms margin each side. The turn is handed to `VoiceInput.transcribe_utterance`: the
+same speech worker, the same `clean_transcript`, the same observers, so the words enter the chat as
+the user's own, and `edit_before_send` (and its forcing over plain http) applies.
 
-- *Models.* Silero VAD v5 and openWakeWord's melspectrogram, embedding and wake-word models (a closed
-  set of names in the configuration: `hey_jarvis`, `alexa`, `hey_mycroft`) run directly on
+- *Models.* Silero VAD v5 and openWakeWord's melspectrogram, embedding and wake-word models (a
+  closed set of names in the configuration: `hey_jarvis`, `alexa`, `hey_mycroft`) run directly on
   `onnxruntime`, CPU, one thread; the `openwakeword` package is not used (D23). They are fetched by
-  `scripts/wake-models` against pinned SHA-256 hashes (https only, size and time ceilings, a partial file
-  never becomes a model), and `voice.modelfile.read_verified` checks the same hashes (`voice.models`;
-  a test keeps the script's list equal) every time a file is loaded: the directory text must already be
-  canonical, the path is walked down from `/` with `O_NOFOLLOW` (a symlink anywhere is refused), the
-  file is opened without blocking, must be a regular file of at most 8 MiB, and is read whole; the
-  bytes are hashed and are what `onnxruntime` is given, never a path, so the file cannot change between
-  the check and the load, and nothing is written. `voice.modelfile` is the one voice module besides
-  `piper` that imports `os`, and a test pins every `os` call and open flag it has.
+  `scripts/wake-models` against pinned SHA-256 hashes (https only, size and time ceilings, a partial
+  file never becomes a model), and `voice.modelfile.read_verified` checks the same hashes
+  (`voice.models`; a test keeps the script's list equal) every time a file is loaded: the directory
+  text must already be canonical, the path is walked down from `/` with `O_NOFOLLOW` (a symlink
+  anywhere is refused), the file is opened without blocking, must be a regular file of at most 8
+  MiB, and is read whole; the bytes are hashed and are what `onnxruntime` is given, never a path, so
+  the file cannot change between the check and the load, and nothing is written. `voice.modelfile`
+  is the one voice module besides `piper` that imports `os`, and a test pins every `os` call and
+  open flag it has.
 - *The loudness gate.* In a quiet room nothing can be said, so nothing is computed: after 2.4 s of
   chunks whose RMS is under 100 (16-bit units, about -50 dBFS: a quiet room and a whisper at arm's
   length are on either side) the wake models are not run and a chunk scores 0; the last 30 skipped
   chunks are kept (a fixed cap, 77 KiB) and, when sound returns, run through the melspectrogram and
-  embedding models in order before the loud chunk is scored, so the rolling state, and every score of a
-  chunk that is run, is the same as without the gate (tested with content-dependent fakes and with the
-  real models). Idle in a quiet room costs about 0.5% of a core; with sound the models run, about 10%
-  on an Apple M3 Max (D23 (13)).
+  embedding models in order before the loud chunk is scored, so the rolling state, and every score
+  of a chunk that is run, is the same as without the gate (tested with content-dependent fakes and
+  with the real models). Idle in a quiet room costs about 0.5% of a core; with sound the models run,
+  about 10% on an Apple M3 Max (D23 (13)).
 - *Abandoning.* Every change the user makes (off, Esc, Mute, push-to-talk, a finished turn) bumps a
   generation and sends the engine `set_mode` with it, which makes it forget all audio and every
-  detector's state; every event carries the engine's generation and an older one is dropped on the main
-  thread. A wake word or endpoint found after the user moved on never starts listening, never reaches
-  the speech server and never posts. Commands and audio reach the inference thread in one order, so audio
-  from before a command is never taken for audio after it. The mailbox's cap does not change what is
-  said: if the inference thread falls behind by more than 2 s (it normally needs about 1 ms per 80 ms
-  of audio) and audio of a turn being recorded is dropped, the turn is given up (`AUDIO_LOST`) and the
-  user is asked to say it again, never sent with a hole in it.
-- *The microphone indicator.* `HandsFree.microphone_open` is True from the moment the stream is asked for
-  until the audio worker has confirmed it closed (a count of open and close jobs not yet done), so it
-  is never off while audio is captured: waiting, listening, speaking, thinking, a slow device. The
-  status strip shows "Microphone on" separately from the voice state, because the state can say
-  "speaking" while the microphone is open. Push-to-talk's recording has the same rule
+  detector's state; every event carries the engine's generation and an older one is dropped on the
+  main thread. A wake word or endpoint found after the user moved on never starts listening, never
+  reaches the speech server and never posts. Commands and audio reach the inference thread in one
+  order, so audio from before a command is never taken for audio after it. The mailbox's cap does
+  not change what is said: if the inference thread falls behind by more than 2 s (it normally needs
+  about 1 ms per 80 ms of audio) and audio of a turn being recorded is dropped, the turn is given up
+  (`AUDIO_LOST`) and the user is asked to say it again, never sent with a hole in it.
+- *The microphone indicator.* `HandsFree.microphone_open` is True from the moment the stream is
+  asked for until the audio worker has confirmed it closed (a count of open and close jobs not yet
+  done), so it is never off while audio is captured: waiting, listening, speaking, thinking, a slow
+  device. The status strip shows "Microphone on" separately from the voice state, because the state
+  can say "speaking" while the microphone is open. Push-to-talk's recording has the same rule
   (`VoiceInput.microphone_open`: from `press` until the audio worker confirms the device closed, one
   confirmation per press), so after Esc the state says idle at once and the label stays until the
   device is closed. Turning hands-free off closes the microphone.
 - *The assistant's own voice (#117).* The microphone stays open while a reply is spoken, because the
-  wake word is how the user interrupts it, and speakers can be heard by it. There is no acoustic echo
-  cancellation. Instead: (1) while a reply is spoken and for `speaking_holdoff_ms` after, the wake
-  word needs `speaking_threshold` (default 0.9) instead of `threshold`; (2) nothing is transcribed
-  except after a wake word, so the assistant's speech is never a user turn by itself; (3) a wake word
-  stops the speech *before* listening starts (`SpeechOutput.set_microphone_open`, as push-to-talk
-  does) and nothing is spoken while a turn is recorded; (4) a turn that began while speaking drops its
-  first 250 ms, in which the speakers are still dying away. Residual: a loud speaker, or a reply that
-  contains the wake word, can pass (1); headphones, or `speaking_threshold = 1` (which accepts no
-  wake word at all while speaking), close it; and (5) before synthesis the wake phrase is replaced in
-  reply text by "the wake word" (any case, any punctuation between the words or letters, accents and
-  full-width forms folded, whole words, and across the end of a sentence). Folding is only to find the
-  phrase: the reply is spoken as it was except for the phrase's own span, and a scrubbed sentence is cut
-  to `max_sentence_chars`. That is a mitigation, not a guarantee: a respelling that fools the pattern (a look-alike letter of another script) can pass, and
+  wake word is how the user interrupts it, and speakers can be heard by it. There is no acoustic
+  echo cancellation. Instead: (1) while a reply is spoken and for `speaking_holdoff_ms` after, the
+  wake word needs `speaking_threshold` (default 0.9) instead of `threshold`; (2) nothing is
+  transcribed except after a wake word, so the assistant's speech is never a user turn by itself;
+  (3) a wake word stops the speech *before* listening starts (`SpeechOutput.set_microphone_open`, as
+  push-to-talk does) and nothing is spoken while a turn is recorded; (4) a turn that began while
+  speaking drops its first 250 ms, in which the speakers are still dying away. Residual: a loud
+  speaker, or a reply that contains the wake word, can pass (1); headphones, or `speaking_threshold
+  = 1` (which accepts no wake word at all while speaking), close it; and (5) before synthesis the
+  wake phrase is replaced in reply text by "the wake word" (any case, any punctuation between the
+  words or letters, accents and full-width forms folded, whole words, and across the end of a
+  sentence). Folding is only to find the phrase: the reply is spoken as it was except for the
+  phrase's own span, and a scrubbed sentence is cut to `max_sentence_chars`.
+  The reply-cap and sentence-bound cuts never split a word, and the folded text is searched again as
+  the last step before a sentence is submitted, with everything from a match on dropped: no
+  submitted sentence matches the pattern by construction. That is a mitigation, not a guarantee: a
+  respelling that fools the pattern (a look-alike letter of another script) can pass, and
   `speaking_threshold = 1`, or headphones, are the control.
-- *Focus and a dead capture.* A hands-free turn never moves the keyboard focus (any sound can start one;
-  a password typed into the terminal must not land in the chat): the dictation is put in the input,
-  or sent, with the focus left where it is, and so is any turn that ends while the terminal has it.
-  Wall-clock bounds on the inference thread back up the audio-counted ones: a capture silent for 8 s is
-  reported (as is a bus error or end of stream, `AudioStream`'s `on_error`) and hands-free turned off,
-  and a turn lasting more than `max_utterance_seconds` plus 3 s ends. THINKING is not set for a
-  dictation waiting to be edited (nothing was sent); the user's send of it is typing.
+- *Focus and a dead capture.* A hands-free turn never moves the keyboard focus (any sound can start
+  one; a password typed into the terminal must not land in the chat): the dictation is put in the
+  input, or sent, with the focus left where it is, and so is any turn that ends while the terminal
+  has it. Wall-clock bounds on the inference thread back up the audio-counted ones: a capture silent
+  for 8 s is reported (as is a bus error or end of stream, `AudioStream`'s `on_error`) and
+  hands-free turned off, and a turn lasting more than `max_utterance_seconds` plus 3 s ends.
+  THINKING is not set for a dictation waiting to be edited (nothing was sent); the user's send of it
+  is typing.
 - *Push-to-talk wins.* A push-to-talk press pauses hands-free and abandons what the wake word began;
-  when push-to-talk is idle again hands-free resets and waits for the wake word. Turning hands-free off
-  while it transcribes cancels that transcription. Esc abandons a hands-free turn being recorded,
-  anywhere (the capture controller reads `hands_free.phase`, never the event; with the turn only
-  waiting for the wake word Esc is not taken and goes to the terminal or vim as before), and Mute
-  abandons a turn and any wake word not yet acted on.
+  when push-to-talk is idle again hands-free resets and waits for the wake word. Turning hands-free
+  off while it transcribes cancels that transcription. Esc abandons a hands-free turn being
+  recorded, anywhere (the capture controller reads `hands_free.phase`, never the event; with the
+  turn only waiting for the wake word Esc is not taken and goes to the terminal or vim as before),
+  and Mute abandons a turn and any wake word not yet acted on.
 - *VAD for push-to-talk (#103).* When `[voice.vad]` is set up, `VoiceInput`'s speech worker cuts the
   silence off a recording (`VadTrimmer`: speech plus 256 ms each side) before the request and sends
-  nothing, saying "No speech was recognised.", when it holds none; a detector that fails is logged and
-  the recording is sent as it is. The 300 ms minimum and the annotation list stay: they still cover a
-  host without VAD, and annotations still come from silence the VAD thought was speech.
-- *The indicator.* `THINKING` (#117) is set by the shell, from the moment a dictated message is sent (by
-  either kind of voice turn) until the reply is being spoken, is complete or has failed, or the
+  nothing, saying "No speech was recognised.", when it holds none; a detector that fails is logged
+  and the recording is sent as it is. The 300 ms minimum and the annotation list stay: they still
+  cover a host without VAD, and annotations still come from silence the VAD thought was speech.
+- *The indicator.* `THINKING` (#117) is set by the shell, from the moment a dictated message is sent
+  (by either kind of voice turn) until the reply is being spoken, is complete or has failed, or the
   conversation is replaced; `WAKE` ("waiting for the wake word") is hands-free's idle. Most pressing
-  first: transcribing and listening (push-to-talk or hands-free), speaking, thinking, waiting for the
-  wake word, idle.
+  first: transcribing and listening (push-to-talk or hands-free), speaking, thinking, waiting for
+  the wake word, idle.
 - *Configuration and failures.* `[voice.vad]` and `[voice.wake]`, judged together and apart from the
-  rest: a mistake in either turns hands-free and the trimming off, keeps push-to-talk, speech and the
-  speech server, logs the details and shows one fixed message beside the Mic. Nothing is set up until
-  `models_dir` is named (in `[voice.wake]` for hands-free, in `[voice.vad]` for the trimming); files that
-  are missing or not as pinned have the same effect and message. The models are loaded on first use, on
-  the inference thread, never on the main thread; a failure (models, microphone, or a model that fails
-  to run) turns hands-free off with fixed text, closes the microphone and never stops the shell.
+  rest: a mistake in either turns hands-free and the trimming off, keeps push-to-talk, speech and
+  the speech server, logs the details and shows one fixed message beside the Mic. Nothing is set up
+  until `models_dir` is named (in `[voice.wake]` for hands-free, in `[voice.vad]` for the trimming);
+  files that are missing or not as pinned have the same effect and message. The models are loaded on
+  first use, on the inference thread, never on the main thread; a failure (models, microphone, or a
+  model that fails to run) turns hands-free off with fixed text, closes the microphone and never
+  stops the shell.
 
 ## 3. Request flow
 
@@ -1195,9 +1202,15 @@ Each invariant names where it is enforced. Reviews check every change against th
   new message.
   Voice (`tumbleweed.voice`, D20): a recording is capped in bytes where the samples arrive
   (`max_utterance_seconds`, default 30, at most 120), the speech server's answer is read to at most
-  `max_response_bytes` (default 64 KiB) with a deadline that bounds the whole exchange, and a transcript is at most the transcript's own 16 KiB (section 2, "Voice input"). Speech output (D22): a spoken sentence is at most `max_sentence_chars` (default 400, at most 1000) and a reply at most `max_reply_chars` (default 4000), Piper's audio is capped in bytes as it arrives, its error output is kept to 2 KiB, and each sentence has a deadline (default 20 s) and a killed-and-reaped process (section 2, "Speech output"). Hands-free (D23): the mailbox between the
+  `max_response_bytes` (default 64 KiB) with a deadline that bounds the whole exchange, and a
+  transcript is at most the transcript's own 16 KiB (section 2, "Voice input"). Speech output (D22):
+  a spoken sentence is at most `max_sentence_chars` (default 400, at most 1000) and a reply at most
+  `max_reply_chars` (default 4000), Piper's audio is capped in bytes as it arrives, its error output
+  is kept to 2 KiB, and each sentence has a deadline (default 20 s) and a killed-and-reaped process
+  (section 2, "Speech output"). Hands-free (D23): the mailbox between the
   microphone and the models holds at most 2 s of audio (the oldest dropped first), an utterance at most
-  `max_utterance_seconds`, a turn in which nothing is said is given up after `wait_for_speech_seconds`, a
+  `max_utterance_seconds`, a turn in which nothing is said is given up after
+  `wait_for_speech_seconds`, a
   model file is at most 8 MiB, and every wait of the inference thread is at most half a second
   (section 2, "Hands-free voice").
 - **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input. The
