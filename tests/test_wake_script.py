@@ -221,3 +221,22 @@ class TestTheCpuScript:
 
         assert result.returncode == 2
         assert "hands-free did not start" in result.stderr
+
+    def test_a_pipeline_that_never_gets_audio_to_the_models_exits_2_not_with_a_number(self) -> None:
+        result = self.run(
+            "--fake-models", "--seconds", "1", "--warmup", "0", "--start-timeout", "2",
+            "--die-after", "0",
+        )  # fmt: skip
+
+        assert result.returncode == 2
+        assert "never reached the wake word" in result.stderr
+        assert "% of one core" not in result.stdout
+
+    def test_a_pipeline_that_dies_while_measuring_exits_2_not_with_a_number(self) -> None:
+        result = self.run(
+            "--fake-models", "--seconds", "4", "--warmup", "1", "--die-after", "2.0",
+        )  # fmt: skip
+
+        assert result.returncode == 2
+        assert "died while measuring" in result.stderr
+        assert "% of one core" not in result.stdout

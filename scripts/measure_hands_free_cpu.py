@@ -46,6 +46,7 @@ from tumbleweed.voice.wake import OpenWakeWordDetector
 
 if TYPE_CHECKING:
     from tumbleweed.voice.audio import AudioStream
+    from tumbleweed.voice.wake import WakeDetector
 
 CHUNK_SECONDS = 0.08
 
@@ -67,6 +68,22 @@ class Queue:
                 return
 
 
+class Counting:
+    """A `WakeDetector` that counts the chunks it is given: proof that audio reached the models."""
+
+    scored = 0
+
+    def __init__(self, inner: "WakeDetector") -> None:
+        self._inner = inner
+
+    def score(self, chunk: bytes) -> float:
+        Counting.scored += 1
+        return self._inner.score(chunk)
+
+    def reset(self) -> None:
+        self._inner.reset()
+
+
 def noise(rms: float, seconds: float, seed: int) -> bytes:
     import numpy as np
 
@@ -79,6 +96,10 @@ def main() -> int:
     parser.add_argument("--seconds", type=float, default=60.0, help="measured time (default 60)")
     parser.add_argument("--warmup", type=float, default=5.0, help="seconds not measured")
     parser.add_argument("--noise-rms", type=float, default=50.0, help="int16 rms of the noise")
+    parser.add_argument(
+        "--start-timeout", type=float, default=30.0, help="seconds to reach WAITING"
+    )
+    parser.add_argument("--die-after", type=float, help=argparse.SUPPRESS)  # for the tests
     parser.add_argument("--max", type=float, default=15.0, help="percent of a core that passes")
     parser.add_argument(
         "--models", help="the models directory (default: where wake-models puts it)"
@@ -108,7 +129,7 @@ def main() -> int:
             )
             vad = SileroVad(store.get(SILERO_VAD))
         return HandsFreeEngine(
-            wake=wake,
+            wake=Counting(wake),
             vad=vad,
             wake_config=WakeConfig(),
             vad_config=VadConfig(),
@@ -151,7 +172,8 @@ def main() -> int:
         second = noise(args.noise_rms, 1.0, seed=1)
         step = int(CHUNK_SECONDS * BYTES_PER_SECOND)
         offset, due = 0, time.monotonic()
-        while not stop.is_set():
+        began = due
+        while not stop.is_set() and (args.die_after is None or due - began < args.die_after):
             fake.feed(second[offset : offset + step])
             offset = (offset + step) % (len(second) - step)
             due += CHUNK_SECONDS
@@ -161,13 +183,25 @@ def main() -> int:
     feeder = None if args.microphone else threading.Thread(target=feed, daemon=True)
     if feeder is not None:
         feeder.start()
-    deadline = time.monotonic() + args.warmup
-    while time.monotonic() < deadline:
+    # Warm up until it is waiting for the wake word with audio reaching the models (and for at least
+    # `--warmup` seconds); a pipeline that never gets there, within `--start-timeout`, is dead.
+    started = time.monotonic()
+    while not problems and time.monotonic() - started < args.start_timeout:
         dispatcher.pump()
+        if (
+            hands_free.phase is HandsFreePhase.WAITING
+            and Counting.scored >= 5
+            and time.monotonic() - started >= args.warmup
+        ):
+            break
         time.sleep(0.01)
     if problems:
         print(f"hands-free did not start: {problems[0]}", file=sys.stderr)
         return 2
+    if hands_free.phase is not HandsFreePhase.WAITING or Counting.scored < 5:
+        print("hands-free did not start: it never reached the wake word", file=sys.stderr)
+        return 2
+    scored_before = Counting.scored
 
     cpu0, wall0, times0 = time.process_time(), time.monotonic(), os.times()
     deadline = wall0 + args.seconds
@@ -175,10 +209,21 @@ def main() -> int:
         dispatcher.pump()
         time.sleep(0.05)
     cpu, wall, times = time.process_time() - cpu0, time.monotonic() - wall0, os.times()
+    dispatcher.pump()
+    alive = (
+        not problems
+        and hands_free.phase is HandsFreePhase.WAITING
+        and Counting.scored - scored_before >= int(args.seconds / CHUNK_SECONDS / 2)
+    )
     stop.set()
     hands_free.close()
     voice.close()
 
+    if not alive:
+        # A dead pipeline costs almost nothing, and would pass: say so, not a number.
+        reason = problems[0] if problems else "it stopped waiting for the wake word or fell behind"
+        print(f"hands-free died while measuring: {reason}", file=sys.stderr)
+        return 2
     share = 100.0 * cpu / wall
     user, system = times.user - times0.user, times.system - times0.system
     print(
