@@ -221,6 +221,20 @@ class TestScansAndChunks:
         with pytest.raises(UnsupportedImageError, match="animated"):
             inspect_image(cleared)
 
+    def test_a_frame_chunk_alone_is_enough_and_so_is_an_animation_chunk_after_an_odd_one(
+        self,
+    ) -> None:
+        def chunk(kind: bytes, size: int) -> bytes:
+            return kind + size.to_bytes(4, "little") + bytes(size + (size & 1))
+
+        base = webp_header("extended", 3, 2)  # (the animation flag is clear)
+
+        with pytest.raises(UnsupportedImageError, match="animated"):
+            inspect_image(base + chunk(b"ANMF", 16))  # frames, with no ANIM chunk
+        with pytest.raises(UnsupportedImageError, match="animated"):
+            # An odd-sized chunk is padded by one byte: the next chunk starts after the padding.
+            inspect_image(base + chunk(b"EXIF", 3) + chunk(b"ANIM", 6))
+
     def test_a_still_webp_with_other_chunks_is_fine_and_one_with_too_many_is_not(self) -> None:
         def chunk(kind: bytes, size: int) -> bytes:
             return kind + size.to_bytes(4, "little") + bytes(size + (size & 1))

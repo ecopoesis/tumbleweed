@@ -218,7 +218,13 @@ def test_a_text_gesture_handler_is_behind_the_boundary_too(
         mock.patch("tumbleweed.ui.gtk.guard.on_press", side_effect=RuntimeError("boom")),
     ):
         for click in clicks:
-            if isinstance(click, Gtk.GestureClick) and not click.get_touch_only():
+            # Ours only: the capture-phase one. (GTK's own click gesture on the text, emitted with
+            # no event, makes GTK itself log `gdk_event_triggers_context_menu: event != NULL`.)
+            if (
+                isinstance(click, Gtk.GestureClick)
+                and not click.get_touch_only()
+                and click.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
+            ):
                 click.emit("pressed", 1, 0.0, 0.0)
 
     assert FAILED in caplog.text
