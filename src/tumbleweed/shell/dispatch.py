@@ -29,3 +29,33 @@ class GlibDispatcher:
         except Exception:
             logger.exception("a callback posted to the main thread failed")
         return GLib.SOURCE_REMOVE
+
+
+@final
+class _Timer:
+    """One `GLib.timeout_add` that can be cancelled whether or not it already ran."""
+
+    def __init__(self, seconds: float, callback: Callable[[], None]) -> None:
+        self._callback = callback
+        self._source = GLib.timeout_add(max(1, round(seconds * 1000)), self._fire)
+
+    def _fire(self) -> bool:
+        self._source = 0  # the source is gone once this returns SOURCE_REMOVE
+        try:
+            self._callback()
+        except Exception:
+            logger.exception("a timer callback failed")
+        return GLib.SOURCE_REMOVE
+
+    def cancel(self) -> None:
+        if self._source:
+            GLib.source_remove(self._source)
+            self._source = 0
+
+
+@final
+class GlibScheduler:
+    """A `Scheduler` over the default GLib main context (the event gate's timer, S12)."""
+
+    def call_later(self, seconds: float, callback: Callable[[], None]) -> Callable[[], None]:
+        return _Timer(seconds, callback).cancel

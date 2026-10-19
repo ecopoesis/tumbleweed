@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Protocol, final
 
+from tumbleweed.agent.canvas import CanvasLink
 from tumbleweed.agent.config import shell_data_dir
 from tumbleweed.agent.factory import build_agent
 from tumbleweed.agent.responder import Responder
@@ -57,9 +58,11 @@ class ShellApplication(Adw.Application):
         open_history: HistoryOpener | None = None,
         voice: VoiceSetup | None = None,
         terminal: TerminalSettings | None = None,
+        canvas_link: CanvasLink | None = None,
     ) -> None:
         super().__init__(application_id=APPLICATION_ID, flags=flags)
         self._responder = responder
+        self._canvas_link = canvas_link
         self._open_history = open_history
         self._voice = voice
         self._terminal = terminal
@@ -81,6 +84,7 @@ class ShellApplication(Adw.Application):
                 self._open_history,
                 voice=self._voice,
                 terminal=self._terminal,
+                canvas_link=self._canvas_link,
             )
             logger.info("shell window created")
         window.present()
@@ -163,6 +167,7 @@ def run(argv: Sequence[str] = (PROGRAM,)) -> int:
         agent.responder,
         open_history=functools.partial(HistoryStore.open, shell_data_dir(os.environ)),
         voice=voice,
+        canvas_link=agent.canvas,
     )
     try:
         with quit_on_signals(app):
