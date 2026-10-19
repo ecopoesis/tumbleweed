@@ -681,17 +681,20 @@ has the reasons.
   (`RenderedTool(spec, images=...)`; with none every image says that images are not available): the
   ref is a file name and nothing else, opened without following links (see section 6), and what
   comes back is at most `8 MiB`. Those bytes are *looked at before they are decoded*: the magic number
-  must be a PNG, a JPEG or a still WebP (an SVG is none, whatever the file is called, and an animated
-  WebP is refused), and the size in the header must be at most 8,192 pixels a side and 16,777,216
-  pixels (width times height times 4 bytes is at most `64 MiB` decoded). Only then do the bytes go to a
+  must be a PNG, a JPEG or a still WebP (an SVG is none, whatever the file is called; an animated
+  WebP is refused, and so is a JPEG of more than `64` scans), and the size in the header must be at
+  most `8,192` pixels a side and `16,777,216` pixels (width times height times 4 bytes is at most
+  `64 MiB` decoded). Only then do the bytes go to a
   decoder, pinned to the format that was found, on a worker thread: the interface never waits for a
   file or a decode. What is refused, missing or broken is a line of fixed text in the image's place
   (`The image was not found.`, `The image is not allowed.`, `The image is too large.`,
   `Only PNG, JPEG and WebP images can be shown.`, `The image could not be read.`), never a word of the
   file or the error; a line `Loading the image...` stands there while it loads. A new ref (or the same
   one assigned again) replaces what is shown at once: the widget never shows an image the entry no
-  longer holds. An image is scaled down to fit 480 pixels, never up, and `alt` is for assistive
-  technology only (it is not displayed).
+  longer holds. An image is scaled down to fit `480` pixels as it is decoded, never up (one that
+  size or smaller keeps its pixels), so a tool's images together keep at most `64 MiB` of pixels;
+  over that an image says it is too large. `alt` is for assistive technology only (it is not
+  displayed).
 - **`table`** is a `Gtk.ColumnView` of the columns and rows of a `table` entry, rebuilt when the
   entry changes. At most `1,000` rows are shown; a cell shows at most `256` characters (then ` (cut)`) on
   one line (line ends become spaces), a column name at most `64`; every text goes through the display

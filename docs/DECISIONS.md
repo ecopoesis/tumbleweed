@@ -635,15 +635,20 @@ leaves the workspace, returns at most the limit, and treats the ref as a literal
 `~root/x.png` and `%2e%2e/x.png` are a file and two directories called that (the tests put a trap
 on each: a home directory with an `x.png`, a file next to the workspace). In S11 the resolver is a
 fake (`FakeResolver`, in memory) and a reference opener over a real directory (`DirfdResolver`, in
-the tests), both passing the contract; S19's broker-backed resolver adds its own subclass.
+the tests), both passing the contract; S19's broker-backed resolver adds its own subclass of `ResolverContract`.
 (2) *Inspection reads the bytes, not the name.* `inspect_image` recognises PNG, JPEG and WebP by
 their magic numbers and reads the size from the header (PNG's IHDR, the first frame header of a
 JPEG found by walking its segments by their lengths, a WebP's VP8, VP8L or VP8X chunk), by hand, with
 no library: an SVG named `x.png` starts with `<`, and is refused as not an image. An animated WebP
 is refused (its frames are as many decodes). The caps are 8 MiB for the file, 8,192 pixels a
-side and 16,777,216 pixels (`MAX_DECODED_BYTES`, 64 MiB of RGBA); they are renderer constants, set so
-that the largest image costs a decode of a second or so on a worker and 64 MiB at most, and are
-checked before the decoder is made.
+side and 16,777,216 pixels (64 MiB of RGBA, `MAX_DECODED_BYTES`); they are renderer constants, set
+so that the largest image costs a decode of a second or so on a worker and 64 MiB of working memory
+at most (a progressive JPEG of that size peaked at about 145 MiB), and are checked before the
+decoder is made. A JPEG of more than 64 scans (`MAX_JPEG_SCANS`) is refused: each scan is another
+pass of the decoder over the whole image, so a file that repeats one thousands of times would
+decode for minutes to hours (2,000 repeats took 44 s) on a worker that cannot be interrupted; with
+the cap the worst case is a few seconds. A WebP is walked chunk by chunk and refused if it has an
+ANIM or ANMF chunk, whatever its header flag says.
 (3) *The decoder is pinned.* gdk-pixbuf, asked to load bytes, sniffs them and picks any installed
 loader, SVG's included; `Gdk.Texture.new_from_bytes` sniffs the same way (and falls back to
 gdk-pixbuf). `PixbufDecoder` instead makes the loader for the one format that was inspected
@@ -651,7 +656,12 @@ gdk-pixbuf). `PixbufDecoder` instead makes the loader for the one format that wa
 (`test_a_loader_is_made_for_the_format_that_was_inspected_and_never_sniffs` makes `inspect_image`
 lie to prove it, and shows that a sniffing loader would have decoded the same bytes). The loader's
 `size-prepared` signal, which comes before it allocates pixels, is checked against the header's
-size (a loader told to make 1 by 1 if they differ), and the pixbuf is checked again after.
+size (a loader told to make 1 by 1 if they differ), and the pixbuf is checked again after. An
+image over 480 pixels a side is scaled to that size as it is loaded (`fit`; one at or under it is
+kept exactly as it is), so what a view keeps is at most 480 by 480 by 4 bytes, and a tool's views
+together hold at most 64 MiB of pixels (`PixelBudget`, reserved on the worker before the decode
+and given back when the view clears, is replaced or is closed; over it the image says it is too
+large). 20 views of one 8,192 by 2,048 PNG used to keep 900 MiB.
 WebP needs gdk-pixbuf's WebP loader (`webp-pixbuf-loader`, which the test image installs); a system
 without it shows the line for an unsupported format. The libraries behind the loaders still parse
 hostile bytes in the shell's process: that is the accepted residual risk of ARCHITECTURE section 8,
@@ -683,12 +693,18 @@ from the budget; the notebook's tab menu is off. (8) *No surface:* `harden_text_
 view what `harden_text` gave entries (D14); the column view and notebook have no popover to
 turn off, and `tests/ui/gtk/test_no_surfaces.py` renders a hostile spec that has all of these, with
 a real image decoded, every tab visited and every view typed in, and finds none. **Consequences.**
-An image appears a moment after its ref is set (`Loading the image...` meanwhile). A table is the
+S11 adds `PixelCount` to `core.types`, an import contract for `ui.images` (no `gi`, `ui.gtk` or
+shell), `images=` on `RenderedTool` and `CanvasView.show_spec`, and `gir1.2-gdkpixbuf-2.0` and
+`webp-pixbuf-loader` to the Linux image. An image appears a moment after its ref is set (`Loading
+the image...` meanwhile), and putting the widgets back to the state after a failed handler does not
+read a shown image again (an equal ref assigned is read again). A table is the
 first 1,000 rows however the budget stands; a cell is a line of at most 256 characters. A text view
 is a fixed 160 pixels tall and scrolls. A text view's text cannot be edited while it is cut or the
 budget has no room for it, like an entry. The default `RenderedTool` has no resolver, so
 `tumbleweed-render` shows every image as unavailable until S19. **Deviations from the plan.** None;
 the resolver is a fake in the renderer's tests, as the plan says, and the real one is S19's.
+What was left out is in #109 (WebP loader packaging for S26, table sorting, content-sized views,
+a workspace for `tumbleweed-render`, uncancellable decodes) and #107 (the transcript, #63).
 
 ## D22 — Speech output: Piper as one process per sentence, text on stdin, barge-in by generation and abort signal, GStreamer playback in the one adapter (2026-10-18, accepted)
 

@@ -1125,9 +1125,12 @@ Each invariant names where it is enforced. Reviews check every change against th
   raster formats (PNG, JPEG, WebP; never SVG). Size, depth and count limits. An image's bytes come
   from the resolver (which opens the ref only through a directory file descriptor, I11), are
   recognised by their magic number and sized from their header (an SVG renamed `.png`, an animated
-  WebP, more than 8 MiB, 8,192 pixels a side or 16 million pixels are refused) before any decoder
-  sees them, and are then decoded by a loader pinned to that format (`tumbleweed.ui.images`,
-  `tumbleweed.ui.gtk.imageview`, D21). Table cells, text view text and tab and expander titles
+  WebP, a JPEG of more than 64 scans, more than 8 MiB, 8,192 pixels a side or 16 million pixels
+  are refused) before any decoder sees them, and are then decoded by a loader pinned to that
+  format and kept at the display size (`tumbleweed.ui.images`, `tumbleweed.ui.gtk.imageview`,
+  D21). Memory is bounded twice: an image's decode needs at most its decoded size (64 MiB) as
+  working memory (a progressive JPEG of that size peaked at about 145 MiB), two at a time, and
+  what a tool keeps is at most 64 MiB of pixels in all, reserved before each decode. Table cells, text view text and tab and expander titles
   go in as plain text like every other text.
 - **I5 — Trusted chrome is unspoofable.** Prompts, the picker and other chrome render in a
   reserved region the canvas cannot draw over, with styling generated specs cannot use. The
@@ -1378,6 +1381,7 @@ src/tumbleweed/
   ipc/        framing, typed messages, async client/server
   ui/spec/    UI spec schema, expression AST and value types (no GTK)
   ui/runtime/ state store, expression interpreter, bindings, handler dispatch (no GTK)
+  ui/images   image rules: what may be decoded, the resolver Protocol and its contract (no GTK)
   ui/gtk/     GTK4 adapter that renders specs
   shell/      Adw application, window, chat panel, trusted prompts, terminal pane
   shell/viewmodel/  transcript view-model, chat controller, terminal choices and spawner (no GTK)
@@ -1400,9 +1404,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
 - `broker` imports `ipc` only in its daemon layer (`service`, `daemon`, `client`, `toolscli`); the
   policy core, storage and audit modules never do, nor do they import the daemon layer; `ipc` never
   imports `broker`.
-- `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
-  import `gi`; `ui.runtime` also never imports `ui.gtk` or the shell, so it cannot reach GTK
-  through them. `voice` imports it only in `voice._gst`, the pin of the GStreamer adapter, which
+- `core`, `ipc`, `ui.spec`, `ui.runtime`, `ui.images`, `agent`, `history`, `broker` and `sandbox`
+  never import `gi`; `ui.runtime` and `ui.images` also never import `ui.gtk` or the shell, so they
+  cannot reach GTK through them. `voice` imports it only in `voice._gst`, the pin of the GStreamer adapter, which
   only `voice.gstreamer` and `voice.factory` (lazily) import; the rest of `voice` cannot import
   either, and `voice` never imports `shell` or `broker` (the shell depends on it). The one edge
   between `agent` and `voice` is configuration: `agent.config` holds the loader of the one file and
