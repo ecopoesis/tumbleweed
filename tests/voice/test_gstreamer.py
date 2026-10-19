@@ -254,12 +254,16 @@ class TestTheStream:
         assert reported == ["The microphone stopped delivering audio."]
 
     def test_a_microphone_that_cannot_be_opened_is_refused_in_start_and_not_reported_after(
-        self,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """No device in the container: `autoaudiosrc` posts an ERROR during the state change. That
-        is `start`'s to refuse with (fixed text), not a capture that "stopped delivering"."""
+        """A source whose state change fails and posts an ERROR (`filesrc` with no file name stands
+        in for a device that is gone): that is `start`'s to refuse with, in fixed text, and not a
+        capture that "stopped delivering audio" (`on_error` is for after it is open)."""
+        from tumbleweed.voice import gstreamer
+
+        monkeypatch.setattr(gstreamer, "microphone_elements", lambda _platform: ("filesrc",))
         reported: list[str] = []
-        stream = GStreamerAudioStream(platform="linux")  # the real microphone elements
+        stream = GStreamerAudioStream(platform="linux")
 
         with pytest.raises(AudioError, match="could not be opened"):
             stream.start(lambda _chunk: None, reported.append)
