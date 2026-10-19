@@ -175,7 +175,9 @@ class TableWidget(Gtk.Box):
             self._hide_notice()
             return
         names = tuple(column_name(column.name) for column in table.columns)
-        room = self._budget.room(self)  # what is left, and what this table already holds
+        # What is left, and what the table already holds, its notice's line included (which is
+        # reserved again below if it is still needed: counted twice, a refresh would lose rows).
+        room = self._budget.room(self) + self._budget.held(self._notice)
         header = sum(len(name) for name in names)
         if header > room:
             self._budget.claim(self, 0)
@@ -185,7 +187,7 @@ class TableWidget(Gtk.Box):
         texts: list[tuple[str, ...]] = []
         costs: list[int] = []
         for row in table.rows[:MAX_SHOWN_ROWS]:
-            cells = tuple(cell_text(cell) for cell, column in zip(row, table.columns, strict=True))
+            cells = tuple(cell_text(cell) for cell in row)
             cost = sum(len(cell) for cell in cells)
             if header + sum(costs) + cost > room:
                 break

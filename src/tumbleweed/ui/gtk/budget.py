@@ -71,6 +71,10 @@ class TextBudget:
         """The characters `owner` could claim now: what is left, and what it already holds."""
         return max(0, MAX_SHOWN_PER_TOOL - self._total + self._claims.get(owner, 0))
 
+    def held(self, owner: object) -> int:
+        """The characters `owner` claims now."""
+        return self._claims.get(owner, 0)
+
     def fits(self, owner: object, text: str) -> bool:
         """Claim `text` for `owner`, for good (an option, a button label)."""
         return self.claim(owner, len(text))

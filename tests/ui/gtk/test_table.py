@@ -329,6 +329,22 @@ class TestBounds:
         assert widget.notice == ""
         assert tool.shown_text_total == len("a") + len("x")
 
+    def test_showing_a_cut_table_again_keeps_the_same_rows(self) -> None:
+        # The line "more rows not shown" is part of what the table claims; counted twice it
+        # would cost a row on the first refresh (817 -> 814 in review) and announce room.
+        rows: list[JsonValue] = [["c" * 100] for _ in range(1000)]
+        tool = tool_with({"columns": columns(("a", "string")), "rows": rows})
+        widget = widget_of(tool)
+        shown, total, cells = widget.rows, tool.shown_text_total, widget.cells
+
+        widget.refresh()
+        widget.refresh()
+
+        assert widget.rows == shown
+        assert widget.cells == cells
+        assert tool.shown_text_total == total
+        assert widget.notice == MORE_ROWS
+
     def test_the_line_about_more_rows_always_fits_in_what_the_table_claims(self) -> None:
         cell = "c" * 255  # 1 + 257 * 255 is exactly the budget: no room left for the line
         rows: list[JsonValue] = [[cell] for _ in range(300)]
