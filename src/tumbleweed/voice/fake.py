@@ -287,8 +287,10 @@ class FakeAudioStream:
 @final
 class FakeWake:
     """A `WakeDetector` whose score for a chunk is read from the chunk itself, so a test makes a
-    wake word by building audio: the score is the chunk's first sample divided by 1000 (a chunk
-    that starts with 800 scores 0.8; silence scores 0). `resets` counts `reset` calls."""
+    wake word by building audio: the score is the chunk's *second* sample divided by 1000 (a chunk
+    whose second sample is 800 scores 0.8; silence scores 0). It is the second, not the first, so
+    that audio built for `FakeVad`, which reads the first sample of a window, is no wake word.
+    `resets` counts `reset` calls."""
 
     def __init__(self, *, error: Exception | None = None) -> None:
         self.error = error
@@ -299,7 +301,7 @@ class FakeWake:
         if self.error is not None:
             raise self.error
         self.chunks += 1
-        return int.from_bytes(chunk[:2], "little", signed=True) / 1000
+        return int.from_bytes(chunk[2:4], "little", signed=True) / 1000
 
     def reset(self) -> None:
         self.resets += 1

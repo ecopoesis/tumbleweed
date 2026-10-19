@@ -32,7 +32,7 @@
 
     [voice.wake]                            # the wake word (S08): hands-free mode
     enabled = true
-    models_dir = "/home/me/.local/share/tumbleweed/wake"    # defaults to [voice.vad]'s
+    models_dir = "/home/me/.local/share/tumbleweed/wake"    # names it again: hands-free is opt-in
     model = "hey_jarvis"                    # "alexa", "hey_jarvis" or "hey_mycroft"
     threshold = 0.5                         # score at which the wake word is heard
     speaking_threshold = 0.9                # the stricter score while a reply is being spoken
@@ -195,8 +195,3 @@ class VoiceConfig(BaseModel):
     @property
     def endpoint(self) -> SttEndpoint:
         return SttEndpoint(self.stt_url)
-
-    @property
-    def wake_models_dir(self) -> str | None:
-        """Where the wake-word models are: `[voice.wake]`'s own directory, else `[voice.vad]`'s."""
-        return self.wake.models_dir or self.vad.models_dir

@@ -18,10 +18,11 @@ Hands-free mode (`HandsFree`, S08) has a **Hands-free** toggle after Mute (none 
 while it is on. The indicator then says "waiting for the wake word", and shows "Microphone on"
 whenever audio may be being captured, hands-free or push-to-talk, in whatever state the voice
 indicator is in: the mic-active indicator is separate from the state so that "speaking" or
-"thinking" never hides an open microphone. The wake word is barge-in and the turn it starts is transcribed through the same path
-as dictation (`transcribed`: `edit_before_send` applies). THINKING (#117) is shown from the moment
-a dictated message is sent until the reply is spoken (SPEAKING) or finished. Esc during a hands-free
-turn abandons it, as for push-to-talk, and so does Mute.
+"thinking" never hides an open microphone. The wake word is barge-in and the turn it starts is
+transcribed through the same path as dictation (`transcribed`: `edit_before_send` applies).
+THINKING (#117) is shown from the moment a dictated message is sent until the reply is spoken
+(SPEAKING) or finished. Esc during a hands-free turn abandons it, as for push-to-talk, and so does
+Mute.
 
 Push-to-talk is a key and a button, both plain widgets, never `GAction`s: actions are exported on
 the session bus (`tests/shell/test_session_bus.py` pins the set), and another process must not be
@@ -208,6 +209,7 @@ class VoiceControls(Gtk.Box):
             voice.subscribe(BargeIn(speech))
             speech.subscribe(self._speech_view)
         voice.subscribe(self)
+        voice.subscribe_microphone(self._on_microphone)
         if notice:
             self._show_message(notice)
 
@@ -230,6 +232,9 @@ class VoiceControls(Gtk.Box):
             self._show_message("")
         self._sync_button(phase)
 
+    def _on_microphone(self, is_open: bool) -> None:
+        self.refresh_indicator()
+
     def refresh_indicator(self) -> None:
         """What the voice side is doing, most pressing first: listening or transcribing
         (push-to-talk or hands-free), then speaking, then thinking, then waiting for the wake word.
@@ -249,8 +254,7 @@ class VoiceControls(Gtk.Box):
         else:
             self._indicator.set_state(VoiceState.IDLE)
         self._indicator.set_microphone(
-            self._voice.phase is VoicePhase.LISTENING
-            or (hands_free is not None and hands_free.microphone_open)
+            self._voice.microphone_open or (hands_free is not None and hands_free.microphone_open)
         )
 
     def set_thinking(self, thinking: bool) -> None:
@@ -321,6 +325,7 @@ class VoiceControls(Gtk.Box):
         """Stop observing, abandon the utterance, stop the speech, and release the microphone, the
         speaker and the connection."""
         self._voice.unsubscribe(self)
+        self._voice.unsubscribe_microphone(self._on_microphone)
         try:
             if self._hands_free is not None:
                 self._hands_free.unsubscribe(self._hands_free_view)

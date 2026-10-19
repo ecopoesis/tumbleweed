@@ -16,6 +16,13 @@ belongs to; `cancel` (and the next `press`) bump the generation, so a late resul
 that was abandoned is dropped instead of reaching the chat. Every wait on a worker is bounded by
 the source's and the backend's own timeouts; a daemon worker never keeps the process from exiting.
 
+The microphone indicator (S08). `microphone_open` is True from `press` until the audio worker has
+*confirmed* that this recording's device is closed (`_open_sessions`, one entry per press, removed
+when the worker has stopped, cancelled or failed to open it), whatever the phase says: after
+`cancel` the phase is IDLE at once, but the microphone may be open for a while yet (a device slow to
+close), and the shell's "Microphone on" must not say otherwise. Observers of it
+(`subscribe_microphone`) are told on the main thread when it changes.
+
 Speech detection (S08, #103). With a `SpeechTrimmer` (Silero VAD, when `[voice.vad]` is set up) the
 speech worker cuts the silence off a recording before sending it, and sends nothing, saying
 `NO_SPEECH`, when it holds no speech: Whisper writes words for silence. Without one (or if it
@@ -114,9 +121,14 @@ class VoiceInput:
         self._abort = AbortSignal()  # of the utterance in progress
         self._closed = False
         self._observers: list[VoiceObserver] = []
+        self._microphone_observers: list[Callable[[bool], None]] = []
+        self._session = 0  # one per press: the recording whose device must be confirmed closed
+        self._open_sessions: set[int] = set()
+        self._microphone_reported = False
         # Touched only by the audio worker:
         self._source: AudioSource | None = None
         self._capturing = False
+        self._capturing_session = 0
         self._audio_worker = Worker("tumbleweed-audio")
         self._speech_worker = Worker("tumbleweed-stt")
 
@@ -133,6 +145,22 @@ class VoiceInput:
         if observer in self._observers:
             self._observers.remove(observer)
 
+    @property
+    def microphone_open(self) -> bool:
+        """Whether this recording's microphone may be open: from `press` until the audio worker has
+        confirmed it closed (see the module docstring)."""
+        return bool(self._open_sessions)
+
+    def subscribe_microphone(self, observer: Callable[[bool], None]) -> None:
+        """Be told (on the main thread) when `microphone_open` changes."""
+        self._require_main_thread()
+        self._microphone_observers.append(observer)
+
+    def unsubscribe_microphone(self, observer: Callable[[bool], None]) -> None:
+        self._require_main_thread()
+        if observer in self._microphone_observers:
+            self._microphone_observers.remove(observer)
+
     # Main thread: what the user does
 
     def press(self) -> None:
@@ -143,8 +171,12 @@ class VoiceInput:
         self._generation += 1
         generation = self._generation
         self._abort = AbortSignal()
+        self._session += 1
+        session = self._session
+        self._open_sessions.add(session)
+        self._notify_microphone()
         self._set_phase(VoicePhase.LISTENING)
-        self._audio_worker.submit(lambda: self._start_capture(generation))
+        self._audio_worker.submit(lambda: self._start_capture(generation, session))
 
     def transcribe_utterance(self, utterance: Utterance) -> bool:
         """Transcribe audio that was recorded elsewhere: hands-free mode's endpointed, already
@@ -172,7 +204,8 @@ class VoiceInput:
             return
         self._set_phase(VoicePhase.TRANSCRIBING)
         generation, abort = self._generation, self._abort
-        self._audio_worker.submit(lambda: self._stop_capture(generation, abort))
+        session = self._session
+        self._audio_worker.submit(lambda: self._stop_capture(generation, abort, session))
 
     def cancel(self) -> None:
         """Abandon the utterance, whatever it is doing: nothing of it reaches the chat."""
@@ -202,31 +235,38 @@ class VoiceInput:
 
     # Audio worker
 
-    def _start_capture(self, generation: int) -> None:
+    def _start_capture(self, generation: int, session: int) -> None:
         try:
             if self._source is None:
                 self._source = self._audio_factory()
             self._source.start(lambda: self._dispatcher.post(lambda: self._on_full(generation)))
             self._capturing = True
+            self._capturing_session = session
         except AudioError as exc:
+            self._closed_later(session)
             self._finish_later(generation, message=str(exc))
         except Exception:
             logger.exception("starting the capture failed")
+            self._closed_later(session)
             self._finish_later(generation, message=_AUDIO_FAILED)
 
-    def _stop_capture(self, generation: int, abort: AbortSignal) -> None:
+    def _stop_capture(self, generation: int, abort: AbortSignal, session: int) -> None:
         if not self._capturing or self._source is None:
-            return  # the capture never started; why has been reported
+            self._closed_later(session)  # the capture never started or is already closed
+            return  # (if it never started, why has been reported)
         self._capturing = False
         try:
             utterance = self._source.stop()
         except AudioError as exc:
+            self._closed_later(self._capturing_session)
             self._finish_later(generation, message=str(exc))
             return
         except Exception:
             logger.exception("stopping the capture failed")
+            self._closed_later(self._capturing_session)
             self._finish_later(generation, message=_AUDIO_FAILED)
             return
+        self._closed_later(self._capturing_session)
         if utterance.byte_count < self._limits.min_utterance_bytes:
             self._finish_later(generation, message=NOTHING_HEARD)
             return
@@ -236,12 +276,20 @@ class VoiceInput:
         if self._capturing and self._source is not None:
             self._capturing = False
             self._source.cancel()
+            self._closed_later(self._capturing_session)
 
     def _release_source(self) -> None:
         if self._source is not None:
+            was_capturing = self._capturing
             self._capturing = False
             self._source.close()
             self._source = None
+            if was_capturing:
+                self._closed_later(self._capturing_session)
+
+    def _closed_later(self, session: int) -> None:
+        """The audio worker has closed (or never opened) this session's microphone."""
+        self._dispatcher.post(lambda: self._session_closed(session))
 
     # Speech worker
 
@@ -296,6 +344,22 @@ class VoiceInput:
             self._notify(lambda observer: observer.problem(message))
         if text is not None:
             self._notify(lambda observer: observer.transcribed(text))
+
+    def _session_closed(self, session: int) -> None:
+        if session in self._open_sessions:
+            self._open_sessions.discard(session)
+            self._notify_microphone()
+
+    def _notify_microphone(self) -> None:
+        is_open = self.microphone_open
+        if is_open is self._microphone_reported:
+            return
+        self._microphone_reported = is_open
+        for observer in tuple(self._microphone_observers):
+            try:
+                observer(is_open)
+            except Exception:
+                logger.exception("a microphone observer failed")
 
     def _on_full(self, generation: int) -> None:
         if generation != self._generation or self._phase is not VoicePhase.LISTENING:

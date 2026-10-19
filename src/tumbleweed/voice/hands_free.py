@@ -121,15 +121,17 @@ type _Command = _SetMode | _SetSpeaking
 
 @final
 class _Mailbox:
-    """Audio and commands for the inference thread. `push` may be called from any thread (the
-    capture thread) and never blocks; audio beyond `max_bytes` drops the oldest chunks."""
+    """Audio and commands for the inference thread, in the order they came. `push` may be called
+    from any thread (the capture thread) and never blocks; audio beyond `max_bytes` drops the
+    oldest chunks (never a command: they are tiny and say what the user did)."""
 
     def __init__(self, max_bytes: int) -> None:
         self._max = max_bytes - max_bytes % 2
         self._condition = threading.Condition()
-        self._chunks: collections.deque[bytes] = collections.deque()
+        self._chunks: collections.deque[tuple[int, bytes]] = collections.deque()
+        self._commands: list[tuple[int, _Command]] = []
+        self._sequence = 0
         self._size = 0
-        self._commands: list[_Command] = []
         self._closed = False
         self.dropped_bytes = 0
 
@@ -141,10 +143,11 @@ class _Mailbox:
         with self._condition:
             if self._closed:
                 return
-            self._chunks.append(chunk)
+            self._sequence += 1
+            self._chunks.append((self._sequence, chunk))
             self._size += len(chunk)
             while self._size > self._max:
-                dropped = self._chunks.popleft()
+                _, dropped = self._chunks.popleft()
                 self._size -= len(dropped)
                 self.dropped_bytes += len(dropped)
             self._condition.notify()
@@ -152,7 +155,8 @@ class _Mailbox:
     def command(self, command: _Command) -> None:
         with self._condition:
             if not self._closed:
-                self._commands.append(command)
+                self._sequence += 1
+                self._commands.append((self._sequence, command))
                 self._condition.notify()
 
     def close(self) -> None:
@@ -162,19 +166,30 @@ class _Mailbox:
             self._size = 0
             self._condition.notify_all()
 
-    def take(self, timeout: float) -> tuple[list[_Command], bytes] | None:
-        """Wait up to `timeout` for something; the commands and audio so far (both may be empty
-        after a timeout), or None once closed."""
+    def take(self, timeout: float) -> list[_Command | bytes] | None:
+        """Wait up to `timeout` for something; what came, in order, with the audio between two
+        commands joined (an empty list after a timeout), or None once closed."""
         with self._condition:
             if not (self._chunks or self._commands or self._closed):
                 self._condition.wait(timeout)
             if self._closed:
                 return None
+            items: list[_Command | bytes] = []
+            pending: list[bytes] = []
+            chunks, self._chunks = self._chunks, collections.deque()
             commands, self._commands = self._commands, []
-            audio = b"".join(self._chunks)
-            self._chunks.clear()
             self._size = 0
-            return commands, audio
+            for sequence, command in commands:
+                while chunks and chunks[0][0] < sequence:
+                    pending.append(chunks.popleft()[1])
+                if pending:
+                    items.append(b"".join(pending))
+                    pending = []
+                items.append(command)
+            pending.extend(chunk for _, chunk in chunks)
+            if pending:
+                items.append(b"".join(pending))
+            return items
 
 
 @final
@@ -200,43 +215,49 @@ class _Inference:
         self._thread.start()
 
     def _run(self) -> None:
-        while (item := self._mailbox.take(_WAIT_SECONDS)) is not None:
-            commands, audio = item
-            try:
-                if commands:
-                    self._apply(commands)
-                    audio = b""  # older than the command: it belongs to what was abandoned
-                if audio and self._engine is not None and not self._faulted:
-                    events = self._engine.feed(audio)
-                    if events:
-                        self._on_events(events)
-            except VoiceError as exc:
-                self._fault(str(exc))
-            except Exception:
-                logger.exception("hands-free inference failed")
-                self._fault(_DETECTION_FAILED)
+        while (items := self._mailbox.take(_WAIT_SECONDS)) is not None:
+            for index, item in enumerate(items):
+                try:
+                    if isinstance(item, bytes):
+                        self._feed(item)
+                    elif not (isinstance(item, _SetMode) and _is_mode(items, index + 1)):
+                        self._apply(item)  # (a mode that the next item replaces loads nothing)
+                except VoiceError as exc:
+                    self._fault(str(exc))
+                except Exception:
+                    logger.exception("hands-free inference failed")
+                    self._fault(_DETECTION_FAILED)
 
-    def _apply(self, commands: list[_Command]) -> None:
-        # Only the last mode and the last speaking flag matter (a burst of toggles loads nothing).
-        mode = next((c for c in reversed(commands) if isinstance(c, _SetMode)), None)
-        speaking = next((c for c in reversed(commands) if isinstance(c, _SetSpeaking)), None)
-        if speaking is not None:
-            self._speaking = speaking.speaking
-            if self._engine is not None:
-                self._engine.set_speaking(self._speaking)
-        if mode is None:
-            return
-        self._generation = mode.generation
-        self._faulted = False
-        if self._engine is None and mode.mode is not EngineMode.PAUSED:
-            self._engine = self._factory()  # loads the models: off the main thread, hashes checked
-            self._engine.set_speaking(self._speaking)
-        if self._engine is not None:
-            self._engine.set_mode(mode.mode, mode.generation)
+    def _feed(self, audio: bytes) -> None:
+        if self._engine is not None and not self._faulted:
+            events = self._engine.feed(audio)
+            if events:
+                self._on_events(events)
+
+    def _apply(self, command: _Command) -> None:
+        match command:
+            case _SetSpeaking(speaking=speaking):
+                self._speaking = speaking
+                if self._engine is not None:
+                    self._engine.set_speaking(speaking)
+            case _SetMode(mode=mode, generation=generation):
+                self._generation = generation
+                self._faulted = False
+                if self._engine is None and mode is not EngineMode.PAUSED:
+                    self._engine = (
+                        self._factory()
+                    )  # reads and hashes the models: off the main thread
+                    self._engine.set_speaking(self._speaking)
+                if self._engine is not None:
+                    self._engine.set_mode(mode, generation)
 
     def _fault(self, message: str) -> None:
         self._faulted = True
         self._on_fault(self._generation, message)
+
+
+def _is_mode(items: list[_Command | bytes], index: int) -> bool:
+    return index < len(items) and isinstance(items[index], _SetMode)
 
 
 @final
@@ -479,10 +500,12 @@ class HandsFree:
             return None
 
     def _set_phase(self, phase: HandsFreePhase) -> None:
-        if phase is not self._phase:
-            self._phase = phase
-            self._notify(lambda observer: observer.phase_changed(phase))
+        changed = phase is not self._phase
+        self._phase = phase
+        # Before anyone is told: a wake word stops the speech first, as push-to-talk does.
         self._sync_speech()
+        if changed:
+            self._notify(lambda observer: observer.phase_changed(phase))
 
     def _sync_speech(self) -> None:
         """Nothing is spoken while a turn is being recorded, and speech in progress stops when one

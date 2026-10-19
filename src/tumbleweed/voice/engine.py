@@ -165,9 +165,9 @@ class HandsFreeEngine:
         self._skip = 0
 
     def _wait(self, chunk: bytes) -> WakeHeard | None:
+        guarded = self._speaking or self._holdoff > 0
         if self._holdoff:
             self._holdoff -= 1
-        guarded = self._speaking or self._holdoff > 0
         threshold = self._wake_config.speaking_threshold if guarded else self._wake_config.threshold
         if self._wake.score(chunk) < threshold:
             return None

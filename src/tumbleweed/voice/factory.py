@@ -136,7 +136,7 @@ def _build_detection(
     up, and the notice for the user, if `[voice.vad]` or `[voice.wake]` ask for any."""
     if config.hands_free_problem is not None:
         return None, None, "Hands-free is off: invalid [voice.vad] or [voice.wake] setting."
-    vad_dir, wake_dir = config.vad.models_dir, config.wake_models_dir
+    vad_dir, wake_dir = config.vad.models_dir, config.wake.models_dir
     if vad_dir is None and wake_dir is None:
         return None, None, None  # not set up: that is not an error
     trimmer: SpeechTrimmer | None = None
