@@ -1,4 +1,5 @@
-"""The status strip along the bottom of the window, with the voice indicator."""
+"""The status strip along the bottom of the window: the voice indicator, the voice buttons (Mic and
+Mute, added by the window) and the terminal button."""
 
 import enum
 from typing import assert_never, final
@@ -9,10 +10,12 @@ from tumbleweed.shell._widgets import plain_label
 
 
 class VoiceState(enum.StrEnum):
-    """What the voice side is doing. Nothing sets it yet: S06 and S07 wire it up."""
+    """What the voice side is doing. Push-to-talk sets IDLE, LISTENING and TRANSCRIBING (S06) and
+    speech output sets SPEAKING (S07); nothing sets THINKING yet (S08's state machine does)."""
 
     IDLE = "idle"
     LISTENING = "listening"
+    TRANSCRIBING = "transcribing"
     THINKING = "thinking"
     SPEAKING = "speaking"
 
@@ -23,6 +26,8 @@ def _describe(state: VoiceState) -> str:
             return "Voice: idle"
         case VoiceState.LISTENING:
             return "Voice: listening"
+        case VoiceState.TRANSCRIBING:
+            return "Voice: transcribing"
         case VoiceState.THINKING:
             return "Voice: thinking"
         case VoiceState.SPEAKING:
@@ -70,3 +75,18 @@ class StatusStrip(Gtk.Box):
         self.set_margin_bottom(4)
         self.voice = VoiceIndicator()
         self.append(self.voice)
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        self.append(spacer)
+        # A widget, not a GAction: actions are exported on the session bus (test_session_bus.py),
+        # and starting a shell is not something another process should be able to ask for.
+        self.terminal_button = Gtk.Button(label="Terminal (F12)")
+        self.terminal_button.set_has_frame(False)
+        # Not in the tab order and no focus from a click: F12 is the keyboard way, and a button
+        # that took the focus would get it when the side panel hides, and start a terminal on a
+        # stray Space or Enter.
+        self.terminal_button.set_focusable(False)
+        self.terminal_button.set_focus_on_click(False)
+        self.terminal_button.add_css_class("caption")
+        # No tooltip: a tooltip is a surface of its own, and none is allowed in the window (#53).
+        self.append(self.terminal_button)

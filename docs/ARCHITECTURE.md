@@ -55,6 +55,79 @@ In v1 the broker runs as a separate process under the same uid as the shell (sys
 service on the target; started on demand by the shell in development, with reconnect).
 Running the broker and sandboxes under dedicated uids is post-v1 hardening.
 
+### The terminal escape hatch (S05, D18)
+
+A terminal is always one keystroke (F12) or one button (the status strip's "Terminal (F12)") away,
+whether or not an API key is configured and whatever state the agent is in: it does not depend on
+the responder, the configuration or the broker. It is the **user's** tool in the trusted shell, not
+a tool of the agent (I1): there is no code path from the model to it, and the pane has no method
+that types into the terminal or reads what it shows. I1 holds because no code of ours does either,
+which review and the import contracts check (the agent cannot import the shell at all).
+`tests/shell/test_terminal_isolation.py` is a **tripwire** for accidental or casual use, not a
+security boundary: a static check of Python cannot stop deliberate obfuscation (`exec` of a computed
+string, `ctypes`, a C extension, a monkeypatch from another module), and that is what code review and
+the import contracts are for. What it checks:
+
+- In the two modules that use Vte (`shell/terminal_pane.py`, `shell/_vte.py`): every attribute name
+  (single-underscore private names apart) is on a list of exactly the names those modules use today;
+  the imports are pinned to the exact (module, name) pairs used today, with no `as` rename; only the
+  constant signal name `child-exited` may be connected or emitted; no dunder attribute but `__init__`
+  and `__name__`; no call of a bare name that is neither defined there, imported from the pinned set,
+  nor one of a few builtins; none of `getattr`, `setattr`, `delattr`, `vars`, `eval`, `exec`,
+  `compile`, `globals`, `locals`, `__import__`, `attrgetter`, `methodcaller`; no class derived from
+  anything of Vte and no `do_*` virtual function; and no key controller (`Gtk.EventControllerKey` or
+  `EventControllerLegacy`), also in `window.py`, where `key-pressed`, `key-released` and `event`
+  connects are rejected too.
+- In the rest of `src/` it is a denylist of names: feeding and pasting (`feed_child*`, `paste_*`),
+  reading text (`get_text_range*`, `get_text_selected*`, `get_text_format`,
+  `get_text_include_trailing_spaces`, `write_contents_sync`, `copy_clipboard*`, `copy_primary`), the
+  pty (`get_pty`, `set_pty`, `Pty.new_sync`, `new_foreign_sync`, `get_fd`, `spawn_sync`,
+  `spawn_with_fds_async`), the screen (`match_check*`, `check_match_at`, `check_regex_simple_at`,
+  `check_hyperlink_at`, `hyperlink_check_event`, `event_check_*`, `search_find_*`), what the shell says
+  (`get_current_*_uri`, `get_window_title`, `get_icon_title`, `get_hyperlink_hover_uri`, any `.props`
+  access, and `get_property` or `set_property` of `window-title`, `icon-title`,
+  `current-directory-uri`, `current-file-uri`, `hyperlink-hover-uri`, `pty`, and `notify::` of those),
+  connecting to the signals `commit` (every keystroke), `contents-changed`, `text-inserted`,
+  `text-deleted`, `text-modified`, `text-scrolled`, `selection-changed`, `cursor-moved` and the
+  `*-changed` ones for the title and URIs, `emit` or `signal_emit_by_name` of those and of
+  `paste-clipboard` and `copy-clipboard`, and subclassing `Vte.*`.
+
+What it does not see: outside the Vte modules, a call through an alias or `getattr`, or a signal or
+property named by a variable; a key controller made anywhere but the Vte modules and `window.py`
+(there are two, both reviewed and pinned by their own tests: the chat input's Enter key, and
+push-to-talk's capture controller on the window, which sees every key including the terminal's and
+so does nothing, and returns False, while the focus is in the terminal pane: section 2, "Voice
+input" and "Speech output");
+methods and signals Vte gains later, outside the Vte modules; a terminal widget handed to another
+module (it never is); and anything done by obfuscation as above.
+
+- **Embedded**, where Vte 3.91 (the GTK 4 build) is installed (the Linux image, the target): a
+  pane under the canvas with a VTE terminal running the user's **login shell**, taken from the
+  passwd database (`pwd.getpwuid`), not from `$SHELL`, which is whatever started the shell
+  set; `/bin/sh` if the entry is unusable. It starts as `env -i NAME=value ... shell -l` in the
+  home directory, because VTE adds this process's whole environment to any it is given. The
+  environment is built from nothing: `PATH`, the locale, the session variables (display, bus,
+  `XAUTHORITY`, `XDG_*`, `SSH_AUTH_SOCK`) copied when present, `HOME`, `SHELL`, `USER`, `LOGNAME` from
+  the passwd entry, and the constants `TERM` and `COLORTERM`; never the API key or any `TUMBLEWEED_*` setting (I6).
+  Hiding the pane keeps the shell; its exit closes the pane (a start that fails, or a shell that
+  ends within two seconds with a non-zero status, is reported in the pane instead); closing the window
+  sends it SIGHUP (SIGKILL after a second), waiting at most two seconds. Whether the shell exits or
+  F12 closes the pane, the focus moves to the chat input, and the side panel is shown first if the
+  user hid it with F9: the input must be visible to take the focus, and closing the terminal is a
+  deliberate return to the chat.
+- **External**, where there is no VTE (macOS): `/usr/bin/open -b com.apple.Terminal <home>` there, elsewhere the
+  first of a fixed list of known terminals found on the absolute entries of `PATH`, started with no
+  arguments, in the home directory, with the same environment and in a session of its own. Nothing
+  is read from configuration to choose the program, and every program is started from an argv
+  list (`subprocess.Popen`, `shell=False`), so no text is interpolated into a command line. At most
+  eight started terminals may be open; closing the window ends those still running as its children
+  (not Terminal.app on a Mac, nor terminals that hand the window to a server), signalling every
+  group first and waiting at most two seconds in all. On macOS Terminal.app's shell gets the user's
+  login environment from LaunchServices, not ours.
+- The shortcut is a `Gtk.Shortcut` and the button a widget, **not** GActions: actions are exported
+  on the session bus, where any process of the user could ask for a shell to be started. The set
+  pinned by `tests/shell/test_session_bus.py` is unchanged.
+
 ### Tasks and workspace agents (see D7)
 
 A **task** (`TaskId`) is a unit of work with its own workspace directory, its own grants, and
@@ -432,6 +505,141 @@ the broker imports the agent or an LLM (I2).
   S19's scope in the plan). `BrokerClient`'s heartbeat stops only when the connection ends; a ping
   that times out or is refused is logged and the next is tried.
 
+### Voice input (S06, D20)
+
+`tumbleweed.voice` turns a held key (or a toggled button) into a user message. The user holds
+Ctrl+Space, or clicks the Mic, and `VoiceInput` (GTK-free: `press`, `release`, `cancel`, observers)
+runs `IDLE -> LISTENING -> TRANSCRIBING -> IDLE`; the voice indicator shows the phase. The main thread
+never waits on audio or on the network: an *audio worker* thread opens, stops and cancels the capture
+(`AudioSource`, in production `GStreamerAudioSource`: a pipeline of fixed element names that ends in
+16 kHz mono PCM; `osxaudiosrc` on macOS, PipeWire or Pulse on Linux) and a *speech worker* thread
+makes the HTTP request (`SttBackend`, in production `WhisperServerBackend`, whisper.cpp's
+`whisper-server`, reached at a configurable URL so that a VM can use its host's Metal). Both are daemon
+threads; results come back through the injected main-thread dispatcher, tagged with the utterance's
+generation, so what an abandoned utterance finds later is dropped.
+
+- *Trust.* The microphone is open only while the user holds the key or has toggled the button.
+  The transcript is untrusted text from a server (and, behind it, from whatever the microphone
+  heard: "Ambient audio", section 8). It is made safe in one place, `stt.clean_transcript`: exactly
+  a `str`, at most the transcript's 16 KiB for a user message, strictly encodable, controls and
+  format characters (right-to-left overrides, zero-width spaces) removed, whitespace collapsed, and
+  nothing at all if it is only `[BLANK_AUDIO]` or the like. It enters the input as the **user's own
+  words** (it is not framed as untrusted data to the model, because it is what the user said, as
+  typing would be, and carries no more authority); it is shown with plain-text APIs (I4). With
+  `edit_before_send` it waits in the input to be edited, and a draft that is already there is never
+  sent by a transcript. It cannot approve anything: prompts and pickers take keyboard and pointer
+  input only (I10), and the key and button are plain widgets, never `GAction`s, which would be
+  exported on the session bus.
+- *Bounds (I9).* A recording stops by itself at `max_utterance_seconds` (default 30, at most 120): the
+  cap is in bytes, in the buffer that takes the samples (`BoundedPcm`), so a device that keeps
+  delivering cannot grow memory. A tap shorter than 300 ms is not sent. `request_timeout` (default
+  30 s, at most 120) bounds the **whole exchange**: every operation of the request (name lookup,
+  connecting, the TLS handshake, each write, each read) runs through `voice.budget.BudgetBackend`,
+  which cuts it to what is left of one deadline and fails once there is none, so a server that
+  answers a byte at a time, or reads the upload slowly, is cut off at the deadline. The one thing it
+  cannot shorten is the operating system's resolver once asked (the request stops waiting for it; the
+  lookup's own thread ends with it; an IP address needs none). The user can abandon a request
+  (`AbortSignal`, set by `VoiceInput.cancel`: Esc, closing the shell), which shuts its sockets down at
+  once, so the next utterance does not queue behind it. It reads at most
+  `max_response_bytes` (default 64 KiB, at most 1 MiB) counted as the bytes arrive, before decoding,
+  and refuses a response with any content encoding, any status but 200, any type but JSON. Redirects
+  are not followed and the environment's proxies are ignored. `Accept-Encoding: identity` is asked for.
+- *The URL* (`voice.endpoint.SttEndpoint`) is validated wherever one is made: http or https, a host
+  that is a DNS name or an IP address, no credentials, query or fragment, a conservative path; only
+  `scheme://host:port` is ever logged or shown. Plain `http` to a host that is not the loopback is
+  allowed (a VM reaches its host over a private network), logged as a warning, and then a transcript
+  is **never sent automatically**: `edit_before_send` is forced on (`voice.factory`), because anyone on
+  the network could rewrite what comes back.
+- *Audio is never persisted.* It exists in memory from the capture callback to the request body. No
+  voice module can write a file (an AST scan), the pipeline is built from fixed elements none of
+  which writes (checked by name), and an utterance run under a Python audit hook writes nothing
+  (`tests/voice/test_no_audio_on_disk.py`; an audit hook cannot see native writes, so a Linux test
+  also runs a real GStreamer capture and checks that no file appears).
+- *Keys.* Push-to-talk is a capture-phase key controller on the window, the one place the
+  terminal's lint cannot see (S05's "key controller made elsewhere" gap), so it is reviewed and pinned
+  (`tests/shell/test_terminal_isolation.py`: it connects only `key-pressed` and `key-released`, reads
+  only the key value and the modifiers, and has no other name in its handlers). While the focus is
+  in the terminal pane it returns False at once and keeps no state: Ctrl+Space is the shell's
+  (set-mark), and no keystroke typed there is looked at beyond its key value. Elsewhere the key is
+  *latched*: the first press starts a recording, repeat is consumed and ignored (a held or stuck key
+  cannot record again when its utterance ends), the release of Space or Ctrl ends what the keyboard
+  started (not a recording the Mic button started), and so does the window losing focus. The one
+  other key it takes is a plain Esc **while an utterance is in progress**, which abandons it even
+  with the terminal focused (the terminal gets the bubble-phase Esc first); with nothing in progress
+  Esc is untouched, so vim still gets it. (Since S07 it also takes Esc while a reply is being spoken,
+  but never while the terminal has the focus: "Speech output" below.) The Mic button takes no focus (like the Terminal button),
+  so an utterance never leaves the window without a focused widget.
+- *Configuration.* `[voice]` is read apart from `[agent]` (`agent.config.load_voice_config`): a
+  mistake in it turns voice off, with a logged message, and leaves the agent working, and the other
+  way round; a syntax error in the file is both's.
+- *Failures* are fixed text shown next to the Mic button (never a server's or a library's words),
+  and the shell keeps running; a bug in a backend is logged by type and place, not by message.
+
+### Speech output (S07, D22)
+
+`tumbleweed.voice` also reads the assistant's reply aloud as it streams. `SpeechFeed` (shell) observes
+the `Transcript` and calls `SpeechOutput` (GTK-free: `begin_reply`, `feed`, `end_reply`, `stop`,
+`set_muted`, observers); a streaming assistant message begins a reply, each growth of its text is fed
+as new text, and completion ends it. `SentenceChunker` makes the text speakable and cuts it into
+sentences; a *synthesis* worker runs the `TtsBackend` (production: `PiperBackend`) and a *playback*
+worker the `AudioPlayer` (production: `GStreamerAudioPlayer`), in order, so the first sentence is
+audible while tokens still arrive. Both are daemon threads, main-thread calls never wait on them, and
+results come back through the injected dispatcher tagged with the reply's generation.
+
+- *Trust.* The text is model output. It is made safe in one place, `voice.speakable`: fenced code
+  dropped, Markdown marks and addresses removed, controls to spaces, format characters (bidi
+  overrides, zero-width spaces), lone surrogates and unassigned code points dropped, one line of at
+  most `max_sentence_chars` (default 400, at most 1000), a reply of at most `max_reply_chars` (default
+  4000, at most 20000; the user is told once if it is cut). It is spoken, never executed or shown
+  through this path, and speaking it approves nothing (I10).
+- *Piper.* One process per sentence: argv `[piper, --model, <voice>, --output_raw]` (no shell) from
+  two configured absolute paths, never from model output: the program is resolved and must be an
+  executable regular file, the voice model must be a regular file at an already canonical path (no
+  symlink, no dots), checked at start-up and again before every process. The sentence is on **stdin**,
+  never on the command line. The environment is `PATH`, `LANG`, `LC_ALL` and nothing else (I6: the API
+  key and the broker's and shell's variables never reach it; tested). The child has no inherited
+  descriptors, its own session and process group, and `/` as its directory. *Bounds (I9):* audio is
+  capped in bytes as it arrives (`max_audio_seconds`, default 60, at most 300), error output is
+  drained and only 2 KiB kept (a child past 1 MiB is killed), and `synthesis_timeout_seconds`
+  (default 20, at most 120) bounds each sentence, every wait being a 50 ms `select`. The abort signal
+  kills the process group at once from the thread that set it; the worker always reaps (no zombie),
+  and signals only a child it has not reaped (one lock), so a reused pid is never hit. Piper's own
+  words are logged, cleaned and bounded, never shown: the UI gets fixed text. The residual: a user
+  who can replace the voice file between the check and Piper's open is the user.
+- *Playback.* GStreamer, in the adapter that also does capture: `appsrc ! audioconvert !
+  audioresample ! volume ! <sink>` from fixed element names (`osxaudiosink`; `pipewiresink`,
+  `pulsesink`, `autoaudiosink`), a pipeline per sentence, waits in 20 ms slices on EOS and the abort
+  signal, a deadline of the audio's length plus a margin. Audio is never written anywhere (the
+  voice-package scan and audit-hook proofs cover it).
+- *Barge-in.* `stop` (push-to-talk, Esc, mute, a new user message, a new reply, closing) bumps the
+  generation, sets the reply's `AbortSignal` (kills Piper, mutes the `volume` element, from the
+  calling thread) and forgets the reply: text that arrives later is dropped, queued sentences are
+  dropped by their worker, and a chunk finishing late is dropped before the player, so nothing of a
+  stopped reply starts after the stop. A failure of a worker sets the signal itself, so what is queued
+  behind it never plays. A new reply speaks again; mute keeps the current reply silent after unmuting.
+- *The microphone.* The assistant must not hear itself and send its own words as the user's. Push-to-talk
+  stops speech first: `BargeIn` stops it as `VoiceInput` enters LISTENING, which happens before the audio
+  worker is asked to open the microphone, and nothing is spoken while it is open. That is ordering
+  (the key is the only thing that opens the microphone in S06); echo through speakers is not
+  cancelled, and S08's hands-free mode must (#117).
+- *Keys and chrome.* No new key controller: the reviewed push-to-talk controller's plain Esc also takes
+  "a reply is being spoken", **but not while the terminal has the focus** (it reads the speech
+  phase and `in_terminal()`, never the event): speech lasts as long as the model's text, and a user in
+  vim must not lose the Esc that leaves insert mode. Mute, or Esc elsewhere, stops it. S06's Esc
+  (abandon an utterance, the terminal included) is unchanged; with nothing in progress Esc is left to
+  the terminal and vim. The phase is SPEAKING only while a sentence is queued or playing: it is off
+  while a code block is dropped or the reply waits for words, and Esc is not spent then. A first Esc stops
+  the voice only; a second (the window's shortcut) stops a reply that is still streaming. **Mute** is a
+  toggle button after the Mic in the status strip: no tooltip, no focus, not a `GAction`; it stops
+  speech and keeps the rest of the reply, and unmuting speaks the next reply. The indicator says
+  "speaking" while a reply is read and gives way to listening and transcribing.
+- *Configuration and failures.* `[voice.tts]`, in the same table but judged on its own: a mistake in
+  it (a relative or `~` path, a misspelled key, a limit out of range) turns speech off only, keeps the
+  Mic, the key and the speech server, and says so once next to the Mic in fixed text. Nothing is
+  spoken until both paths are set and check out (a path that does not has the same effect), and
+  there is no Mute button without speech. `[voice] enabled = false` turns speech off too. A synthesis or playback failure is fixed text beside the Mic, ends that reply's speech
+  (one message, not one per sentence), and never stops the shell.
+
 ## 3. Request flow
 
 1. The user speaks (push-to-talk or wake word) or types. Speech goes through the STT backend;
@@ -784,7 +992,11 @@ Each invariant names where it is enforced. Reviews check every change against th
 - **I1 — No execution of model output outside a sandbox.** The shell and broker never
   `eval`/`exec`/`compile` model text, never import model-provided modules, never pass model
   text to a shell, never parse expression strings. `subprocess` only with argv lists,
-  never `shell=True`.
+  never `shell=True`. The terminal escape hatch (below) is the user's own tool: nothing the
+  model produced reaches it, and no code of the shell types into it or reads from it. Speech
+  output (S07) is the one place model text goes to a child process: it is *data on Piper's stdin*
+  (cleaned, one line, bounded), never an argument and never a command, and the program and its
+  voice are named by the user's configuration (section 2, "Speech output").
 - **I2 — Grants only from policy or the user.** No code path turns model output into a grant
   without a user decision in trusted UI. Static deny rules beat every grant. The broker
   never imports LLM code (enforced by import-linter).
@@ -840,7 +1052,11 @@ Each invariant names where it is enforced. Reviews check every change against th
   inherits it), reads a key file only if it is a regular file of the user's with mode 0600 and not a
   symlink, holds it in an object that cannot print, and shows the user only fixed error texts: a
   provider's own words are never displayed or logged. The SDK's DEBUG and INFO logging, which would
-  hold prompts and error text, is turned down to WARNING.
+  hold prompts and error text, is turned down to WARNING. The terminal's shell is started with an
+  environment built from a fixed list of names (`tumbleweed.shell.viewmodel.terminal`), so the
+  key, or anything else the shell's environment holds, does not reach it. Piper (S07) gets a fixed
+  three-variable environment (`voice.piper.PIPER_ENVIRONMENT`) for the same reason, and a test sets
+  the API key and the broker's variables and checks that none arrives.
 - **I7 — Everything privileged is audited.** Every grant decision, sandbox run, snapshot,
   restore and revocation is appended to the broker's audit log (S17: `audit.jsonl`, section 2
   "Broker daemon"), before the act it records, so an act whose entry cannot be written does not
@@ -889,7 +1105,15 @@ Each invariant names where it is enforced. Reviews check every change against th
   MiB of their text, a value or row over 128 KiB fails the read, and every record is validated. What is sent to the
   model is bounded by `agent.context`: a token budget over the system prompt, the history and the
   new message.
-- **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input.
+  Voice (`tumbleweed.voice`, D20): a recording is capped in bytes where the samples arrive
+  (`max_utterance_seconds`, default 30, at most 120), the speech server's answer is read to at most
+  `max_response_bytes` (default 64 KiB) with a deadline that bounds the whole exchange, and a transcript is at most the transcript's own 16 KiB (section 2, "Voice input"). Speech output (D22): a spoken sentence is at most `max_sentence_chars` (default 400, at most 1000) and a reply at most `max_reply_chars` (default 4000), Piper's audio is capped in bytes as it arrives, its error output is kept to 2 KiB, and each sentence has a deadline (default 20 s) and a killed-and-reaped process (section 2, "Speech output").
+- **I10 — Voice cannot approve.** Prompts and pickers require keyboard or pointer input. The
+  microphone feeds the chat input only (S06): a transcript is typed-equivalent text, nothing reads
+  it as an answer to a prompt, and the push-to-talk key and button are not `GAction`s (so no other
+  process can switch the microphone on through the session bus). Speech output (S07) is the other
+  direction and takes no input: its Mute button is a widget too, and the reply it reads is text the
+  chat already shows.
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps
   what it reads. Workspace references are relative and validated.
@@ -921,6 +1145,10 @@ only, so it can only refuse more; and case folding is not every file system's ow
 |---|---|---|
 | Shell config (TOML), API key file (0600) | `$XDG_CONFIG_HOME/tumbleweed/` | Never |
 | Chat history (SQLite), invocation log | `$XDG_DATA_HOME/tumbleweed/shell/` | Never |
+| Speech models for `whisper-server` (fetched by `scripts/whisper-model`, hash-checked) | `$XDG_DATA_HOME/tumbleweed/whisper/` | Never |
+| Recorded audio | Nowhere: held in memory from the microphone to the request, never written (S06) | n/a |
+| Piper and its voice models (installed by the user, named by absolute path in `[voice.tts]`) | Wherever the user put them | Never |
+| Synthesised speech | Nowhere: held in memory from Piper's pipe to the player, never written (S07) | n/a |
 | Broker data: grants, tasks and the tool store's index (`broker.sqlite3`), tool packages (`tool-blobs/`), audit log (`audit.jsonl`) | `$XDG_DATA_HOME/tumbleweed/broker/` | Never |
 | Copy/reflink snapshots | `$XDG_DATA_HOME/tumbleweed/broker/snapshots/` | Never |
 | btrfs snapshots | dedicated subvolume on the same filesystem, on the deny list | Never |
@@ -1025,7 +1253,7 @@ src/tumbleweed/
   ui/runtime/ state store, expression interpreter, bindings, handler dispatch (no GTK)
   ui/gtk/     GTK4 adapter that renders specs
   shell/      Adw application, window, chat panel, trusted prompts, terminal pane
-  shell/viewmodel/  transcript view-model and chat controller (no GTK)
+  shell/viewmodel/  transcript view-model, chat controller, terminal choices and spawner (no GTK)
   agent/      agent loop, tool registry, LLM providers, invocation recorder, prompts, config;
               the `Responder` interface the shell is built against (`agent/responder.py`)
   voice/      audio capture, STT, TTS, VAD, wake word
@@ -1047,11 +1275,18 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   imports `broker`.
 - `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
   import `gi`; `ui.runtime` also never imports `ui.gtk` or the shell, so it cannot reach GTK
-  through them.
+  through them. `voice` imports it only in `voice._gst`, the pin of the GStreamer adapter, which
+  only `voice.gstreamer` and `voice.factory` (lazily) import; the rest of `voice` cannot import
+  either, and `voice` never imports `shell` or `broker` (the shell depends on it). The one edge
+  between `agent` and `voice` is configuration: `agent.config` holds the loader of the one file and
+  imports `voice.config` (the `[voice]` model), and `voice.factory` imports `agent.config` to read
+  it; a contract lets `agent` import nothing else of `voice`.
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
 - `history` never imports `shell` or `agent`; the shell depends on it through `ChatHistory`.
 - The Anthropic SDK is imported only by `agent.anthropic_provider`; the rest of the agent, and
-  everything else, uses the `LlmProvider` interface (D3). `agent` runs its asyncio loop on its own
+  everything else, uses the `LlmProvider` interface (D3). Its HTTP library, `httpx2`, and that
+  library's transport, `httpcore2`, are also imported by `voice.whisper`, the speech server's client,
+  and `voice.budget` (`httpcore2` only), and by nothing else (D20, #43). `agent` runs its asyncio loop on its own
   worker thread and reaches the GTK main thread only through a dispatcher the shell injects (D11).
 - `shell.viewmodel` never imports `gi`, directly or through another module, so it cannot import
   the GTK adapter modules of `shell` either. `tests/test_import_contracts.py` plants each
@@ -1065,7 +1300,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   nothing of that runs on Linux. whisper.cpp and Piper run natively (Metal) and are
   reachable over HTTP from a VM. Linux-only parts (bubblewrap, Landlock, seccomp, btrfs) are
   exercised through the Docker harness `scripts/test-linux`.
-- **Docker harness**: runs as a non-root user with `--security-opt seccomp=unconfined
+- **Docker harness**: has the GTK 4, libadwaita and VTE (`gir1.2-vte-3.91`) typelibs, so the
+  terminal pane's embedded path runs there and in CI (macOS has no VTE: the fallback path runs
+  there). It runs as a non-root user with `--security-opt seccomp=unconfined
   --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device
   /dev/net/tun`, so bubblewrap can create user namespaces and mount a fresh `/proc`, and
   slirp4netns can create its tap device. GTK tests run under weston's headless

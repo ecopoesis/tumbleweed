@@ -351,6 +351,25 @@ class ChatPanel(Gtk.Box):
         buffer.set_text("")
         self._show_notice("")
 
+    def dictate(self, text: str, *, send: bool) -> None:
+        """Put what was said (S06) in the input, and send it if `send` and nothing was drafted.
+
+        A draft that is already there is never sent by a transcript, nor replaced: the words are
+        added after it (one space between) and left for the user to review and send. A reply still
+        streaming, or any refusal, is handled by `send` as for typed text: a notice, and the text
+        stays in the input.
+        """
+        buffer = self.input_view.get_buffer()
+        draft = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
+        if draft.strip():
+            separator = "" if draft[-1].isspace() else " "
+            buffer.insert(buffer.get_end_iter(), separator + text)
+        else:
+            buffer.set_text(text)
+        self.input_view.grab_focus()
+        if send and not draft.strip():
+            self.send()
+
     def _show_history_notice(self, text: str) -> None:
         self.history_notice.set_text(display_text(text))
         self.history_notice.set_visible(bool(text))

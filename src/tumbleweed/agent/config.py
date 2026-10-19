@@ -7,6 +7,7 @@ absolute path). It holds no secret: a key in it is refused. Environment variable
     TUMBLEWEED_MODEL       the model of the `chat` role
     TUMBLEWEED_BASE_URL    where the API is (a proxy such as LiteLLM, later)
     TUMBLEWEED_KEY_FILE    absolute path of the key file
+    TUMBLEWEED_STT_URL     where whisper-server is (`[voice]`, S06)
 
 The API key comes from `ANTHROPIC_API_KEY`, or else from a key file (by default
 `$XDG_CONFIG_HOME/tumbleweed/api-key`). Both are read with care:
@@ -29,6 +30,7 @@ query or fragment in it, because the key is sent there.
 import enum
 import errno
 import json
+import logging
 import os
 import stat
 import tomllib
@@ -43,6 +45,9 @@ from tumbleweed.agent.errors import ConfigError, MissingKeyError
 from tumbleweed.agent.limits import AgentLimits
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.types import ByteCount, ModelName
+from tumbleweed.voice.config import TtsConfig, VoiceConfig
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL: Final = ModelName("claude-sonnet-5-5")
 DEFAULT_BASE_URL: Final = "https://api.anthropic.com"
@@ -130,7 +135,9 @@ class AgentConfig(BaseModel):
 
 @final
 class TumbleweedConfig(BaseModel):
-    """The whole file. Other components add their tables as they arrive."""
+    """The whole file as the agent reads it. Other components add their tables as they arrive; the
+    `[voice]` table is read apart (`load_voice_config`), so that a mistake in it disables voice
+    and not the agent."""
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
@@ -275,6 +282,7 @@ def parse_config(text: str, environ: Mapping[str, str], *, source: str) -> Tumbl
             raise ConfigError(f"In {source}: [agent] must be a table.")
         for key, value in _env_overrides(environ).items():
             agent[key] = value
+        data.pop("voice", None)  # read apart: `parse_voice_config`
         return TumbleweedConfig.model_validate_json(json.dumps(data))
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{source} is not valid TOML: {str(exc)[:200]}") from None
@@ -284,18 +292,68 @@ def parse_config(text: str, environ: Mapping[str, str], *, source: str) -> Tumbl
         raise ConfigError(f"{source} holds a value that cannot be used.") from None
 
 
-def load_config(environ: Mapping[str, str]) -> TumbleweedConfig:
-    """The configuration: the file if there is one, then the environment's overrides."""
+def _config_text(environ: Mapping[str, str]) -> tuple[str, str]:
+    """The text of the configuration file and what to call it in a message ("the environment" if
+    there is no file). Raises `ConfigError` for a file that cannot be used."""
     path = config_dir(environ) / "config.toml"
     try:
         data = _read_regular_file(path, limit=MAX_CONFIG_BYTES, private=False, what="config file")
     except FileNotFoundError:
-        return parse_config("", environ, source="the environment")
+        return "", "the environment"
     try:
-        text = data.decode("utf-8")
+        return data.decode("utf-8"), str(path)
     except UnicodeDecodeError:
         raise ConfigError(f"The config file must be UTF-8 text: {path}") from None
-    return parse_config(text, environ, source=str(path))
+
+
+def load_config(environ: Mapping[str, str]) -> TumbleweedConfig:
+    """The configuration: the file if there is one, then the environment's overrides."""
+    text, source = _config_text(environ)
+    return parse_config(text, environ, source=source)
+
+
+def _tts_table(table: object, source: str) -> tuple[dict[str, object], Literal["invalid"] | None]:
+    """The checked `[voice.tts]` table and no problem, or a switched-off one and "invalid" (the
+    details, never a value, go to the log; the user is told in fixed text by the factory)."""
+    try:
+        if not isinstance(table, dict):
+            raise ValueError("not a table")
+        TtsConfig.model_validate_json(json.dumps(table))
+    except (TypeError, ValueError) as exc:
+        detail = _problems(exc) if isinstance(exc, ValidationError) else str(exc)[:100]
+        logger.warning("speech output is off: invalid [voice.tts] in %s: %s", source, detail)
+        return {"enabled": False}, "invalid"
+    return table, None
+
+
+def parse_voice_config(text: str, environ: Mapping[str, str], *, source: str) -> VoiceConfig:
+    """The `[voice]` table of TOML `text`, with `TUMBLEWEED_STT_URL` applied. Raises `ConfigError`
+    (a message that never repeats a value: a URL may hold credentials)."""
+    try:
+        voice = tomllib.loads(text).get("voice", {})
+        if not isinstance(voice, dict):
+            raise ConfigError(f"In {source}: [voice] must be a table.")
+        if stt_url := environ.get("TUMBLEWEED_STT_URL"):
+            voice["stt_url"] = stt_url
+        if "tts_problem" in voice:
+            raise ConfigError(f"Invalid [voice] configuration in {source}: tts_problem is unknown.")
+        # [voice.tts] is judged apart: a mistake in it turns speech off and not the microphone.
+        voice["tts"], voice["tts_problem"] = _tts_table(voice.pop("tts", {}), source)
+        return VoiceConfig.model_validate_json(json.dumps(voice))
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{source} is not valid TOML: {str(exc)[:200]}") from None
+    except (TypeError, ValueError) as exc:
+        if isinstance(exc, ValidationError):
+            raise ConfigError(
+                f"Invalid [voice] configuration in {source}: {_problems(exc)}"
+            ) from None
+        raise ConfigError(f"{source} holds a value that cannot be used.") from None
+
+
+def load_voice_config(environ: Mapping[str, str]) -> VoiceConfig:
+    """The voice configuration, apart from the agent's: an error here is voice's alone."""
+    text, source = _config_text(environ)
+    return parse_voice_config(text, environ, source=source)
 
 
 def _key_from_text(raw: str, *, source: str) -> ApiKey:

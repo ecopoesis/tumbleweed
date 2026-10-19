@@ -10,8 +10,10 @@ together, and [`docs/handoff.md`](docs/handoff.md) for the original vision. What
 far is the typed foundation in `src/tumbleweed/core`, the build and test setup around it, and the
 GTK4 shell skeleton (`tumbleweed-shell`: a window with a canvas, a chat panel that talks to Claude,
 and a status strip; see [Running the shell](#running-the-shell) and
-[Talking to Claude](#talking-to-claude)), and the renderer core that turns a UI spec into live
-widgets (`tumbleweed-render`; see [UI spec](#ui-spec)).
+[Talking to Claude](#talking-to-claude)), the renderer core that turns a UI spec into live
+widgets (`tumbleweed-render`; see [UI spec](#ui-spec)), push-to-talk voice input to a local
+whisper.cpp ([Voice input](#voice-input)), and spoken replies through Piper
+([Speech output](#speech-output)).
 
 ## Development setup (macOS)
 
@@ -66,12 +68,16 @@ One window opens, with no desktop around it:
 - the **side panel** (right): the chat transcript, a multi-line input and a Send button. Messages are
   answered by Claude, streamed in as they are written (with no key configured the chat says how to
   set one; `responder = "echo"` brings back the S02 placeholder that echoes). While a reply streams
-  the Send button waits, and the input stays editable; **Esc** stops the reply;
-- the **status strip** (bottom) with the voice indicator, which reads "idle" until voice arrives (S06);
+  the Send button waits, and the input stays editable; **Esc** stops the reply (while it is being read
+  aloud, the first Esc stops the voice and a second the reply: [Speech output](#speech-output));
+- the **status strip** (bottom) with the voice indicator (idle, listening, transcribing, speaking; thinking
+  arrives with S08), the **Mic** button ([Voice input](#voice-input)), the **Mute** button
+  ([Speech output](#speech-output), there when Piper is set up) and a **Terminal** button;
+- a **terminal pane** (above the status strip, hidden until you open it), see "The terminal" below;
 - a **reserved strip for trusted prompts** along the top, outside the canvas, which is empty until S18.
 
 Enter sends, Shift+Enter inserts a newline. Ctrl+L focuses the input (and shows the side panel if it
-is hidden), F9 shows or hides the side panel, Ctrl+Q quits. (Ctrl, also on a Mac.) SIGTERM and Ctrl+C
+is hidden), F9 shows or hides the side panel, F12 or the Terminal button opens the terminal, Ctrl+Q quits. (Ctrl, also on a Mac.) SIGTERM and Ctrl+C
 in the terminal quit the same way. Text from the chat is shown as plain text, never as markup, and
 very long or hostile text (a 5000-character grapheme cluster, 64 KiB with no spaces) cannot widen the
 window or freeze it: it is shown with zero-width spaces added. Ctrl+C and Copy in a message's menu put
@@ -85,9 +91,38 @@ well-known name on the session bus, and a second `tumbleweed-shell` is a second 
 to the first. That does **not** keep it off the bus: GLib still exports the application's and the
 window's actions (`quit`, `focus-input`, `toggle-side-panel`) there, so any process of your user that
 can reach the session bus can activate them. A test starts a private bus and pins that list (#54);
-nothing security-relevant, such as a permission prompt or a grant, is ever to be an action. Without a
+nothing security-relevant, such as a permission prompt or a grant, is ever to be an action, nor is
+anything that starts a process: the terminal's key and button are not actions. Without a
 display (no `WAYLAND_DISPLAY` or `DISPLAY` that works) the command says so in one line and exits
 with status 1.
+
+### The terminal
+
+A terminal is one keystroke away whether or not an API key is configured, and whatever state the agent
+is in (no key, an unreadable config file, a failed reply): **F12** or the **Terminal** button in the
+status strip. It is your tool, not the agent's: nothing the model says can type into it or read it.
+
+- **Where VTE (the GTK 4 build, `gir1.2-vte-3.91` on Debian and Ubuntu) is installed**, which includes the
+  Linux image: the terminal is a pane under the canvas running your **login shell** as the passwd database
+  (`getent passwd`) has it, not `$SHELL`, in your home directory. F12 or the button again hides the pane and
+  keeps the shell; `exit` closes the pane and the next F12 starts a new shell; closing the window ends the
+  shell (SIGHUP, then SIGKILL after a second). While the terminal has the focus, Ctrl+L is the shell's (clear
+  screen) and not "focus the input"; Ctrl+Q and F9 still act on the shell (#90). Ctrl+Space is the
+  shell's too (set-mark in Emacs and readline): push-to-talk ([Voice input](#voice-input)) does nothing,
+  and lets the key through untouched, while the terminal has the focus; use the Mic button there. Esc is yours too, except that it abandons a voice utterance in progress (not stopping a reply being spoken: Esc stays the terminal's while it has the focus).
+- **Where there is no VTE** (macOS, whose Homebrew has no GTK 4 build of it): F12 opens an external terminal
+  window, in your home directory: Terminal.app (`open -b com.apple.Terminal`) on a Mac, otherwise the first of
+  `x-terminal-emulator`, `gnome-terminal`, `kgx`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `foot`,
+  `xterm` found on your `PATH`. Every F12 opens another window (at most eight started from one shell are
+  kept track of); closing the shell ends those still running as its children (not Terminal.app on a
+  Mac, nor terminals that hand the window to a server, such as gnome-terminal). If none is found the pane says which to
+  install.
+- The terminal's environment is built from nothing, not copied: your `PATH`, locale, display and session
+  variables (including `XAUTHORITY`), `HOME`, `SHELL`, `USER` and `LOGNAME` from your passwd entry, and
+  the constants `TERM` (`xterm-256color`) and `COLORTERM` (`truecolor`). On a Mac, Terminal.app's shell gets
+  your login environment from the system, not this one. Your API key, and any other
+  variable, is not passed. Programs are started from argument lists, never through a shell, and nothing
+  configures which terminal is used. Why: `docs/DECISIONS.md` D18.
 
 **On macOS** the command works from any shell, with or without the `DYLD_FALLBACK_LIBRARY_PATH` line
 above. Homebrew's libraries are not on dyld's search path, and the variable is read when a process
@@ -215,6 +250,140 @@ last session's data is damaged, a new session starts and the old data stays in t
 directory or file of yours that is too open is corrected, with a log line. Deferred pieces (a session
 browser, and others) are in #80.
 
+### Voice input
+
+Hold **Ctrl+Space** (anywhere but the terminal) and speak; let go and the words are transcribed and sent as your message (or click
+**Mic** in the status strip to start, and click again to stop). The voice indicator shows
+*listening* while you talk and *transcribing* while the speech server works; **Esc** abandons the
+utterance. Speech-to-text is whisper.cpp's `whisper-server`, which the shell reaches over HTTP, so
+it can run natively on a Mac (with Metal, which a VM does not have) while the shell runs anywhere.
+Replies are read aloud when Piper is set up ([Speech output](#speech-output)); hands-free listening is
+a later step (S08). On a Mac, Ctrl+Space may be
+taken by the system's input-source shortcut (System Settings, Keyboard, Keyboard Shortcuts, Input
+Sources); the Mic button works regardless (a configurable key is #100).
+
+**1. The speech server.** Homebrew's `whisper-cpp` does not include `whisper-server` (its formula
+turns it off), so build it from the source, at a release tag; on Apple Silicon Metal is on by default:
+
+```sh
+brew install cmake
+git clone --depth 1 --branch v1.9.5 https://github.com/ggml-org/whisper.cpp ~/whisper.cpp
+cmake -S ~/whisper.cpp -B ~/whisper.cpp/build -DCMAKE_BUILD_TYPE=Release
+cmake --build ~/whisper.cpp/build -j --config Release
+scripts/whisper-model                                  # base.en, 142 MiB, checked against a pinned SHA-256
+WHISPER_SERVER_BIN=~/whisper.cpp/build/bin/whisper-server scripts/whisper-server
+```
+
+`scripts/whisper-model [tiny.en|base.en|base]` downloads over https to
+`~/.local/share/tumbleweed/whisper/` and installs the file only if its SHA-256 is the pinned one.
+`scripts/whisper-server` runs the server on `127.0.0.1:8080` with that model (`WHISPER_MODEL`,
+`WHISPER_HOST`, `WHISPER_PORT` change it). The startup log of whisper.cpp says which backend it uses
+(`ggml_metal_init` on a Mac with Metal). `base` is multilingual: set `language` below to your language.
+
+**2. The shell.** With the server on its default address nothing needs configuring. Otherwise, in
+`config.toml` (all optional) or the environment:
+
+```toml
+[voice]
+enabled = true                       # false: no Mic button, no key, and no speech output
+stt_url = "http://127.0.0.1:8080"    # whisper-server's address         (TUMBLEWEED_STT_URL)
+language = "auto"                    # or a code such as "en", "de"
+edit_before_send = false             # true: the words wait in the input for you to edit and send
+                                     # (always, over plain http to an address that is not local)
+
+[voice.limits]                       # ARCHITECTURE I9
+max_utterance_seconds = 30           # recording stops by itself here (up to 120)
+request_timeout_seconds = 30         # the whole exchange with the server (up to 120)
+max_response_bytes = 65536           # the most of the server's answer that is read
+```
+
+**From a VM**, run the server on the Mac bound to the host-only address the VM sees (for example
+`WHISPER_HOST=192.168.64.1 scripts/whisper-server`) and give the VM `stt_url = "http://192.168.64.1:8080"`.
+whisper-server has no authentication or encryption, and anyone who reaches the port can send it audio,
+use the machine's CPU and GPU and change its model, so bind it to the loopback or to a private
+interface and never to a network you share. Over plain `http` to an address that is not local, the
+shell logs a warning and **never sends a transcript by itself**: it waits in the input for you to read
+it (`edit_before_send` is forced on), because anyone on that network could have rewritten it on its
+way back. `https` works if you put a TLS proxy in front.
+
+`request_timeout_seconds` bounds the whole exchange with the server, however slow it is (the lookup of
+its name, connecting, sending the audio and reading the answer each get what is left of it, so a
+server that answers a byte at a time is cut off at the limit); Esc abandons a request at once. Only
+the operating system's name lookup, once started, cannot be shortened (the request stops waiting for
+it); an IP address needs none.
+
+**The microphone** is read through GStreamer, 16 kHz mono, only while you talk, and the shell
+never writes audio anywhere: it lives in memory from the microphone to the HTTP request. A recording is capped at
+`max_utterance_seconds` however long the key is held. GStreamer is needed only for voice and is not
+part of the base setup: on a Mac `brew install gstreamer` (it bundles `osxaudiosrc` and the
+typelibs, and macOS asks for microphone permission the first time you talk); on Linux
+`gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gstreamer1.0-plugins-base` plus
+`gstreamer1.0-pipewire` or `gstreamer1.0-pulseaudio`. Without it the shell starts as usual and the
+Mic says what is missing. The server's answer is untrusted text: it is size-limited, read as strict
+UTF-8 JSON, stripped of control and direction-changing characters, and shown as plain text. It then
+enters the chat exactly as if you had typed it: it is *your* message, with no more authority than
+typing, and nothing a transcript says can approve anything (prompts take the keyboard and pointer
+only, I10). If your input already has a draft, the words are added to it and not sent.
+
+**A real server** is exercised by the `live` test (never run in CI): it has macOS's `say` speak a
+sentence, sends it to the server and checks the words that come back:
+
+```sh
+TUMBLEWEED_LIVE=1 TUMBLEWEED_STT_URL=http://127.0.0.1:8080 uv run pytest -m live tests/voice -v
+```
+
+### Speech output
+
+When Piper is set up, the assistant's replies are **read aloud as they stream in**: the first sentence
+starts playing while the rest of the reply is still being written. Code blocks and Markdown marks are
+not spoken (links keep their text, addresses become the word "link", the words of an inline code span stay).
+The voice indicator says *speaking*. **Barge-in is immediate**: hold Ctrl+Space (or click Mic) and speech
+stops before the microphone opens, and **Esc** stops it, except while the terminal has the focus (a reply can be read for a long time, and
+vim must keep its Esc; use Mute, or click out of the terminal). A first Esc stops the voice; the reply goes on
+arriving as text, and a second Esc stops that too. The **Mute** button beside the Mic stops what is
+being said and keeps the rest of that reply, and every later one, silent until you click it again;
+sending a new message also stops the speech of the last reply.
+
+Nothing is spoken until you point the shell at Piper and a voice. Install Piper
+([rhasspy/piper](https://github.com/rhasspy/piper): a release binary, or `pip install piper-tts`, which
+puts a `piper` program in its environment) and download a voice (an `.onnx` file with its `.onnx.json`
+beside it, from [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)), then, in `config.toml`:
+
+```toml
+[voice.tts]
+enabled = true
+piper_path = "/usr/local/bin/piper"        # absolute; a symlink is followed (Homebrew's are)
+voice_model = "/home/me/.local/share/tumbleweed/piper/en_US-lessac-medium.onnx"
+                                           # absolute, a regular file, no symlink and no ".." in the path
+sample_rate_hz = 22050                     # the voice's: "audio" > "sample_rate" in its .onnx.json (medium: 22050, low: 16000)
+max_sentence_chars = 400                   # one synthesis request (up to 1000)
+max_reply_chars = 4000                     # the most of one reply that is spoken (up to 20000); the rest is dropped
+synthesis_timeout_seconds = 20             # per sentence (up to 120)
+max_audio_seconds = 60                     # the most audio one sentence may become (up to 300)
+```
+
+`[voice] enabled = false` turns speech off too (it is part of voice). A voice with the wrong `sample_rate_hz` plays too fast or too slow, nothing worse (reading it from the voice is #113). If a path or any setting of
+`[voice.tts]` is wrong, the shell starts anyway with the Mic and the key working, says so next to the Mic
+(once, in fixed words; the log has the details), and does not speak. The shell runs `piper --model
+<voice> --output_raw` once per sentence, with the sentence on its standard input (never on the command
+line), no shell, a fixed minimal environment (none of your variables, so the API key never reaches it), a
+time limit and a size limit on its audio; Esc and Mute kill it at once. The audio is played through
+GStreamer, and never written anywhere. Without GStreamer the shell starts as usual and the first spoken
+sentence says what is missing; on a Mac `brew install gstreamer` has `osxaudiosink`, on Linux you need
+`gstreamer1.0-plugins-base` and `gstreamer1.0-pipewire` or `gstreamer1.0-pulseaudio` (or `gstreamer1.0-plugins-good`
+for `autoaudiosink`) next to the packages the microphone needs. A new process per sentence means Piper
+loads the voice each time (a fraction of a second on a Mac): a long-lived Piper is #112.
+
+The assistant must not hear itself: nothing is spoken while the microphone is open, and holding the key
+stops speech first. Headphones are still a good idea; echo cancellation is not attempted.
+
+A **real Piper** is exercised by the `live` test (never run in CI):
+
+```sh
+TUMBLEWEED_LIVE=1 TUMBLEWEED_PIPER=/usr/local/bin/piper TUMBLEWEED_PIPER_MODEL=/path/to/voice.onnx \
+    uv run pytest -m live tests/voice/test_live.py -k piper -v
+```
+
 ### Checks
 
 ```sh
@@ -246,7 +415,10 @@ checker), `anthropic` (the official Claude SDK, behind our provider interface; i
 few small pure-Python packages, all locked for the three platforms, and 1.13 is the newest release
 inside the cooldown today) and `httpx2`, the SDK's HTTP library, which is a direct dependency because
 `agent.anthropic_provider` imports it: for the transport that bounds a response, for refusing
-redirects and environment proxies, and for its exception types. A new one needs its justification in the PR and a lock for macOS and Linux.
+redirects and environment proxies, and for its exception types, and by `voice.whisper`, the speech
+server's client (one HTTP stack for the project, not two: DECISIONS D20, #43). `httpcore2`, httpx2's own
+transport library, is declared too (it was already locked as httpx2's dependency): `voice.budget` and
+`voice.whisper` use it to put one deadline on every operation of a speech request. A new one needs its justification in the PR and a lock for macOS and Linux.
 
 - To update: `uv lock --upgrade`, which re-resolves with the window as of today.
 - To take a newer release of one package before its week is up (a security fix), add
