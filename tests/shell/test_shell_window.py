@@ -625,6 +625,7 @@ class TestVoiceIndicator:
         ("name", "text"),
         [
             ("IDLE", "Voice: idle"),
+            ("WAKE", "Voice: waiting for the wake word"),
             ("LISTENING", "Voice: listening"),
             ("TRANSCRIBING", "Voice: transcribing"),
             ("THINKING", "Voice: thinking"),
@@ -645,6 +646,7 @@ class TestVoiceIndicator:
 
         assert [state.value for state in VoiceState] == [
             "idle",
+            "wake",
             "listening",
             "transcribing",
             "thinking",

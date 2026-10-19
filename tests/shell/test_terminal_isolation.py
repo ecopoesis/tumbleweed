@@ -694,7 +694,8 @@ def test_the_window_module_uses_a_shortcut_controller_not_a_key_controller() -> 
 # reads the key value and the modifiers of a press or release, passes nothing on, and does nothing
 # at all (returns False, the event goes on to the terminal) while the focus is in the terminal pane.
 # Since S07 its Esc also takes "a reply is being spoken" (it reads the speech output's phase, never
-# the event), so the handler names include `speech`.
+# the event), so the handler names include `speech`. Since S08 it also takes Esc while a hands-free
+# turn is being recorded (it reads that machine's phase, never the event): `hands_free`, `hearing`.
 PUSH_TO_TALK_MODULE = "shell/voice_controls.py"
 OTHER_KEY_CONTROLLER_MODULES = ["shell/chat_panel.py"]
 PUSH_TO_TALK_HANDLER_NAMES = frozenset(
@@ -702,7 +703,7 @@ PUSH_TO_TALK_HANDLER_NAMES = frozenset(
         "Gdk", "Gtk", "keyval", "state", "in_terminal", "held", "voice", "_RELEASE_KEYS",
         "KEY_space", "accelerator_get_default_mod_mask", "ModifierType", "CONTROL_MASK",
         "KEY_Escape", "phase", "VoicePhase", "IDLE", "speech", "SpeechPhase", "SPEAKING",
-        "listening", "speaking",
+        "listening", "speaking", "hands_free", "HandsFreePhase", "LISTENING", "hearing",
     }
 )  # fmt: skip
 

@@ -18,9 +18,11 @@ from tumbleweed.voice.errors import AudioError
 from tumbleweed.voice.limits import BYTES_PER_SECOND
 
 try:
+    from tumbleweed.voice._gst import Gst
     from tumbleweed.voice.gstreamer import (
         CaptureSource,
         GStreamerAudioSource,
+        GStreamerAudioStream,
         _make,
         microphone_elements,
     )
@@ -139,3 +141,143 @@ def test_a_real_capture_creates_no_file(tmp_path: Path, monkeypatch: pytest.Monk
 
     assert utterance.byte_count > 0
     assert sorted(tmp_path.rglob("*")) == before
+
+
+class TestTheStream:
+    """Hands-free mode's capture (S08): the same pipeline kept open, every buffer handed on."""
+
+    def test_a_tone_is_delivered_as_whole_16_bit_samples_at_16_khz(self) -> None:
+        chunks: list[bytes] = []
+        lock = threading.Lock()
+
+        def deliver(chunk: bytes) -> None:
+            with lock:
+                chunks.append(chunk)
+
+        stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
+        try:
+            started = time.monotonic()
+            stream.start(deliver, lambda _message: None)
+            time.sleep(0.8)
+            stream.stop()
+            elapsed = time.monotonic() - started
+        finally:
+            stream.stop()
+
+        with lock:
+            audio = b"".join(chunks)
+        assert all(len(chunk) % 2 == 0 for chunk in chunks)
+        assert 0.3 < len(audio) / BYTES_PER_SECOND <= elapsed + 0.1  # 16 kHz, not mislabelled
+        samples = struct.unpack(f"<{len(audio) // 2}h", audio)
+        assert max(abs(sample) for sample in samples) > 1000
+
+    def test_nothing_is_delivered_after_stop_returns(self) -> None:
+        count = 0
+
+        def deliver(_chunk: bytes) -> None:
+            nonlocal count
+            count += 1
+
+        stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
+        stream.start(deliver, lambda _message: None)
+        time.sleep(0.3)
+        stream.stop()
+        seen = count
+
+        time.sleep(0.3)
+
+        assert seen > 0
+        assert count == seen
+
+    def test_stop_is_idempotent_and_without_a_start_is_nothing(self) -> None:
+        stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
+
+        stream.stop()
+        stream.start(lambda _chunk: None, lambda _message: None)
+        stream.stop()
+        stream.stop()
+
+    def test_starting_again_replaces_the_capture(self) -> None:
+        first, second = threading.Event(), threading.Event()
+        stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
+        try:
+            stream.start(lambda _chunk: first.set(), lambda _message: None)
+            assert first.wait(timeout=5)
+            stream.start(lambda _chunk: second.set(), lambda _message: None)
+            assert second.wait(timeout=5)
+        finally:
+            stream.stop()
+
+    def test_a_platform_with_no_microphone_source_is_an_audio_error_not_a_crash(self) -> None:
+        nowhere = GStreamerAudioStream(platform="plan9")
+
+        with pytest.raises(AudioError, match="not supported"):
+            nowhere.start(lambda _chunk: None, lambda _message: None)
+
+    def test_a_real_stream_creates_no_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name in ("HOME", "TMPDIR", "XDG_CACHE_HOME", "XDG_DATA_HOME"):
+            place = tmp_path / name.lower()
+            place.mkdir()
+            monkeypatch.setenv(name, str(place))
+        monkeypatch.chdir(tmp_path)
+        before = sorted(tmp_path.rglob("*"))
+        received = threading.Event()
+
+        stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
+        try:
+            stream.start(lambda _chunk: received.set(), lambda _message: None)
+            assert received.wait(timeout=5)
+            time.sleep(0.3)
+        finally:
+            stream.stop()
+
+        assert sorted(tmp_path.rglob("*")) == before
+
+    def test_the_end_of_the_stream_is_reported_as_an_error_not_left_silent(self) -> None:
+        reported: list[str] = []
+        got_audio = threading.Event()
+        stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
+        try:
+            stream.start(lambda _chunk: got_audio.set(), reported.append)
+            assert got_audio.wait(timeout=5)
+
+            assert stream._pipeline is not None  # noqa: SLF001  (to end it, as a device going away does)
+            stream._pipeline.send_event(Gst.Event.new_eos())  # noqa: SLF001
+            deadline = time.monotonic() + 5
+            while not reported and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            stream.stop()
+
+        assert reported == ["The microphone stopped delivering audio."]
+
+    def test_a_microphone_that_cannot_be_opened_is_refused_in_start_and_not_reported_after(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A source whose state change fails and posts an ERROR (`filesrc` with no file name stands
+        in for a device that is gone): that is `start`'s to refuse with, in fixed text, and not a
+        capture that "stopped delivering audio" (`on_error` is for after it is open)."""
+        from tumbleweed.voice import gstreamer
+
+        monkeypatch.setattr(gstreamer, "microphone_elements", lambda _platform: ("filesrc",))
+        reported: list[str] = []
+        stream = GStreamerAudioStream(platform="linux")
+
+        with pytest.raises(AudioError, match="could not be opened"):
+            stream.start(lambda _chunk: None, reported.append)
+        time.sleep(0.3)
+
+        assert reported == []
+
+    def test_stopping_it_reports_nothing(self) -> None:
+        reported: list[str] = []
+        stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
+        stream.start(lambda _chunk: None, reported.append)
+        time.sleep(0.2)
+
+        stream.stop()
+        time.sleep(0.2)
+
+        assert reported == []

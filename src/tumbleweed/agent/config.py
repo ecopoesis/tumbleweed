@@ -45,7 +45,7 @@ from tumbleweed.agent.errors import ConfigError, MissingKeyError
 from tumbleweed.agent.limits import AgentLimits
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.types import ByteCount, ModelName
-from tumbleweed.voice.config import TtsConfig, VoiceConfig
+from tumbleweed.voice.config import TtsConfig, VadConfig, VoiceConfig, WakeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +326,26 @@ def _tts_table(table: object, source: str) -> tuple[dict[str, object], Literal["
     return table, None
 
 
+def _hands_free_tables(
+    vad: object, wake: object, source: str
+) -> tuple[dict[str, object], dict[str, object], Literal["invalid"] | None]:
+    """The checked `[voice.vad]` and `[voice.wake]` tables and no problem, or empty ones and
+    "invalid" if either is wrong (judged together, so half a hands-free setup never runs). The
+    details, never a value, go to the log; the user is told in fixed text by the factory."""
+    try:
+        if not isinstance(vad, dict) or not isinstance(wake, dict):
+            raise ValueError("not a table")
+        VadConfig.model_validate_json(json.dumps(vad))
+        WakeConfig.model_validate_json(json.dumps(wake))
+    except (TypeError, ValueError) as exc:
+        detail = _problems(exc) if isinstance(exc, ValidationError) else str(exc)[:100]
+        logger.warning(
+            "hands-free is off: invalid [voice.vad] or [voice.wake] in %s: %s", source, detail
+        )
+        return {}, {"enabled": False}, "invalid"
+    return vad, wake, None
+
+
 def parse_voice_config(text: str, environ: Mapping[str, str], *, source: str) -> VoiceConfig:
     """The `[voice]` table of TOML `text`, with `TUMBLEWEED_STT_URL` applied. Raises `ConfigError`
     (a message that never repeats a value: a URL may hold credentials)."""
@@ -339,6 +359,15 @@ def parse_voice_config(text: str, environ: Mapping[str, str], *, source: str) ->
             raise ConfigError(f"Invalid [voice] configuration in {source}: tts_problem is unknown.")
         # [voice.tts] is judged apart: a mistake in it turns speech off and not the microphone.
         voice["tts"], voice["tts_problem"] = _tts_table(voice.pop("tts", {}), source)
+        if "hands_free_problem" in voice:
+            raise ConfigError(
+                f"Invalid [voice] configuration in {source}: hands_free_problem is unknown."
+            )
+        # [voice.vad] and [voice.wake] are judged apart too: a mistake in either turns hands-free
+        # off (and the trimming of push-to-talk), not the microphone.
+        voice["vad"], voice["wake"], voice["hands_free_problem"] = _hands_free_tables(
+            voice.pop("vad", {}), voice.pop("wake", {}), source
+        )
         return VoiceConfig.model_validate_json(json.dumps(voice))
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{source} is not valid TOML: {str(exc)[:200]}") from None

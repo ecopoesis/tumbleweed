@@ -24,6 +24,10 @@ is logged, bounded, and not shown.
 Called from the voice audio worker only (`VoiceInput`); the sink callback runs on GStreamer's
 streaming thread and touches only the buffer and the `on_full` callback.
 
+`GStreamerAudioStream` (S08) is the same capture pipeline kept open: it hands every buffer to a
+callback as it arrives (hands-free mode's inference thread takes it from a bounded mailbox) and
+keeps nothing; `start` and `stop` are bounded in the same way.
+
 `GStreamerAudioPlayer` (S07) plays one sentence's speech per call, in the same way (fixed names, a
 new pipeline each time, bounded waits):
 
@@ -76,6 +80,7 @@ _POLL: Final = 20 * Gst.MSECOND
 _PLAYBACK_MARGIN: Final = 5.0  # seconds a sentence may take beyond its own length
 _PLAY_OPEN_FAILED: Final = "The speaker could not be opened. Check that audio output is available."
 _PLAY_FAILED: Final = "The speaker stopped working while speaking."
+_STOPPED: Final = "The microphone stopped delivering audio."
 _init_lock = threading.Lock()
 _initialised = False
 
@@ -118,6 +123,83 @@ def _link(first: Gst.Element, second: Gst.Element) -> None:
         raise AudioError("GStreamer could not connect the audio elements.")
 
 
+def _source_element(kind: CaptureSource, platform: str) -> Gst.Element:
+    match kind:
+        case CaptureSource.TEST_TONE:
+            tone = _make("audiotestsrc")
+            tone.set_property("is-live", True)
+            return tone
+        case CaptureSource.MICROPHONE:
+            names = microphone_elements(platform)
+            for name in names:
+                if Gst.ElementFactory.find(name) is not None:
+                    return _make(name)
+            raise AudioError(
+                "No GStreamer audio source is installed for the microphone "
+                f"(looked for {', '.join(names) or 'none: this platform is not supported'})."
+            )
+
+
+def _capture_pipeline(
+    kind: CaptureSource, platform: str, deliver: Callable[[bytes], None]
+) -> Gst.Pipeline:
+    """The capture pipeline, built from fixed element names; every buffer is copied and handed to
+    `deliver` on GStreamer's streaming thread, which must return at once."""
+    pipeline = Gst.Pipeline.new("tumbleweed-capture")
+    source = _source_element(kind, platform)
+    convert = _make("audioconvert")
+    resample = _make("audioresample")
+    caps = _make("capsfilter")
+    caps.set_property("caps", Gst.Caps.from_string(_CAPS))
+    sink = _make("appsink")
+    sink.set_property("emit-signals", True)
+    sink.set_property("sync", False)
+    sink.set_property("max-buffers", 16)
+    elements = (source, convert, resample, caps, sink)
+    for element in elements:
+        # Bin.add returns a bool, or (with gst-python's override, which not every install has)
+        # nothing and raises on failure: so the result is not used, the parent is checked.
+        pipeline.add(element)
+        if element.get_parent() != pipeline:
+            raise AudioError("GStreamer could not build the capture pipeline.")
+    for first, second in itertools.pairwise(elements):
+        _link(first, second)
+
+    def on_sample(appsink: GstApp.AppSink) -> Gst.FlowReturn:
+        # GStreamer's streaming thread: copy the samples out and hand them over, nothing else.
+        try:
+            sample = appsink.emit("pull-sample")
+            if not isinstance(sample, Gst.Sample):
+                return Gst.FlowReturn.OK
+            buffer = sample.get_buffer()
+            if buffer is None:
+                return Gst.FlowReturn.OK
+            mapped, info = buffer.map(Gst.MapFlags.READ)
+            if not mapped:
+                return Gst.FlowReturn.OK
+            try:
+                chunk = bytes(info.data)
+            finally:
+                buffer.unmap(info)
+            deliver(chunk)
+        except Exception:
+            logger.exception("the capture callback failed")
+            return Gst.FlowReturn.ERROR
+        return Gst.FlowReturn.OK
+
+    sink.connect("new-sample", on_sample)
+    return pipeline
+
+
+def _log_bus_error(pipeline: Gst.Pipeline, message: Gst.Message | None = None) -> None:
+    bus = pipeline.get_bus()
+    if message is None and bus is not None:
+        message = bus.pop_filtered(Gst.MessageType.ERROR)
+    if message is not None and message.type == Gst.MessageType.ERROR:
+        error, _debug = message.parse_error()
+        logger.warning("GStreamer: %s", str(error.message)[:_MAX_LOGGED_CHARS])
+
+
 @final
 class GStreamerAudioSource:
     """An `AudioSource` over a GStreamer pipeline (see the module docstring)."""
@@ -136,68 +218,12 @@ class GStreamerAudioSource:
         self._pipeline: Gst.Pipeline | None = None
         self._pcm = BoundedPcm(max_bytes)
 
-    def _source_element(self) -> Gst.Element:
-        match self._kind:
-            case CaptureSource.TEST_TONE:
-                tone = _make("audiotestsrc")
-                tone.set_property("is-live", True)
-                return tone
-            case CaptureSource.MICROPHONE:
-                names = microphone_elements(self._platform)
-                for name in names:
-                    if Gst.ElementFactory.find(name) is not None:
-                        return _make(name)
-                raise AudioError(
-                    "No GStreamer audio source is installed for the microphone "
-                    f"(looked for {', '.join(names) or 'none: this platform is not supported'})."
-                )
-
     def _build(self, pcm: BoundedPcm, on_full: Callable[[], None]) -> Gst.Pipeline:
-        pipeline = Gst.Pipeline.new("tumbleweed-capture")
-        source = self._source_element()
-        convert = _make("audioconvert")
-        resample = _make("audioresample")
-        caps = _make("capsfilter")
-        caps.set_property("caps", Gst.Caps.from_string(_CAPS))
-        sink = _make("appsink")
-        sink.set_property("emit-signals", True)
-        sink.set_property("sync", False)
-        sink.set_property("max-buffers", 16)
-        elements = (source, convert, resample, caps, sink)
-        for element in elements:
-            # Bin.add returns a bool, or (with gst-python's override, which not every install has)
-            # nothing and raises on failure: so the result is not used, the parent is checked.
-            pipeline.add(element)
-            if element.get_parent() != pipeline:
-                raise AudioError("GStreamer could not build the capture pipeline.")
-        for first, second in itertools.pairwise(elements):
-            _link(first, second)
+        def deliver(chunk: bytes) -> None:
+            if pcm.append(chunk):
+                on_full()
 
-        def on_sample(appsink: GstApp.AppSink) -> Gst.FlowReturn:
-            # GStreamer's streaming thread: copy the samples into the bounded buffer, nothing else.
-            try:
-                sample = appsink.emit("pull-sample")
-                if not isinstance(sample, Gst.Sample):
-                    return Gst.FlowReturn.OK
-                buffer = sample.get_buffer()
-                if buffer is None:
-                    return Gst.FlowReturn.OK
-                mapped, info = buffer.map(Gst.MapFlags.READ)
-                if not mapped:
-                    return Gst.FlowReturn.OK
-                try:
-                    chunk = bytes(info.data)
-                finally:
-                    buffer.unmap(info)
-                if pcm.append(chunk):
-                    on_full()
-            except Exception:
-                logger.exception("the capture callback failed")
-                return Gst.FlowReturn.ERROR
-            return Gst.FlowReturn.OK
-
-        sink.connect("new-sample", on_sample)
-        return pipeline
+        return _capture_pipeline(self._kind, self._platform, deliver)
 
     def start(self, on_full: Callable[[], None]) -> None:
         self.cancel()
@@ -208,7 +234,7 @@ class GStreamerAudioSource:
         if result != Gst.StateChangeReturn.FAILURE:
             result, _current, _pending = pipeline.get_state(START_TIMEOUT)
         if result not in (Gst.StateChangeReturn.SUCCESS, Gst.StateChangeReturn.NO_PREROLL):
-            self._log_bus_error(pipeline)
+            _log_bus_error(pipeline)
             self.cancel()
             raise AudioError(_OPEN_FAILED)
 
@@ -221,7 +247,7 @@ class GStreamerAudioSource:
         message = bus.timed_pop_filtered(STOP_TIMEOUT, Gst.MessageType.EOS | Gst.MessageType.ERROR)
         failed = message is not None and message.type == Gst.MessageType.ERROR
         if failed:
-            self._log_bus_error(pipeline, message)
+            _log_bus_error(pipeline, message)
         elif message is None:
             logger.warning(
                 "the capture did not end within %s s; using what it has", STOP_TIMEOUT // Gst.SECOND
@@ -247,6 +273,67 @@ class GStreamerAudioSource:
         if message is not None and message.type == Gst.MessageType.ERROR:
             error, _debug = message.parse_error()
             logger.warning("GStreamer: %s", str(error.message)[:_MAX_LOGGED_CHARS])
+
+
+@final
+class GStreamerAudioStream:
+    """An `AudioStream` over the capture pipeline (see the module docstring): the microphone, open
+    from `start` to `stop`, every buffer handed to `on_audio` and none kept."""
+
+    def __init__(
+        self, *, kind: CaptureSource = CaptureSource.MICROPHONE, platform: str = sys.platform
+    ) -> None:
+        _initialise()
+        self._kind = kind
+        self._platform = platform
+        self._pipeline: Gst.Pipeline | None = None
+
+    def start(self, on_audio: Callable[[bytes], None], on_error: Callable[[str], None]) -> None:
+        self.stop()
+        pipeline = _capture_pipeline(self._kind, self._platform, on_audio)
+        self._pipeline = pipeline
+        bus = pipeline.get_bus()
+
+        armed = threading.Event()  # set once the microphone is open: errors of opening are start's
+
+        def on_message(_bus: Gst.Bus, message: Gst.Message) -> Gst.BusSyncReply:
+            # Called on the thread that posts the message: it only passes the news on. Until the
+            # microphone is open an error is left on the bus for `start` to log and refuse with;
+            # once it is, an error or the end of the stream means it has stopped delivering audio.
+            # Nothing else reads this bus, so every message is dropped, not queued for ever.
+            if not armed.is_set():
+                return Gst.BusSyncReply.PASS
+            if message.type in (Gst.MessageType.ERROR, Gst.MessageType.EOS):
+                if message.type == Gst.MessageType.ERROR:
+                    _log_bus_error(pipeline, message)
+                on_error(_STOPPED)
+            return Gst.BusSyncReply.DROP
+
+        bus.set_sync_handler(on_message)
+        result = pipeline.set_state(Gst.State.PLAYING)
+        if result != Gst.StateChangeReturn.FAILURE:
+            result, _current, _pending = pipeline.get_state(START_TIMEOUT)
+        if result not in (Gst.StateChangeReturn.SUCCESS, Gst.StateChangeReturn.NO_PREROLL):
+            _log_bus_error(pipeline)
+            self.stop()
+            raise AudioError(_OPEN_FAILED)
+        armed.set()
+        # A message posted after the state change returned but before the handler was armed was
+        # passed to the bus (unarmed handlers pass): look once, so it is not lost.
+        late = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
+        if late is not None:
+            if late.type == Gst.MessageType.ERROR:
+                _log_bus_error(pipeline, late)
+            on_error(_STOPPED)
+
+    def stop(self) -> None:
+        """Setting the pipeline to NULL joins the streaming thread, so `on_audio` is not called
+        again afterwards."""
+        pipeline, self._pipeline = self._pipeline, None
+        if pipeline is not None:
+            bus = pipeline.get_bus()
+            bus.set_sync_handler(None)  # tearing it down is not a failure to report
+            pipeline.set_state(Gst.State.NULL)
 
 
 class PlaybackSink(enum.StrEnum):
@@ -348,7 +435,7 @@ class GStreamerAudioPlayer:
         if abort.is_set:
             return
         if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-            self._log_bus_error(pipeline)
+            _log_bus_error(pipeline)
             raise PlaybackError(_PLAY_OPEN_FAILED)
         bus = pipeline.get_bus()
         started = time.monotonic()
@@ -357,7 +444,7 @@ class GStreamerAudioPlayer:
             message = bus.timed_pop_filtered(_POLL, Gst.MessageType.EOS | Gst.MessageType.ERROR)
             if message is not None:
                 if message.type == Gst.MessageType.ERROR:
-                    self._log_bus_error(pipeline, message)
+                    _log_bus_error(pipeline, message)
                     raise PlaybackError(_PLAY_FAILED)
                 return  # EOS: the sentence has been played
             if time.monotonic() >= deadline:
@@ -366,12 +453,3 @@ class GStreamerAudioPlayer:
 
     def close(self) -> None:
         """Nothing is held between sentences: each one's pipeline is gone when `play` returns."""
-
-    @staticmethod
-    def _log_bus_error(pipeline: Gst.Pipeline, message: Gst.Message | None = None) -> None:
-        bus = pipeline.get_bus()
-        if message is None and bus is not None:
-            message = bus.pop_filtered(Gst.MessageType.ERROR)
-        if message is not None and message.type == Gst.MessageType.ERROR:
-            error, _debug = message.parse_error()
-            logger.warning("GStreamer: %s", str(error.message)[:_MAX_LOGGED_CHARS])

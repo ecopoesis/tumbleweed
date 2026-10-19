@@ -706,3 +706,187 @@ audio waiting to be played is bounded only through the reply cap (#122); speech 
 voice input (#123); audio is never written by us (the AST scan and audit-hook tests cover
 speech too). The reply's cap and the sentence cap bound what Piper is asked to do. A model can make
 the assistant say anything; as with any displayed text, speaking it is no approval of anything (I10).
+
+## D23 — Hands-free voice: Silero VAD and openWakeWord's ONNX pipeline on onnxruntime, hash-checked
+models, an engine on an inference thread, the wake word gated while speaking (2026-10-18, accepted)
+
+**Context.** S08 adds a wake word and end-of-speech detection, so that a turn needs no key. The
+microphone is then opened by something other than the user's hand, while the assistant may be
+speaking, and what it records is derived from whatever the room says. (D21 is reserved for S11; D22
+is S07.)
+**Decision.** (1) *VAD: Silero v5 over `onnxruntime`, not `webrtcvad`.* webrtcvad is a small C
+extension with an energy-and-GMM model: it is unmaintained, it mistakes steady noise for speech (the
+failure #103 describes), and its wheels are the first thing to go missing on a new Python. Silero is
+a 2 MiB neural model (MIT) with a probability per 32 ms window, which the thresholds tune, and it
+needs the runtime the wake word needs anyway. (2) *The wake word: openWakeWord's pipeline,
+reimplemented on `onnxruntime`; the `openwakeword` package is not used.* #42 found that 0.6.0 needs
+`tflite-runtime` on Linux (no wheels for Python 3.12+) and that a plain lock resolves 0.4.0 there;
+an override that drops it works today but has to be kept against an upstream that does not test that
+configuration, and the package also brings `scipy`, `scikit-learn`, `tqdm` and `requests` (which
+fetches models from its own list of URLs, unpinned) for what is three small models and a little
+arithmetic. `voice.wake` has the same arithmetic as upstream's `AudioFeatures` (80 ms chunks and 480
+samples of context into the melspectrogram, `/ 10 + 2`, a window of 76 frames into the embedding
+model, the last 16 embeddings into the classifier, the first five scores ignored). One difference:
+after a start or a reset upstream fills the embedding window from random noise, we fill it with the
+embedding of an all-ones spectrogram (the first five scores are ignored either way). Checked once,
+by hand, against upstream's own `Model.predict` (openwakeword 0.6.0, installed without
+`tflite-runtime`, onnx framework) on the same 48 chunks of "hey jarvis" made with `say`: the same
+peak (0.99917 at the same chunk), largest difference 0.003 over all chunks. That check needs the
+models and the upstream package, so it is not in CI (#134). Real models, on speech made with `say`,
+are in a `live` test ("hey jarvis" scores 0.999; other speech and silence score below 0.1, white
+noise at an RMS of 300 0.14). #42 is closed by this: no package whose resolution differs per
+platform is used, and `tests/test_lock_hands_free.py` checks that the two we do add resolve once.
+(3) *Dependencies: `onnxruntime` and `numpy`.* No standard-library equivalent runs ONNX models. Both
+have binary wheels for Python 3.12, 3.13 and 3.14 on macOS arm64 and Linux x86_64 and aarch64 (the
+test checks it from the lock, and CI's macOS job installs 3.12 to 3.14); onnxruntime runs on the CPU
+with one intra-op and one inter-op thread, logs nothing, and is imported only by `voice.onnx` (numpy
+by `voice.onnx`, `voice.vad`, `voice.wake`): import contracts, with a planted-import test for each,
+keep the untyped library behind the `OnnxModel` protocol, which is where its returns are narrowed to
+arrays of a known dtype. `onnxruntime` is imported when the first model is loaded, not with the
+module: on macOS it loads CoreML and other system frameworks, which cost start-up time the shell
+does not need until hands-free mode or the VAD is used, and which change how the system's SQLite
+treats a moved database (the same effect as loading GTK: #132); a test pins that importing the voice
+package does not load it. (4) *Models are data the machine runs, so they are checked like code.*
+They are not committed. `scripts/wake-models` fetches them over https (redirects https only, a size
+ceiling that holds even when the server announces no length, a time ceiling, a temporary name until
+the pinned SHA-256 matches); `voice.modelfile.read_verified` checks the same hashes, which a test
+keeps equal, before every load: the directory text must be canonical, the path is walked down from
+`/` with `O_NOFOLLOW`, a FIFO is refused without blocking, the file must be regular and at most 8
+MiB, and the bytes that were hashed are what `onnxruntime` is given (it is never given a path, so
+there is no window between check and load, and it writes nothing). A model name in the configuration
+is one of a closed set, never a path. `voice.modelfile` is the second voice module that imports `os`
+and a test pins its calls and flags. Licences are in the README: Silero MIT; openWakeWord code
+Apache-2.0, its melspectrogram and embedding models derived from Google's Apache-2.0 model, and its
+pre-trained wake words **CC BY-NC-SA 4.0 (non-commercial)**. (5) *An engine with no threads, and a
+state machine around it.* `HandsFreeEngine` (WAITING, LISTENING, PAUSED over fakes of the two
+detectors) is synchronous and tested with synthetic frames; `HandsFree` is the main-thread machine
+(`OFF`, `WAITING`, `LISTENING`, `TRANSCRIBING`, `PAUSED`); the capture thread only copies into a
+mailbox that drops the oldest audio past 2 s; the inference thread loads the models on its first
+command (never on the main thread), takes audio and commands in the order they came, and posts
+events tagged with the generation the engine last got from `set_mode`. Each user action bumps the
+generation and resets the engine, and an event of an older generation is dropped, so a wake word or
+an endpoint found after turning it off, Esc, Mute or push-to-talk starts nothing and posts nothing;
+the mailbox's cap (2 s) must not change what is said, so a turn that lost audio to it is given up
+and the user asked to say it again (tested with a stalled model); every wait is bounded (the
+mailbox's wait is half a second, the device's are GStreamer's, a turn is capped at
+`max_utterance_seconds` and given up after `wait_for_speech_seconds`). (6) *The microphone indicator
+errs towards "on".* `microphone_open` is True from the request to open until the audio worker has
+confirmed the close, so it is never off while audio is captured, whatever state the voice indicator
+shows; the status strip shows it as its own "Microphone on", because "speaking" and "thinking" can
+both have the microphone open. Push-to-talk's recording follows the same rule
+(`VoiceInput.microphone_open`, one confirmation per press), so Esc no longer leaves "idle" with an
+open device unannounced. A test samples it from another thread while a random sequence of toggles
+runs. Turning hands-free off closes the device (tested). (7) *Echo and barge-in (#117): gate, no
+cancellation.* Real echo cancellation (GStreamer's `webrtcdsp` with a probe on the playback path, or
+PipeWire's module) needs the playback and capture pipelines to share a clock and an element that the
+macOS bundle and the Linux image do not both have; it is not small, and it could not be tested
+without a speaker and a microphone. What is done instead is small and testable: while a reply is
+spoken, and for `speaking_holdoff_ms` (default 500) after, the wake word needs `speaking_threshold`
+(default 0.9) instead of `threshold` (0.5); nothing is transcribed except after a wake word, so the
+assistant's voice is never a user turn by itself; a wake word stops speech *before* listening
+starts, as push-to-talk does, and nothing is spoken while a turn is recorded; a turn that began
+while speaking drops its first 250 ms. A loopback test feeds the player's output back into the
+microphone: it scores 0.6, which is the wake word in the clear and nothing while speaking. The
+residual is documented in the README and ARCHITECTURE: a loud speaker, or a reply containing the
+wake word, can pass; headphones, or `speaking_threshold = 1`, close it: a speaking threshold of 1
+(the most the configuration allows) accepts *no* wake word while a reply is spoken, nor during the
+holdoff, even though a float32 score can saturate at exactly 1.0 (tested with a saturated score).
+Reply text is also cleaned of the phrase as written: before synthesis the configured phrase is
+replaced by "the wake word", in any case, with any punctuation between its words or letters, with
+accents and full-width forms folded, as whole words, and across the end of a sentence (the first
+sentence is already on its way, so what the phrase takes from the second is dropped; this assumes
+phrases of at most two words). Folding is used only to *find* the phrase, character by character
+with a map back to where each folded character came from; only the phrase's own span of the original
+text is replaced, so the reply is otherwise spoken exactly as it was (`10²`, `schön`, `й`, kana with
+dakuten, Devanagari, `½` and U+FDFA all unchanged: a test each), and a scrubbed sentence is cut to
+`max_sentence_chars`, which keeps Piper's stdin bounded. The pattern also catches ordinary text that
+sounds like the phrase said slowly ("Alex a" for "alexa"): defensible, and pinned by a test. The
+reply-cap cut and the sentence-bound cut never split a word (a cut into `Jarvisson` could make
+`Jarvis`): with no space to cut at they speak nothing more; and as the last step before a sentence
+is submitted, after every cut, the folded text is searched again and everything from a match on is
+dropped, so no submitted sentence matches the pattern by construction, and, because the cut at a
+sentence
+end is repeated until nothing straddles it and a sentence that came to nothing leaves the memory of
+the
+one before it alone, nor do two consecutive sentences of one reply together (a property test over
+token-biased text and random caps says so, and so do the reproductions for the three stock models).
+Replies are separate: `begin_reply` forgets the last sentence, and a user turn sits between two
+replies. The no-mid-word rule applies only while the phrase is scrubbed, that is with hands-free set
+up: without it D22's cut is as S07 left it. With it, a final sentence over the reply cap that has no
+space in it to cut at (CJK text, say) is dropped rather than partly spoken.
+Respellings that fool the pattern (a look-alike letter of another script, say) can pass, so this is
+a mitigation and not a guarantee: `speaking_threshold = 1`, or headphones, are the control. This
+amends D22 (5), which left echo uncancelled for S08 (D22 itself is as S07 left it). The microphone
+stays open while speaking because the wake word is how the user interrupts. (8) *The indicator*
+(amends D22 (8), which moved THINKING here; D22's text is unchanged): `THINKING` is set by the shell
+from the moment a dictated message is sent, by either kind of voice turn, until the reply is spoken,
+is complete or has failed, or the conversation is replaced (a typed message is not a voice turn); a
+new `WAKE` state is hands-free's "waiting for the wake word". With `edit_before_send` the dictation
+waits in the input and nothing was sent, so there is no THINKING; the user's own send of the edited
+words is typing, which is not a voice turn (tested). (9) *VAD for push-to-talk (#103).* With
+`[voice.vad]` set up, the speech worker trims a recording to its speech (256 ms of margin) and sends
+nothing, with "No speech was recognised.", when there is none; a detector that fails is logged and
+the recording goes as it is. The 300 ms minimum stays (a host without VAD still needs it) and so
+does the annotation list (VAD can take silence for speech); #103 is closed by this. (10)
+*Configuration.* `[voice.vad]` and `[voice.wake]` are judged together and apart from the rest of
+`[voice]` like `[voice.tts]` (D22 (9)): a mistake turns hands-free and the trimming off, keeps
+push-to-talk, speech and the speech server, logs the details and shows one fixed message. Nothing is
+set up until `models_dir` is named (`[voice.wake]` for hands-free, so a user of the VAD alone is
+never nagged; `[voice.vad]` for the trimming); a file that is missing or not as pinned has the same
+effect. (11) *Keys: no new controller.* Push-to-talk's reviewed capture controller also takes Esc
+while a hands-free turn is being recorded (it reads `hands_free.phase`, never the event; the pinned
+handler names gain `hands_free`, `hearing`, `HandsFreePhase`, `LISTENING`), anywhere, as for an
+utterance; while only waiting for the wake word Esc is not taken. Mute abandons a turn and any wake
+word not yet acted on; push-to-talk pauses hands-free and wins. The toggle is a widget (no tooltip,
+no focus, not a `GAction`). (12) *Wake-word turns and trust.* The turn goes through
+`VoiceInput.transcribe_utterance`: the same worker, `clean_transcript` and observers, so
+`edit_before_send` (and its forcing over plain http) applies to it and a draft already in the input
+is never sent. Ambient audio can say the wake word and what follows is sent as the user's message
+(with `edit_before_send` it waits); it cannot approve anything (I10): prompts take keyboard and
+pointer input only, and a test checks that a transcript such as "yes, allow it" is a message and
+nothing else (no action, nothing in the chrome region). (13) *Performance.*
+`scripts/measure_hands_free_cpu.py` runs the production pipeline (mailbox, inference thread, engine,
+the real models, 80 ms chunks paced in real time) and prints the share of one core. On an Apple M3
+Max, without the capture (GStreamer is not installed on the development Mac), in a quiet room (noise
+RMS 50) it measured **0.56%** of a core, and with sound the models cannot skip (noise RMS 400)
+**10.3%** (target 15%; re-measured with the script as committed in this step, which waits for
+WAITING
+and exits 2 for a dead pipeline: 0.53% and 9.86%); idle is the wake word only, since VAD runs only
+in a turn. The 10.3% is not the cost of the models, which take 1.3 ms of CPU per 80 ms chunk in a
+tight loop (1.6%), but of waking a core every 80 ms: a core that wakes that often runs slower than
+one in a loop (measured: 7.9 ms a tick when paced, and batching two to five chunks per wake only
+brought it to 9.5% to 7.5%). So the wake models sit behind a *loudness gate*: after 2.4 s of chunks
+with an RMS under 100 (about -50 dBFS) they are not run, the last 30 chunks are kept (a fixed cap)
+and run first when sound returns, so the state, and every score of a chunk that is run, is as
+without the gate (tested with content-dependent fakes and, `live`, with the real models); a chunk
+that quiet is never the wake word. A microphone whose noise floor is above the gate (an RMS of 100)
+never lets it close, and then costs the 10%.
+(14) *Focus, and a capture that dies* (round 1 of review). Any sound can start a hands-free turn, so
+such a turn never moves the keyboard focus: `ChatPanel.dictate(take_focus=False)`, for a turn from a
+wake word (`VoiceInput.wake_turn`) and for any turn that ends while the terminal has the focus; a
+push-to-talk turn elsewhere still puts the focus in the input, as in S06 (tested with the focus in
+the terminal and in another widget, for both `edit_before_send` values). Counting audio cannot bound
+time when the audio stops, so the inference thread also keeps wall-clock bounds (the monotonic
+clock): a capture that has delivered nothing for 8 s is reported and hands-free turned off, a turn
+that has lasted `max_utterance_seconds` plus 3 s ends with what was heard (`TIMED_OUT`, with its own
+message), and `AudioStream.start` takes an `on_error` that the GStreamer adapter calls on a bus
+error or end of stream once the microphone is open (an error while opening is `start`'s, refused in
+fixed text; tested on Linux with a test tone and with no device), so no reply stays silenced by a
+turn that cannot end. The inference thread is started by the first turn-on, not at construction.
+Audio dropped by the engine's own cap, as by the mailbox's, gives the turn up.
+**Deviations from the plan.** None in scope. The plan allows `webrtcvad`: Silero chosen, above. The
+plan says to "use the `openwakeword` package only if it installs on Python ≥ 3.12 on macOS and Linux
+(on Linux it currently requires `tflite-runtime`, which has no Python 3.12 wheels)": without an
+unsupported override that drops `tflite-runtime` it does not install on Linux, so the condition is
+not met and the pipeline is run directly, above; its arithmetic is not checked against upstream in
+CI (only by hand, above, and by `live` tests), #134. The mic-active indicator is a label of its own
+beside the state.
+**Consequences.** There is no acoustic echo cancellation (above). The wake-word models are
+non-commercial (CC BY-NC-SA); a model of one's own needs a new pinned entry. Models are hash-checked
+at start-up and again when they are loaded, but a session already loaded is not re-checked.
+Hands-free is off every time the shell starts. Opening and closing the stream can be held by a hung
+audio device as capture and playback can (#101, #115); the indicator then keeps saying "Microphone
+on", which is the honest answer. The real GStreamer capture path of hands-free (and the macOS
+microphone permission) is exercised in neither CI nor, on this Mac, here (#102); the pipeline up to
+the source is the capture pipeline that is. Hands-free needs the speech server, like the key.
+`models_dir` is named in both tables to opt in to both features.

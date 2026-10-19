@@ -21,6 +21,19 @@ CHANNELS: Final = 1
 BYTES_PER_SAMPLE: Final = 2
 BYTES_PER_SECOND: Final = SAMPLE_RATE_HZ * CHANNELS * BYTES_PER_SAMPLE
 
+# Hands-free (S08): the frame sizes of the two models. openWakeWord takes 80 ms at a time, Silero
+# VAD 32 ms; the engine cuts the stream into whichever the mode needs.
+WAKE_CHUNK_SAMPLES: Final = 1280
+WAKE_CHUNK_BYTES: Final = WAKE_CHUNK_SAMPLES * BYTES_PER_SAMPLE
+VAD_WINDOW_SAMPLES: Final = 512
+VAD_WINDOW_BYTES: Final = VAD_WINDOW_SAMPLES * BYTES_PER_SAMPLE
+VAD_WINDOW_MS: Final = VAD_WINDOW_SAMPLES * 1000 // SAMPLE_RATE_HZ  # 32
+WAKE_CHUNK_MS: Final = WAKE_CHUNK_SAMPLES * 1000 // SAMPLE_RATE_HZ  # 80
+# The most audio the capture thread may leave unread for the inference thread: the ring drops the
+# oldest beyond it, so a stalled model costs old audio, never memory (I9).
+RING_SECONDS: Final = 2
+RING_BYTES: Final = RING_SECONDS * BYTES_PER_SECOND
+
 MAX_UTTERANCE_SECONDS_CEILING: Final = 120
 MAX_REQUEST_TIMEOUT_SECONDS: Final = 120
 MIN_RESPONSE_BYTES: Final = 1024

@@ -10,10 +10,13 @@ from tumbleweed.shell._widgets import plain_label
 
 
 class VoiceState(enum.StrEnum):
-    """What the voice side is doing. Push-to-talk sets IDLE, LISTENING and TRANSCRIBING (S06) and
-    speech output sets SPEAKING (S07); nothing sets THINKING yet (S08's state machine does)."""
+    """What the voice side is doing. Push-to-talk sets IDLE, LISTENING and TRANSCRIBING (S06),
+    speech output sets SPEAKING (S07), and hands-free mode (S08) sets WAKE (the microphone is open,
+    waiting for the wake word) and, with the chat, THINKING (a voice turn was sent and the agent has
+    not yet spoken or finished)."""
 
     IDLE = "idle"
+    WAKE = "wake"
     LISTENING = "listening"
     TRANSCRIBING = "transcribing"
     THINKING = "thinking"
@@ -24,6 +27,8 @@ def _describe(state: VoiceState) -> str:
     match state:
         case VoiceState.IDLE:
             return "Voice: idle"
+        case VoiceState.WAKE:
+            return "Voice: waiting for the wake word"
         case VoiceState.LISTENING:
             return "Voice: listening"
         case VoiceState.TRANSCRIBING:
@@ -36,16 +41,39 @@ def _describe(state: VoiceState) -> str:
             assert_never(unreachable)
 
 
+MICROPHONE_ON_TEXT = "Microphone on"
+
+
 @final
 class VoiceIndicator(Gtk.Box):
-    """Shows a `VoiceState` as text."""
+    """Shows a `VoiceState` as text, and, next to it, whether the microphone may be capturing.
+
+    The microphone label is separate from the state because the two are different facts: the
+    state can say "speaking" or "thinking" while hands-free mode still has the microphone open,
+    and the user must always be able to see that it is (S08).
+    """
 
     def __init__(self) -> None:
-        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self._label = plain_label("", css_classes=["caption", "dim-label"])
         self.append(self._label)
+        self._microphone = plain_label(MICROPHONE_ON_TEXT, css_classes=["caption", "error"])
+        self._microphone.set_visible(False)
+        self.append(self._microphone)
         self._state = VoiceState.IDLE
         self.set_state(VoiceState.IDLE)
+
+    @property
+    def microphone_on(self) -> bool:
+        """Whether the indicator says that the microphone may be capturing."""
+        return self._microphone.get_visible()
+
+    @property
+    def microphone_text(self) -> str:
+        return self._microphone.get_text()
+
+    def set_microphone(self, microphone_on: bool) -> None:
+        self._microphone.set_visible(microphone_on)
 
     @property
     def state(self) -> VoiceState:
