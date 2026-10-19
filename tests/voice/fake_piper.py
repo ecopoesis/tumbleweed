@@ -10,6 +10,8 @@ says, so a test drives every way a synthesiser can go wrong without Piper instal
     FAIL     writes a line of error output and exits with status 3
     EMPTY    exits with status 0 and says nothing
     ODD      three bytes of audio
+    AUDIOFAIL writes audio, then exits with status 3
+    BIGERR   writes 10 KiB of error output, then exits with status 3
     LINGER   writes its audio, closes its streams and then never exits
     anything else: `len(line) * 10` samples of a quiet tone
 """
@@ -48,6 +50,14 @@ elif text == "NOISE":
     out.write(b"\\x01\\x00" * 100)
 elif text == "FAIL":
     sys.stderr.write("boom: secret-looking text\\n")
+    sys.exit(3)
+elif text == "AUDIOFAIL":
+    out.write(b"\\x01\\x00" * 100)
+    out.flush()
+    sys.exit(3)
+elif text == "BIGERR":
+    sys.stderr.write("e" * 10240)
+    sys.stderr.flush()
     sys.exit(3)
 elif text == "EMPTY":
     pass

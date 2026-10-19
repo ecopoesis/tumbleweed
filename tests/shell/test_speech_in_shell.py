@@ -1,6 +1,7 @@
 """Speech output in the real shell (S07): a streamed reply is spoken sentence by sentence, the voice
-indicator says "speaking", push-to-talk and Esc are barge-in (the terminal's focus included), the
-mute button works and keeps the focus alone, and nothing of a stopped reply is spoken afterwards.
+indicator says "speaking" only while something is audible, push-to-talk and Esc are barge-in (Esc
+not in the terminal pane, which keeps its own), the mute button works and keeps the focus alone, and
+nothing of a stopped reply is spoken afterwards.
 
 The window, the controls and the dispatcher are the shell's own (`GLib.idle_add`); the microphone,
 the speech server, the synthesiser and the speaker are fakes, so no test needs a device, Piper or a
@@ -247,9 +248,11 @@ class TestSpeakingAReply:
 
 
 class TestBargeIn:
-    def test_esc_stops_the_speech_even_with_the_terminal_focused_and_is_taken(
+    def test_esc_goes_to_the_terminal_while_speaking_when_the_terminal_has_the_focus(
         self, build_speaking: SpeakingBuilder
     ) -> None:
+        """How long speech lasts is the model's: a user in vim must not lose the Esc that leaves
+        insert mode because a reply is being read."""
         from tumbleweed.shell._gi import Gdk, Gtk
 
         s = build_speaking()
@@ -265,10 +268,70 @@ class TestBargeIn:
 
         taken = key(s, "key-pressed", Gdk.KEY_Escape, ctrl=False)
 
-        assert taken is True  # the terminal (bubble phase) never sees this one
+        assert taken is False  # not consumed: the terminal gets it
+        assert s.speech.phase is SpeechPhase.SPEAKING
+        assert indicator(s) == "Voice: speaking"
+        pump_until(lambda: False, timeout=0.2)
+        assert s.player.interrupted == 0  # and the speech goes on
+
+    def test_esc_stops_the_speech_when_the_focus_is_not_in_the_terminal(
+        self, build_speaking: SpeakingBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        s = build_speaking()
+        window = s.shell.window
+        show(s.shell)
+        start_speaking(s)
+        window.set_focus(window.chat_panel.input_view)
+
+        taken = key(s, "key-pressed", Gdk.KEY_Escape, ctrl=False)
+
+        assert taken is True
         assert indicator(s) == "Voice: idle"
         assert s.speech.phase is SpeechPhase.IDLE
         assert pump_until(lambda: s.player.interrupted == 1)
+
+    def test_esc_still_abandons_an_utterance_with_the_terminal_focused_even_while_speaking(
+        self, build_speaking: SpeakingBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk, Gtk
+
+        s = build_speaking()
+        window = s.shell.window
+        show(s.shell)
+        controls(s).mic_button.set_active(True)  # listening: the speech was stopped by it
+        assert pump_until(lambda: s.source.capturing)
+        inside = Gtk.Box()
+        inside.set_focusable(True)
+        window.terminal_pane.append(inside)
+        window.terminal_pane.set_visible(True)
+        window.set_focus(inside)
+
+        taken = key(s, "key-pressed", Gdk.KEY_Escape, ctrl=False)
+
+        assert taken is True  # S06's rule is unchanged
+        assert indicator(s) == "Voice: idle"
+
+    def test_while_a_code_block_is_streaming_nothing_speaks_and_esc_is_not_taken(
+        self, build_speaking: SpeakingBuilder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        s = build_speaking(hold=False)
+        window = s.shell.window
+        show(s.shell)
+        window.set_focus(window.chat_panel.input_view)
+        ask(s)
+        s.responder.sink.emit(ReplyDelta(text=f"{FIRST}\n```py\nprint(1)\n"))
+        assert pump_until(lambda: len(s.player.played) == 1)
+        assert pump_until(lambda: indicator(s) == "Voice: idle")
+
+        s.responder.sink.emit(ReplyDelta(text="print(2)\nprint(3)\n"))
+        pump_until(lambda: False, timeout=0.3)
+
+        assert indicator(s) == "Voice: idle"  # silence is not "speaking"
+        assert key(s, "key-pressed", Gdk.KEY_Escape, ctrl=False) is False  # so Esc is not spent
 
     def test_esc_stops_the_voice_and_not_also_the_reply_a_second_esc_does(
         self, build_speaking: SpeakingBuilder

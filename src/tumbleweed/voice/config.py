@@ -1,7 +1,8 @@
 """The `[voice]` table of the configuration (`tumbleweed.agent.config` reads the file).
 
     [voice]
-    enabled = true                          # false: no microphone button, no push-to-talk key
+    enabled = true                          # false: no microphone button, no push-to-talk key,
+                                            # and no speech output either (it needs voice input)
     stt_url = "http://127.0.0.1:8080"       # whisper-server (TUMBLEWEED_STT_URL); a VM: its host
     language = "auto"                       # or a code such as "en"
     edit_before_send = false                # true: the transcript waits in the input to be edited
@@ -96,6 +97,9 @@ class VoiceConfig(BaseModel):
     edit_before_send: bool = False
     limits: VoiceLimits = VoiceLimits()
     tts: TtsConfig = TtsConfig()
+    tts_problem: str | None = None
+    """Set by the loader (`agent.config`) when `[voice.tts]` was invalid: speech is then off, and
+    this fixed text is what the user is told. Not a file setting."""
 
     @field_validator("stt_url")
     @classmethod

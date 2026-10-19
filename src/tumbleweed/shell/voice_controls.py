@@ -11,7 +11,7 @@ Speech output (`SpeechOutput`, fed by `SpeechFeed`) has a **Mute** toggle beside
 speech is not set up) and shares the voice indicator, which says "speaking" while a reply is being
 read and gives way to listening and transcribing. The microphone opening stops speech first
 (`BargeIn`): push-to-talk, by the key or the Mic, is barge-in, and nothing is spoken while it is
-open, so the assistant never hears itself. Esc stops speech too.
+open, so the assistant never hears itself. Esc stops speech too (not in the terminal pane).
 
 Push-to-talk is a key and a button, both plain widgets, never `GAction`s: actions are exported on
 the session bus (`tests/shell/test_session_bus.py` pins the set), and another process must not be
@@ -24,11 +24,13 @@ able to switch the microphone on (ARCHITECTURE I10, section 8).
   window losing focus, so a key release that is never delivered cannot leave the microphone open
   (the recording also stops by itself at its length limit).
 - **Click the mic** to start and click again to stop; the button shows pressed while listening.
-- **Esc** while listening, transcribing or **speaking** abandons the utterance and stops the
-  speech, wherever the focus is, the terminal included (the same capture controller; with nothing
-  in progress the key is left alone, and vim still gets it). It does not also cancel a reply that
-  is still streaming: a second Esc does (the window's own Esc), so stopping the voice never loses
-  the text.
+- **Esc** while listening or transcribing abandons the utterance, wherever the focus is, the
+  terminal included (the same capture controller). While a reply is **being spoken** Esc stops
+  the speech, *except while the terminal has the focus*: there it goes to the terminal, because
+  how long the speaking lasts is up to the model, and a user in vim must not lose the Escape that
+  leaves insert mode (Mute, or Esc outside the terminal, stops it). With nothing in progress the
+  key is left alone. Esc does not also cancel a reply that is still streaming: a second Esc does
+  (the window's own Esc), so stopping the voice never loses the text.
 
 Nothing here blocks: `VoiceInput` does the audio and the network on worker threads.
 """
@@ -235,8 +237,10 @@ def install_push_to_talk(
     modifiers of a press or release, nothing else, and it does nothing at all, letting the event
     through untouched, while `in_terminal()` says the focus is in the terminal pane (Ctrl+Space is
     the shell's own key there: set-mark in Emacs and readline). The one other key it takes is a
-    plain Esc while an utterance is in progress or a reply is being spoken, which abandons the one
-    and stops the other (the terminal would otherwise get it).
+    plain Esc while an utterance is in progress (which it abandons, the terminal included: the
+    terminal would otherwise get it) or a reply is being spoken (which it stops, but not while the
+    terminal has the focus: speech lasts as long as the model's text, so it never takes the
+    terminal's Esc).
 
     The key is *latched*: only the first Ctrl+Space press starts a recording, key repeat is consumed
     and ignored, and only the release of Space or Ctrl (or the window losing focus) ends what the
@@ -253,11 +257,13 @@ def install_push_to_talk(
     ) -> bool:
         nonlocal held
         if keyval == Gdk.KEY_Escape:
-            # Esc abandons an utterance in progress and stops speech, wherever the focus is (the
-            # terminal takes the bubble-phase Esc); with neither it is not ours, and vim still gets
-            # it.
+            # Esc abandons an utterance in progress, wherever the focus is (the terminal takes the
+            # bubble-phase Esc), and stops speech, except with the terminal focused (a model-long
+            # speech must not eat vim's Esc); with neither it is not ours, and vim still gets it.
             listening = voice.phase is not VoicePhase.IDLE
-            speaking = speech is not None and speech.phase is SpeechPhase.SPEAKING
+            speaking = (
+                speech is not None and speech.phase is SpeechPhase.SPEAKING and not in_terminal()
+            )
             if state & Gtk.accelerator_get_default_mod_mask() or not (listening or speaking):
                 return False
             held = False

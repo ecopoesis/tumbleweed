@@ -57,7 +57,8 @@ PIPER_ENVIRONMENT: Final[Mapping[str, str]] = MappingProxyType(
     {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
 )
 # The longest stdin: a sentence of at most 1000 characters is at most 4000 bytes of UTF-8 and a
-# newline, which is under PIPE_BUF, so a write to the empty pipe never blocks.
+# newline. A pipe takes that much in one write on Linux and macOS (the buffer is 16 KiB or more),
+# and `_write` copes with a short write anyway.
 MAX_STDIN_BYTES: Final = 4096
 _STDERR_KEPT: Final = 2048
 _STDERR_LIMIT: Final = 1024 * 1024

@@ -668,10 +668,12 @@ plugins have all of it). (5) *The assistant does not hear itself, by ordering.* 
 worker is asked to open the microphone, and nothing is spoken while it is open (`set_microphone_open`).
 Echo through speakers is not cancelled (#117, for S08). (6) *Keys:* no new controller. The one
 reviewed push-to-talk controller's Esc now also takes "a reply is being spoken" (it reads the speech
-phase, never the event, and the pinned handler names gain `speech`), so Esc stops the voice wherever
-the focus is, the terminal included, and with nothing in progress it is left alone, as before. A first
-Esc stops the voice only; a second Esc, through the window's own shortcut, stops a reply still
-streaming. The mute control is a toggle button in `VoiceControls` after the Mic (no tooltip, no
+phase, never the event, and the pinned handler names gain `speech`), **except while the terminal has
+the focus**: how long speaking lasts is the model's doing, and a user in vim must not lose the Esc
+that leaves insert mode (Mute, or Esc outside the terminal, stops it). S06's Esc, which abandons an
+utterance wherever the focus is, is unchanged, and with nothing in progress Esc is left alone, as
+before. A first Esc stops the voice only; a second Esc, through the window's own shortcut, stops a
+reply still streaming. The mute control is a toggle button in `VoiceControls` after the Mic (no tooltip, no
 focus, not in the tab order, not a `GAction`); it stops speech and silences the rest of that
 reply, and unmuting is for the next reply. (7) *The shell feeds speech from the transcript*
 (`shell.speech_feed.SpeechFeed`), the one place a reply's text arrives, so every responder is spoken:
@@ -680,14 +682,23 @@ reply (the last sentence is spoken), a failed or cancelled message stops the spe
 message or a replaced transcript stops it (restored history is never read aloud). Its errors are
 logged and never reach the chat. (8) *Indicator:* SPEAKING is set while a reply is spoken and gives
 way to LISTENING and TRANSCRIBING; THINKING stays unset (S08's state machine owns it, #117). (9)
-*Config:* `[voice.tts]` in the same table (a mistake there turns all voice off, like any mistake in
-`[voice]`); nothing is spoken until both `piper_path` and `voice_model` are set; a path that does
-not check out turns speech off, shows one fixed message beside the Mic (`VoiceSetup.notice`) and
-leaves push-to-talk working; the sample rate is a setting (default 22050), not read from the voice
+*Config:* `[voice.tts]` in the same table but judged on its own: any mistake in it (a relative or `~`
+path, a misspelled key, a limit out of range, a table that is not a table) turns *speech* off, keeps the
+Mic, the key and the speech server, logs the details and shows one fixed message beside the Mic
+(`VoiceSetup.notice`); a mistake in the rest of `[voice]` still turns all voice off, as in S06.
+Nothing is spoken until both `piper_path` and `voice_model` are set; a path that does not check
+out has the same effect; the sample rate is a setting (default 22050), not read from the voice
 (#113). (10) *Speech is off when the whole `[voice]` is,* and there is no mute button without it.
-**Deviations from the plan.** None in scope. The plan's "or HTTP if documented": subprocess chosen.
+**Deviations from the plan.** The plan's "or HTTP if documented": subprocess chosen. The sample rate is
+a setting and not read from the voice (#113). The Linux image is unchanged (a real-time `fakesink`
+tests playback; a real Piper is `live`). THINKING is left to S08. Speech needs voice input: `[voice]
+enabled = false` turns it off too, and without a configured Piper there is no Mute button. Esc does
+not stop speech while the terminal has the focus. Nothing in scope is missing.
 **Consequences.** Per-sentence start-up cost (#112); the playback worker can be held by a stuck audio
 device, as capture can (#115, #101); the real speaker paths and a real Piper are not exercised in CI
-(#116, #114: the `live` test); audio is never written by us (the AST scan and audit-hook tests cover
+(#116, #114: the `live` test); the files Piper reads are the program and model, whose ownership and
+modes are not checked (#121), and `<model>.onnx.json`, which is not checked at all (#113); synthesised
+audio waiting to be played is bounded only through the reply cap (#122); speech cannot be had without
+voice input (#123); audio is never written by us (the AST scan and audit-hook tests cover
 speech too). The reply's cap and the sentence cap bound what Piper is asked to do. A model can make
 the assistant say anything; as with any displayed text, speaking it is no approval of anything (I10).

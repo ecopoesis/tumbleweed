@@ -35,10 +35,11 @@ new pipeline each time, bounded waits):
 `appsrc` followed by end-of-stream, and `play` waits for EOS on the bus in slices of `_POLL`
 seconds, looking at the `AbortSignal` each time: barge-in returns within one slice and takes the
 pipeline down. Setting the signal also mutes the `volume` element at once, from whatever thread set
-it, so the sound is cut before `play` has even noticed. A pipeline that has not started within
-`START_TIMEOUT`, or is not finished a margin after the audio's own length, is torn down with an
-error. As for capture, `set_state(NULL)` has no timeout in GStreamer's API: a hung audio server can
-leave the playback worker stuck there (the main thread is never involved), which is the same
+it, so the sound is cut before `play` has even noticed. One deadline bounds `play`: the audio's own
+length plus `_PLAYBACK_MARGIN` (there is no separate start-up timeout: a pipeline that never reaches
+EOS, started or not, is torn down with an error at that deadline). As for capture, `set_state(NULL)`
+has no timeout in GStreamer's API: a hung audio server can leave the playback worker stuck there
+(the main thread is never involved), which is the same
 limitation as #101 (for playback: #115).
 """
 

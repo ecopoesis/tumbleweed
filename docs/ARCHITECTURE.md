@@ -566,7 +566,8 @@ generation, so what an abandoned utterance finds later is dropped.
   started (not a recording the Mic button started), and so does the window losing focus. The one
   other key it takes is a plain Esc **while an utterance is in progress**, which abandons it even
   with the terminal focused (the terminal gets the bubble-phase Esc first); with nothing in progress
-  Esc is untouched, so vim still gets it. The Mic button takes no focus (like the Terminal button),
+  Esc is untouched, so vim still gets it. (Since S07 it also takes Esc while a reply is being spoken,
+  but never while the terminal has the focus: "Speech output" below.) The Mic button takes no focus (like the Terminal button),
   so an utterance never leaves the window without a focused widget.
 - *Configuration.* `[voice]` is read apart from `[agent]` (`agent.config.load_voice_config`): a
   mistake in it turns voice off, with a logged message, and leaves the agent working, and the other
@@ -622,15 +623,21 @@ results come back through the injected dispatcher tagged with the reply's genera
   (the key is the only thing that opens the microphone in S06); echo through speakers is not
   cancelled, and S08's hands-free mode must (#117).
 - *Keys and chrome.* No new key controller: the reviewed push-to-talk controller's plain Esc also takes
-  "a reply is being spoken", wherever the focus is, the terminal included (it reads the speech phase,
-  never the event; with nothing in progress Esc is left to the terminal and vim). A first Esc stops
+  "a reply is being spoken", **but not while the terminal has the focus** (it reads the speech
+  phase and `in_terminal()`, never the event): speech lasts as long as the model's text, and a user in
+  vim must not lose the Esc that leaves insert mode. Mute, or Esc elsewhere, stops it. S06's Esc
+  (abandon an utterance, the terminal included) is unchanged; with nothing in progress Esc is left to
+  the terminal and vim. The phase is SPEAKING only while a sentence is queued or playing: it is off
+  while a code block is dropped or the reply waits for words, and Esc is not spent then. A first Esc stops
   the voice only; a second (the window's shortcut) stops a reply that is still streaming. **Mute** is a
   toggle button after the Mic in the status strip: no tooltip, no focus, not a `GAction`; it stops
   speech and keeps the rest of the reply, and unmuting speaks the next reply. The indicator says
   "speaking" while a reply is read and gives way to listening and transcribing.
-- *Configuration and failures.* `[voice.tts]`, in the same table: nothing is spoken until both paths
-  are set and check out; otherwise the shell has no speech and no Mute button, and says why once next
-  to the Mic. A synthesis or playback failure is fixed text beside the Mic, ends that reply's speech
+- *Configuration and failures.* `[voice.tts]`, in the same table but judged on its own: a mistake in
+  it (a relative or `~` path, a misspelled key, a limit out of range) turns speech off only, keeps the
+  Mic, the key and the speech server, and says so once next to the Mic in fixed text. Nothing is
+  spoken until both paths are set and check out (a path that does not has the same effect), and
+  there is no Mute button without speech. `[voice] enabled = false` turns speech off too. A synthesis or playback failure is fixed text beside the Mic, ends that reply's speech
   (one message, not one per sentence), and never stops the shell.
 
 ## 3. Request flow

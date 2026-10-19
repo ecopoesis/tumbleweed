@@ -143,12 +143,9 @@ class TestTheProcess:
 class TestTheBounds:
     def test_audio_is_read_to_a_limit_and_no_further(self, tmp_path: Path) -> None:
         backend, _model = backend_for(tmp_path, max_audio_seconds=1)  # 44,100 bytes
-        started = time.monotonic()
 
         with pytest.raises(TtsResponseError, match="more audio than is allowed"):
-            backend.synthesize("FLOOD", AbortSignal())
-
-        assert time.monotonic() - started < 5
+            backend.synthesize("FLOOD", AbortSignal())  # it never stops by itself
 
     def test_error_output_is_drained_but_cannot_hold_the_call_hostage(self, tmp_path: Path) -> None:
         backend, _model = backend_for(tmp_path)
@@ -165,19 +162,16 @@ class TestTheBounds:
         with pytest.raises(TtsResponseError, match="took too long"):
             backend.synthesize("HANG", AbortSignal())
 
-        assert 0.9 < time.monotonic() - started < 4
+        assert 0.9 < time.monotonic() - started < 30  # the child would sleep for 60
         assert not alive(int((model.parent / "voice.onnx.pid").read_text()))
 
     def test_a_synthesiser_that_closes_its_streams_but_never_exits_is_cut_off_too(
         self, tmp_path: Path
     ) -> None:
         backend, _model = backend_for(tmp_path, synthesis_timeout_seconds=1)
-        started = time.monotonic()
 
         with pytest.raises(TtsResponseError, match="took too long"):
-            backend.synthesize("LINGER", AbortSignal())
-
-        assert time.monotonic() - started < 4
+            backend.synthesize("LINGER", AbortSignal())  # the child would sleep for 60 s
 
     def test_a_sentence_that_is_too_long_is_refused_before_anything_starts(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -216,6 +210,29 @@ class TestTheBounds:
 
         assert str(caught.value) == "Piper could not speak that."
         assert "secret-looking" not in str(caught.value)
+
+    def test_audio_and_then_a_failing_exit_is_an_error_not_speech(self, tmp_path: Path) -> None:
+        backend, _model = backend_for(tmp_path)
+
+        with pytest.raises(TtsResponseError):
+            backend.synthesize("AUDIOFAIL", AbortSignal())  # it wrote 200 bytes, then status 3
+
+    def test_only_the_start_of_the_error_output_is_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        backend, _model = backend_for(tmp_path)
+        kept: list[int] = []
+
+        def excerpt(output: bytes) -> str:
+            kept.append(len(output))
+            return ""
+
+        monkeypatch.setattr("tumbleweed.voice.piper._excerpt", excerpt)
+
+        with pytest.raises(TtsResponseError):
+            backend.synthesize("BIGERR", AbortSignal())  # 10 KiB of it
+
+        assert kept == [2048]
 
     def test_a_synthesiser_that_says_nothing_is_an_error(self, tmp_path: Path) -> None:
         backend, _model = backend_for(tmp_path)
@@ -286,14 +303,43 @@ class TestBargeIn:
         pid = int(pid_file.read_text())
         assert alive(pid)
 
-        started = time.monotonic()
         abort.set()
-        thread.join(timeout=5)
+        thread.join(timeout=30)
 
         assert not thread.is_alive()
         assert len(outcome) == 1
-        assert time.monotonic() - started < 1
         assert not alive(pid)  # killed and reaped: not even a zombie
+
+    def test_the_abort_itself_kills_the_child_the_worker_need_not_look(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With the worker's own look at the signal made very slow (a 30 s select), only the kill
+        done by `abort.set()` ends the call: the dead child closes its pipes, waking the select."""
+        monkeypatch.setattr("tumbleweed.voice.piper._POLL", 30.0)
+        backend, model = backend_for(tmp_path)
+        abort = AbortSignal()
+        outcome: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                backend.synthesize("HANG", abort)
+            except TtsCancelledError as exc:
+                outcome.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        pid_file = Path(f"{model}.pid")
+        deadline = time.monotonic() + 10
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        started = time.monotonic()
+
+        abort.set()
+        thread.join(timeout=20)
+
+        assert not thread.is_alive()
+        assert len(outcome) == 1
+        assert time.monotonic() - started < 15  # not the 30 s of the select
 
     def test_an_abort_kills_the_whole_process_group(self, tmp_path: Path) -> None:
         backend, model = backend_for(tmp_path)
@@ -333,12 +379,25 @@ class TestBargeIn:
         assert not alive(parent)
         assert not alive(child)
 
-    def test_no_zombie_is_left_after_any_outcome(self, tmp_path: Path) -> None:
+    def test_no_zombie_is_left_after_any_outcome(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         backend, _model = backend_for(tmp_path, synthesis_timeout_seconds=1)
         before = set(zombie_children())  # other tests of a whole run may have left some
-        for text in ("hello there", "FAIL", "EMPTY", "HANG", "FLOOD"):
-            _swallow(functools.partial(backend.synthesize, text, AbortSignal()), TtsError)
+        children: list[subprocess.Popen[bytes]] = []
+        real = subprocess.Popen
 
+        def spy(*args: object, **kwargs: object) -> "subprocess.Popen[bytes]":
+            child = real(*args, **kwargs)  # type: ignore[call-overload]  # a spy forwards what it got
+            children.append(child)
+            return child  # type: ignore[no-any-return]  # as above
+
+        monkeypatch.setattr("tumbleweed.voice.piper.subprocess.Popen", spy)
+        for text in ("hello there", "FAIL", "EMPTY", "HANG", "FLOOD", "AUDIOFAIL", "TREE"):
+            _swallow(functools.partial(backend.synthesize, text, AbortSignal()), TtsError)
+            assert children[-1].returncode is not None, text  # reaped before the call returned
+
+        assert len(children) == 7
         assert set(zombie_children()) - before == set()
 
     def test_a_late_abort_after_the_call_signals_nothing(

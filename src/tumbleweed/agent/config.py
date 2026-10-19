@@ -30,6 +30,7 @@ query or fragment in it, because the key is sent there.
 import enum
 import errno
 import json
+import logging
 import os
 import stat
 import tomllib
@@ -44,7 +45,9 @@ from tumbleweed.agent.errors import ConfigError, MissingKeyError
 from tumbleweed.agent.limits import AgentLimits
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.types import ByteCount, ModelName
-from tumbleweed.voice.config import VoiceConfig
+from tumbleweed.voice.config import TtsConfig, VoiceConfig
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL: Final = ModelName("claude-sonnet-5-5")
 DEFAULT_BASE_URL: Final = "https://api.anthropic.com"
@@ -309,6 +312,20 @@ def load_config(environ: Mapping[str, str]) -> TumbleweedConfig:
     return parse_config(text, environ, source=source)
 
 
+def _tts_table(table: object, source: str) -> tuple[dict[str, object], str | None]:
+    """The checked `[voice.tts]` table and no problem, or a switched-off one and a fixed message
+    (never a value, never a key: the details go to the log)."""
+    try:
+        if not isinstance(table, dict):
+            raise ValueError("not a table")
+        TtsConfig.model_validate_json(json.dumps(table))
+    except (TypeError, ValueError) as exc:
+        detail = _problems(exc) if isinstance(exc, ValidationError) else str(exc)[:100]
+        logger.warning("speech output is off: invalid [voice.tts] in %s: %s", source, detail)
+        return {"enabled": False}, "[voice.tts] has an invalid setting."
+    return table, None
+
+
 def parse_voice_config(text: str, environ: Mapping[str, str], *, source: str) -> VoiceConfig:
     """The `[voice]` table of TOML `text`, with `TUMBLEWEED_STT_URL` applied. Raises `ConfigError`
     (a message that never repeats a value: a URL may hold credentials)."""
@@ -318,6 +335,10 @@ def parse_voice_config(text: str, environ: Mapping[str, str], *, source: str) ->
             raise ConfigError(f"In {source}: [voice] must be a table.")
         if stt_url := environ.get("TUMBLEWEED_STT_URL"):
             voice["stt_url"] = stt_url
+        if "tts_problem" in voice:
+            raise ConfigError(f"Invalid [voice] configuration in {source}: tts_problem is unknown.")
+        # [voice.tts] is judged apart: a mistake in it turns speech off and not the microphone.
+        voice["tts"], voice["tts_problem"] = _tts_table(voice.pop("tts", {}), source)
         return VoiceConfig.model_validate_json(json.dumps(voice))
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{source} is not valid TOML: {str(exc)[:200]}") from None

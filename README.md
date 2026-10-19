@@ -108,7 +108,7 @@ status strip. It is your tool, not the agent's: nothing the model says can type 
   shell (SIGHUP, then SIGKILL after a second). While the terminal has the focus, Ctrl+L is the shell's (clear
   screen) and not "focus the input"; Ctrl+Q and F9 still act on the shell (#90). Ctrl+Space is the
   shell's too (set-mark in Emacs and readline): push-to-talk ([Voice input](#voice-input)) does nothing,
-  and lets the key through untouched, while the terminal has the focus; use the Mic button there. Esc is yours too, except that it abandons a voice utterance in progress and stops a reply being spoken.
+  and lets the key through untouched, while the terminal has the focus; use the Mic button there. Esc is yours too, except that it abandons a voice utterance in progress (not stopping a reply being spoken: Esc stays the terminal's while it has the focus).
 - **Where there is no VTE** (macOS, whose Homebrew has no GTK 4 build of it): F12 opens an external terminal
   window, in your home directory: Terminal.app (`open -b com.apple.Terminal`) on a Mac, otherwise the first of
   `x-terminal-emulator`, `gnome-terminal`, `kgx`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `foot`,
@@ -337,8 +337,9 @@ When Piper is set up, the assistant's replies are **read aloud as they stream in
 starts playing while the rest of the reply is still being written. Code blocks and Markdown marks are
 not spoken (links keep their text, addresses become the word "link", the words of an inline code span stay).
 The voice indicator says *speaking*. **Barge-in is immediate**: hold Ctrl+Space (or click Mic) and speech
-stops before the microphone opens, and **Esc** stops it wherever the focus is, the terminal included. (A first Esc stops the voice; the reply goes on
-arriving as text, and a second Esc stops that too.) The **Mute** button beside the Mic stops what is
+stops before the microphone opens, and **Esc** stops it, except while the terminal has the focus (a reply can be read for a long time, and
+vim must keep its Esc; use Mute, or click out of the terminal). A first Esc stops the voice; the reply goes on
+arriving as text, and a second Esc stops that too. The **Mute** button beside the Mic stops what is
 being said and keeps the rest of that reply, and every later one, silent until you click it again;
 sending a new message also stops the speech of the last reply.
 
@@ -360,8 +361,9 @@ synthesis_timeout_seconds = 20             # per sentence (up to 120)
 max_audio_seconds = 60                     # the most audio one sentence may become (up to 300)
 ```
 
-A voice with the wrong `sample_rate_hz` plays too fast or too slow, nothing worse (reading it from the voice is #113). If a path is wrong the
-shell starts anyway, says why next to the Mic (once), and does not speak. The shell runs `piper --model
+`[voice] enabled = false` turns speech off too (it is part of voice). A voice with the wrong `sample_rate_hz` plays too fast or too slow, nothing worse (reading it from the voice is #113). If a path or any setting of
+`[voice.tts]` is wrong, the shell starts anyway with the Mic and the key working, says so next to the Mic
+(once, in fixed words; the log has the details), and does not speak. The shell runs `piper --model
 <voice> --output_raw` once per sentence, with the sentence on its standard input (never on the command
 line), no shell, a fixed minimal environment (none of your variables, so the API key never reaches it), a
 time limit and a size limit on its audio; Esc and Mute kill it at once. The audio is played through

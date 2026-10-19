@@ -96,7 +96,6 @@ class SpeechOutput:
         self._abort = AbortSignal()  # of the reply in progress
         self._chunker: SentenceChunker | None = None
         self._accepting = False  # text of the current reply is still taken
-        self._ended = True  # the current reply's text is complete (or it was stopped)
         self._pending = 0  # sentences queued, not yet played, failed or dropped
         self._spoken_chars = 0
         self._muted = False
@@ -136,7 +135,6 @@ class SpeechOutput:
             return
         self._chunker = SentenceChunker(max_sentence_chars=self._config.max_sentence_chars)
         self._accepting = not (self._muted or self._microphone_open)
-        self._ended = not self._accepting
 
     def feed(self, delta: str) -> None:
         """More of the reply's text (untrusted: it is cleaned, stripped and bounded here)."""
@@ -151,7 +149,6 @@ class SpeechOutput:
             return
         self._enqueue(self._chunker.finish())
         self._accepting = False
-        self._ended = True
         self._idle_if_drained()
 
     # Main thread: what the user does
@@ -199,7 +196,6 @@ class SpeechOutput:
         self._abort = AbortSignal()
         self._chunker = None
         self._accepting = False
-        self._ended = True
         self._pending = 0
         self._spoken_chars = 0
         self._set_phase(SpeechPhase.IDLE)
@@ -215,12 +211,9 @@ class SpeechOutput:
                 self._submit(sentence)
             if not self._accepting:
                 break
-        if self._ended:
-            self._idle_if_drained()  # the cap ended the reply: nothing more is coming
 
     def _cap_reached(self) -> None:
         self._accepting = False
-        self._ended = True
         self._chunker = None
         self._notify(lambda observer: observer.problem(REPLY_TOO_LONG))
 
@@ -237,7 +230,9 @@ class SpeechOutput:
         self._idle_if_drained()
 
     def _idle_if_drained(self) -> None:
-        if self._ended and self._pending == 0:
+        """SPEAKING means a sentence is queued or playing: with none (a code block is streaming,
+        the reply waits for its next words) nothing is audible, and Esc is not ours."""
+        if self._pending == 0:
             self._set_phase(SpeechPhase.IDLE)
 
     def _failed(self, generation: int, message: str) -> None:
@@ -264,9 +259,6 @@ class SpeechOutput:
             logger.exception("synthesis failed")
             self._fail(generation, abort, _TTS_FAILED)
             return
-        if generation != self._generation or abort.is_set:
-            self._post(lambda: self._chunk_done(generation))  # a late chunk: never played
-            return
         self._playback_worker.submit(lambda: self._play(generation, abort, audio))
 
     # Playback worker
@@ -280,12 +272,11 @@ class SpeechOutput:
                 self._player = self._player_factory()
             self._player.play(audio, abort)
         except VoiceError as exc:
-            message = str(exc)  # (`exc` is gone when the callback runs)
-            self._post(lambda: self._failed(generation, message))
+            self._fail(generation, abort, str(exc))
             return
         except Exception:
             logger.exception("playback failed")
-            self._post(lambda: self._failed(generation, _PLAYBACK_FAILED))
+            self._fail(generation, abort, _PLAYBACK_FAILED)
             return
         self._post(lambda: self._chunk_done(generation))
 

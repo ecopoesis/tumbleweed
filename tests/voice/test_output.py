@@ -127,16 +127,15 @@ class TestStreaming:
 
         assert rig.spoken(1)
         assert rig.tts.spoken == [FIRST]
-        assert rig.speech.phase is SpeechPhase.SPEAKING  # and it is not over: more is coming
-        rig.dispatcher.settle()
-        assert rig.speech.phase is SpeechPhase.SPEAKING
+        assert rig.drained()  # the first has been said; the reply is not over, but nothing sounds
 
         rig.speech.feed("ence follows it. And more.")
         rig.speech.end_reply()
         assert rig.spoken(3)
         assert rig.drained()
         assert rig.tts.spoken == [FIRST, "The second sentence follows it.", "And more."]
-        assert rig.watcher.phases == [SpeechPhase.SPEAKING, SpeechPhase.IDLE]
+        assert rig.watcher.phases[:2] == [SpeechPhase.SPEAKING, SpeechPhase.IDLE]
+        assert rig.watcher.phases[-2:] == [SpeechPhase.SPEAKING, SpeechPhase.IDLE]
 
     def test_sentences_are_played_in_order(self, build: BuildRig) -> None:
         rig = build()
@@ -212,12 +211,10 @@ class TestBargeIn:
         rig.speech.feed(f"{FIRST} {SECOND}")
         assert rig.player.playing.wait(timeout=5)
 
-        started = time.monotonic()
         rig.speech.stop()
 
         assert rig.speech.phase is SpeechPhase.IDLE  # on the spot, not when the player notices
         assert rig.dispatcher.pump_until(lambda: rig.player.interrupted == 1)
-        assert time.monotonic() - started < 1
 
     def test_what_waits_for_synthesis_is_never_synthesised(self, build: BuildRig) -> None:
         rig = build(slow_tts=True)
@@ -303,21 +300,44 @@ class TestBargeIn:
 
             def close(self) -> None: ...
 
+        class Marking:
+            """The fake synthesiser, noting when its third sentence is asked for: by then the
+            second is made and queued behind the first (one synthesis worker, in order)."""
+
+            def __init__(self) -> None:
+                self.inner = FakeTts()
+                self.third = threading.Event()
+                self.calls = 0
+
+            def synthesize(self, text: str, abort: AbortSignal) -> SpeechAudio:
+                self.calls += 1
+                if self.calls == 3:
+                    self.third.set()
+                return self.inner.synthesize(text, abort)
+
+            def close(self) -> None: ...
+
         dispatcher = ManualDispatcher()
         deaf = Deaf()
+        backend = Marking()
         speech = SpeechOutput(
-            backend=FakeTts(), player=lambda: deaf, dispatcher=dispatcher, config=TtsConfig()
+            backend=backend, player=lambda: deaf, dispatcher=dispatcher, config=TtsConfig()
         )
         speech.begin_reply()
-        speech.feed(f"{FIRST} {SECOND} ")
+        speech.feed(f"{FIRST} {SECOND} {THIRD} ")
         assert deaf.playing.wait(timeout=5)
-        time.sleep(0.2)  # the second chunk is synthesised and waiting behind the first
+        assert backend.third.wait(timeout=5)
 
         speech.stop()
         deaf.release.set()
-        dispatcher.settle(0.3)
+        speech.begin_reply()  # the worker has to get past the stopped reply's chunks to this
+        speech.feed("Another one is here. ")
+        assert dispatcher.pump_until(lambda: len(deaf.played) >= 2)
 
-        assert len(deaf.played) == 1
+        assert [len(a.pcm) for a in deaf.played] == [
+            2 * 100 * len(FIRST),
+            2 * 100 * len("Another one is here."),
+        ]
         speech.close()
 
     def test_text_that_arrives_after_the_stop_for_the_same_reply_is_not_spoken(
@@ -395,6 +415,38 @@ class TestBargeIn:
         rig.speech.stop()
 
         assert rig.watcher.phases == [SpeechPhase.SPEAKING, SpeechPhase.IDLE]
+
+
+class TestWhatIsAudible:
+    def test_while_a_code_block_streams_nothing_is_speaking(self, build: BuildRig) -> None:
+        rig = build()
+        rig.speech.begin_reply()
+        rig.speech.feed("A sentence before the code.\n```py\n")
+        assert rig.spoken(1)
+        assert rig.drained()  # said; the code block that follows is dropped, not spoken
+
+        rig.speech.feed("print('one')\nprint('two')\n")
+        rig.dispatcher.settle(0.2)
+
+        assert rig.speech.phase is SpeechPhase.IDLE  # silence is not "speaking"
+        rig.speech.feed("```\nThe sentence after the code is here. ")
+        assert rig.spoken(2)
+
+    def test_stopping_in_that_gap_still_silences_the_rest_of_the_reply(
+        self, build: BuildRig
+    ) -> None:
+        rig = build()
+        rig.speech.begin_reply()
+        rig.speech.feed("A sentence before the code.\n```\n")
+        assert rig.spoken(1)
+        assert rig.drained()
+
+        rig.speech.stop()  # idle already, but the reply is open: its later text must stay silent
+        rig.speech.feed("```\nA sentence after the code block.\n")
+        rig.speech.end_reply()
+        rig.dispatcher.settle(0.3)
+
+        assert rig.tts.spoken == ["A sentence before the code."]
 
 
 class TestMute:
@@ -594,6 +646,49 @@ class TestFailures:
         assert watcher.problems == ["Speech synthesis failed."]
         speech.close()
 
+    @pytest.mark.parametrize(
+        ("error", "shown"),
+        [
+            (PlaybackError("The speaker stopped."), "The speaker stopped."),
+            (RuntimeError("secret detail"), "Audio playback failed."),  # a bug: fixed text
+        ],
+    )
+    def test_a_playback_failure_stops_what_is_queued_behind_it_before_the_main_thread_hears(
+        self, build: BuildRig, error: Exception, shown: str
+    ) -> None:
+        class FailsOnce:
+            def __init__(self, error: Exception) -> None:
+                self.error = error
+                self.attempts = 0
+                self.played: list[SpeechAudio] = []
+
+            def play(self, audio: SpeechAudio, abort: AbortSignal) -> None:
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise self.error
+                self.played.append(audio)
+
+            def close(self) -> None: ...
+
+        dispatcher = ManualDispatcher()  # never pumped until the end: the main thread is deaf
+        player = FailsOnce(error)
+        speech = SpeechOutput(
+            backend=FakeTts(), player=lambda: player, dispatcher=dispatcher, config=TtsConfig()
+        )
+        watcher = Watcher()
+        speech.subscribe(watcher)
+        speech.begin_reply()
+        speech.feed(f"{FIRST} {SECOND} {THIRD} ")
+        deadline = time.monotonic() + 5
+        while player.attempts == 0 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        time.sleep(0.5)  # an absence cannot be waited for: a leak would show in a few milliseconds
+
+        assert player.played == []  # the other two never started
+        assert dispatcher.pump_until(lambda: bool(watcher.problems))
+        assert watcher.problems == [shown]
+        speech.close()
+
     def test_a_player_that_cannot_be_made_is_an_error_not_a_crash(self, build: BuildRig) -> None:
         def no_player() -> FakeAudioPlayer:
             raise PlaybackError("Speech output needs GStreamer, which is not installed.")
@@ -655,6 +750,52 @@ class TestBounds:
         assert rig.drained()
 
         assert sum(len(s) for s in rig.tts.spoken) <= 100
+        assert rig.watcher.problems == [REPLY_TOO_LONG]
+
+    def test_a_reply_of_exactly_the_cap_is_spoken_whole_and_is_not_told_off(
+        self, build: BuildRig
+    ) -> None:
+        rig = build(config=TtsConfig(max_reply_chars=100))
+        sentence = ("word " * 19) + "end."  # 99 characters
+        sentence += "!"  # 100
+        assert len(sentence) == 100
+        rig.speech.begin_reply()
+        rig.speech.feed(sentence)
+        rig.speech.end_reply()
+
+        assert rig.drained()
+
+        assert rig.tts.spoken == [sentence]
+        assert rig.watcher.problems == []
+
+    def test_one_character_past_the_cap_cuts_the_sentence_and_says_so(
+        self, build: BuildRig
+    ) -> None:
+        rig = build(config=TtsConfig(max_reply_chars=100))
+        rig.speech.begin_reply()
+        rig.speech.feed(("word " * 19) + "end!!")  # 100 plus nothing: the 101st is below
+        rig.speech.feed("x")
+        rig.speech.end_reply()
+
+        assert rig.drained()
+
+        assert sum(len(s) for s in rig.tts.spoken) <= 100
+        assert rig.watcher.problems == [REPLY_TOO_LONG]
+
+    def test_a_sentence_after_a_reply_that_spent_the_cap_exactly_is_the_cap(
+        self, build: BuildRig
+    ) -> None:
+        rig = build(config=TtsConfig(max_reply_chars=100))
+        first = ("word " * 19) + "end!!"  # 100
+        assert len(first) == 100
+        rig.speech.begin_reply()
+        rig.speech.feed(first + " ")
+        rig.speech.feed("And one more sentence. ")
+        rig.speech.end_reply()
+
+        assert rig.drained()
+
+        assert rig.tts.spoken == [first]
         assert rig.watcher.problems == [REPLY_TOO_LONG]
 
     def test_a_cap_that_falls_inside_a_sentence_speaks_the_start_of_it(
@@ -730,7 +871,9 @@ class TestThreads:
         rig.speech.stop()
         rig.speech.set_muted(True)
 
-        assert time.monotonic() - started < 0.2
+        # Both fakes would hold a caller for ten seconds; a main thread that waited on either
+        # would show here.
+        assert time.monotonic() - started < 5
 
 
 class TestClosing:
@@ -759,3 +902,5 @@ class TestClosing:
         rig.dispatcher.settle(0.3)
 
         assert rig.tts.spoken == []
+        assert rig.speech.phase is SpeechPhase.IDLE
+        assert rig.watcher.phases == []

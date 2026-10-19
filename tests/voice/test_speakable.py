@@ -58,6 +58,23 @@ class TestSentences:
             "Notes. Then a sentence that follows it."
         ]
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Ask Dr. Smith about the plan, e.g. tomorrow morning.",
+            "Mr. and Mrs. Jones are here, vs. the others, etc. and so on.",
+            "That is, i.e. the one that we want, is here today.",
+        ],
+    )
+    def test_an_abbreviation_does_not_end_a_sentence(self, text: str) -> None:
+        assert speak(text) == [text]
+
+    def test_a_sentence_ends_where_a_closing_mark_follows_the_stop(self) -> None:
+        assert speak("This is **done now.** Then the next one starts here.") == [
+            "This is done now.",
+            "Then the next one starts here.",
+        ]
+
     def test_a_short_sentence_waits_for_the_next(self) -> None:
         assert speak("Sure. I can do that for you right now.") == [
             "Sure. I can do that for you right now."
@@ -108,6 +125,33 @@ class TestMarkdown:
         pieces = ["Before the code.\n``", "`py\nsecret code\n`", "``\nAfter it is fine."]
 
         assert chunks(pieces) == ["Before the code.", "After it is fine."]
+
+    def test_a_longer_fence_is_not_closed_by_a_shorter_one(self) -> None:
+        reply = "````\n```\nprint('secret')\n```\nstill code\n````\nDone now, all good."
+
+        assert speak(reply) == ["Done now, all good."]
+
+    def test_a_closing_fence_may_be_longer_and_followed_by_blanks_only(self) -> None:
+        assert speak("Before the code.\n```\ncode\n`````   \nAfter the code is spoken.") == [
+            "Before the code.",
+            "After the code is spoken.",
+        ]
+
+    def test_a_shorter_run_with_blanks_after_it_does_not_close_a_longer_fence_either(self) -> None:
+        reply = "````\n```  \nsecret code\n```\nmore secret\n````\nDone now, all good."
+
+        assert speak(reply) == ["Done now, all good."]
+
+    def test_a_fence_line_with_words_after_the_marks_does_not_close_it(self) -> None:
+        assert speak(
+            "Before the code.\n```\ncode\n``` not a close\nmore code\n```\nAfter it all."
+        ) == [
+            "Before the code.",
+            "After it all.",
+        ]
+
+    def test_a_fence_that_is_one_line_with_no_info_string_opens_at_the_line_end(self) -> None:
+        assert speak("Before the code.\n```\nsecret code here\n```\n") == ["Before the code."]
 
     def test_a_fence_needs_all_three_marks(self) -> None:
         assert speak("``not a fence`` is how this reads, really.") == [
@@ -171,6 +215,21 @@ class TestMarkdown:
 
     def test_table_pipes_go(self) -> None:
         assert "|" not in " ".join(speak("| name | value |\n|---|---|\n| a | b |\n"))
+
+    def test_a_cut_never_leaves_a_piece_of_punctuation_alone(self) -> None:
+        for limit in range(40, 60):
+            for sentence in speak("x" * (limit - 1) + " ... --- !!! ???", limit=limit):
+                assert any(c.isalnum() for c in sentence)
+
+    def test_splitting_text_never_leaves_a_piece_of_punctuation_alone(self) -> None:
+        chunker = SentenceChunker(max_sentence_chars=40)
+        out: list[str] = []
+
+        chunker._split("a " + ". " * 60 + "end", out)  # noqa: SLF001  (the splitting step itself)
+
+        assert out
+        assert all(any(c.isalnum() for c in piece) for piece in out)
+        assert all(len(piece) <= 40 for piece in out)
 
     def test_text_with_no_letter_or_digit_is_not_spoken(self) -> None:
         assert speak("---\n***\n...\n") == []
