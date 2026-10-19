@@ -690,5 +690,14 @@ would be told, one problem per line, with exit status 1 and no window. The rende
 `tumbleweed.ui.runtime` (state, expressions, handlers; no GTK, unit-tested without a display) and
 `tumbleweed.ui.gtk` (the thin adapter; `pytest -m gtk` in the container). It creates no popover,
 dialog, tooltip or drag icon from a spec, so that the canvas can never cover the trusted chrome
-(a `dropdown` is a list in place; DECISIONS D14), and images, tables, text views, tabs and expanders
-show as a placeholder until S11.
+(a `dropdown` is a list in place; DECISIONS D14).
+
+All 18 kinds of component render for real (S11). A table is a column view (at most 1,000 rows shown,
+typed columns), a text view is read-only or two-way bound, tabs and expanders hold any component,
+and an `image` is read through a resolver that the host passes (`RenderedTool(spec, images=...)`;
+the real one is the broker's, S19), checked as bytes (PNG, JPEG or still WebP, never SVG, within 8
+MiB and 16 million pixels) and only then decoded, on a worker thread. `tumbleweed-render` has no
+workspace, so its images say so. `uv run pytest tests/ui/test_image_contract.py` is the contract
+every resolver passes. WebP decoding needs gdk-pixbuf's WebP loader (`webp-pixbuf-loader` on Linux,
+which the test image has); without it a WebP shows the line
+"Only PNG, JPEG and WebP images can be shown."

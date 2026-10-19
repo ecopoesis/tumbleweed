@@ -18,6 +18,7 @@ from typing import final
 from tumbleweed.shell._gi import Gtk
 from tumbleweed.shell._widgets import plain_label
 from tumbleweed.ui.gtk import RenderedTool
+from tumbleweed.ui.images import ImageResolver
 from tumbleweed.ui.runtime import UiRuntime
 from tumbleweed.ui.spec import UiSpec
 
@@ -79,12 +80,20 @@ class CanvasView(Gtk.Box):
         """The tool `show_spec` rendered, if that is what the canvas shows."""
         return self._tool
 
-    def show_spec(self, spec: UiSpec, *, runtime: UiRuntime | None = None) -> RenderedTool:
+    def show_spec(
+        self,
+        spec: UiSpec,
+        *,
+        runtime: UiRuntime | None = None,
+        images: ImageResolver | None = None,
+    ) -> RenderedTool:
         """Render `spec` and show it, in place of whatever the canvas showed.
 
-        `runtime` lets the caller connect sinks for `sandbox` and `agent` handlers (S12, S20).
+        `runtime` lets the caller connect sinks for `sandbox` and `agent` handlers (S12, S20), and
+        `images` the resolver the tool's images are read with (S19); without one, every image
+        is refused.
         """
-        tool = RenderedTool(spec, runtime=runtime)
+        tool = RenderedTool(spec, runtime=runtime, images=images)
         self.set_content(tool.widget)
         self._tool = tool
         return tool

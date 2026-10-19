@@ -812,8 +812,10 @@ and a thin GTK adapter (`tumbleweed.ui.gtk`). A spec that does not validate is n
 a malformed node cannot reach the renderer; a node that is valid and still cannot be built (or
 cannot show its entry) renders as an error placeholder and the rest of the tool renders, so
 nothing in a spec can crash the shell. Every change of state carries its origin (user, handler,
-patch, sandbox, computed), and only a user's action on a widget fires a handler. Until S11 an
-image, table, text view, tabs or expander renders as a placeholder.
+patch, sandbox, computed), and only a user's action on a widget fires a handler. The rich
+widgets (S11, D21) are an image (resolved by an injected `ImageResolver`, inspected, and only then
+decoded, on a worker thread), a table (a column view of plain-text cells), a text view, tabs and an
+expander; each is bounded like the rest and none creates a surface.
 
 ## 5. Saved tools
 
@@ -1120,7 +1122,17 @@ Each invariant names where it is enforced. Reviews check every change against th
   `tumbleweed.shell._widgets.plain_label`, and `tests/shell/test_markup_lint.py` rejects the GTK
   APIs that parse markup in the GTK packages). No URIs opened automatically. Images and files only by
   workspace reference, never arbitrary paths or remote URLs; images only in allowlisted
-  raster formats (PNG, JPEG, WebP; never SVG). Size, depth and count limits.
+  raster formats (PNG, JPEG, WebP; never SVG). Size, depth and count limits. An image's bytes come
+  from the resolver (which opens the ref only through a directory file descriptor, I11), are
+  recognised by their magic number and sized from their header (an SVG renamed `.png`, an animated
+  WebP, a JPEG of more than 64 scans, more than 8 MiB, 8,192 pixels a side or 16 million pixels are
+  refused) before any decoder sees them, and are then decoded by a loader pinned to that format and
+  kept at the display size (`tumbleweed.ui.images`, `tumbleweed.ui.gtk.imageview`, D21). Memory is
+  bounded twice. A decode's working memory is a small multiple of its decoded size, which is at most
+  64 MiB of pixels (a progressive JPEG of that size peaked at about 145 MiB, and scaling while
+  loading does not lower the peak), two decodes at a time. What a tool keeps is at most 64 MiB of
+  pixels in all, reserved before each decode. Table cells, text view text and tab and expander
+  titles go in as plain text like every other text.
 - **I5 — Trusted chrome is unspoofable.** Prompts, the picker and other chrome render in a
   reserved region the canvas cannot draw over, with styling generated specs cannot use. The
   region is a sibling of the canvas in the window's vertical layout (`tumbleweed.shell.window`),
@@ -1130,14 +1142,15 @@ Each invariant names where it is enforced. Reviews check every change against th
   nor push it out of the window (`tumbleweed.shell.canvas`; proven with real layout and
   rendering in `tests/shell/test_chrome_isolation.py`). Clipping does not reach other surfaces:
   popovers, dialogs, tooltips and drag icons are separate windows, so the renderer creates none
-  from a spec (#53): a `dropdown` is a list in place and not a `Gtk.DropDown` (D14), a text entry or
-  spin button cannot open its context menu or emoji chooser or start a drag
+  from a spec (#53): a `dropdown` is a list in place and not a `Gtk.DropDown` (D14), a text entry,
+  spin button or text view cannot open its context menu or emoji chooser or start a drag
   (`tumbleweed.ui.gtk.guard`; touchscreen sequences are claimed too, so no selection bubble or
-  handles), no tooltip is ever set, and `tests/ui/gtk/test_no_surfaces.py`
+  handles), a table has no header menu and its columns cannot be dragged, the tab menu of tabs is
+  off, no tooltip is ever set, and `tests/ui/gtk/test_no_surfaces.py`
   looks for any toplevel, native surface, popover-bearing widget, tooltip or drag source besides
   the shell's own window after every golden spec and a hostile one has been rendered and used.
-  Whatever later adds a widget to the renderer (S11) or a tooltip (S12's disabled `sandbox`
-  handlers) keeps to this, or says why a surface is contained.
+  Whatever later adds a widget to the renderer or a tooltip (S12's disabled `sandbox` handlers)
+  keeps to this, or says why a surface is contained.
   **Every model-supplied string** shown in chrome (reasons, task titles, tool names and
   descriptions, spec titles) is plain, length-capped, and labelled as coming from the
   assistant. What is being granted is rendered from the structured capability. While a
@@ -1182,11 +1195,15 @@ Each invariant names where it is enforced. Reviews check every change against th
   labels.
   The renderer bounds the total as well (`tumbleweed.ui.gtk.budget`): a label shows at most 8,192
   characters then ` (cut)`, a tool at most 65,536 characters in all (`MAX_SHOWN_PER_TOOL`, a renderer
-  constant, not a spec limit; labels, buttons, options and entries all count), what does not fit is
+  constant, not a spec limit; labels, buttons, options, entries, table cells, text views and tab and
+  expander titles all count), what does not fit is
   replaced by a mark or left out until room appears (the one entry that has the focus, or is
-  being edited, may pass the total by its own cap, 8,192 characters, until the focus leaves), and text updates are applied once per frame
-  with the latest value (an 80 KB spec of 441 labels bound to one 64K string used to take minutes
-  to lay out, with the chrome frozen; a test holds it to seconds).
+  being edited, may pass the total by its own cap, 8,192 characters, until the focus leaves), and
+  text updates are applied once per frame with the latest value (an 80 KB spec of 441 labels bound
+  to one 64K string used to take minutes to lay out, with the chrome frozen; a test holds it to
+  seconds). A table shows at most 1,000 rows of cells of at most 256 characters; an image is read
+  and decoded on two worker threads shared by the process, never on the main one, with one job in
+  flight per widget.
   The agent's limits are enforced in three places: `agent.limits` holds the values and refuses
   out-of-range settings; `agent.loop` enforces iterations per reply, output tokens per reply, the
   bytes of reply text (`MAX_REPLY_BYTES`, the hard guarantee that a reply fits a transcript message;
@@ -1366,6 +1383,7 @@ src/tumbleweed/
   ipc/        framing, typed messages, async client/server
   ui/spec/    UI spec schema, expression AST and value types (no GTK)
   ui/runtime/ state store, expression interpreter, bindings, handler dispatch (no GTK)
+  ui/images.py image rules: what may be decoded, the resolver Protocol and its contract (no GTK)
   ui/gtk/     GTK4 adapter that renders specs
   shell/      Adw application, window, chat panel, trusted prompts, terminal pane
   shell/viewmodel/  transcript view-model, chat controller, terminal choices and spawner (no GTK)
@@ -1388,14 +1406,14 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
 - `broker` imports `ipc` only in its daemon layer (`service`, `daemon`, `client`, `toolscli`); the
   policy core, storage and audit modules never do, nor do they import the daemon layer; `ipc` never
   imports `broker`.
-- `core`, `ipc`, `ui.spec`, `ui.runtime`, `agent`, `history`, `broker` and `sandbox` never
-  import `gi`; `ui.runtime` also never imports `ui.gtk` or the shell, so it cannot reach GTK
-  through them. `voice` imports it only in `voice._gst`, the pin of the GStreamer adapter, which
-  only `voice.gstreamer` and `voice.factory` (lazily) import; the rest of `voice` cannot import
-  either, and `voice` never imports `shell` or `broker` (the shell depends on it). The one edge
-  between `agent` and `voice` is configuration: `agent.config` holds the loader of the one file and
-  imports `voice.config` (the `[voice]` model), and `voice.factory` imports `agent.config` to read
-  it; a contract lets `agent` import nothing else of `voice`.
+- `core`, `ipc`, `ui.spec`, `ui.runtime`, `ui.images`, `agent`, `history`, `broker` and `sandbox`
+  never import `gi`; `ui.runtime` and `ui.images` also never import `ui.gtk` or the shell, so they
+  cannot reach GTK through them. `voice` imports it only in `voice._gst`, the pin of the GStreamer
+  adapter, which only `voice.gstreamer` and `voice.factory` (lazily) import; the rest of `voice`
+  cannot import either, and `voice` never imports `shell` or `broker` (the shell depends on it).
+  The one edge between `agent` and `voice` is configuration: `agent.config` holds the loader of the
+  one file and imports `voice.config` (the `[voice]` model), and `voice.factory` imports
+  `agent.config` to read it; a contract lets `agent` import nothing else of `voice`.
 - `agent` never imports `shell`; the shell depends on the agent through interfaces.
 - `history` never imports `shell` or `agent`; the shell depends on it through `ChatHistory`.
 - The Anthropic SDK is imported only by `agent.anthropic_provider`; the rest of the agent, and

@@ -801,3 +801,113 @@ def test_a_focused_entry_keeps_its_claim_until_the_focus_leaves(echo_shell: Shel
     assert pump_until(lambda: tool.shown_text_total <= MAX_SHOWN_PER_TOOL)
 
     assert last.get_text() == NOT_SHOWN
+
+
+class TestTheRichWidgetsAreBudgetedToo:
+    """Titles of tabs and expanders, the lines an image shows, table cells and text views all
+    count in the tool's text, and what does not fit waits for room like any label."""
+
+    PAD = "x" * 8192
+
+    def crowded(self, *rich: Json) -> "RenderedTool":
+        from tumbleweed.ui.gtk import RenderedTool
+
+        pads: list[Json] = [{"kind": "label", "bind": "pad"} for _ in range(8)]  # all of it
+        state: list[Json] = [
+            text("pad", self.PAD, max_length=65536),
+            text("s", "some text", max_length=65536),
+            {"kind": "image", "key": "img"},
+        ]
+        return RenderedTool(spec_of(many_of([*pads, *rich]), state))
+
+    def test_tab_and_expander_titles_are_refused_with_the_budget_full_and_come_with_room(
+        self,
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        tool = self.crowded(
+            {"kind": "tabs", "pages": [{"title": "Tab one", "content": {"kind": "separator"}}]},
+            {"kind": "expander", "title": "Expander", "child": {"kind": "separator"}},
+        )
+        (notebook,) = of_type(tool, Gtk.Notebook)
+        (expander,) = of_type(tool, Gtk.Expander)
+        tab = notebook.get_tab_label(notebook.get_nth_page(0))  # type: ignore[arg-type]
+        title = expander.get_label_widget()
+        assert isinstance(tab, Gtk.Label)
+        assert isinstance(title, Gtk.Label)
+        assert (tab.get_text(), title.get_text()) == (NOT_SHOWN, NOT_SHOWN)
+
+        tool.runtime.patch_state({"pad": ""})
+        tool.flush()
+        tool.flush()
+
+        assert (tab.get_text(), title.get_text()) == ("Tab one", "Expander")
+
+    def test_a_text_view_is_refused_with_the_budget_full_and_comes_with_room(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        tool = self.crowded({"kind": "text_view", "bind": "s"})
+        (view,) = of_type(tool, Gtk.TextView)
+        buffer = view.get_buffer()
+
+        def shown() -> str:
+            return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
+
+        assert shown() == NOT_SHOWN
+        tool.runtime.patch_state({"pad": ""})
+        tool.flush()
+        tool.flush()
+
+        assert shown() == "some text"
+
+    def test_the_line_an_image_shows_is_counted_and_waits_for_room(self) -> None:
+        from tumbleweed.ui.gtk.imageview import ImageView
+
+        tool = self.crowded({"kind": "image", "bind": "img"})
+        (view,) = of_type(tool, ImageView)
+        view.set_ref(None, stale=True)  # "Out of date" has no room: a mark stands in its place
+
+        assert view.notice == NOT_SHOWN
+        tool.runtime.patch_state({"pad": ""})
+        tool.flush()
+        tool.flush()
+
+        assert view.notice == "Out of date"
+
+    def test_the_hostile_spec_with_every_rich_widget_stays_within_the_budget(self) -> None:
+        from tests.ui.gtk.hostile import hostile_spec
+        from tumbleweed.ui.gtk import RenderedTool
+
+        started = time.monotonic()
+        tool = RenderedTool(hostile_spec())
+        tool.flush()
+
+        assert time.monotonic() - started < 10
+        assert tool.shown_text_total <= MAX_SHOWN_PER_TOOL
+
+    def test_hundreds_of_text_views_and_tables_of_one_big_value_show_at_most_the_budget(
+        self, echo_shell: Shell
+    ) -> None:
+        big: Json = {
+            "columns": [{"name": f"c{i}", "type": "string"} for i in range(20)],
+            "rows": [["v" * 100 for _ in range(20)] for _ in range(10)],
+        }
+        state: list[Json] = [
+            text("long", "각" * 20000, max_length=65536),
+            {"kind": "table", "key": "t", "default": big},
+        ]
+        views: list[Json] = [{"kind": "text_view", "bind": "long"} for _ in range(100)]
+        tables: list[Json] = [{"kind": "table", "bind": "t"} for _ in range(100)]
+        spec = spec_of(many_of([*views, *tables]), state)
+
+        started = time.monotonic()
+        tool = echo_shell.window.canvas.show_spec(spec)
+        echo_shell.window.present()
+        assert pump_until(
+            lambda: echo_shell.window.get_mapped() and echo_shell.window.canvas.get_width() > 0,
+            timeout=60,
+        )
+        pump(0.3)
+
+        assert tool.shown_text_total <= MAX_SHOWN_PER_TOOL
+        assert time.monotonic() - started < 30

@@ -13,20 +13,27 @@ A widget is bound with `ctx.bind` (the entry it shows) and, for an input, a sign
 calls `ctx.user_input`. Numbers go through `NumericRange`, which makes every range and step a
 validated spec can have into finite adjustment values.
 
-The image, table, text view, tabs and expander components are S11's: until then each is a
-placeholder saying so.
+The rich widgets are each in a module of their own, built from here: `imageview` (an image,
+resolved, inspected and decoded off the main thread), `table` (a column view of plain-text cells)
+and `textview` (a text view with the same bounds and hardening as an entry). Tabs are a
+`Gtk.Notebook` and an expander a `Gtk.Expander`, with plain titles; neither has a popup (the
+notebook's tab menu is off) and their pages and child are built as any child is, so a page that
+fails is a placeholder inside its tab.
 """
 
 from collections.abc import Callable
 from typing import Literal, assert_never, final
 
-from tumbleweed.shell._gi import Gtk
+from tumbleweed.shell._gi import Gtk, Pango
 from tumbleweed.shell.viewmodel.display import display_text
 from tumbleweed.ui.gtk.budget import MAX_SHOWN_PER_TEXT, NOT_SHOWN
 from tumbleweed.ui.gtk.choice import ChoiceList
 from tumbleweed.ui.gtk.context import BuildContext
 from tumbleweed.ui.gtk.guard import harden_text, quiet_spin_input_marshalling
-from tumbleweed.ui.gtk.text import TextBlock, line_label, placeholder
+from tumbleweed.ui.gtk.imageview import ImageView
+from tumbleweed.ui.gtk.table import TableWidget
+from tumbleweed.ui.gtk.text import TextBlock, line_label
+from tumbleweed.ui.gtk.textview import make_text_view
 from tumbleweed.ui.runtime import NumericRange, UiEvent, bind_of
 from tumbleweed.ui.runtime.values import number_of
 from tumbleweed.ui.spec.components import (
@@ -56,13 +63,17 @@ from tumbleweed.ui.spec.state import (
     BoolState,
     EnumState,
     FloatState,
+    ImageState,
     IntState,
     StateValue,
     StringState,
+    TableState,
 )
+from tumbleweed.ui.spec.values import ImageRef, Table
 
 WARNING_CLASS = "warning"
 WARNING_ICON = "dialog-warning-symbolic"
+TITLE_WIDTH_CHARS = 32  # a tab's title is this wide at most, then an ellipsis
 
 
 def _orientation(orientation: Orientation) -> Gtk.Orientation:
@@ -80,7 +91,7 @@ def _event(
     return UiEvent(handler=handler, component=component, event=event, bind=key)
 
 
-def _bound[D: (BoolState, IntState, FloatState, StringState, EnumState)](
+def _bound[D: (BoolState, IntState, FloatState, StringState, EnumState, ImageState, TableState)](
     component: Component, ctx: BuildContext, decl_type: type[D]
 ) -> tuple[StateKey, D]:
     binding = bind_of(component, ctx.decls)
@@ -124,6 +135,32 @@ def _grid(component: Grid, path: str, ctx: BuildContext) -> Gtk.Widget:
     return grid
 
 
+def _title(text: str, ctx: BuildContext) -> Gtk.Label:
+    """A tab's or an expander's title: one plain line, counted in the text budget."""
+    label = line_label(text, budget=ctx.budget)
+    label.set_wrap(False)
+    label.set_ellipsize(Pango.EllipsizeMode.END)
+    label.set_max_width_chars(TITLE_WIDTH_CHARS)
+    return label
+
+
+def _tabs(component: Tabs, path: str, ctx: BuildContext) -> Gtk.Widget:
+    notebook = Gtk.Notebook(scrollable=True)
+    notebook.popup_disable()  # (off by default: the tab menu is a popover, so it stays off)
+    for index, page in enumerate(component.pages):
+        content = ctx.build_child(page.content, f"{path}.pages[{index}].content")
+        notebook.append_page(content, _title(page.title, ctx))
+    return notebook
+
+
+def _expander(component: Expander, path: str, ctx: BuildContext) -> Gtk.Widget:
+    expander = Gtk.Expander()
+    expander.set_label_widget(_title(component.title, ctx))
+    expander.set_child(ctx.build_child(component.child, f"{path}.child"))
+    expander.set_expanded(component.expanded)
+    return expander
+
+
 # --- display ---------------------------------------------------------------------------------
 
 
@@ -164,6 +201,55 @@ def _progress(component: Progress, ctx: BuildContext) -> Gtk.Widget:
 
     ctx.bind(binding.key, bar, update)
     return bar
+
+
+def _image(component: Image, ctx: BuildContext) -> Gtk.Widget:
+    key, _decl = _bound(component, ctx, ImageState)
+    view = ImageView(component.alt, ctx.images, ctx.decoder, ctx.budget, ctx.pixels)
+    ctx.on_close(view.release)
+
+    def update(value: StateValue, stale: bool) -> None:
+        # (an equal ref assigned again is read again, but not when the widgets are put back)
+        view.set_ref(
+            value if isinstance(value, ImageRef) else None,
+            stale=stale,
+            refresh=not ctx.resyncing,
+        )
+
+    ctx.bind(key, view, update)
+    return view
+
+
+def _table(component: TableView, ctx: BuildContext) -> Gtk.Widget:
+    key, _decl = _bound(component, ctx, TableState)
+    table = TableWidget(ctx)
+    ctx.on_close(table.release)
+    first = True
+
+    def update(value: StateValue, stale: bool) -> None:
+        nonlocal first
+        if first:
+            first = False
+            table.set_table(value if isinstance(value, Table) else None, stale=stale)
+            return
+        # A table costs a rebuild to show: once per frame, the latest value only.
+        store = ctx.runtime.store
+
+        def later() -> None:
+            current = store.value(key)
+            table.set_table(
+                current if isinstance(current, Table) else None, stale=store.is_stale(key)
+            )
+
+        ctx.defer(table, later)
+
+    ctx.bind(key, table, update)
+    return table
+
+
+def _text_view(component: TextView, ctx: BuildContext) -> Gtk.Widget:
+    key, decl = _bound(component, ctx, StringState)
+    return make_text_view(component, key, decl, ctx)
 
 
 def _separator(component: Separator) -> Gtk.Widget:
@@ -481,7 +567,15 @@ def build_widget(component: Component, path: str, ctx: BuildContext) -> Gtk.Widg
             return _progress(component, ctx)
         case Separator():
             return _separator(component)
-        case Image() | TableView() | TextView() | Tabs() | Expander():
-            return placeholder(f"A {component.kind} cannot be shown yet.")
+        case Image():
+            return _image(component, ctx)
+        case TableView():
+            return _table(component, ctx)
+        case TextView():
+            return _text_view(component, ctx)
+        case Tabs():
+            return _tabs(component, path, ctx)
+        case Expander():
+            return _expander(component, path, ctx)
         case _ as unreachable:
             assert_never(unreachable)

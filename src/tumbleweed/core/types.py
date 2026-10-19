@@ -159,6 +159,13 @@ class ByteCount(_BoundedInt, minimum=0):
 
 
 @final
+class PixelCount(_BoundedInt, minimum=1):
+    """A length in pixels (the width or height of an image): at least 1."""
+
+    __slots__ = ()
+
+
+@final
 class TokenCount(_BoundedInt, minimum=0):
     """A number of LLM tokens (usage, limits): never negative."""
 
@@ -380,6 +387,7 @@ __all__ = [
     "JsonValue",
     "ModelName",
     "PatternStr",
+    "PixelCount",
     "ProviderRequestId",
     "TokenCount",
     "ToolVersion",

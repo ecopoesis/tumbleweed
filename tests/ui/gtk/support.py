@@ -8,7 +8,7 @@ with the reason instead of breaking the collection of every other test.
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from tests.shell.gtk_support import descendants, pump
+from tests.shell.gtk_support import Shell, descendants, pump, pump_until
 from tests.ui.spec.support import Json, build, golden_text
 from tumbleweed.ui.spec import UiSpec, parse_ui_spec, validate_ui_spec
 
@@ -23,6 +23,7 @@ __all__ = [
     "of_type",
     "pump",
     "render",
+    "show_in_window",
     "spec_of",
 ]
 
@@ -66,3 +67,13 @@ def labels_text(tool: "RenderedTool") -> list[str]:
         ):
             found.append(widget.get_text())
     return found
+
+
+def show_in_window(shell: Shell, spec: UiSpec) -> "RenderedTool":
+    """Render `spec` on the shell's canvas and let the window map and lay it out, so that widgets
+    that are made when they are seen (the rows of a list) exist."""
+    tool = shell.window.canvas.show_spec(spec)
+    shell.window.present()
+    assert pump_until(lambda: shell.window.get_mapped() and shell.window.canvas.get_width() > 0)
+    pump(0.2)
+    return tool

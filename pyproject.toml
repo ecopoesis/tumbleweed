@@ -318,6 +318,14 @@ type = "forbidden"
 source_modules = ["tumbleweed.ui.runtime"]
 forbidden_modules = ["gi", "tumbleweed.ui.gtk", "tumbleweed.shell"]
 
+# The image rules (what may be decoded, and what a resolver must do) are checked in tests without a
+# display, and the broker's resolver (S19) implements them without GTK.
+[[tool.importlinter.contracts]]
+name = "ui.images never imports gi, the GTK adapter or the shell (D21)"
+type = "forbidden"
+source_modules = ["tumbleweed.ui.images"]
+forbidden_modules = ["gi", "tumbleweed.ui.gtk", "tumbleweed.shell"]
+
 [[tool.importlinter.contracts]]
 name = "history never imports gi (ARCHITECTURE section 10)"
 type = "forbidden"

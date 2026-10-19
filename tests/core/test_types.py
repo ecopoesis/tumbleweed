@@ -22,6 +22,7 @@ from tumbleweed.core.types import (
     JsonValue,
     ModelName,
     PatternStr,
+    PixelCount,
     ProviderRequestId,
     TokenCount,
     ToolVersion,
@@ -62,6 +63,16 @@ class TestTokenCount:
             TokenCount(-1)
         with pytest.raises(InvalidValueError, match="TokenCount must be an int"):
             TokenCount(True)  # the point of the test: a bool is not a count
+
+
+class TestPixelCount:
+    def test_is_at_least_one_and_refuses_what_is_not_a_length(self) -> None:
+        assert PixelCount(1) == 1
+        assert PixelCount(16_384) == 16_384
+        with pytest.raises(InvalidValueError, match="PixelCount must be from 1"):
+            PixelCount(0)  # an image with no pixels has no size
+        with pytest.raises(InvalidValueError, match="PixelCount must be an int"):
+            PixelCount(True)  # a bool is not a length
 
 
 class TestByteCount:

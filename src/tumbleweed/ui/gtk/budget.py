@@ -5,9 +5,10 @@ labels to one 64 KiB string, and laying them all out takes minutes on the main t
 serves the trusted chrome. So the text shown is bounded in total:
 
 - a text block shows at most `MAX_SHOWN_PER_TEXT` characters of its text, then `CUT_MARK`;
-- all the text a tool shows (blocks, buttons, check boxes, options) is at most
-  `MAX_SHOWN_PER_TOOL` characters. What does not fit is replaced by `NOT_SHOWN` (a block) or left
-  out (an option of a list, which ends in a mark saying so).
+- all the text a tool shows (blocks, buttons, check boxes, options, table cells, text views, tab
+  and expander titles) is at most `MAX_SHOWN_PER_TOOL` characters. What does not fit is replaced
+  by `NOT_SHOWN` (a block) or left out (an option of a list, a row of a table; each ends in a mark
+  saying so).
 
 The state still holds the whole value: only what is displayed is bounded. Nothing is shown out of
 order: the claim is made when a widget is built or its text changes, first come first served.
@@ -21,6 +22,7 @@ MAX_SHOWN_PER_TOOL: Final = 65_536
 CUT_MARK: Final = " (cut)"
 NOT_SHOWN: Final = "(not shown: too much text on screen)"
 MORE_OPTIONS: Final = "(more options not shown)"
+MORE_ROWS: Final = "(more rows not shown)"
 
 
 @final
@@ -64,6 +66,14 @@ class TextBudget:
         if wanted < old:
             self._room()
         return True
+
+    def room(self, owner: object) -> int:
+        """The characters `owner` could claim now: what is left, and what it already holds."""
+        return max(0, MAX_SHOWN_PER_TOOL - self._total + self._claims.get(owner, 0))
+
+    def held(self, owner: object) -> int:
+        """The characters `owner` claims now."""
+        return self._claims.get(owner, 0)
 
     def fits(self, owner: object, text: str) -> bool:
         """Claim `text` for `owner`, for good (an option, a button label)."""

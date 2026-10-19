@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.shell.gtk_support import pump_until
 from tests.ui.gtk.support import golden_spec, labels_text, of_type, render
+from tests.ui.image_support import FakeResolver, png
 from tumbleweed.ui.runtime import Dispatch, Origin, UiEvent, UiRuntime
 from tumbleweed.ui.spec.handlers import SandboxHandler
 from tumbleweed.ui.spec.names import HandlerName, StateKey
@@ -194,8 +196,9 @@ class TestPhotoAdjuster:
         spec = golden_spec("photo_adjuster")
         return RenderedTool(spec, runtime=UiRuntime(spec, sandbox=sandbox)), sandbox
 
-    def test_the_inputs_and_what_cannot_be_shown_yet(self) -> None:
+    def test_the_inputs_and_the_image_which_starts_empty(self) -> None:
         from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk.imageview import ImageView
 
         tool = render(golden_spec("photo_adjuster"))
 
@@ -204,8 +207,26 @@ class TestPhotoAdjuster:
         assert len(of_type(tool, Gtk.Switch)) == 1
         assert len(of_type(tool, Gtk.Button)) == 2
         image = tool.widget_at("root.children[2]")
-        assert isinstance(image, Gtk.Label)  # the image is S11's: a placeholder says so
-        assert image.get_text() == "A image cannot be shown yet."
+        assert isinstance(image, ImageView)  # a real image widget, with nothing to show yet
+        assert image.texture is None
+        assert image.notice == ""
+
+    def test_the_adjusted_photo_is_shown_when_a_handler_sets_the_image(self) -> None:
+        from tumbleweed.ui.gtk import RenderedTool
+        from tumbleweed.ui.gtk.imageview import ImageView
+
+        resolver = FakeResolver({"out/adjusted.png": png(3, 2)})
+        tool = RenderedTool(golden_spec("photo_adjuster"), images=resolver)
+        image = tool.widget_at("root.children[2]")
+        assert isinstance(image, ImageView)
+
+        tool.runtime.patch_state({"result": {"path": "out/adjusted.png"}})  # what S20 will do
+        assert pump_until(lambda: image.texture is not None)
+
+        texture = image.texture
+        assert texture is not None
+        assert (texture.get_width(), texture.get_height()) == (3, 2)
+        assert [path for path, _limit in resolver.reads] == ["out/adjusted.png"]
 
     def test_moving_a_slider_sends_the_inputs_to_the_sandbox_sink(self) -> None:
         from tumbleweed.shell._gi import Gtk
@@ -318,15 +339,51 @@ class TestCsvViewer:
         switch.set_active(False)
         assert tool.runtime.store.value(key("has_header")) is False
 
-    def test_the_tabs_are_a_placeholder_until_the_rich_widgets_exist(self) -> None:
+    def test_the_tabs_hold_the_table_and_the_raw_text(self) -> None:
         from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk.table import TableWidget
 
         tool = render(golden_spec("csv_viewer"))
 
         tabs = tool.widget_at("root.children[4]")
-        assert isinstance(tabs, Gtk.Label)
-        assert tabs.get_text() == "A tabs cannot be shown yet."
-        assert tool.widget_at("root.children[4].pages[0].content") is None  # not built
+        assert isinstance(tabs, Gtk.Notebook)
+        assert tabs.get_n_pages() == 2
+        table = tool.widget_at("root.children[4].pages[0].content")
+        text = tool.widget_at("root.children[4].pages[1].content")
+        assert isinstance(table, TableWidget)
+        assert isinstance(text, Gtk.ScrolledWindow)
+        view = text.get_child()
+        assert isinstance(view, Gtk.TextView)
+        assert view.get_monospace() is True
+        assert view.get_editable() is False  # a read-only view of the raw head of the file
+
+    def test_a_loaded_file_fills_the_table_and_the_raw_text(self) -> None:
+        from tumbleweed.shell._gi import Gtk
+        from tumbleweed.ui.gtk.table import TableWidget
+
+        tool = render(golden_spec("csv_viewer"))
+        table = tool.widget_at("root.children[4].pages[0].content")
+        assert isinstance(table, TableWidget)
+        (view,) = of_type(tool, Gtk.TextView)
+
+        tool.runtime.patch_state(  # what the sandbox handler's result will be (S20)
+            {
+                "data": {
+                    "columns": [{"name": "city", "type": "string"}, {"name": "pop", "type": "int"}],
+                    "rows": [["Oslo", 709000], ["Lima", 10700000]],
+                },
+                "raw_head": "city,pop\nOslo,709000\nLima,10700000",
+                "status": "2 rows",
+            }
+        )
+        tool.flush()
+
+        assert table.column_names == ("city", "pop")
+        assert table.cells == (("Oslo", "709000"), ("Lima", "10700000"))
+        buffer = view.get_buffer()
+        assert buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False) == (
+            "city,pop\nOslo,709000\nLima,10700000"
+        )
 
 
 def labels_text_of(row: "object") -> str:
@@ -339,9 +396,7 @@ def labels_text_of(row: "object") -> str:
 
 class TestEveryGoldenSpec:
     @pytest.mark.parametrize("name", ["tip_calculator", "photo_adjuster", "csv_viewer"])
-    def test_it_renders_without_a_placeholder_for_anything_this_step_supports(
-        self, name: str
-    ) -> None:
+    def test_it_renders_every_widget_for_real_with_no_placeholder(self, name: str) -> None:
         from tumbleweed.shell._gi import Gtk
 
         tool = render(golden_spec(name))
@@ -349,10 +404,8 @@ class TestEveryGoldenSpec:
         placeholders = [
             w.get_text() for w in of_type(tool, Gtk.Label) if "error" in w.get_css_classes()
         ]
-        assert all("cannot be shown yet" in text for text in placeholders)  # only S11's kinds
-        assert (
-            len(placeholders) == {"tip_calculator": 0, "photo_adjuster": 1, "csv_viewer": 1}[name]
-        )
+        assert placeholders == []  # none of the 18 kinds is a placeholder any more
+        assert "cannot be shown" not in " ".join(labels_text(tool))
 
     def test_closing_the_tool_stops_it_following_the_state(self) -> None:
         tool = render(golden_spec("tip_calculator"))

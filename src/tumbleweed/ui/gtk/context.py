@@ -21,7 +21,9 @@ from typing import Protocol, final
 from tumbleweed.shell._gi import GLib, Gtk
 from tumbleweed.ui.gtk.budget import TextBudget
 from tumbleweed.ui.gtk.guard import SignalHandler
+from tumbleweed.ui.gtk.imageview import ImageDecoder, PixelBudget
 from tumbleweed.ui.gtk.text import TextBlock
+from tumbleweed.ui.images import ImageResolver
 from tumbleweed.ui.runtime import Change, Dispatch, UiEvent, UiRuntime, Value
 from tumbleweed.ui.spec.components import Component
 from tumbleweed.ui.spec.names import StateKey
@@ -56,16 +58,27 @@ class _Binding:
 
 @final
 class BuildContext:
-    """Shared by the builders of one rendered tool."""
+    """Shared by the builders of one rendered tool: the runtime, the bindings, the text budget, and
+    what an `image` is read and decoded with."""
 
-    def __init__(self, runtime: UiRuntime, build_child: BuildChild) -> None:
+    def __init__(
+        self,
+        runtime: UiRuntime,
+        build_child: BuildChild,
+        images: ImageResolver,
+        decoder: ImageDecoder,
+    ) -> None:
         self.runtime = runtime
+        self.images = images
+        self.decoder = decoder
         self.decls = runtime.spec.declarations()
         self.build_child = build_child
         self._bindings: list[_Binding] = []
         self._by_key: dict[StateKey, list[_Binding]] = {}
         self._programmatic = 0
         self.budget = TextBudget()
+        self.pixels = PixelBudget()
+        self.resyncing = False
         self._on_close: list[Callable[[], None]] = []
         self._pending: dict[object, Callable[[], None]] = {}
         self._idle = 0
@@ -99,12 +112,16 @@ class BuildContext:
     def resync(self) -> None:
         """Show the state's values in every bound widget again."""
         store = self.runtime.store
-        with self.programmatic():
-            for binding in tuple(self._bindings):
-                try:
-                    binding.update(store.value(binding.key), store.is_stale(binding.key))
-                except Exception:
-                    logger.exception("a widget could not be put back to %s", binding.key)
+        self.resyncing = True
+        try:
+            with self.programmatic():
+                for binding in tuple(self._bindings):
+                    try:
+                        binding.update(store.value(binding.key), store.is_stale(binding.key))
+                    except Exception:
+                        logger.exception("a widget could not be put back to %s", binding.key)
+        finally:
+            self.resyncing = False
 
     def on_close(self, undo: Callable[[], None]) -> None:
         """Run `undo` when the tool is closed."""

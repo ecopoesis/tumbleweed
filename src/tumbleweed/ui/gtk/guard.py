@@ -1,9 +1,9 @@
-"""Keeps a spec's text entries from opening surfaces of their own (I5, #53).
+"""Keeps a spec's text entries and text views from opening surfaces of their own (I5, #53).
 
-A `Gtk.Text` (inside `Gtk.Entry` and `Gtk.SpinButton`) can open a popover, which is a window of its
-own that clipping cannot contain: its context menu (a right click, the Menu key, Shift+F10, a long
-press) and the emoji chooser (Ctrl+.). It can also start a drag, which has a drag icon, from
-selected text. `harden_text` turns each off:
+A `Gtk.Text` (inside `Gtk.Entry` and `Gtk.SpinButton`) and a `Gtk.TextView` can open a popover,
+which is a window of its own that clipping cannot contain: its context menu (a right click, the
+Menu key, Shift+F10, a long press) and the emoji chooser (Ctrl+.). It can also start a drag, which
+has a drag icon, from selected text. `harden_text` turns each off:
 
 - the actions `menu.popup` and `misc.insert-emoji` are disabled (the keyboard routes);
 - the long-press gesture is removed (the touch route);
@@ -14,7 +14,10 @@ selected text. `harden_text` turns each off:
   selection handles and the magnifier (popups of their own) never start; a tap still focuses the
   text, but a touch cannot place the cursor or select (a keyboard can).
 
-Selecting and typing, and copy and paste with the shortcuts, work as before.
+Selecting and typing, and copy and paste with the shortcuts, work as before. A `Gtk.TextView` gets
+the same measures (`harden_text_view`): its two actions are disabled, its input hints say no emoji,
+a capture-phase click claims the secondary button and drops the selection on any other press, and
+a touch-only click claims every touch sequence.
 """
 
 import re
@@ -33,12 +36,23 @@ class _Claimable(Protocol):
     def set_state(self, state: Gtk.EventSequenceState) -> bool: ...
 
 
-def on_press(button: int, gesture: _Claimable, text: _Selectable) -> None:
-    """What a press of `button` does in the capture phase: see the module docstring."""
-    if button == Gdk.BUTTON_SECONDARY:
+def on_press(
+    button: int, gesture: _Claimable, text: _Selectable, *, triggers_menu: bool = False
+) -> None:
+    """What a press of `button` does in the capture phase: see the module docstring.
+
+    `triggers_menu` is what GDK says of the event (Ctrl+click on macOS opens a context menu
+    though the button is the primary one): such a press is claimed like a secondary one."""
+    if button == Gdk.BUTTON_SECONDARY or triggers_menu:
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
     else:
         text.select_region(0, 0)
+
+
+def _opens_menu(gesture: Gtk.GestureClick) -> bool:
+    """Whether GDK takes the press for the one that opens a context menu on this platform."""
+    event = gesture.get_current_event()
+    return event is not None and event.triggers_context_menu()
 
 
 class _Focusable(Protocol):
@@ -81,7 +95,9 @@ def harden_text(widget: Gtk.Editable, connect: _Connect) -> None:
 
     def pressed(gesture: object, _presses: object, _x: object, _y: object) -> None:
         if isinstance(gesture, Gtk.GestureClick):
-            on_press(gesture.get_current_button(), gesture, widget)
+            on_press(
+                gesture.get_current_button(), gesture, widget, triggers_menu=_opens_menu(gesture)
+            )
 
     def touched(gesture: object, _presses: object, _x: object, _y: object) -> None:
         if isinstance(gesture, Gtk.GestureClick):
@@ -93,6 +109,59 @@ def harden_text(widget: Gtk.Editable, connect: _Connect) -> None:
     connect(touch, "pressed", touched)
     delegate.add_controller(click)
     delegate.add_controller(touch)
+
+
+class _ViewSelection:
+    """What `on_press` needs of a text view: to drop its selection (put the cursor where the
+    insertion point is), whatever range it is asked to select."""
+
+    def __init__(self, view: Gtk.TextView) -> None:
+        self._view = view
+
+    def select_region(self, start_pos: int, end_pos: int) -> None:
+        buffer = self._view.get_buffer()
+        insert = buffer.get_iter_at_mark(buffer.get_insert())
+        buffer.select_range(insert, insert)
+
+
+def harden_text_view(view: Gtk.TextView, connect: _Connect) -> None:
+    """Apply the measures of the module to a `Gtk.TextView`, as `harden_text` does to a `Gtk.Text`.
+
+    The handlers refer back to the view, so they are connected with `connect` (the tool's
+    `BuildContext.connect`), which disconnects them on close and keeps what they raise from GTK.
+    """
+    view.action_set_enabled("menu.popup", False)
+    view.action_set_enabled("misc.insert-emoji", False)
+    view.set_input_hints(Gtk.InputHints.NO_EMOJI)
+    view.set_extra_menu(None)
+    controllers = view.observe_controllers()
+    for position in reversed(range(controllers.get_n_items())):
+        controller = controllers.get_item(position)
+        if isinstance(controller, Gtk.GestureLongPress):
+            view.remove_controller(controller)
+    selection = _ViewSelection(view)
+    click = Gtk.GestureClick(button=0)  # every button
+    click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+
+    def pressed(gesture: object, _presses: object, _x: object, _y: object) -> None:
+        if isinstance(gesture, Gtk.GestureClick):
+            on_press(
+                gesture.get_current_button(),
+                gesture,
+                selection,
+                triggers_menu=_opens_menu(gesture),
+            )
+
+    def touched(gesture: object, _presses: object, _x: object, _y: object) -> None:
+        if isinstance(gesture, Gtk.GestureClick):
+            on_touch(gesture, view)
+
+    connect(click, "pressed", pressed)
+    touch = Gtk.GestureClick(touch_only=True)
+    touch.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    connect(touch, "pressed", touched)
+    view.add_controller(click)
+    view.add_controller(touch)
 
 
 _SPIN_INPUT_WARNING = "g_value_get_double: assertion 'G_VALUE_HOLDS_DOUBLE (value)' failed"

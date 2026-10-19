@@ -84,6 +84,24 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         "ui.runtime never imports gi",
         (),
     ),
+    "ui.images imports gi": (
+        "ui/images.py",
+        "import gi",
+        "ui.images never imports gi",
+        (),
+    ),
+    "ui.images imports the GTK adapter": (
+        "ui/images.py",
+        "import tumbleweed.ui.gtk.imageview",
+        "ui.images never imports gi",
+        (),
+    ),
+    "ui.images imports the shell": (
+        "ui/images.py",
+        "import tumbleweed.shell._widgets",
+        "ui.images never imports gi",
+        (),
+    ),
     "the agent imports gi": (
         "agent/responder.py",
         "import gi",
