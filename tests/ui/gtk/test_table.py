@@ -397,6 +397,101 @@ class TestBounds:
 
         assert spy.call_count <= builds + 10  # a few retries, then quiet
 
+    # --- the claim is the whole of what the table shows, whatever it showed before -----------
+
+    def honest(self, tool: "RenderedTool", widget: TableWidget) -> None:
+        """What the table claims is exactly the characters it shows (header, cells and the line
+        under them), and the tool never has more on screen than the budget."""
+        budget = tool._context.budget  # noqa: SLF001
+        shown = sum(len(cell) for row in widget.cells for cell in row)
+        shown += sum(len(name) for name in widget.column_names) + len(widget.notice)
+        if widget.rows == 0 and not widget.column_names:
+            shown = len(widget.notice)
+        assert budget.held(widget) == shown, (budget.held(widget), shown, widget.notice)
+        assert budget.total <= MAX_SHOWN_PER_TOOL
+
+    def value_costing(self, characters: int) -> Json:
+        """A one-column table (header `a`) that costs exactly `characters` to show, whole."""
+        cells = characters - 1
+        rows: list[JsonValue] = [["c" * 100] for _ in range(cells // 100)]
+        if cells % 100:
+            rows.append(["c" * (cells % 100)])
+        return {"columns": columns(("a", "string")), "rows": rows}
+
+    def cut_table_tool(self) -> "tuple[RenderedTool, TableWidget]":
+        rows: list[JsonValue] = [["c" * 100] for _ in range(1000)]
+        tool = tool_with({"columns": columns(("a", "string")), "rows": rows})
+        return tool, widget_of(tool)
+
+    @pytest.mark.parametrize("extra", [0, 10, 21, 36])
+    def test_a_cut_table_replaced_by_one_that_costs_the_room_exactly_or_more_claims_what_it_shows(
+        self, extra: int
+    ) -> None:
+        tool, widget = self.cut_table_tool()
+        assert widget.notice == MORE_ROWS  # holds the line's claim
+        room = tool._context.budget.room(widget)  # noqa: SLF001
+
+        value = self.value_costing(room + extra)
+        tool.runtime.patch_state({"t": value})
+        tool.flush()
+
+        self.honest(tool, widget)
+        if extra == 0:  # exactly the room, with no line to say: it is shown whole
+            assert widget.notice == ""
+
+    def test_an_out_of_date_table_replaced_by_a_full_one_claims_what_it_shows(self) -> None:
+        tool, widget = self.cut_table_tool()
+        widget.set_table(None, stale=True)
+        self.honest(tool, widget)
+        room = tool._context.budget.room(widget)  # noqa: SLF001
+
+        for extra in (0, 10, 30):
+            widget.set_table(Table.model_validate(self.value_costing(room + extra)), stale=False)
+            self.honest(tool, widget)
+            widget.set_table(None, stale=True)
+            self.honest(tool, widget)
+
+    def test_a_table_that_was_not_shown_for_lack_of_room_claims_what_it_shows_when_it_is(
+        self,
+    ) -> None:
+        from tumbleweed.ui.gtk.budget import MAX_SHOWN_PER_TOOL as WHOLE
+
+        tool, widget = self.cut_table_tool()
+        budget = tool._context.budget  # noqa: SLF001
+        filler = object()
+        widget.set_table(None, stale=False)
+        budget.claim(filler, WHOLE - budget.total)  # every character spent
+        for value in (
+            self.value_costing(5),
+            {"columns": columns(("a", "string")), "rows": [["x"]] * 1001},
+        ):
+            widget.set_table(Table.model_validate(value), stale=False)
+            assert widget.notice == NOT_SHOWN
+            assert widget.rows == 0  # nothing is shown that is not claimed
+            assert budget.total <= WHOLE
+        budget.claim(filler, 0)  # room appears: the waiting table is shown again
+        tool.flush()
+        tool.flush()
+
+        self.honest(tool, widget)
+        assert widget.rows > 0
+
+    def test_a_refused_claim_shows_no_rows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Fail closed: were the budget to refuse the table's claim, no rows are put on screen.
+        tool, widget = self.cut_table_tool()
+        budget = tool._context.budget  # noqa: SLF001
+        real = budget.claim
+
+        def refusing(owner: object, wanted: int, *, keep: bool = False) -> bool:
+            return False if owner is widget and wanted > 10 else real(owner, wanted, keep=keep)
+
+        monkeypatch.setattr(budget, "claim", refusing)
+        widget.set_table(Table.model_validate(PEOPLE), stale=False)
+
+        assert widget.rows == 0
+        assert widget.cells == ()
+        assert widget.notice == NOT_SHOWN
+
     def test_closing_the_tool_lets_the_table_go(self) -> None:
         tool = tool_with(PEOPLE)
         widget = widget_of(tool)

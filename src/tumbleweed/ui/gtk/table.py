@@ -7,9 +7,10 @@ other text is, and the value keeps all of it:
 - at most `MAX_SHOWN_ROWS` rows;
 - a cell shows at most `MAX_SHOWN_CELL` characters (then `CUT_MARK`) on one line (line ends become
   spaces, and a long cell is cut with an ellipsis), a column name at most `MAX_SHOWN_NAME`;
-- all the cells and names together are claimed from the tool's text budget (`budget`), so a table
-  cannot spend what the labels have: the rows that do not fit are left out, the table ends in
-  `MORE_ROWS`, and they are added when room appears.
+- all the cells and names, and the line under them (`MORE_ROWS`, `NOT_SHOWN` or the out-of-date
+  mark), are claimed from the tool's text budget in one claim under the table's own owner, so a
+  table cannot spend what the labels have: the rows that do not fit are left out, the table ends in
+  `MORE_ROWS`, and they are added when room appears. A claim that is refused shows no rows.
 
 Every cell is a `Gtk.Label` set with `set_text` (never markup), after `display_text`; a column name
 goes into the header as plain text too (the column view sets it with `gtk_label_new`, no markup, no
@@ -26,7 +27,7 @@ from tumbleweed.shell._widgets import plain_label
 from tumbleweed.shell.viewmodel.display import display_text
 from tumbleweed.ui.gtk.budget import CUT_MARK, MORE_ROWS, NOT_SHOWN
 from tumbleweed.ui.gtk.context import BuildContext
-from tumbleweed.ui.gtk.text import TextBlock
+from tumbleweed.ui.gtk.text import STALE_TEXT, TextBlock
 from tumbleweed.ui.spec.limits import MAX_TABLE_COLUMNS
 from tumbleweed.ui.spec.values import ColumnType, Table
 
@@ -87,7 +88,7 @@ class TableWidget(Gtk.Box):
         )
         self._scrolled.add_css_class("frame")
         self._scrolled.set_visible(False)
-        self._notice = TextBlock(budget=ctx.budget)
+        self._notice = TextBlock()  # (no budget of its own: the table's claim covers its line)
         self._notice.set_visible(False)
         self.append(self._scrolled)
         self.append(self._notice)
@@ -159,31 +160,28 @@ class TableWidget(Gtk.Box):
     def set_table(self, table: Table | None, *, stale: bool) -> None:
         """Show `table` (or a mark that it is out of date, or nothing for an empty one).
 
-        The claim on the budget is made once, replacing the last: letting it go first and
-        claiming again would announce room (to whoever waits) on every call, and two tables cut
-        by the budget would then rebuild each other for ever.
+        The table makes ONE claim on the budget, under its own owner, that covers its header, its
+        rows and the line under them (the line is a block with no budget of its own), computed
+        against `room` (what is left and what the table already holds) and replacing the last. So
+        nothing is counted twice, no claim is made while an older one of the same table is still
+        counted against it, and letting go first (which announces room to whoever waits, on every
+        call) is not needed: two tables cut by the budget used to rebuild each other for ever.
+        A claim that is refused is never ignored: the table then shows no rows, only the line
+        that says so, and waits for room.
         """
         self._shown = (table, stale)
         self._budget.stop_waiting(self)
         self._empty()
         if stale:
-            self._budget.claim(self, 0)
-            self._say("", stale=True)
+            self._only(STALE_TEXT, stale=True)
             return
         if table is None or not table.columns:
             self._budget.claim(self, 0)
             self._hide_notice()
             return
         names = tuple(column_name(column.name) for column in table.columns)
-        # What is left, and what the table already holds, its notice's line included (which is
-        # reserved again below if it is still needed: counted twice, a refresh would lose rows).
-        room = self._budget.room(self) + self._budget.held(self._notice)
+        room = self._budget.room(self)
         header = sum(len(name) for name in names)
-        if header > room:
-            self._budget.claim(self, 0)
-            self._say(NOT_SHOWN)
-            self._budget.wait_for_room(self, self.refresh)
-            return
         texts: list[tuple[str, ...]] = []
         costs: list[int] = []
         for row in table.rows[:MAX_SHOWN_ROWS]:
@@ -194,11 +192,15 @@ class TableWidget(Gtk.Box):
             costs.append(cost)
             texts.append(cells)
         cut = len(texts) < len(table.rows)
-        # The line that says rows are left out must itself fit: make room for it.
+        # The line that says rows are left out is part of the claim: make room for it.
         while cut and texts and header + sum(costs) + len(MORE_ROWS) > room:
             texts.pop()
             costs.pop()
-        self._budget.claim(self, header + sum(costs))  # it fits: within `room`, own claim counted
+        wanted = header + sum(costs) + (len(MORE_ROWS) if cut else 0)
+        if wanted > room or not self._budget.claim(self, wanted):
+            self._only(NOT_SHOWN)  # not even the header and the line fit: fail closed
+            self._budget.wait_for_room(self, self.refresh)
+            return
         if cut:
             self._say(MORE_ROWS)
             if len(texts) < min(len(table.rows), MAX_SHOWN_ROWS):  # cut by the budget, not the cap
@@ -206,6 +208,13 @@ class TableWidget(Gtk.Box):
         else:
             self._hide_notice()
         self._fill(table, names, texts)
+
+    def _only(self, line: str, *, stale: bool = False) -> None:
+        """Show just `line` and no rows. It is claimed if it fits; if not it is shown unclaimed,
+        as every mark of ours is (a fixed line of at most 36 characters, as `NOT_SHOWN` is)."""
+        if not self._budget.claim(self, len(line)):
+            self._budget.claim(self, 0)
+        self._say(line, stale=stale)
 
     def _fill(self, table: Table, names: tuple[str, ...], texts: list[tuple[str, ...]]) -> None:
         self._numeric = tuple(column.type in _NUMERIC for column in table.columns)
