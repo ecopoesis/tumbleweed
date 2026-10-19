@@ -99,7 +99,10 @@ def main() -> int:
     parser.add_argument(
         "--start-timeout", type=float, default=30.0, help="seconds to reach WAITING"
     )
-    parser.add_argument("--die-after", type=float, help=argparse.SUPPRESS)  # for the tests
+    # For the tests: the feeder starts late, stops, or plays a wake word (fake detectors) at a time.
+    parser.add_argument("--start-delay", type=float, default=0.0, help=argparse.SUPPRESS)
+    parser.add_argument("--die-after", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--wake-after", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--max", type=float, default=15.0, help="percent of a core that passes")
     parser.add_argument(
         "--models", help="the models directory (default: where wake-models puts it)"
@@ -171,9 +174,14 @@ def main() -> int:
         # The audio a microphone would deliver: 80 ms every 80 ms, from a pre-made second of noise.
         second = noise(args.noise_rms, 1.0, seed=1)
         step = int(CHUNK_SECONDS * BYTES_PER_SECOND)
+        time.sleep(args.start_delay)
         offset, due = 0, time.monotonic()
         began = due
+        woken = False
         while not stop.is_set() and (args.die_after is None or due - began < args.die_after):
+            if args.wake_after is not None and not woken and due - began >= args.wake_after:
+                woken = True  # what FakeWake scores as a wake word
+                fake.feed(bytes(2) + (950).to_bytes(2, "little", signed=True) + bytes(2 * 1278))
             fake.feed(second[offset : offset + step])
             offset = (offset + step) % (len(second) - step)
             due += CHUNK_SECONDS

@@ -240,3 +240,30 @@ class TestTheCpuScript:
         assert result.returncode == 2
         assert "died while measuring" in result.stderr
         assert "% of one core" not in result.stdout
+
+    def test_a_slow_start_is_waited_for_not_given_up_on(self) -> None:
+        result = self.run(
+            "--fake-models", "--seconds", "1", "--warmup", "0", "--start-delay", "1.5",
+            "--start-timeout", "10", "--max", "100",
+        )  # fmt: skip
+
+        assert result.returncode == 0, result.stderr
+        assert "% of one core" in result.stdout
+
+    def test_a_start_slower_than_the_timeout_exits_2(self) -> None:
+        result = self.run(
+            "--fake-models", "--seconds", "1", "--warmup", "0", "--start-delay", "5",
+            "--start-timeout", "1",
+        )  # fmt: skip
+
+        assert result.returncode == 2
+        assert "never reached the wake word" in result.stderr
+
+    def test_a_wake_word_during_the_measurement_is_not_idle_and_exits_2(self) -> None:
+        result = self.run(
+            "--fake-models", "--seconds", "3", "--warmup", "1", "--wake-after", "2.0",
+        )  # fmt: skip
+
+        assert result.returncode == 2
+        assert "died while measuring" in result.stderr
+        assert "% of one core" not in result.stdout
