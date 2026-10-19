@@ -734,7 +734,12 @@ Linux x86_64 and aarch64 (the test checks it from the lock, and CI's macOS job i
 onnxruntime runs on the CPU with one intra-op and one inter-op thread, logs nothing, and is imported
 only by `voice.onnx` (numpy by `voice.onnx`, `voice.vad`, `voice.wake`): import contracts, with a
 planted-import test for each, keep the untyped library behind the `OnnxModel` protocol, which is where
-its returns are narrowed to arrays of a known dtype. (4) *Models are data the machine runs, so they are
+its returns are narrowed to arrays of a known dtype. `onnxruntime` is imported when the first model
+is loaded, not with the module: on macOS it loads CoreML and other system frameworks, which cost
+start-up time the shell does not need until hands-free mode or the VAD is used, and which change how
+the system's SQLite treats a moved database (found when `tests/history/test_integrity.py` failed in a
+full run once its collection imported it); a test pins that importing the voice package does not
+load it. (4) *Models are data the machine runs, so they are
 checked like code.* They are not committed. `scripts/wake-models` fetches them over https (redirects
 https only, a size ceiling that holds even when the server announces no length, a time ceiling, a
 temporary name until the pinned SHA-256 matches); `voice.modelfile.read_verified` checks the same hashes,

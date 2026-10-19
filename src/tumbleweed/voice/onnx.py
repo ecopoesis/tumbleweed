@@ -7,6 +7,12 @@ the *bytes* of a file that `voice.modelfile.read_verified` has hashed, never fro
 Runtime is given no filename to open, and writes no file (no optimised-model path is set). It runs
 on the CPU, on one thread, so idle hands-free listening costs a fraction of a core, and it logs
 nothing.
+
+`onnxruntime` is imported when the first model is loaded, not when this module is: on macOS it
+loads CoreML and other system frameworks, which the shell has no use for until hands-free mode or
+speech detection is used, and loading them changes how the system's SQLite treats a moved
+database (`tests/history/test_integrity.py` depends on the process not having done so). So the
+shell starts as fast as before, and the chat history behaves as before, until a model is loaded.
 """
 
 import logging
@@ -14,7 +20,6 @@ from collections.abc import Mapping
 from typing import Final, Protocol, final
 
 import numpy as np
-import onnxruntime as ort  # type: ignore[import-untyped]  # ships no stubs: confined here, narrowed below
 from numpy.typing import NDArray
 
 from tumbleweed.voice.errors import ModelError
@@ -83,6 +88,8 @@ def load_model(verified: bytes) -> OnnxSession:
     """A session over the bytes of a model whose hash has been checked (`modelfile.read_verified`).
     Raises `ModelError`."""
     try:
+        import onnxruntime as ort  # type: ignore[import-untyped]  # ships no stubs; lazy, see above
+
         options = ort.SessionOptions()
         options.intra_op_num_threads = 1
         options.inter_op_num_threads = 1

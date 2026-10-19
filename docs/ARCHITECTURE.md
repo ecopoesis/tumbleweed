@@ -1375,7 +1375,8 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   worker thread and reaches the GTK main thread only through a dispatcher the shell injects (D11).
 - `onnxruntime` is imported only by `voice.onnx`, and `numpy` only by `voice.onnx`, `voice.vad` and
   `voice.wake` (D23): the rest sees the `OnnxModel` protocol, so nothing untyped leaks out of the
-  one module that narrows it.
+  one module that narrows it. `onnxruntime` is imported on the first model load, not at import
+  (a test pins it): on macOS it loads frameworks the shell does not need until then.
 - `shell.viewmodel` never imports `gi`, directly or through another module, so it cannot import
   the GTK adapter modules of `shell` either. `tests/test_import_contracts.py` plants each
   forbidden import in a copy of the tree and checks that its contract breaks.
