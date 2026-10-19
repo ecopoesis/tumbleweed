@@ -212,7 +212,9 @@ def test_no_voice_module_can_write_a_file() -> None:
                     if isinstance(function, ast.Name)
                     else (function.attr if isinstance(function, ast.Attribute) else "")
                 )
-                if called in forbidden_calls:
+                if called in forbidden_calls and not (
+                    name == "modelfile.py" and ast.unparse(node.func) == "os.open"
+                ):  # modelfile's read-only opens are pinned by their own test below
                     problems.append(f"{name}:{node.lineno}: calls {called}")
 
     # The one `open` there is: the WAV wrapper writes to an in-memory buffer.
@@ -222,7 +224,7 @@ def test_no_voice_module_can_write_a_file() -> None:
 # Piper (S07) is the one module that may import `os`: it checks the voice model's file type, kills
 # a process group and reads and writes the child's pipes. The next test pins everything it does
 # with it, so the exception cannot grow into a way to write a file.
-_ALLOWED_IMPORTS = {"piper.py": frozenset({"os"})}
+_ALLOWED_IMPORTS = {"piper.py": frozenset({"os"}), "modelfile.py": frozenset({"os"})}
 _PIPER_OS_CALLS = {"stat", "access", "killpg", "set_blocking", "read", "write"}
 
 
@@ -238,6 +240,55 @@ def test_piper_uses_os_only_for_file_types_process_groups_and_pipes() -> None:
 
     assert used <= _PIPER_OS_CALLS | {"X_OK"}
     assert {"killpg", "set_blocking"} <= used
+
+
+# `modelfile` (S08) is the other: it opens the speech-detection models, read-only, with the
+# symlink-proof walk, and reads them. The test below pins every `os` name it uses and the flags of
+# every open, so the exception cannot become a way to write a file.
+_MODELFILE_OS = {"open", "close", "fstat", "read"}
+_MODELFILE_FLAGS = {
+    "O_RDONLY",
+    "O_CLOEXEC",
+    "O_NOFOLLOW",
+    "O_NOCTTY",
+    "O_DIRECTORY",
+    "O_NONBLOCK",
+}
+
+
+def test_modelfile_opens_files_read_only_and_nothing_else() -> None:
+    tree = _sources()["modelfile.py"]
+    used = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "os"
+    }
+    opens = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "os.open"
+    ]
+
+    assert used <= _MODELFILE_OS | _MODELFILE_FLAGS
+    assert {name for name in used if name.startswith("O_")} == _MODELFILE_FLAGS
+    assert len(opens) == 3
+    assert sorted(ast.unparse(call.args[1]) for call in opens) == [
+        "_DIRECTORY",
+        "_DIRECTORY",
+        "_FILE",
+    ]
+    flags = {
+        node.target.id: ast.unparse(node.value)
+        for node in tree.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.value is not None
+    }
+    assert flags["_COMMON"] == "os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NOCTTY"
+    assert flags["_DIRECTORY"] == "_COMMON | os.O_DIRECTORY"
+    assert flags["_FILE"] == "_COMMON | os.O_NONBLOCK"
 
 
 def _wave_open_line() -> int:

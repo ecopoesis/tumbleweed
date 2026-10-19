@@ -23,15 +23,30 @@
     synthesis_timeout_seconds = 20          # per sentence (up to 120)
     max_audio_seconds = 60                  # most audio one sentence may become (up to 300)
 
+    [voice.vad]                             # speech detection (S08); off until models_dir is set
+    models_dir = "/home/me/.local/share/tumbleweed/wake"    # where scripts/wake-models put them
+    threshold = 0.5                         # speech probability at or above which audio is speech
+    end_silence_ms = 800                    # this much silence after speech ends a hands-free turn
+    min_speech_ms = 128                     # less than this of speech is noise, not speech
+    wait_for_speech_seconds = 6             # a turn that hears no speech this long is given up
+
+    [voice.wake]                            # the wake word (S08): hands-free mode
+    enabled = true
+    models_dir = "/home/me/.local/share/tumbleweed/wake"    # defaults to [voice.vad]'s
+    model = "hey_jarvis"                    # "alexa", "hey_jarvis" or "hey_mycroft"
+    threshold = 0.5                         # score at which the wake word is heard
+    speaking_threshold = 0.9                # the stricter score while a reply is being spoken
+    speaking_holdoff_ms = 500               # ... and for this long after it ends
+
 It holds no secret. The URL is validated here (`SttEndpoint`: http or https, no credentials, query
 or fragment), and so is the shape of the two paths of `[voice.tts]` (absolute, no control
 characters; the files are checked when the voice is built, `voice.piper`), so that a bad one is
 refused when the file is read, with a message that does not repeat it.
 """
 
-from typing import Final, Literal, final
+from typing import Final, Literal, Self, final
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.types import ByteCount
@@ -85,6 +100,60 @@ class TtsConfig(BaseModel):
         return ByteCount(self.sample_rate_hz * BYTES_PER_SAMPLE * self.max_audio_seconds)
 
 
+WakeModelName = Literal["alexa", "hey_jarvis", "hey_mycroft"]
+"""The wake words there is a pinned, hash-checked model for (`voice.models`): a closed set, so a
+configured name can never name a file."""
+
+
+@final
+class VadConfig(BaseModel):
+    """The `[voice.vad]` table: Silero speech detection, which ends a hands-free turn by itself and
+    trims push-to-talk recordings (S08, D23)."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    models_dir: str | None = None
+    threshold: float = Field(default=0.5, ge=0.1, le=0.95)
+    end_silence_ms: int = Field(default=800, ge=200, le=3000)
+    min_speech_ms: int = Field(default=128, ge=32, le=1000)
+    wait_for_speech_seconds: int = Field(default=6, ge=1, le=30)
+
+    @field_validator("models_dir")
+    @classmethod
+    def _dir_is_absolute(cls, value: str | None) -> str | None:
+        if value is not None and not _is_absolute_path_text(value):
+            raise ValueError("must be an absolute path with no control characters")
+        return value
+
+
+@final
+class WakeConfig(BaseModel):
+    """The `[voice.wake]` table: which wake word, how sure the model must be, and how much stricter
+    that is while the assistant speaks (its own voice, heard back, must not wake it)."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
+
+    enabled: bool = True
+    models_dir: str | None = None
+    model: WakeModelName = "hey_jarvis"
+    threshold: float = Field(default=0.5, ge=0.1, le=0.99)
+    speaking_threshold: float = Field(default=0.9, ge=0.1, le=1.0)
+    speaking_holdoff_ms: int = Field(default=500, ge=0, le=3000)
+
+    @field_validator("models_dir")
+    @classmethod
+    def _dir_is_absolute(cls, value: str | None) -> str | None:
+        if value is not None and not _is_absolute_path_text(value):
+            raise ValueError("must be an absolute path with no control characters")
+        return value
+
+    @model_validator(mode="after")
+    def _speaking_is_not_looser(self) -> Self:
+        if self.speaking_threshold < self.threshold:
+            raise ValueError("speaking_threshold must not be below threshold")
+        return self
+
+
 @final
 class VoiceConfig(BaseModel):
     """The `[voice]` table."""
@@ -100,6 +169,12 @@ class VoiceConfig(BaseModel):
     tts_problem: Literal["invalid"] | None = None
     """Set by the loader (`agent.config`) when `[voice.tts]` was invalid: speech is then off and the
     factory tells the user in fixed text. Not a file setting."""
+    vad: VadConfig = VadConfig()
+    wake: WakeConfig = WakeConfig()
+    hands_free_problem: Literal["invalid"] | None = None
+    """Set by the loader when `[voice.vad]` or `[voice.wake]` was invalid: hands-free mode and the
+    trimming of push-to-talk recordings are then off, and the factory tells the user in fixed text.
+    Push-to-talk and speech stay. Not a file setting."""
 
     @field_validator("stt_url")
     @classmethod
@@ -120,3 +195,8 @@ class VoiceConfig(BaseModel):
     @property
     def endpoint(self) -> SttEndpoint:
         return SttEndpoint(self.stt_url)
+
+    @property
+    def wake_models_dir(self) -> str | None:
+        """Where the wake-word models are: `[voice.wake]`'s own directory, else `[voice.vad]`'s."""
+        return self.wake.models_dir or self.vad.models_dir

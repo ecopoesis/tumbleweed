@@ -6,6 +6,10 @@ callback to the HTTP request, and nothing in this package opens a file or builds
 (`tests/voice/test_no_audio_on_disk.py` proves it, by running a whole utterance under an audit
 hook that refuses writes, and by scanning the sources).
 
+Hands-free mode (S08) captures continuously through an `AudioStream`: audio is handed to the
+inference thread chunk by chunk and kept only in the mailbox and utterance buffers of
+`voice.hands_free` and `voice.engine`, each with a fixed cap.
+
 Every size is bounded where the bytes arrive. `BoundedPcm` takes at most `max_bytes` in total and
 drops the rest, so a source that keeps delivering after the limit (a live microphone does, until it
 is stopped) cannot grow memory, whatever the thread that stops it is doing.
@@ -114,4 +118,22 @@ class AudioSource(Protocol):
 
     def close(self) -> None:
         """Release the device. Never raises."""
+        ...
+
+
+class AudioStream(Protocol):
+    """A continuous capture, for hands-free mode (S08): audio is delivered as it arrives, never
+    kept (`AudioSource` keeps one utterance; this keeps nothing). Its methods block, for a bounded
+    time, and are called from one worker thread, never the GTK main thread.
+
+    Implementations: `GStreamerAudioStream` (`voice.gstreamer`) and `FakeAudioStream`.
+    """
+
+    def start(self, on_audio: Callable[[bytes], None]) -> None:
+        """Open the microphone. `on_audio(chunk)` is then called from any thread, with whole
+        16 kHz mono S16LE samples, and must return at once. Raises `AudioError`."""
+        ...
+
+    def stop(self) -> None:
+        """Close the microphone. When it returns `on_audio` is not called again. Never raises."""
         ...

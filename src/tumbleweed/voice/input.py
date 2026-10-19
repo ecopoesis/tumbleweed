@@ -16,6 +16,13 @@ belongs to; `cancel` (and the next `press`) bump the generation, so a late resul
 that was abandoned is dropped instead of reaching the chat. Every wait on a worker is bounded by
 the source's and the backend's own timeouts; a daemon worker never keeps the process from exiting.
 
+Speech detection (S08, #103). With a `SpeechTrimmer` (Silero VAD, when `[voice.vad]` is set up) the
+speech worker cuts the silence off a recording before sending it, and sends nothing, saying
+`NO_SPEECH`, when it holds no speech: Whisper writes words for silence. Without one (or if it
+fails: that is logged, and the recording is sent as it is) nothing changes from S06. Hands-free mode
+(`voice.hands_free`) records the utterance itself, endpointed and already trimmed, and hands it to
+`transcribe_utterance`: the same phase, the same worker, the same checks, the same transcript.
+
 A recording ends by itself at the byte cap of `VoiceLimits.max_utterance_seconds` (the source calls
 `on_full`; the user is told, and what was recorded is transcribed), so a key release that never
 arrives (focus lost, a stuck key) cannot record forever or grow memory without bound. Audio is
@@ -48,6 +55,16 @@ class VoicePhase(enum.StrEnum):
     IDLE = "idle"
     LISTENING = "listening"
     TRANSCRIBING = "transcribing"
+
+
+class SpeechTrimmer(Protocol):
+    """Finds the speech in a recording (`voice.vad.VadTrimmer`). Blocks, for a time bounded by the
+    recording's length, on the speech worker, never the main thread."""
+
+    def trim(self, utterance: Utterance, abort: AbortSignal) -> Utterance | None:
+        """`utterance` without the silence around its speech, or None if it holds none. Raises
+        `SttCancelledError` once `abort` is set, and `VoiceError` if the detector fails."""
+        ...
 
 
 class MainThreadDispatcher(Protocol):
@@ -84,9 +101,11 @@ class VoiceInput:
         stt: SttBackend,
         dispatcher: MainThreadDispatcher,
         limits: VoiceLimits,
+        trimmer: SpeechTrimmer | None = None,
     ) -> None:
         self._audio_factory = audio
         self._stt = stt
+        self._trimmer = trimmer
         self._dispatcher = dispatcher
         self._limits = limits
         self._main_thread = threading.get_ident()
@@ -126,6 +145,25 @@ class VoiceInput:
         self._abort = AbortSignal()
         self._set_phase(VoicePhase.LISTENING)
         self._audio_worker.submit(lambda: self._start_capture(generation))
+
+    def transcribe_utterance(self, utterance: Utterance) -> bool:
+        """Transcribe audio that was recorded elsewhere: hands-free mode's endpointed, already
+        trimmed utterance. Enters TRANSCRIBING and returns True; ignored (False) unless idle."""
+        self._require_main_thread()
+        if self._closed or self._phase is not VoicePhase.IDLE:
+            return False
+        self._generation += 1
+        generation = self._generation
+        self._abort = AbortSignal()
+        abort = self._abort
+        self._set_phase(VoicePhase.TRANSCRIBING)
+        if utterance.byte_count < self._limits.min_utterance_bytes:
+            self._finish_later(generation, message=NO_SPEECH)
+        else:
+            self._speech_worker.submit(
+                lambda: self._transcribe(generation, utterance, abort, trim=False)
+            )
+        return True
 
     def release(self) -> None:
         """Stop listening and transcribe what was heard. Ignored unless listening."""
@@ -207,9 +245,24 @@ class VoiceInput:
 
     # Speech worker
 
-    def _transcribe(self, generation: int, utterance: Utterance, abort: AbortSignal) -> None:
+    def _transcribe(
+        self, generation: int, utterance: Utterance, abort: AbortSignal, *, trim: bool = True
+    ) -> None:
         if generation != self._generation or abort.is_set:
             return  # abandoned while it waited: do not send audio nobody wants
+        if trim and self._trimmer is not None:
+            try:
+                trimmed = self._trimmer.trim(utterance, abort)
+            except SttCancelledError:
+                return  # abandoned: nobody is waiting for the result
+            except Exception:
+                # Not fatal: without speech detection this is S06's push-to-talk.
+                logger.exception("speech detection failed; sending the recording as it is")
+                trimmed = utterance
+            if trimmed is None:
+                self._finish_later(generation, message=NO_SPEECH)
+                return
+            utterance = trimmed
         try:
             text = clean_transcript(
                 self._stt.transcribe(utterance, abort), max_bytes=MAX_TRANSCRIPT_BYTES

@@ -274,6 +274,30 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         "voice outside its GStreamer adapter and factory never imports the adapter",
         (),
     ),
+    "the hands-free machine imports onnxruntime": (
+        "voice/hands_free.py",
+        "import onnxruntime",
+        "onnxruntime is imported only by tumbleweed.voice.onnx",
+        (),
+    ),
+    "the shell imports onnxruntime": (
+        "shell/chrome.py",
+        "import onnxruntime",
+        "onnxruntime is imported only by tumbleweed.voice.onnx",
+        (),
+    ),
+    "the engine imports numpy": (
+        "voice/engine.py",
+        "import numpy",
+        "numpy is imported only by the speech-detection modules",
+        (),
+    ),
+    "the agent imports numpy": (
+        "agent/echo.py",
+        "import numpy",
+        "numpy is imported only by the speech-detection modules",
+        (),
+    ),
 }
 
 

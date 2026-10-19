@@ -1,5 +1,6 @@
 """Fakes of the voice protocols, for tests and for trying the shell without a microphone, a speech
-server, Piper or a speaker: `FakeAudioSource`, `FakeStt`, `FakeTts` and `FakeAudioPlayer`. They
+server, Piper or a speaker: `FakeAudioSource`, `FakeStt`, `FakeTts`, `FakeAudioPlayer`, and for
+hands-free mode `FakeAudioStream`, `FakeWake` and `FakeVad`. They
 behave like the real thing (bounded buffer, scripted answers, errors, a gate to hold a call open,
 giving up at once when aborted) rather than mocking it.
 """
@@ -227,3 +228,98 @@ class FakeAudioPlayer:
 
     def close(self) -> None:
         self.closed = True
+
+
+@final
+class FakeAudioStream:
+    """An `AudioStream` a test `feed`s, as a capture thread would. `start_error` is raised by
+    `start`; `gate`, if given, makes `start` and `stop` wait for it (with a deadline) to play a slow
+    device. `capturing` is True from a successful `start` to the end of `stop`, which is when the
+    microphone is really open; `on_state`, if given, is called (on the calling thread) just after
+    capture begins and just before it ends, with True and False."""
+
+    def __init__(
+        self,
+        *,
+        start_error: AudioError | None = None,
+        gate: threading.Event | None = None,
+        on_state: Callable[[bool], None] | None = None,
+    ) -> None:
+        self.start_error = start_error
+        self._gate = gate
+        self._on_state = on_state
+        self._on_audio: Callable[[bytes], None] | None = None
+        self.capturing = False
+        self.starts = 0
+        self.stops = 0
+        self._lock = threading.Lock()
+
+    def start(self, on_audio: Callable[[bytes], None]) -> None:
+        if self._gate is not None:
+            self._gate.wait(timeout=10)
+        if self.start_error is not None:
+            raise self.start_error
+        with self._lock:
+            self._on_audio = on_audio
+            self.capturing = True
+            self.starts += 1
+        if self._on_state is not None:
+            self._on_state(True)
+
+    def feed(self, chunk: bytes) -> None:
+        """Deliver samples, if the microphone is open (as a device would)."""
+        with self._lock:
+            deliver = self._on_audio if self.capturing else None
+        if deliver is not None:
+            deliver(chunk)
+
+    def stop(self) -> None:
+        if self._gate is not None:
+            self._gate.wait(timeout=10)
+        if self._on_state is not None and self.capturing:
+            self._on_state(False)
+        with self._lock:
+            self.capturing = False
+            self._on_audio = None
+            self.stops += 1
+
+
+@final
+class FakeWake:
+    """A `WakeDetector` whose score for a chunk is read from the chunk itself, so a test makes a
+    wake word by building audio: the score is the chunk's first sample divided by 1000 (a chunk
+    that starts with 800 scores 0.8; silence scores 0). `resets` counts `reset` calls."""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.chunks = 0
+        self.resets = 0
+
+    def score(self, chunk: bytes) -> float:
+        if self.error is not None:
+            raise self.error
+        self.chunks += 1
+        return int.from_bytes(chunk[:2], "little", signed=True) / 1000
+
+    def reset(self) -> None:
+        self.resets += 1
+
+
+@final
+class FakeVad:
+    """A `VoiceActivity` whose probability for a window is read from the window itself: the first
+    sample divided by 1000 (a window that starts with 900 is 0.9 speech; silence is 0)."""
+
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.windows = 0
+        self.resets = 0
+
+    def probability(self, window: bytes) -> float:
+        if self.error is not None:
+            raise self.error
+        self.windows += 1
+        return int.from_bytes(window[:2], "little", signed=True) / 1000
+
+    def reset(self) -> None:
+        self.resets += 1

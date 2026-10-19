@@ -29,6 +29,13 @@ dependencies = [
     # approximate and let drift. A C extension with wheels for every platform we lock; stdlib has
     # no equivalent. See DECISIONS D10.
     "regex>=2026.9.29",
+    # Hands-free voice (S08, D23): Silero VAD and openWakeWord's three models run directly on
+    # onnxruntime (the `openwakeword` package needs tflite-runtime on Linux, which has no Python
+    # 3.12+ wheels: #42). Both have wheels for cp312 to cp314 on every platform we lock (a test in
+    # tests/test_lock.py checks it), run on the CPU on one thread, and are imported by three voice
+    # modules only (import contracts below). numpy is onnxruntime's own input type.
+    "numpy>=2.5.4",
+    "onnxruntime>=1.31.0",
 ]
 
 [project.scripts]
@@ -420,15 +427,23 @@ source_modules = [
     "tumbleweed.voice.budget",
     "tumbleweed.voice.config",
     "tumbleweed.voice.endpoint",
+    "tumbleweed.voice.engine",
     "tumbleweed.voice.errors",
     "tumbleweed.voice.fake",
+    "tumbleweed.voice.hands_free",
     "tumbleweed.voice.input",
     "tumbleweed.voice.limits",
+    "tumbleweed.voice.modelfile",
+    "tumbleweed.voice.models",
+    "tumbleweed.voice.onnx",
     "tumbleweed.voice.output",
     "tumbleweed.voice.piper",
     "tumbleweed.voice.speakable",
+    "tumbleweed.voice.store",
     "tumbleweed.voice.stt",
     "tumbleweed.voice.tts",
+    "tumbleweed.voice.vad",
+    "tumbleweed.voice.wake",
     "tumbleweed.voice.whisper",
     "tumbleweed.voice.worker",
 ]
@@ -452,4 +467,27 @@ forbidden_modules = ["tumbleweed.agent"]
 ignore_imports = [
     "tumbleweed.voice.factory -> tumbleweed.agent.config",
     "tumbleweed.voice.factory -> tumbleweed.agent.errors",
+]
+
+# Hands-free (S08, D23): the model runtime and its array type stay in the modules that need them,
+# so the rest of the code never sees an untyped onnxruntime object. Direct imports only: anything
+# may use `voice.onnx` and its `OnnxModel` protocol, which is the point.
+[[tool.importlinter.contracts]]
+name = "onnxruntime is imported only by tumbleweed.voice.onnx (S08)"
+type = "forbidden"
+source_modules = ["tumbleweed"]
+forbidden_modules = ["onnxruntime"]
+allow_indirect_imports = true
+ignore_imports = ["tumbleweed.voice.onnx -> onnxruntime"]
+
+[[tool.importlinter.contracts]]
+name = "numpy is imported only by the speech-detection modules: voice.onnx, voice.vad and voice.wake (S08)"
+type = "forbidden"
+source_modules = ["tumbleweed"]
+forbidden_modules = ["numpy"]
+allow_indirect_imports = true
+ignore_imports = [
+    "tumbleweed.voice.onnx -> numpy",
+    "tumbleweed.voice.vad -> numpy",
+    "tumbleweed.voice.wake -> numpy",
 ]

@@ -51,3 +51,7 @@ class PlaybackError(VoiceError):
 
 class WrongThreadError(VoiceError):
     """A `VoiceInput` method that belongs to the main thread was called from another one."""
+
+
+class ModelError(VoiceError):
+    """A speech-detection model file is missing, is not what it must be, or cannot be loaded."""
