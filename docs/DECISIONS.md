@@ -791,7 +791,12 @@ score). Reply text is also cleaned of the phrase as written: before synthesis th
 replaced by "the wake word", in any case, with any punctuation between its words or letters, with
 accents and full-width forms folded, as whole words, and across the end of a sentence (the first
 sentence is already on its way, so what the phrase takes from the second is dropped; this assumes
-phrases of at most two words). Respellings that fool the pattern (a look-alike letter of another
+phrases of at most two words). Folding is used only to *find* the phrase, character by character with
+a map back to where each folded character came from; only the phrase's own span of the original text
+is replaced, so the reply is otherwise spoken exactly as it was (`10²`, `schön`, `й`, kana with
+dakuten, Devanagari, `½` and U+FDFA all unchanged: a test each), and a scrubbed sentence is cut to
+`max_sentence_chars`, which keeps Piper's stdin bounded. The pattern also catches ordinary text that
+sounds like the phrase said slowly ("Alex a" for "alexa"): defensible, and pinned by a test. Respellings that fool the pattern (a look-alike letter of another
 script, say) can pass, so this is a mitigation and not a guarantee: `speaking_threshold = 1`, or
 headphones, are the control. This amends
 D22 (5), which left echo uncancelled for S08 (D22 itself is as S07 left it). The microphone stays open
@@ -826,7 +831,8 @@ anything (I10): prompts take keyboard and pointer input only, and a test checks 
 thread, engine, the real models, 80 ms chunks paced in real time) and prints the share of one core.
 On an Apple M3 Max, without the capture (GStreamer is not installed on the development Mac), in a
 quiet room (noise RMS 50) it measured **0.56%** of a core, and with sound the models cannot skip (noise
-RMS 400) **10.3%** (target 15%); idle is the wake word only, since VAD runs only in a turn. The 10.3%
+RMS 400) **10.3%** (target 15%; re-measured with the script as completed in round 2, which waits for
+WAITING and exits 2 for a dead pipeline: 0.53% and 9.86%); idle is the wake word only, since VAD runs only in a turn. The 10.3%
 is not the cost of the models, which take 1.3 ms of CPU per 80 ms chunk in a tight loop (1.6%), but of
 waking a core every 80 ms: a core that wakes that often runs slower than one in a loop (measured: 7.9 ms
 a tick when paced, and batching two to five chunks per wake only brought it to 9.5% to 7.5%). So the

@@ -267,3 +267,12 @@ class TestTheCpuScript:
         assert result.returncode == 2
         assert "died while measuring" in result.stderr
         assert "% of one core" not in result.stdout
+
+    def test_a_wake_word_just_before_the_end_is_caught_by_the_phase_alone(self) -> None:
+        """Too few chunks missed to matter: only noticing that it is no longer waiting says so."""
+        result = self.run(
+            "--fake-models", "--seconds", "4", "--warmup", "1", "--wake-after", "4.5",
+        )  # fmt: skip
+
+        assert result.returncode == 2
+        assert "died while measuring" in result.stderr

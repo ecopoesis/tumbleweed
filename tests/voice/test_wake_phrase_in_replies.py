@@ -162,3 +162,19 @@ def test_ordinary_text_that_sounds_like_the_phrase_is_also_replaced() -> None:
     sentences = speak("Please ask Alex a question about it today.", avoid=("alexa",))
 
     assert SILENCED_PHRASE in " ".join(sentences)
+
+
+def test_the_cut_across_a_sentence_end_counts_original_characters_not_folded_ones() -> None:
+    # "\ufb00" (a ligature) is one character that folds to two: the cut must be in the original,
+    # or it would eat the "2" that follows the phrase
+    sentences = speak(
+        "Sure thing, hey. Je\ufb002 apples are all we have left.", avoid=("hey_jeff",)
+    )
+
+    assert sentences[1] == "2 apples are all we have left."
+
+
+def test_a_combining_mark_on_the_last_letter_of_the_phrase_goes_with_it() -> None:
+    sentences = speak("Hey Jarviś now, please.", avoid=("hey_jarvis",))
+
+    assert " ".join(sentences) == f"{SILENCED_PHRASE} now, please."

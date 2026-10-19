@@ -705,8 +705,9 @@ The turn is handed to `VoiceInput.transcribe_utterance`: the same speech worker,
   contains the wake word, can pass (1); headphones, or `speaking_threshold = 1` (which accepts no
   wake word at all while speaking), close it; and (5) before synthesis the wake phrase is replaced in
   reply text by "the wake word" (any case, any punctuation between the words or letters, accents and
-  full-width forms folded, whole words, and across the end of a sentence). That is a mitigation, not a
-  guarantee: a respelling that fools the pattern (a look-alike letter of another script) can pass, and
+  full-width forms folded, whole words, and across the end of a sentence). Folding is only to find the
+  phrase: the reply is spoken as it was except for the phrase's own span, and a scrubbed sentence is cut
+  to `max_sentence_chars`. That is a mitigation, not a guarantee: a respelling that fools the pattern (a look-alike letter of another script) can pass, and
   `speaking_threshold = 1`, or headphones, are the control.
 - *Focus and a dead capture.* A hands-free turn never moves the keyboard focus (any sound can start one;
   a password typed into the terminal must not land in the chat): the dictation is put in the input,

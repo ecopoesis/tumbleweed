@@ -445,8 +445,9 @@ waits has a timeout. The wake word and VAD run on an inference thread, never the
 acoustically: while a reply is spoken, and for half a second after, the wake word needs
 `speaking_threshold` instead of `threshold`, and nothing is transcribed except after a wake word. A loud
 enough speaker, or a reply that says the wake word, can still get through that: use headphones, or
-`speaking_threshold = 1` (no wake word is accepted while a reply is spoken). The wake phrase is also
-removed from the reply text before it is spoken. Hands-free never moves the keyboard focus, so a
+`speaking_threshold = 1` (no wake word is accepted while a reply is spoken). The wake phrase, as
+written (a respelling can pass), is also removed from the reply text before it is spoken; the rest of
+the reply is spoken exactly as it was. Hands-free never moves the keyboard focus, so a
 turn started by a sound cannot take what you are typing in the terminal. Anyone or anything that says the wake word near the microphone (a video, a
 person) starts a turn, and what it says is sent as your message (so with `edit_before_send = true` it
 waits for you); it still cannot approve anything: prompts take the keyboard and pointer only (I10).
