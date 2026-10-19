@@ -461,7 +461,7 @@ class TestGivingUp:
         waiting = engine()
         waiting.feed(chunk(900))
 
-        assert waiting.give_up() == [TurnEnded(GENERATION, EndReason.NO_SPEECH, None)]
+        assert waiting.give_up() == [TurnEnded(GENERATION, EndReason.TIMED_OUT, None)]
 
     def test_it_is_nothing_unless_listening(self) -> None:
         assert engine().give_up() == []

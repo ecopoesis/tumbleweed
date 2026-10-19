@@ -1297,7 +1297,9 @@ class TestADeadCapture:
         rig.stream.feed(chunk(0))  # keeps the capture itself alive for this test
 
         assert rig.until(lambda: rig.hf.phase is HandsFreePhase.WAITING)
-        assert rig.hands.problems[-1] == NOTHING_AFTER_WAKE
+        assert (
+            rig.hands.problems[-1] == "Stopped listening: the microphone stopped delivering audio."
+        )
         rig.speech.begin_reply()
         rig.speech.feed("The next reply is spoken, the turn being over. ")
         rig.speech.end_reply()

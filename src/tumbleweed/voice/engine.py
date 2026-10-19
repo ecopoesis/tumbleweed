@@ -228,7 +228,7 @@ class HandsFreeEngine:
             reason = EndReason.AUDIO_LOST
         elif self._endpointer is not None and reason is not EndReason.NO_SPEECH:
             pcm = speech_slice(bytes(self._utterance), self._endpointer.tracker)
-        if pcm is None and reason is not EndReason.AUDIO_LOST:
+        if pcm is None and reason not in (EndReason.AUDIO_LOST, EndReason.TIMED_OUT):
             reason = EndReason.NO_SPEECH
         self._mode = EngineMode.PAUSED
         self._clear()

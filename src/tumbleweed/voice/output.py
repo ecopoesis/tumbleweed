@@ -92,15 +92,32 @@ def _phrase_pattern(phrases: tuple[str, ...]) -> "re.Pattern[str] | None":
     return re.compile(r"(?<![^\W\d_])(?:" + "|".join(forms) + r")(?![^\W\d_])", re.IGNORECASE)
 
 
-def _fold(text: str) -> str:
-    """`text` with compatibility forms folded (full-width letters, ligatures) and combining marks
-    dropped, so that an accented or full-width spelling of the phrase is the phrase to the pattern.
-    A look-alike letter of another script is not folded: that can pass, and the speaking threshold,
+def _fold(text: str) -> tuple[str, list[int]]:
+    """`text` as the pattern looks at it, and for each character of that, where it came from.
+
+    Each character is folded on its own (compatibility forms such as full-width letters, then its
+    combining marks dropped), so that an accented or full-width spelling of the phrase is the
+    phrase to the pattern. The folded text is *only* for finding the phrase: what is spoken is
+    always `text`, with the phrase's own span replaced and every other character as it was. A
+    look-alike letter of another script is not folded: that can pass, and the speaking threshold,
     or headphones, are the control for it."""
-    decomposed = unicodedata.normalize("NFKD", text)
-    return unicodedata.normalize(
-        "NFC", "".join(c for c in decomposed if not unicodedata.combining(c))
-    )
+    folded: list[str] = []
+    origin: list[int] = []
+    for index, character in enumerate(text):
+        for part in unicodedata.normalize("NFKD", character):
+            if not unicodedata.combining(part):
+                folded.append(part)
+                origin.append(index)
+    return "".join(folded), origin
+
+
+def _original_end(text: str, origin: list[int], folded_end: int) -> int:
+    """Where in `text` a match that ends before `folded_end` in the folded text ends: after the
+    character it ends in and the combining marks that belong to it."""
+    end = origin[folded_end - 1] + 1
+    while end < len(text) and unicodedata.combining(text[end]):
+        end += 1
+    return end
 
 
 @final
@@ -249,18 +266,35 @@ class SpeechOutput:
                 break
 
     def _scrub(self, sentence: str, pattern: "re.Pattern[str]") -> str:
-        """`sentence` without the wake phrase, also where the phrase would be said across the end
-        of the sentence before it: that sentence is already on its way, so what the phrase takes
-        from this one is dropped, and the two are never the phrase in a row."""
-        sentence = _fold(sentence)
-        previous, self._previous = self._previous, sentence
+        """`sentence` with the wake phrase replaced and nothing else changed (not one character of
+        it, if the phrase is not there), also where the phrase would be said across the end of the
+        sentence before it: that sentence is already on its way, so what the phrase takes from
+        this one is dropped, and the two are never the phrase in a row.
+
+        The phrase is looked for in a folded copy and cut out of the original, by the position
+        each folded character came from. The result is at most `max_sentence_chars` long (the
+        replacement is longer than a short phrase), which keeps Piper's stdin bounded."""
+        folded, origin = _fold(sentence)
         # The reach across a sentence end assumes phrases of at most two words ("hey jarvis"): a
         # match that straddles the boundary loses only its second part to this sentence.
-        found = pattern.search(f"{previous} {sentence}")
-        if found is not None and found.start() < len(previous) + 1 < found.end():
-            sentence = sentence[found.end() - len(previous) - 1 :].lstrip(" ,.;:!?-")
-        scrubbed = pattern.sub(SILENCED_PHRASE, sentence)
-        self._previous = scrubbed
+        found = pattern.search(f"{self._previous} {folded}")
+        if found is not None and found.start() < len(self._previous) + 1 < found.end():
+            cut = _original_end(sentence, origin, found.end() - len(self._previous) - 1)
+            sentence = sentence[cut:].lstrip(" ,.;:!?-")
+            folded, origin = _fold(sentence)
+        pieces: list[str] = []
+        taken = 0
+        for match in pattern.finditer(folded):
+            if match.end() == match.start():
+                continue
+            pieces.append(sentence[taken : origin[match.start()]])
+            pieces.append(SILENCED_PHRASE)
+            taken = _original_end(sentence, origin, match.end())
+        scrubbed = "".join(pieces) + sentence[taken:] if pieces else sentence
+        limit = self._config.max_sentence_chars
+        if len(scrubbed) > limit:
+            scrubbed = scrubbed[:limit].rsplit(" ", 1)[0] or scrubbed[:limit]
+        self._previous = _fold(scrubbed)[0]
         return scrubbed
 
     def _cap_reached(self) -> None:

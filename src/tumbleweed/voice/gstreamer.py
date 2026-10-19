@@ -318,6 +318,13 @@ class GStreamerAudioStream:
             self.stop()
             raise AudioError(_OPEN_FAILED)
         armed.set()
+        # A message posted after the state change returned but before the handler was armed was
+        # passed to the bus (unarmed handlers pass): look once, so it is not lost.
+        late = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
+        if late is not None:
+            if late.type == Gst.MessageType.ERROR:
+                _log_bus_error(pipeline, late)
+            on_error(_STOPPED)
 
     def stop(self) -> None:
         """Setting the pipeline to NULL joins the streaming thread, so `on_audio` is not called

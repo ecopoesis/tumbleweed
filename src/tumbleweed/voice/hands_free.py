@@ -559,7 +559,10 @@ class HandsFree:
         utterance = self._utterance(event.pcm)
         if utterance is None:
             self._restart()
-            message = AUDIO_LOST if event.reason is EndReason.AUDIO_LOST else NOTHING_AFTER_WAKE
+            message = {
+                EndReason.AUDIO_LOST: AUDIO_LOST,
+                EndReason.TIMED_OUT: TIMED_OUT,
+            }.get(event.reason, NOTHING_AFTER_WAKE)
             self._notify(lambda observer: observer.problem(message))
             return
         if event.reason is EndReason.MAX_LENGTH:

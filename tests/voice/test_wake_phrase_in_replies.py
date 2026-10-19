@@ -104,3 +104,61 @@ def test_a_look_alike_letter_of_another_script_is_not_folded_and_can_pass() -> N
     sentences = speak("Sure thing, hey J\u0430rvis is what you say to me.", avoid=("hey_jarvis",))
 
     assert SILENCED_PHRASE not in " ".join(sentences)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The area is 10² = 100 square metres here.",
+        "Müller ist schön und wohnt hier schon lange.",
+        "Привет, й is a letter we speak.",
+        "ありがとう、がぎぐ を言いました。",
+        "नमस्ते हिन्दी भाषा है yes.",
+        "We went to the café near the old station today.",
+        "Add ½ cup of sugar and ™ marks the brand.",
+        "Look: " + "ﷺ" * 30 + " is an ordinary run of text.",
+    ],
+)
+def test_text_without_the_phrase_is_spoken_exactly_as_it_was(text: str) -> None:
+    """The scrub must not change normal output: folding is only for finding the phrase."""
+    sentences = speak(text, avoid=("hey_jarvis",))
+
+    assert " ".join(sentences) == text
+
+
+def test_the_phrase_is_cut_from_the_original_and_what_is_around_it_is_kept() -> None:
+    sentences = speak("Café. Hey Jarvís, schön und gut.", avoid=("hey_jarvis",))
+
+    assert " ".join(sentences) == f"Café. {SILENCED_PHRASE}, schön und gut."
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Ｈｅｙ Ｊａｒｖíｓ now, please.", "Hey, Jar-vis now, please."],  # noqa: RUF001  (the point)
+)
+def test_accented_and_full_width_spellings_are_still_the_phrase(text: str) -> None:
+    sentences = speak(text, avoid=("hey_jarvis",))
+
+    assert " ".join(sentences) == f"{SILENCED_PHRASE} now, please."
+
+
+def test_a_phrase_across_a_sentence_end_with_accents_is_still_handled() -> None:
+    sentences = speak("Sure thing, héy. Jàrvis is the one you ask.", avoid=("hey_jarvis",))
+
+    assert sentences[0] == "Sure thing, héy."  # untouched, and already on its way
+    assert "rvis" not in sentences[1]
+    assert sentences[1].startswith("is the one")
+
+
+def test_the_scrubbed_sentence_never_exceeds_the_sentence_bound() -> None:
+    sentences = speak("alexa " * 60, avoid=("alexa",))  # 5 letters become 13: it would triple
+
+    assert all(len(sentence) <= 400 for sentence in sentences)
+    assert sentences
+
+
+def test_ordinary_text_that_sounds_like_the_phrase_is_also_replaced() -> None:
+    """Defensible and pinned: letters apart from each other are the phrase said slowly."""
+    sentences = speak("Please ask Alex a question about it today.", avoid=("alexa",))
+
+    assert SILENCED_PHRASE in " ".join(sentences)
