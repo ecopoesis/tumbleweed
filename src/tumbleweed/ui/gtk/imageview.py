@@ -350,6 +350,7 @@ class ImageView(Gtk.Box):
         of the pixel budget: this view keeps it if it shows the image, else it is given back."""
         self._inflight = False
         if self.closed:
+            self._pixels.release(token)
             return
         if generation != self._generation or isinstance(outcome, ImageError):
             self._pixels.release(token)

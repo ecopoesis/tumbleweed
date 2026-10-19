@@ -813,6 +813,24 @@ class TestWhatAToolsImagesCost:
         assert budget.total == 40
 
 
+class TestAResultForAClosedViewHoldsNothing:
+    def test_a_read_that_finishes_after_the_tool_closed_gives_back_its_pixels(self) -> None:
+        resolver = FakeResolver({"a.png": png(3, 2)})
+        resolver.gate = threading.Event()
+        tool = render_with(resolver)
+        view = view_of(tool)  # (kept: the result then reaches a closed view, not a dead one)
+        pixels = tool._context.pixels  # noqa: SLF001
+        point_at(tool, "a.png")
+        assert resolver.started.wait(5)  # being read: it will reserve its pixels once it has them
+
+        tool.close()
+        resolver.gate.set()
+        drain()
+
+        assert view.closed
+        assert pixels.total == 0
+
+
 class TestSettingTheSameRefAgain:
     def test_putting_the_widgets_back_does_not_read_a_shown_image_again(self) -> None:
         resolver = FakeResolver({"a.png": png(3, 2)})
