@@ -32,7 +32,7 @@ dependencies = [
     # Hands-free voice (S08, D23): Silero VAD and openWakeWord's three models run directly on
     # onnxruntime (the `openwakeword` package needs tflite-runtime on Linux, which has no Python
     # 3.12+ wheels: #42). Both have wheels for cp312 to cp314 on every platform we lock (a test in
-    # tests/test_lock.py checks it), run on the CPU on one thread, and are imported by three voice
+    # tests/test_lock_hands_free.py checks it), run on the CPU on one thread, and are imported by three voice
     # modules only (import contracts below). numpy is onnxruntime's own input type.
     "numpy>=2.5.4",
     "onnxruntime>=1.31.0",

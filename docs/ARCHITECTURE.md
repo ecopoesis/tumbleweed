@@ -702,7 +702,17 @@ The turn is handed to `VoiceInput.transcribe_utterance`: the same speech worker,
   stops the speech *before* listening starts (`SpeechOutput.set_microphone_open`, as push-to-talk
   does) and nothing is spoken while a turn is recorded; (4) a turn that began while speaking drops its
   first 250 ms, in which the speakers are still dying away. Residual: a loud speaker, or a reply that
-  contains the wake word, can pass (1); headphones, or `speaking_threshold = 1`, close it.
+  contains the wake word, can pass (1); headphones, or `speaking_threshold = 1` (which accepts no
+  wake word at all while speaking), close it; and (5) before synthesis the wake phrase is replaced in
+  reply text by "the wake word" (any case, any punctuation between the words, whole words, and across
+  the end of a sentence), so a model cannot make the assistant say it.
+- *Focus and a dead capture.* A hands-free turn never moves the keyboard focus (any sound can start one;
+  a password typed into the terminal must not land in the chat): the dictation is put in the input,
+  or sent, with the focus left where it is, and so is any turn that ends while the terminal has it.
+  Wall-clock bounds on the inference thread back up the audio-counted ones: a capture silent for 8 s is
+  reported (as is a bus error or end of stream, `AudioStream`'s `on_error`) and hands-free turned off,
+  and a turn lasting more than `max_utterance_seconds` plus 3 s ends. THINKING is not set for a
+  dictation waiting to be edited (nothing was sent); the user's send of it is typing.
 - *Push-to-talk wins.* A push-to-talk press pauses hands-free and abandons what the wake word began;
   when push-to-talk is idle again hands-free resets and waits for the wake word. Turning hands-free off
   while it transcribes cancels that transcription. Esc abandons a hands-free turn being recorded,
