@@ -33,5 +33,21 @@ class SttResponseError(SttError):
     that is too large or not what was asked for, text that is too long."""
 
 
+class TtsError(VoiceError):
+    """Text could not be turned into speech."""
+
+
+class TtsCancelledError(TtsError):
+    """The synthesis was abandoned: barge-in, mute, or closing the shell."""
+
+
+class TtsResponseError(TtsError):
+    """The synthesiser failed, took too long, or produced audio that cannot be used."""
+
+
+class PlaybackError(VoiceError):
+    """Audio could not be played: no GStreamer, no speaker, the device failed."""
+
+
 class WrongThreadError(VoiceError):
     """A `VoiceInput` method that belongs to the main thread was called from another one."""

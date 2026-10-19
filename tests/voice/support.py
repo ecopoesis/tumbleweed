@@ -5,6 +5,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import final
 
 from tumbleweed.core.types import ByteCount
@@ -84,3 +85,18 @@ class Recorder:
     def problem(self, message: str) -> None:
         self.problems.append(message)
         self.events.append(f"problem:{message}")
+
+
+def environ_for(home: Path, **extra: str) -> dict[str, str]:
+    return {
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / "config"),
+        "XDG_DATA_HOME": str(home / "data"),
+        **extra,
+    }
+
+
+def write_config(home: Path, text: str) -> None:
+    path = home / "config" / "tumbleweed" / "config.toml"
+    path.write_text(text)
+    path.chmod(0o600)

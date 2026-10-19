@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from tests.voice.stub_server import Reply, StubServer
-from tests.voice.support import ManualDispatcher, Recorder, pcm
+from tests.voice.support import ManualDispatcher, Recorder, environ_for, pcm, write_config
 from tumbleweed.agent import config as agent_config
 from tumbleweed.agent.errors import ConfigError
 from tumbleweed.voice import factory
@@ -21,27 +21,6 @@ from tumbleweed.voice.input import VoicePhase
 
 def parse(text: str, **env: str) -> VoiceConfig:
     return agent_config.parse_voice_config(text, env, source="test")
-
-
-@pytest.fixture
-def home(tmp_path: Path) -> Path:
-    (tmp_path / "config" / "tumbleweed").mkdir(parents=True, mode=0o700)
-    return tmp_path
-
-
-def environ_for(home: Path, **extra: str) -> dict[str, str]:
-    return {
-        "HOME": str(home),
-        "XDG_CONFIG_HOME": str(home / "config"),
-        "XDG_DATA_HOME": str(home / "data"),
-        **extra,
-    }
-
-
-def write_config(home: Path, text: str) -> None:
-    path = home / "config" / "tumbleweed" / "config.toml"
-    path.write_text(text)
-    path.chmod(0o600)
 
 
 class TestTheTable:

@@ -424,8 +424,13 @@ source_modules = [
     "tumbleweed.voice.fake",
     "tumbleweed.voice.input",
     "tumbleweed.voice.limits",
+    "tumbleweed.voice.output",
+    "tumbleweed.voice.piper",
+    "tumbleweed.voice.speakable",
     "tumbleweed.voice.stt",
+    "tumbleweed.voice.tts",
     "tumbleweed.voice.whisper",
+    "tumbleweed.voice.worker",
 ]
 forbidden_modules = ["tumbleweed.voice.gstreamer", "tumbleweed.voice._gst"]
 

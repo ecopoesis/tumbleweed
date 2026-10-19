@@ -11,8 +11,9 @@ far is the typed foundation in `src/tumbleweed/core`, the build and test setup a
 GTK4 shell skeleton (`tumbleweed-shell`: a window with a canvas, a chat panel that talks to Claude,
 and a status strip; see [Running the shell](#running-the-shell) and
 [Talking to Claude](#talking-to-claude)), the renderer core that turns a UI spec into live
-widgets (`tumbleweed-render`; see [UI spec](#ui-spec)), and push-to-talk voice input to a local
-whisper.cpp ([Voice input](#voice-input)).
+widgets (`tumbleweed-render`; see [UI spec](#ui-spec)), push-to-talk voice input to a local
+whisper.cpp ([Voice input](#voice-input)), and spoken replies through Piper
+([Speech output](#speech-output)).
 
 ## Development setup (macOS)
 
@@ -67,9 +68,11 @@ One window opens, with no desktop around it:
 - the **side panel** (right): the chat transcript, a multi-line input and a Send button. Messages are
   answered by Claude, streamed in as they are written (with no key configured the chat says how to
   set one; `responder = "echo"` brings back the S02 placeholder that echoes). While a reply streams
-  the Send button waits, and the input stays editable; **Esc** stops the reply;
-- the **status strip** (bottom) with the voice indicator (idle, listening, transcribing; thinking and
-  speaking arrive with S07), the **Mic** button ([Voice input](#voice-input)) and a **Terminal** button;
+  the Send button waits, and the input stays editable; **Esc** stops the reply (while it is being read
+  aloud, the first Esc stops the voice and a second the reply: [Speech output](#speech-output));
+- the **status strip** (bottom) with the voice indicator (idle, listening, transcribing, speaking; thinking
+  arrives with S08), the **Mic** button ([Voice input](#voice-input)), the **Mute** button
+  ([Speech output](#speech-output), there when Piper is set up) and a **Terminal** button;
 - a **terminal pane** (above the status strip, hidden until you open it), see "The terminal" below;
 - a **reserved strip for trusted prompts** along the top, outside the canvas, which is empty until S18.
 
@@ -106,7 +109,7 @@ status strip. It is your tool, not the agent's: nothing the model says can type 
   shell (SIGHUP, then SIGKILL after a second). While the terminal has the focus, Ctrl+L is the shell's (clear
   screen) and not "focus the input"; Ctrl+Q and F9 still act on the shell (#90). Ctrl+Space is the
   shell's too (set-mark in Emacs and readline): push-to-talk ([Voice input](#voice-input)) does nothing,
-  and lets the key through untouched, while the terminal has the focus; use the Mic button there. Esc is yours too, except that it abandons a voice utterance in progress.
+  and lets the key through untouched, while the terminal has the focus; use the Mic button there. Esc is yours too, except that it abandons a voice utterance in progress (not stopping a reply being spoken: Esc stays the terminal's while it has the focus).
 - **Where there is no VTE** (macOS, whose Homebrew has no GTK 4 build of it): F12 opens an external terminal
   window, in your home directory: Terminal.app (`open -b com.apple.Terminal`) on a Mac, otherwise the first of
   `x-terminal-emulator`, `gnome-terminal`, `kgx`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `foot`,
@@ -254,7 +257,8 @@ Hold **Ctrl+Space** (anywhere but the terminal) and speak; let go and the words 
 *listening* while you talk and *transcribing* while the speech server works; **Esc** abandons the
 utterance. Speech-to-text is whisper.cpp's `whisper-server`, which the shell reaches over HTTP, so
 it can run natively on a Mac (with Metal, which a VM does not have) while the shell runs anywhere.
-Speech output and hands-free listening are later steps (S07, S08). On a Mac, Ctrl+Space may be
+Replies are read aloud when Piper is set up ([Speech output](#speech-output)); hands-free listening is
+a later step (S08). On a Mac, Ctrl+Space may be
 taken by the system's input-source shortcut (System Settings, Keyboard, Keyboard Shortcuts, Input
 Sources); the Mic button works regardless (a configurable key is #100).
 
@@ -281,7 +285,7 @@ WHISPER_SERVER_BIN=~/whisper.cpp/build/bin/whisper-server scripts/whisper-server
 
 ```toml
 [voice]
-enabled = true                       # false: no Mic button and no key
+enabled = true                       # false: no Mic button, no key, and no speech output
 stt_url = "http://127.0.0.1:8080"    # whisper-server's address         (TUMBLEWEED_STT_URL)
 language = "auto"                    # or a code such as "en", "de"
 edit_before_send = false             # true: the words wait in the input for you to edit and send
@@ -326,6 +330,58 @@ sentence, sends it to the server and checks the words that come back:
 
 ```sh
 TUMBLEWEED_LIVE=1 TUMBLEWEED_STT_URL=http://127.0.0.1:8080 uv run pytest -m live tests/voice -v
+```
+
+### Speech output
+
+When Piper is set up, the assistant's replies are **read aloud as they stream in**: the first sentence
+starts playing while the rest of the reply is still being written. Code blocks and Markdown marks are
+not spoken (links keep their text, addresses become the word "link", the words of an inline code span stay).
+The voice indicator says *speaking*. **Barge-in is immediate**: hold Ctrl+Space (or click Mic) and speech
+stops before the microphone opens, and **Esc** stops it, except while the terminal has the focus (a reply can be read for a long time, and
+vim must keep its Esc; use Mute, or click out of the terminal). A first Esc stops the voice; the reply goes on
+arriving as text, and a second Esc stops that too. The **Mute** button beside the Mic stops what is
+being said and keeps the rest of that reply, and every later one, silent until you click it again;
+sending a new message also stops the speech of the last reply.
+
+Nothing is spoken until you point the shell at Piper and a voice. Install Piper
+([rhasspy/piper](https://github.com/rhasspy/piper): a release binary, or `pip install piper-tts`, which
+puts a `piper` program in its environment) and download a voice (an `.onnx` file with its `.onnx.json`
+beside it, from [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)), then, in `config.toml`:
+
+```toml
+[voice.tts]
+enabled = true
+piper_path = "/usr/local/bin/piper"        # absolute; a symlink is followed (Homebrew's are)
+voice_model = "/home/me/.local/share/tumbleweed/piper/en_US-lessac-medium.onnx"
+                                           # absolute, a regular file, no symlink and no ".." in the path
+sample_rate_hz = 22050                     # the voice's: "audio" > "sample_rate" in its .onnx.json (medium: 22050, low: 16000)
+max_sentence_chars = 400                   # one synthesis request (up to 1000)
+max_reply_chars = 4000                     # the most of one reply that is spoken (up to 20000); the rest is dropped
+synthesis_timeout_seconds = 20             # per sentence (up to 120)
+max_audio_seconds = 60                     # the most audio one sentence may become (up to 300)
+```
+
+`[voice] enabled = false` turns speech off too (it is part of voice). A voice with the wrong `sample_rate_hz` plays too fast or too slow, nothing worse (reading it from the voice is #113). If a path or any setting of
+`[voice.tts]` is wrong, the shell starts anyway with the Mic and the key working, says so next to the Mic
+(once, in fixed words; the log has the details), and does not speak. The shell runs `piper --model
+<voice> --output_raw` once per sentence, with the sentence on its standard input (never on the command
+line), no shell, a fixed minimal environment (none of your variables, so the API key never reaches it), a
+time limit and a size limit on its audio; Esc and Mute kill it at once. The audio is played through
+GStreamer, and never written anywhere. Without GStreamer the shell starts as usual and the first spoken
+sentence says what is missing; on a Mac `brew install gstreamer` has `osxaudiosink`, on Linux you need
+`gstreamer1.0-plugins-base` and `gstreamer1.0-pipewire` or `gstreamer1.0-pulseaudio` (or `gstreamer1.0-plugins-good`
+for `autoaudiosink`) next to the packages the microphone needs. A new process per sentence means Piper
+loads the voice each time (a fraction of a second on a Mac): a long-lived Piper is #112.
+
+The assistant must not hear itself: nothing is spoken while the microphone is open, and holding the key
+stops speech first. Headphones are still a good idea; echo cancellation is not attempted.
+
+A **real Piper** is exercised by the `live` test (never run in CI):
+
+```sh
+TUMBLEWEED_LIVE=1 TUMBLEWEED_PIPER=/usr/local/bin/piper TUMBLEWEED_PIPER_MODEL=/path/to/voice.onnx \
+    uv run pytest -m live tests/voice/test_live.py -k piper -v
 ```
 
 ### Checks

@@ -618,3 +618,91 @@ the main thread stays free. `agent.config` imports `voice.config`, and `voice.fa
 and `agent.errors`, nothing more between the packages (two contracts). The macOS and PipeWire/Pulse capture paths are not exercised in CI (no device, and no
 GStreamer on the macOS runner); the pipeline up to the source is (#102). Whisper can invent words from
 silence; only a tap under 300 ms and a bare annotation are dropped until S08's VAD (#103).
+
+## D22 — Speech output: Piper as one process per sentence, text on stdin, barge-in by generation and abort signal, GStreamer playback in the one adapter (2026-10-18, accepted)
+
+**Context.** S07 reads the assistant's replies aloud, starting with the first sentence while the rest
+streams, and lets the user interrupt. What is spoken is model output (untrusted text); what speaks
+it is a program and a library that touch the audio hardware. (D21 is reserved for S11.)
+**Decision.** (1) *Piper, as a subprocess, one per sentence,* not HTTP: the plan allowed either; a
+child is the smallest thing that works and is killed in one call (`killpg`) when the user
+interrupts. The cost is that Piper loads the voice for every sentence (#112 is the long-lived
+alternative). The argv is `[piper, --model, <voice>, --output_raw]` from two configured absolute
+paths (`[voice.tts]`); the program is resolved through symlinks (Homebrew's links), the voice model
+must be a regular file at an **already canonical** path (a symlink, a dot or a symlinked directory is
+refused, not followed) and is looked at again before every start. The check and Piper's own open are
+two steps; a local user who can swap the file in between is outside the threat model (it is the
+user's file). The text goes on **stdin**, one clean line of at most 1000 characters, never on the
+command line; the environment is a fixed three variables (`PATH`, `LANG`, `LC_ALL`), none of ours, so
+`ANTHROPIC_*` and the broker's and shell's settings cannot reach it (I6); no shell, no inherited
+descriptors, a session and a process group of its own, `/` as its directory. Audio is capped in bytes as
+it arrives, stderr is drained and kept to 2 KiB (killed past 1 MiB), one deadline bounds the sentence
+(default 20 s, at most 120), every wait is a 50 ms `select` that looks at the abort signal, and the
+process is always reaped (no zombie), signalling only while it has not been reaped, under one lock,
+so a freed pid is never signalled. The voice package's file-writing scan keeps its meaning: `piper`
+is the one module allowed to import `os` (file type, `killpg`, the child's pipes), and a test pins
+which `os` functions it uses. (2) *One chunker strips and cuts* (`voice.speakable`): fenced code blocks
+are dropped, block marks (heading, bullet, quote) and inline marks are removed, links keep their text
+and lose their address, bare addresses become "link", and the words of an inline code span are kept
+(they are part of the sentence; a sentence with a hole in it is worse). Text is made safe in the same
+pass (controls to spaces, format characters, surrogates and unassigned code points dropped,
+whitespace collapsed to one line), sentences end at `.`, `!`, `?` or a line end, a run with no boundary
+is cut at 400 characters, a sentence under 12 characters waits for the next so Piper is not started for
+"Sure." alone, and the block-level state is bounded (a few characters, and a run of fence marks held as a character and an
+exact count, with no cap: a fence closes only on a run at least as long as its opener), so memory is
+bounded. The reply speaks at
+most `max_reply_chars` (default 4000); the user is told once that the rest is dropped. (3) *Two workers,
+a generation and an abort signal per reply* (`voice.output.SpeechOutput`, the same shape as
+`VoiceInput`): the synthesis worker and the playback worker run in order, so sentence N+1 is made
+while N plays. `stop` bumps the generation, sets the reply's `AbortSignal` (which kills Piper and
+mutes the player *from the calling thread*, without waiting) and forgets the reply: later text of it is
+dropped, queued sentences are dropped by the worker, a chunk that finishes late is dropped before the
+player, so nothing of a stopped reply starts afterwards (tests use a synthesiser that ignores the abort,
+and a player queue, to prove each check). A worker's failure sets the signal itself, so the sentences
+queued behind it are dropped before the main thread has heard of it. (4) *Playback is GStreamer, in
+the same adapter as capture* (`voice.gstreamer`, behind `_gst`): `appsrc ! audioconvert !
+audioresample ! volume ! <sink>` from fixed names, `osxaudiosink` on macOS and `pipewiresink`,
+`pulsesink`, `autoaudiosink` on Linux, a new pipeline per sentence; `PlaybackSink.TEST_NULL` is a
+`fakesink` in real time for the Linux tests. `play` polls the bus every 20 ms for EOS and the abort
+signal, and the abort mutes the `volume` element at once. The image needs nothing more (the base
+plugins have all of it). (5) *The assistant does not hear itself, by ordering.* `BargeIn` (a
+`VoiceObserver`) stops speech when `VoiceInput` enters LISTENING, which `press` does before the audio
+worker is asked to open the microphone, and nothing is spoken while it is open (`set_microphone_open`).
+Echo through speakers is not cancelled (#117, for S08). (6) *Keys:* no new controller. The one
+reviewed push-to-talk controller's Esc now also takes "a reply is being spoken" (it reads the speech
+phase, never the event, and the pinned handler names gain `speech`), **except while the terminal has
+the focus**: how long speaking lasts is the model's doing, and a user in vim must not lose the Esc
+that leaves insert mode (Mute, or Esc outside the terminal, stops it). S06's Esc, which abandons an
+utterance wherever the focus is, is unchanged, and with nothing in progress Esc is left alone, as
+before. A first Esc stops the voice only; a second Esc, through the window's own shortcut, stops a
+reply still streaming. The mute control is a toggle button in `VoiceControls` after the Mic (no tooltip, no
+focus, not in the tab order, not a `GAction`); it stops speech and silences the rest of that
+reply, and unmuting is for the next reply. (7) *The shell feeds speech from the transcript*
+(`shell.speech_feed.SpeechFeed`), the one place a reply's text arrives, so every responder is spoken:
+a streaming assistant message begins a reply, each growth is fed as new text, completion ends the
+reply (the last sentence is spoken), a failed or cancelled message stops the speech, and a user
+message or a replaced transcript stops it (restored history is never read aloud). Its errors are
+logged and never reach the chat. (8) *Indicator* (amends D20 (8): SPEAKING is set here, and THINKING moves to S08, #117): SPEAKING is set only while a sentence is
+queued or playing, so it is off while a code block is being dropped and while the reply waits for its
+next words (Esc is then not spent on nothing), and it gives way to LISTENING and TRANSCRIBING;
+THINKING stays unset. (9)
+*Config:* `[voice.tts]` in the same table but judged on its own: any mistake in it (a relative or `~`
+path, a misspelled key, a limit out of range, a table that is not a table) turns *speech* off, keeps the
+Mic, the key and the speech server, logs the details and shows one fixed message beside the Mic
+(`VoiceSetup.notice`); a mistake in the rest of `[voice]` still turns all voice off, as in S06.
+Nothing is spoken until both `piper_path` and `voice_model` are set; a path that does not check
+out has the same effect; the sample rate is a setting (default 22050), not read from the voice
+(#113). (10) *Speech is off when the whole `[voice]` is,* and there is no mute button without it.
+**Deviations from the plan.** The plan's "or HTTP if documented": subprocess chosen. The sample rate is
+a setting and not read from the voice (#113). The Linux image is unchanged (a real-time `fakesink`
+tests playback; a real Piper is `live`). D22 (8) amends D20 (8), which left THINKING for S07: it moves to S08. Speech needs voice input: `[voice]
+enabled = false` turns it off too, and without a configured Piper there is no Mute button. Esc does
+not stop speech while the terminal has the focus. Nothing in scope is missing.
+**Consequences.** Per-sentence start-up cost (#112); the playback worker can be held by a stuck audio
+device, as capture can (#115, #101); the real speaker paths and a real Piper are not exercised in CI
+(#116, #114: the `live` test); the files Piper reads are the program and model, whose ownership and
+modes are not checked (#121), and `<model>.onnx.json`, which is not checked at all (#113); synthesised
+audio waiting to be played is bounded only through the reply cap (#122); speech cannot be had without
+voice input (#123); audio is never written by us (the AST scan and audit-hook tests cover
+speech too). The reply's cap and the sentence cap bound what Piper is asked to do. A model can make
+the assistant say anything; as with any displayed text, speaking it is no approval of anything (I10).
