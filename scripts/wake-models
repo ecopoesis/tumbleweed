@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Fetch the models of hands-free mode (voice activity detection and the wake word) and check each
+# one against a pinned SHA-256.
+#
+#   scripts/wake-models             silero_vad + openWakeWord's melspectrogram and embedding models
+#                                   + the "hey_jarvis" wake word (about 5 MiB in all)
+#   scripts/wake-models alexa       the same with another wake word (alexa, hey_jarvis, hey_mycroft)
+#
+# The files go to $XDG_DATA_HOME/tumbleweed/wake/ (WAKE_MODEL_DIR changes the directory); name that
+# directory as `models_dir` in [voice.vad] and [voice.wake] of config.toml. Each is downloaded to a
+# temporary name beside the target, checked, and only then moved into place, so a download that is cut
+# short or tampered with never becomes a model; the shell checks the same hashes again before it
+# loads a file (src/tumbleweed/voice/models.py: a test keeps the two lists equal). An upstream that
+# replaces a file later fails the check here until the hash is updated in a reviewed commit.
+#
+# Licences (README, "Hands-free voice"): Silero VAD is MIT; openWakeWord's code is Apache-2.0, its
+# melspectrogram and embedding models derive from Google's Apache-2.0 speech-embedding model, and its
+# pre-trained wake words are CC BY-NC-SA 4.0 (non-commercial use).
+set -euo pipefail
+
+word="${1:-hey_jarvis}"
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+dir="${WAKE_MODEL_DIR:-$data/tumbleweed/wake}"
+max_bytes=8388608    # the shell refuses a model over 8 MiB too; the largest of these is 2.3 MiB
+max_seconds=300
+
+fail() { printf '%s: %s\n' "${0##*/}" "$*" >&2; exit 1; }
+
+# file, SHA-256, source: https only (also for redirects)
+common="
+    silero_vad.onnx 2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/src/silero_vad/data/silero_vad.onnx
+    melspectrogram.onnx ba2b0e0f8b7b875369a2c89cb13360ff53bac436f2895cced9f479fa65eb176f https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx
+    embedding_model.onnx 70d164290c1d095d1d4ee149bc5e00543250a7316b59f31d056cff7bd3075c1f https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/embedding_model.onnx
+"
+case "$word" in
+    alexa) wake="
+    alexa_v0.1.onnx 6ff566a01d12670e8d9e3c59da32651db1575d17272a601b7f8a39283dfbae3e https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/alexa_v0.1.onnx
+" ;;
+    hey_jarvis) wake="
+    hey_jarvis_v0.1.onnx 94a13cfe60075b132f6a472e7e462e8123ee70861bc3fb58434a73712ee0d2cb https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_jarvis_v0.1.onnx
+" ;;
+    hey_mycroft) wake="
+    hey_mycroft_v0.1.onnx c2a311e8fa1338de89c31b3b46dc4dffd4af2f9a8d6ddead48893c2d301b1f18 https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_mycroft_v0.1.onnx
+" ;;
+    *) fail "unknown wake word '$word' (known: alexa, hey_jarvis, hey_mycroft)" ;;
+esac
+
+if command -v sha256sum >/dev/null 2>&1; then
+    checksum() { sha256sum "$1" | cut -d' ' -f1; }
+elif command -v shasum >/dev/null 2>&1; then
+    checksum() { shasum -a 256 "$1" | cut -d' ' -f1; }
+else
+    fail "neither sha256sum nor shasum is installed"
+fi
+
+mkdir -p "$dir"
+partial=""
+trap 'rm -f "${partial:-}"' EXIT
+
+fetch() {
+    local file="$1" sha256="$2" url="$3" target="$dir/$1" actual
+    case "$url" in https://*) ;; *) fail "refusing a source that is not https: $url" ;; esac
+    if [ -f "$target" ] && [ ! -L "$target" ] && [ "$(checksum "$target")" = "$sha256" ]; then
+        echo "$target is already here and matches its hash."
+        return 0
+    fi
+    partial="$(mktemp "$dir/.$file.XXXXXX")"
+    # https only (also for redirects), a ceiling on the size and on the time. `--max-filesize`
+    # only judges a size the server announces, so the file-size limit (ulimit -f, in 512-byte
+    # blocks) is what stops a server that never says: curl is killed when its file reaches it.
+    (
+        ulimit -f $((max_bytes / 512 + 1))
+        curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --max-filesize "$max_bytes" --max-time "$max_seconds" --silent --show-error \
+            --output "$partial" -- "$url"
+    ) || fail "downloading $file failed (or it was too big); not installed"
+    [ "$(wc -c < "$partial")" -le "$max_bytes" ] || fail "$file is bigger than $max_bytes bytes; not installed"
+    actual="$(checksum "$partial")"
+    [ "$actual" = "$sha256" ] || fail "$file does not match its pinned hash (got $actual); not installed"
+    chmod 0644 "$partial"
+    mv -f "$partial" "$target"
+    partial=""
+    echo "Installed $target"
+}
+
+while read -r file sha256 url; do
+    [ -n "$file" ] || continue
+    fetch "$file" "$sha256" "$url"
+done <<EOF
+$common
+$wake
+EOF
+echo "Set models_dir = \"$dir\" in [voice.vad] and [voice.wake] of config.toml."
