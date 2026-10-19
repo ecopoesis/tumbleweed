@@ -674,7 +674,10 @@ The turn is handed to `VoiceInput.transcribe_utterance`: the same speech worker,
   detector's state; every event carries the engine's generation and an older one is dropped on the main
   thread. A wake word or endpoint found after the user moved on never starts listening, never reaches
   the speech server and never posts. Commands and audio reach the inference thread in one order, so audio
-  from before a command is never taken for audio after it.
+  from before a command is never taken for audio after it. The mailbox's cap does not change what is
+  said: if the inference thread falls behind by more than 2 s (it normally needs about 1 ms per 80 ms
+  of audio) and audio of a turn being recorded is dropped, the turn is given up (`AUDIO_LOST`) and the
+  user is asked to say it again, never sent with a hole in it.
 - *The microphone indicator.* `HandsFree.microphone_open` is True from the moment the stream is asked for
   until the audio worker has confirmed it closed (a count of open and close jobs not yet done), so it
   is never off while audio is captured: waiting, listening, speaking, thinking, a slow device. The

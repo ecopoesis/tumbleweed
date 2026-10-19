@@ -753,8 +753,9 @@ mailbox that drops the oldest audio past 2 s; the inference thread loads the mod
 command (never on the main thread), takes audio and commands in the order they came, and posts events
 tagged with the generation the engine last got from `set_mode`. Each user action bumps the generation
 and resets the engine, and an event of an older generation is dropped, so a wake word or an endpoint
-found after turning it off, Esc, Mute or push-to-talk starts nothing and posts nothing; every wait is
-bounded (the mailbox's wait is half a second, the device's are GStreamer's, a turn is capped at
+found after turning it off, Esc, Mute or push-to-talk starts nothing and posts nothing; the mailbox's
+cap (2 s) must not change what is said, so a turn that lost audio to it is given up and the user asked
+to say it again (tested with a stalled model); every wait is bounded (the mailbox's wait is half a second, the device's are GStreamer's, a turn is capped at
 `max_utterance_seconds` and given up after `wait_for_speech_seconds`). (6) *The microphone indicator
 errs towards "on".* `microphone_open` is True from the request to open until the audio worker has
 confirmed the close, so it is never off while audio is captured, whatever state the voice indicator
