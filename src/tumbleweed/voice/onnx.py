@@ -11,8 +11,8 @@ nothing.
 `onnxruntime` is imported when the first model is loaded, not when this module is: on macOS it
 loads CoreML and other system frameworks, which the shell has no use for until hands-free mode or
 speech detection is used, and loading them changes how the system's SQLite treats a moved
-database (`tests/history/test_integrity.py` depends on the process not having done so). So the
-shell starts as fast as before, and the chat history behaves as before, until a model is loaded.
+database (the same effect as loading GTK, #132). So the shell starts as fast as before, and
+the chat history behaves as before, until a model is loaded.
 """
 
 import logging

@@ -737,9 +737,8 @@ planted-import test for each, keep the untyped library behind the `OnnxModel` pr
 its returns are narrowed to arrays of a known dtype. `onnxruntime` is imported when the first model
 is loaded, not with the module: on macOS it loads CoreML and other system frameworks, which cost
 start-up time the shell does not need until hands-free mode or the VAD is used, and which change how
-the system's SQLite treats a moved database (found when `tests/history/test_integrity.py` failed in a
-full run once its collection imported it); a test pins that importing the voice package does not
-load it. (4) *Models are data the machine runs, so they are
+the system's SQLite treats a moved database (the same effect as loading GTK: #132); a test pins
+that importing the voice package does not load it. (4) *Models are data the machine runs, so they are
 checked like code.* They are not committed. `scripts/wake-models` fetches them over https (redirects
 https only, a size ceiling that holds even when the server announces no length, a time ceiling, a
 temporary name until the pinned SHA-256 matches); `voice.modelfile.read_verified` checks the same hashes,

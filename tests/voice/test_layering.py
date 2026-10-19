@@ -58,8 +58,8 @@ def test_the_voice_package_imports_without_gstreamer_or_gtk() -> None:
 
 def test_onnxruntime_is_not_loaded_until_a_model_is() -> None:
     """It loads CoreML and other frameworks on macOS: not for a shell that has no use for it, and
-    not at collection, where it changes how the system's SQLite treats a moved database (the chat
-    history's integrity test depends on that)."""
+    not at collection, where, as GTK does, it changes how the system's SQLite treats a moved
+    database (#132)."""
     import subprocess
     import sys
 
