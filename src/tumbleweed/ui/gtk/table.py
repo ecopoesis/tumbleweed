@@ -44,7 +44,7 @@ _LINE_ENDS: Final = dict.fromkeys((10, 11, 12, 13, 133, 8232, 8233), " ")
 _NUMERIC: Final[frozenset[ColumnType]] = frozenset({"int", "float"})
 
 
-def cell_text(cell: bool | int | float | str, column: ColumnType) -> str:
+def cell_text(cell: bool | int | float | str) -> str:
     """What a cell shows: one line, at most `MAX_SHOWN_CELL` characters, made safe for a label."""
     if isinstance(cell, bool):
         return "yes" if cell else "no"
@@ -149,6 +149,7 @@ class TableWidget(Gtk.Box):
         self._budget.stop_waiting(self)
         self._budget.claim(self, 0)
         self._empty()
+        self._hide_notice()
 
     def refresh(self) -> None:
         """Show the table again, as far as the budget allows now."""
@@ -156,39 +157,52 @@ class TableWidget(Gtk.Box):
         self.set_table(table, stale=stale)
 
     def set_table(self, table: Table | None, *, stale: bool) -> None:
-        """Show `table` (or a mark that it is out of date, or nothing for an empty one)."""
+        """Show `table` (or a mark that it is out of date, or nothing for an empty one).
+
+        The claim on the budget is made once, replacing the last: letting it go first and
+        claiming again would announce room (to whoever waits) on every call, and two tables cut
+        by the budget would then rebuild each other for ever.
+        """
         self._shown = (table, stale)
         self._budget.stop_waiting(self)
-        self._budget.claim(self, 0)  # what it held is let go; a table that fits claims it again
         self._empty()
         if stale:
+            self._budget.claim(self, 0)
             self._say("", stale=True)
             return
         if table is None or not table.columns:
+            self._budget.claim(self, 0)
+            self._hide_notice()
             return
         names = tuple(column_name(column.name) for column in table.columns)
-        room = self._budget.room(self)
-        used = sum(len(name) for name in names)
-        if used > room:
+        room = self._budget.room(self)  # what is left, and what this table already holds
+        header = sum(len(name) for name in names)
+        if header > room:
+            self._budget.claim(self, 0)
             self._say(NOT_SHOWN)
             self._budget.wait_for_room(self, self.refresh)
             return
         texts: list[tuple[str, ...]] = []
+        costs: list[int] = []
         for row in table.rows[:MAX_SHOWN_ROWS]:
-            cells = tuple(
-                cell_text(cell, column.type)
-                for cell, column in zip(row, table.columns, strict=True)
-            )
+            cells = tuple(cell_text(cell) for cell, column in zip(row, table.columns, strict=True))
             cost = sum(len(cell) for cell in cells)
-            if used + cost > room:
+            if header + sum(costs) + cost > room:
                 break
-            used += cost
+            costs.append(cost)
             texts.append(cells)
-        self._budget.claim(self, used)  # it fits: `used` is within `room`, which counts our own
-        if len(texts) < len(table.rows):
+        cut = len(texts) < len(table.rows)
+        # The line that says rows are left out must itself fit: make room for it.
+        while cut and texts and header + sum(costs) + len(MORE_ROWS) > room:
+            texts.pop()
+            costs.pop()
+        self._budget.claim(self, header + sum(costs))  # it fits: within `room`, own claim counted
+        if cut:
             self._say(MORE_ROWS)
             if len(texts) < min(len(table.rows), MAX_SHOWN_ROWS):  # cut by the budget, not the cap
                 self._budget.wait_for_room(self, self.refresh)
+        else:
+            self._hide_notice()
         self._fill(table, names, texts)
 
     def _fill(self, table: Table, names: tuple[str, ...], texts: list[tuple[str, ...]]) -> None:
@@ -206,6 +220,10 @@ class TableWidget(Gtk.Box):
         self.rows = len(texts)
         self._texts = tuple(texts)
 
+    def _hide_notice(self) -> None:
+        self._notice.set_text("")  # which gives back what the line had claimed of the budget
+        self._notice.set_visible(False)
+
     def _say(self, text: str, *, stale: bool = False) -> None:
         self._notice.set_text(text, stale=stale)
         self._notice.set_visible(True)
@@ -221,5 +239,4 @@ class TableWidget(Gtk.Box):
         self.rows = 0
         self._texts = ()
         self._scrolled.set_visible(False)
-        self._notice.set_text("")  # which gives back what the line had claimed of the budget
         self._notice.set_visible(False)

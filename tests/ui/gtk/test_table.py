@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from tests.shell.gtk_support import Shell, descendants
+from tests.shell.gtk_support import Shell, descendants, pump_until
 from tests.ui.gtk.support import of_type, render, show_in_window, spec_of
 from tests.ui.runtime.support import text
 from tests.ui.spec.support import Json
@@ -42,6 +42,9 @@ def table_spec(value: Json | None = None, *, before: list[Json] | None = None) -
         {"kind": "box", "children": [*(before or []), {"kind": "table", "bind": "t"}]},
         [*([text("s", "x" * 8192, max_length=65536)] if before else []), *state],
     )
+
+
+_real = TableWidget.set_table  # what a spy calls through to
 
 
 def widget_of(tool: "RenderedTool") -> TableWidget:
@@ -190,15 +193,15 @@ class TestCellsArePlainText:
         assert not any(label.get_use_underline() for label in labels)
 
     def test_a_long_cell_is_cut_and_marked(self) -> None:
-        shown = cell_text("y" * (MAX_SHOWN_CELL + 1), "string")
+        shown = cell_text("y" * (MAX_SHOWN_CELL + 1))
 
         assert shown == "y" * MAX_SHOWN_CELL + CUT_MARK
-        assert cell_text("y" * MAX_SHOWN_CELL, "string") == "y" * MAX_SHOWN_CELL  # exactly the cap
+        assert cell_text("y" * MAX_SHOWN_CELL) == "y" * MAX_SHOWN_CELL  # exactly the cap
 
     def test_a_cell_is_one_line_whatever_line_ends_it_holds(self) -> None:
         raw = "a\nb\rc\r\nd\x0be\x0cf\x85g" + chr(0x2028) + "h" + chr(0x2029) + "i"
 
-        shown = cell_text(raw, "string")
+        shown = cell_text(raw)
 
         assert shown == "a b c  d e f g h i"
         line_ends = "\n\r\x0b\x0c\x85" + chr(0x2028) + chr(0x2029)
@@ -207,19 +210,19 @@ class TestCellsArePlainText:
     def test_a_cell_goes_through_the_display_transform_like_every_text(self) -> None:
         cluster = "e" + "́" * 100  # one grapheme cluster of a hundred code points
 
-        shown = cell_text(cluster, "string")
+        shown = cell_text(cluster)
 
         assert ZWSP in shown  # broken up, so that a layout can cope with it
         assert shown.replace(ZWSP, "") == cluster
 
     def test_the_kinds_of_cell(self) -> None:
-        assert cell_text(True, "bool") == "yes"
-        assert cell_text(False, "bool") == "no"
-        assert cell_text(36, "int") == "36"
-        assert cell_text(-(2**53 - 1), "int") == str(-(2**53 - 1))
-        assert cell_text(1e-300, "float") == "1e-300"
-        assert cell_text(1.7976931348623157e308, "float") == "1.7976931348623157e+308"
-        assert cell_text(5.0, "float") == "5.0"
+        assert cell_text(True) == "yes"
+        assert cell_text(False) == "no"
+        assert cell_text(36) == "36"
+        assert cell_text(-(2**53 - 1)) == str(-(2**53 - 1))
+        assert cell_text(1e-300) == "1e-300"
+        assert cell_text(1.7976931348623157e308) == "1.7976931348623157e+308"
+        assert cell_text(5.0) == "5.0"
 
     def test_a_long_column_name_is_cut_and_marked_too(self) -> None:
         assert column_name("n" * MAX_SHOWN_NAME) == "n" * MAX_SHOWN_NAME
@@ -325,6 +328,58 @@ class TestBounds:
 
         assert widget.notice == ""
         assert tool.shown_text_total == len("a") + len("x")
+
+    def test_the_line_about_more_rows_always_fits_in_what_the_table_claims(self) -> None:
+        cell = "c" * 255  # 1 + 257 * 255 is exactly the budget: no room left for the line
+        rows: list[JsonValue] = [[cell] for _ in range(300)]
+        tool = tool_with({"columns": columns(("a", "string")), "rows": rows})
+        widget = widget_of(tool)
+
+        assert widget.notice == MORE_ROWS  # a row is left out to make room for it
+        assert widget.rows == 256
+        assert tool.shown_text_total <= MAX_SHOWN_PER_TOOL
+
+    def test_a_table_cut_only_by_the_row_cap_does_not_wait_for_room(self) -> None:
+        from unittest import mock
+
+        rows: list[JsonValue] = [["r"] for _ in range(MAX_SHOWN_ROWS + 1)]
+        spec = table_spec(
+            {"columns": columns(("a", "string")), "rows": rows},
+            before=[{"kind": "label", "bind": "s"}],
+        )
+        with mock.patch.object(TableWidget, "set_table", autospec=True, side_effect=_real) as spy:
+            tool = render(spec)
+            tool.runtime.patch_state({"s": ""})  # room appears
+            tool.flush()
+            tool.flush()
+
+        assert spy.call_count == 1  # it fits the budget: nobody is waiting for room
+
+    def test_two_tables_cut_by_the_budget_do_not_rebuild_each_other_for_ever(self) -> None:
+        from unittest import mock
+
+        cell = "c" * 100
+        rows: list[JsonValue] = [[cell] for _ in range(1000)]
+        value: Json = {"columns": columns(("a", "string")), "rows": rows}
+        state: list[Json] = [
+            text("s", "x" * 8192, max_length=65536),
+            {"kind": "table", "key": "t", "max_rows": 10_000, "default": value},
+        ]
+        root: Json = {
+            "kind": "box",
+            "children": [
+                {"kind": "label", "bind": "s"},
+                {"kind": "table", "bind": "t"},
+                {"kind": "table", "bind": "t"},
+            ],
+        }
+        with mock.patch.object(TableWidget, "set_table", autospec=True, side_effect=_real) as spy:
+            tool = render(spec_of(root, state))
+            builds = spy.call_count
+            tool.runtime.patch_state({"s": "y"})  # a little room appears
+            assert not pump_until(lambda: spy.call_count > builds + 10, timeout=1.0)
+
+        assert spy.call_count <= builds + 10  # a few retries, then quiet
 
     def test_closing_the_tool_lets_the_table_go(self) -> None:
         tool = tool_with(PEOPLE)
