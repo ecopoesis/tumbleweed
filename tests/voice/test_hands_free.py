@@ -41,6 +41,7 @@ from tumbleweed.voice.fake import (
     Heard,
 )
 from tumbleweed.voice.hands_free import (
+    AUDIO_LOST,
     NOTHING_AFTER_WAKE,
     HandsFree,
     HandsFreePhase,
@@ -162,6 +163,7 @@ class Builder(Protocol):
         voice_limits: VoiceLimits | None = None,
         on_state: Callable[[bool], None] | None = None,
         stream_gate: threading.Event | None = None,
+        vad_gate: threading.Event | None = None,
     ) -> Rig: ...
 
 
@@ -182,6 +184,7 @@ def build() -> Iterator[Builder]:
         voice_limits: VoiceLimits | None = None,
         on_state: Callable[[bool], None] | None = None,
         stream_gate: threading.Event | None = None,
+        vad_gate: threading.Event | None = None,
     ) -> Rig:
         voice_limits = voice_limits or limits(max_utterance_seconds=2)
         dispatcher = ManualDispatcher()
@@ -194,7 +197,7 @@ def build() -> Iterator[Builder]:
         heard = Recorder()
         voice.subscribe(heard)
         stream = FakeAudioStream(start_error=start_error, on_state=on_state, gate=stream_gate)
-        wake, vad = FakeWake(error=wake_error), FakeVad()
+        wake, vad = FakeWake(error=wake_error), FakeVad(gate=vad_gate)
         engines: list[HandsFreeEngine] = []
 
         def engine() -> HandsFreeEngine:
@@ -354,6 +357,29 @@ class TestTheTurn:
         assert rig.hf.phase is HandsFreePhase.TRANSCRIBING
         rig.stt_gate.set()
         assert rig.until(lambda: rig.heard.texts == [HELLO])
+
+
+class TestFallingBehind:
+    def test_audio_dropped_in_the_middle_of_a_turn_gives_the_turn_up_and_says_so(
+        self, build: Builder
+    ) -> None:
+        release = threading.Event()
+        rig = build(vad_gate=release)
+        try:
+            rig.start()
+            rig.wake_up()
+            rig.stream.feed(windows(900))
+            assert rig.vad.entered.wait(5)  # the inference thread is stuck inside the model
+
+            for _ in range(20):  # more than the mailbox holds, while it is stuck
+                rig.stream.feed(bytes(RING_BYTES // 4))
+        finally:
+            release.set()
+
+        assert rig.until(lambda: rig.hands.problems == [AUDIO_LOST])
+        assert rig.until(lambda: rig.hf.phase is HandsFreePhase.WAITING)
+        assert rig.stt.heard == []
+        assert rig.heard.texts == []
 
 
 class TestOff:

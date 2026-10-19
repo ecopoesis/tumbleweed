@@ -194,6 +194,53 @@ class TestListening:
         assert vad.resets > resets
 
 
+class TestAGapInTheAudio:
+    """The mailbox dropped audio (the thread fell behind): a turn with a hole in it is given up."""
+
+    def test_a_turn_with_a_gap_is_given_up_not_sent(self) -> None:
+        waiting = engine()
+        waiting.feed(chunk(900))
+        waiting.feed(windows(900, 900))
+
+        waiting.note_gap()
+        events = waiting.feed(windows(900, 900, 900))
+
+        assert events == [TurnEnded(GENERATION, EndReason.AUDIO_LOST, None)]
+        assert waiting.mode is EngineMode.PAUSED
+
+    def test_a_gap_while_only_waiting_for_the_wake_word_changes_nothing(self) -> None:
+        waiting = engine()
+
+        waiting.note_gap()
+        events = waiting.feed(chunk(900) + talk())
+
+        (_, ended) = events
+        assert isinstance(ended, TurnEnded)
+        assert ended.reason is EndReason.ENDPOINT
+
+    def test_the_next_turn_is_not_marked_by_the_last_ones_gap(self) -> None:
+        waiting = engine()
+        waiting.feed(chunk(900))
+        waiting.note_gap()
+        waiting.feed(window(900))
+        waiting.set_mode(EngineMode.WAITING, 9)
+
+        events = waiting.feed(chunk(900) + talk())
+
+        (_, ended) = events
+        assert isinstance(ended, TurnEnded)
+        assert ended.reason is EndReason.ENDPOINT
+
+    def test_a_gap_beats_a_turn_that_would_have_ended_in_the_cap(self) -> None:
+        waiting = engine(max_windows=3)
+        waiting.feed(chunk(900))
+        waiting.note_gap()
+
+        events = waiting.feed(windows(*([900] * 10)))
+
+        assert events == [TurnEnded(GENERATION, EndReason.AUDIO_LOST, None)]
+
+
 class TestSpeakingGuard:
     def test_while_a_reply_is_spoken_a_surer_score_is_needed(self) -> None:
         waiting = engine()
