@@ -669,6 +669,14 @@ The turn is handed to `VoiceInput.transcribe_utterance`: the same speech worker,
   bytes are hashed and are what `onnxruntime` is given, never a path, so the file cannot change between
   the check and the load, and nothing is written. `voice.modelfile` is the one voice module besides
   `piper` that imports `os`, and a test pins every `os` call and open flag it has.
+- *The loudness gate.* In a quiet room nothing can be said, so nothing is computed: after 2.4 s of
+  chunks whose RMS is under 100 (16-bit units, about -50 dBFS: a quiet room and a whisper at arm's
+  length are on either side) the wake models are not run and a chunk scores 0; the last 30 skipped
+  chunks are kept (a fixed cap, 77 KiB) and, when sound returns, run through the melspectrogram and
+  embedding models in order before the loud chunk is scored, so the rolling state, and every score of a
+  chunk that is run, is the same as without the gate (tested with content-dependent fakes and with the
+  real models). Idle in a quiet room costs about 0.5% of a core; with sound the models run, about 10%
+  on an Apple M3 Max (D23 (13)).
 - *Abandoning.* Every change the user makes (off, Esc, Mute, push-to-talk, a finished turn) bumps a
   generation and sends the engine `set_mode` with it, which makes it forget all audio and every
   detector's state; every event carries the engine's generation and an older one is dropped on the main

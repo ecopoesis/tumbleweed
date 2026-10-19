@@ -451,8 +451,11 @@ waits for you); it still cannot approve anything: prompts take the keyboard and 
 
 **Performance.** `uv run python scripts/measure_hands_free_cpu.py` runs the real pipeline on the
 real models for a minute, paced in real time on a quiet room's noise, and prints idle CPU as a share of
-one core (the target is 15% on Apple Silicon; `--microphone` includes the real capture). The numbers
-are in the PR. Real models, heard on speech made by macOS's `say`, are exercised by the `live` tests (never
+one core (the target is 15% on Apple Silicon; `--microphone` includes the real capture). In a quiet
+room the wake-word models are not run at all (a loudness gate: after 2.4 s under an RMS of about -50
+dBFS they stop, and catch up when sound returns, scoring exactly as they would have), which costs
+about 0.5% of a core on an Apple M3 Max; with sound they run, about 10% there (`--noise-rms 400`); a
+microphone with a noise floor above the gate never lets it close. The numbers are in the PR. Real models, heard on speech made by macOS's `say`, are exercised by the `live` tests (never
 run in CI): `scripts/wake-models && TUMBLEWEED_LIVE=1 uv run pytest -m live tests/voice/test_live.py -k "silero or wake or whole_turn"`.
 
 ### Checks

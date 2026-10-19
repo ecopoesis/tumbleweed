@@ -210,6 +210,36 @@ def test_the_wake_word_is_heard_and_other_speech_is_not(
     assert best(noise(3)) < 0.5
 
 
+def test_the_loudness_gate_changes_no_score_of_a_chunk_that_is_run(
+    wake_models: ModelStore, tmp_path: Path
+) -> None:
+    def detector(quiet_rms: float) -> OpenWakeWordDetector:
+        return OpenWakeWordDetector(
+            wake_models.get(MELSPECTROGRAM),
+            wake_models.get(EMBEDDING),
+            wake_models.get(WAKE_WORDS["hey_jarvis"]),
+            quiet_rms=quiet_rms,
+        )
+
+    # a long quiet, the wake word, another long quiet, and the wake word again
+    word = speech_pcm(tmp_path, "hey jarvis")
+    audio = silence(4) + word + silence(5) + word + silence(1)
+    chunks = [
+        audio[i : i + WAKE_CHUNK_BYTES]
+        for i in range(0, len(audio) - WAKE_CHUNK_BYTES + 1, WAKE_CHUNK_BYTES)
+    ]
+    gated, plain = detector(100.0), detector(0.0)
+
+    with_gate = [gated.score(chunk) for chunk in chunks]
+    without = [plain.score(chunk) for chunk in chunks]
+
+    assert max(with_gate) > 0.5
+    assert max(with_gate) == pytest.approx(max(without), abs=1e-4)
+    skipped = [i for i, (a, b) in enumerate(zip(with_gate, without, strict=True)) if a != b]
+    assert len(skipped) > 20  # the quiet really was skipped
+    assert all(with_gate[i] == 0.0 and without[i] < 0.1 for i in skipped)
+
+
 def test_a_whole_turn_with_the_real_models_wakes_listens_and_ends(
     wake_models: ModelStore, tmp_path: Path
 ) -> None:

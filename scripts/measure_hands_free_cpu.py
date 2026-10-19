@@ -8,11 +8,13 @@ It runs the production pipeline: `HandsFree`, its mailbox and inference thread, 
 `HandsFreeEngine` over Silero VAD and openWakeWord's models (hash-checked from the directory
 `scripts/wake-models` fills), fed 80 ms chunks of audio paced in real time, in the state hands-free
 spends nearly all of its life in: waiting for the wake word. The audio is low-level noise by
-default (a quiet room: no speech, nothing to wake it), or the real microphone with `--microphone`
-(needs GStreamer; the first use may ask for microphone permission). The result is the whole
-process's CPU time (user + system, every thread) over the wall-clock time of the measured part,
-after the models have loaded and the pipeline has warmed up, as a percentage of one core; the plan's
-target is at most 15% on Apple Silicon, native, and the exit status is 1 above `--max`.
+default (a quiet room: no speech, nothing to wake it; the wake models are then behind their loudness
+gate and mostly not run, so use `--noise-rms 400` to measure a room with sound, where they run),
+or the real microphone with `--microphone` (needs GStreamer; the first use may ask for microphone
+permission). The result is the whole process's CPU time (user + system, every thread) over the
+wall-clock time of the measured part, after the models have loaded and the pipeline has warmed up,
+as a percentage of one core; the plan's target is at most 15% on Apple Silicon, native, and the exit
+status is 1 above `--max`.
 
 Without `--microphone` the capture itself (CoreAudio, GStreamer's resampling) is not in the number:
 it is a callback that copies a few kilobytes into the mailbox. `--fake-models` replaces the models

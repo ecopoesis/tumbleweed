@@ -8,6 +8,8 @@ hash is replaced by the hash of the stub's bytes; the real files were fetched an
 
 import hashlib
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -184,3 +186,38 @@ class TestInstall:
         assert result.returncode == 0, result.stderr
         assert (bin_dir / "curl.calls").exists()  # it fetched, rather than accepting the link
         assert "already here" not in result.stdout.splitlines()[0]
+
+
+class TestTheCpuScript:
+    """`scripts/measure_hands_free_cpu.py`, tried with trivial detectors (no models, no device)."""
+
+    def run(self, *args: str, models: str | None = None) -> "subprocess.CompletedProcess[str]":
+        environment = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"}
+        return subprocess.run(  # noqa: S603  (our own interpreter and script, an argv list)
+            [sys.executable, "-I", str(ROOT / "scripts" / "measure_hands_free_cpu.py"), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+            env={**environment, **({"WAKE_MODEL_DIR": models} if models else {})},
+        )
+
+    def test_it_runs_the_pipeline_and_prints_a_share_of_one_core(self) -> None:
+        result = self.run("--fake-models", "--seconds", "1", "--warmup", "1", "--max", "100")
+
+        assert result.returncode == 0, result.stderr
+        assert "idle hands-free: " in result.stdout
+        assert "% of one core" in result.stdout
+        assert "fake detectors" in result.stdout
+
+    def test_above_the_limit_it_fails(self) -> None:
+        result = self.run("--fake-models", "--seconds", "1", "--warmup", "1", "--max", "0")
+
+        assert result.returncode == 1
+        assert "% of one core" in result.stdout
+
+    def test_models_that_are_not_there_are_reported_and_fail(self, tmp_path: Path) -> None:
+        result = self.run("--seconds", "1", "--warmup", "1", "--models", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "hands-free did not start" in result.stderr

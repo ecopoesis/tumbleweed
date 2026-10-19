@@ -184,3 +184,143 @@ class TestRefusals:
 
         with pytest.raises(ModelError, match="wrong shape"):
             wake.score(samples(0))
+
+
+def constant(level: int) -> bytes:
+    """A chunk of one repeated sample: its RMS is `abs(level)`."""
+    return level.to_bytes(2, "little", signed=True) * 1280
+
+
+def content_models(*, quiet_rms: float | None = None) -> tuple[OpenWakeWordDetector, Recorder]:
+    """Models whose answers depend only on what they are given, so that two detectors that see the
+    same audio, however they got there, give the same scores: the mean of the audio, of the
+    spectrogram window, of the embeddings."""
+
+    def mel(_call: int, audio: Tensor) -> Array:
+        return np.full((1, 1, 8, 32), float(np.mean(audio)), dtype=np.float32)
+
+    def embedding(_call: int, window: Tensor) -> Array:
+        return np.full((1, 1, 1, 96), float(np.mean(window)), dtype=np.float32)
+
+    def classifier(_call: int, window: Tensor) -> Array:
+        return np.array([[min(1.0, abs(float(np.mean(window))) / 100.0)]], dtype=np.float32)
+
+    mels = Recorder("input", mel)
+    gate = {} if quiet_rms is None else {"quiet_rms": quiet_rms}
+    return (
+        OpenWakeWordDetector(
+            mels, Recorder("input_1", embedding), Recorder("x.1", classifier), **gate
+        ),
+        mels,
+    )
+
+
+QUIET_CHUNKS = 30  # `voice.wake._QUIET_CHUNKS`: the pins below say what it must be
+
+
+class TestTheLoudnessGate:
+    """In a quiet room the models are not run; when sound comes back the state is what it would
+    have been, and no score of a chunk that is run changes."""
+
+    def test_after_enough_quiet_chunks_the_models_stop_being_run(self) -> None:
+        wake, mels = content_models()
+        for _ in range(QUIET_CHUNKS):
+            wake.score(constant(0))
+        called = len(mels.inputs)
+
+        scores = [wake.score(constant(10)) for _ in range(50)]
+
+        assert len(mels.inputs) == called  # not one more call
+        assert scores == [0.0] * 50
+
+    def test_a_quiet_start_is_run_until_the_quiet_has_lasted(self) -> None:
+        wake, mels = content_models()
+
+        for _ in range(QUIET_CHUNKS):
+            wake.score(constant(0))
+
+        assert len(mels.inputs) == QUIET_CHUNKS
+
+    def test_when_sound_comes_back_the_skipped_chunks_are_run_first_in_order(self) -> None:
+        wake, mels = content_models()
+        for _ in range(QUIET_CHUNKS):
+            wake.score(constant(0))
+        for level in (1, 2, 3):
+            wake.score(constant(level))  # skipped, and kept
+        called = len(mels.inputs)
+
+        wake.score(constant(5000))
+
+        replayed = [int(call[0, 480]) for call in mels.inputs[called:]]
+        assert replayed == [1, 2, 3, 5000]  # the held chunks in order, then the loud one
+
+    def test_what_is_kept_has_a_fixed_cap(self) -> None:
+        wake, mels = content_models()
+        for _ in range(QUIET_CHUNKS + 1000):
+            wake.score(constant(1))
+        called = len(mels.inputs)
+
+        wake.score(constant(5000))
+
+        assert len(wake._held) == 0  # noqa: SLF001  (the cap is the point)
+        assert len(mels.inputs) - called == QUIET_CHUNKS + 1  # at most the cap, and the loud one
+
+    def test_a_score_is_the_same_with_the_gate_as_without_it(self) -> None:
+        sequence = [0] * 45 + [3000] * 6 + [0] * 70 + [2500] * 4 + [0] * 33 + [4000] * 3
+        gated, _ = content_models()
+        plain, _ = content_models(quiet_rms=0.0)  # nothing is quieter than 0: never skipped
+
+        with_gate = [gated.score(constant(level)) for level in sequence]
+        without = [plain.score(constant(level)) for level in sequence]
+
+        skipped = [index for index, score in enumerate(with_gate) if score != without[index]]
+        assert skipped  # the gate did skip chunks
+        assert all(without[index] == 0.0 or with_gate[index] == 0.0 for index in skipped)
+        for index, level in enumerate(sequence):
+            if level >= 100:  # a chunk that is loud is always run, and scores as it would have
+                assert with_gate[index] == pytest.approx(without[index])
+
+    def test_the_state_after_a_gap_is_what_it_would_have_been(self) -> None:
+        sequence = [0] * 40 + [3000] * 8 + [10] * 60 + [3000] * 8
+        gated, _ = content_models()
+        plain, _ = content_models(quiet_rms=0.0)
+
+        for level in sequence:
+            gated.score(constant(level))
+            plain.score(constant(level))
+
+        assert gated.score(constant(2000)) == pytest.approx(plain.score(constant(2000)))
+        assert gated.score(constant(2000)) == pytest.approx(plain.score(constant(2000)))
+
+    def test_sustained_sound_is_never_skipped(self) -> None:
+        wake, mels = content_models()
+
+        for _ in range(QUIET_CHUNKS * 3):
+            wake.score(constant(400))
+
+        assert len(mels.inputs) == QUIET_CHUNKS * 3
+
+    @pytest.mark.parametrize(
+        ("level", "run"), [(99, False), (100, True), (-100, True), (-99, False)]
+    )
+    def test_the_threshold_is_an_rms_of_100(self, level: int, run: bool) -> None:
+        wake, mels = content_models()
+        for _ in range(QUIET_CHUNKS):
+            wake.score(constant(0))
+        called = len(mels.inputs)
+
+        wake.score(constant(level))
+
+        assert (len(mels.inputs) > called) is run
+
+    def test_reset_starts_the_quiet_count_and_the_kept_chunks_again(self) -> None:
+        wake, mels = content_models()
+        for _ in range(QUIET_CHUNKS + 5):
+            wake.score(constant(0))
+        wake.reset()
+        called = len(mels.inputs)
+
+        wake.score(constant(0))
+
+        assert len(mels.inputs) == called + 1  # run again, not skipped
+        assert len(wake._held) == 0  # noqa: SLF001
