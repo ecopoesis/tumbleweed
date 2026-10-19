@@ -680,38 +680,39 @@ has the reasons.
 - **`image`** shows the file an `ImageRef` names. The host passes a resolver that reads it
   (`RenderedTool(spec, images=...)`; with none every image says that images are not available): the
   ref is a file name and nothing else, opened without following links (see section 6), and what
-  comes back is at most `8 MiB`. Those bytes are *looked at before they are decoded*: the magic number
-  must be a PNG, a JPEG or a still WebP (an SVG is none, whatever the file is called; an animated
-  WebP is refused, and so is a JPEG of more than `64` scans), and the size in the header must be at
-  most `8,192` pixels a side and `16,777,216` pixels (width times height times 4 bytes is at most
-  `64 MiB` decoded). Only then do the bytes go to a
-  decoder, pinned to the format that was found, on a worker thread: the interface never waits for a
-  file or a decode. What is refused, missing or broken is a line of fixed text in the image's place
-  (`The image was not found.`, `The image is not allowed.`, `The image is too large.`,
-  `Only PNG, JPEG and WebP images can be shown.`, `The image could not be read.`), never a word of the
-  file or the error; a line `Loading the image...` stands there while it loads. A new ref (or the same
-  one assigned again) replaces what is shown at once: the widget never shows an image the entry no
-  longer holds. An image is scaled down to fit `480` pixels as it is decoded, never up (one that
-  size or smaller keeps its pixels), so a tool's images together keep at most `64 MiB` of pixels;
-  over that an image says it is too large. `alt` is for assistive technology only (it is not
+  comes back is at most `8 MiB`. Those bytes are *looked at before they are decoded*: the magic
+  number must be a PNG, a JPEG or a still WebP (an SVG is none, whatever the file is called; an
+  animated WebP is refused, and so is a JPEG of more than `64` scans), and the size in the header
+  must be at most `8,192` pixels a side and `16,777,216` pixels (width times height times 4 bytes is
+  at most `64 MiB` decoded). Only then do the bytes go to a decoder, pinned to the format that was
+  found, on a worker thread: the interface never waits for a file or a decode. What is refused,
+  missing or broken is a line of fixed text in the image's place (`The image was not found.`,
+  `The image is not allowed.`, `The image is too large.`,
+  `Only PNG, JPEG and WebP images can be shown.`, `The image could not be read.`), never a word of
+  the file or the error; a line `Loading the image...` stands there while it loads. A new ref (or
+  the same one assigned again) replaces what is shown at once: the widget never shows an image the
+  entry no longer holds. An image is scaled down to fit `480` pixels as it is decoded, never up (one
+  that size or smaller keeps its pixels), so a tool's images together keep at most `64 MiB` of
+  pixels; over that an image says it is too large. `alt` is for assistive technology only (it is not
   displayed).
 - **`table`** is a `Gtk.ColumnView` of the columns and rows of a `table` entry, rebuilt when the
-  entry changes. At most `1,000` rows are shown; a cell shows at most `256` characters (then ` (cut)`) on
-  one line (line ends become spaces), a column name at most `64`; every text goes through the display
-  transform and into a label with `set_text`, and all of it counts in the tool's text budget, so
-  rows that do not fit are left out, the table ends in `(more rows not shown)`, and they are added
-  when room appears. Columns are typed: `int` and `float` cells are right-aligned and a `bool` reads
-  `yes` or `no`. There is no selection, the columns cannot be dragged, and there is no header menu.
+  entry changes. At most `1,000` rows are shown; a cell shows at most `256` characters (then the
+  mark `(cut)`) on one line (line ends become spaces), a column name at most `64`; every text goes
+  through the display transform and into a label with `set_text`, and all of it counts in the tool's
+  text budget, so rows that do not fit are left out, the table ends in `(more rows not shown)`, and
+  they are added when room appears. Columns are typed: `int` and `float` cells are right-aligned and
+  a `bool` reads `yes` or `no`. There is no selection, the columns cannot be dragged, and there is
+  no header menu.
 - **`text_view`** is a `Gtk.TextView` that wraps at any character. It shows a `string` entry as it
   is (no display transform: nothing is inserted into the text, so what the user selects and copies
-  is the source text), at most 8,192 characters then ` (cut)`, counted in the budget like an entry,
-  and is two-way only while the whole text is shown (a cut text, or one the budget has no room for,
-  is read-only with a warning style). What the user types or pastes is held to the entry's
-  `max_length` and to 8,192 characters: an insert that would pass it is refused whole.
+  is the source text), at most `8,192` characters then the mark `(cut)`, counted in the budget like
+  an entry, and is two-way only while the whole text is shown (a cut text, or one the budget has no
+  room for, is read-only with a warning style). What the user types or pastes is held to the entry's
+  `max_length` and to `8,192` characters: an insert that would pass it is refused whole.
 - **`tabs`** are a `Gtk.Notebook` (the tab menu is off, tabs cannot be reordered or detached), each
   title one plain, ellipsized line counted in the budget, and **`expander`** is a `Gtk.Expander`
-  with a plain title. Their pages and child are built like any other child, so a page that cannot
-  be built is a placeholder inside its tab.
+  with a plain title. Their pages and child are built like any other child, so a page that cannot be
+  built is a placeholder inside its tab.
 
 What a widget shows or edits is an entry named by `bind`. The entry's declaration supplies range,
 options and limits, so they are written once. Which kinds of entry a component accepts:
