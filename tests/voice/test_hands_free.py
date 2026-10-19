@@ -44,6 +44,7 @@ from tumbleweed.voice.fake import (
 from tumbleweed.voice.hands_free import (
     AUDIO_LOST,
     NOTHING_AFTER_WAKE,
+    TIMED_OUT,
     HandsFree,
     HandsFreePhase,
     _Command,
@@ -1297,9 +1298,7 @@ class TestADeadCapture:
         rig.stream.feed(chunk(0))  # keeps the capture itself alive for this test
 
         assert rig.until(lambda: rig.hf.phase is HandsFreePhase.WAITING)
-        assert (
-            rig.hands.problems[-1] == "Stopped listening: the microphone stopped delivering audio."
-        )
+        assert rig.hands.problems[-1] == TIMED_OUT
         rig.speech.begin_reply()
         rig.speech.feed("The next reply is spoken, the turn being over. ")
         rig.speech.end_reply()
@@ -1358,7 +1357,7 @@ class TestEdgesOfTheWatch:
         wait_for_inference(rig)
 
         assert rig.until(lambda: rig.heard.texts == [HELLO])
-        assert rig.hands.problems == ["Stopped listening: the microphone stopped delivering audio."]
+        assert rig.hands.problems == [TIMED_OUT]
 
 
 class TestStaleFaults:

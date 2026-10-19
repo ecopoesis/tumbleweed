@@ -53,7 +53,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Final, Protocol, final
+from typing import Final, Protocol, assert_never, final
 
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.voice.audio import AudioStream, Utterance
@@ -87,6 +87,19 @@ _STALL_SECONDS: Final = 8.0
 # turn that has lasted this much longer in wall-clock time (the capture stopped) is over.
 _LISTEN_GRACE_SECONDS: Final = 3.0
 _STOPPED: Final = "The microphone stopped delivering audio."
+
+
+def _nothing_to_say(reason: EndReason) -> str:
+    """What to tell the user about a turn that ended without anything to transcribe."""
+    match reason:
+        case EndReason.AUDIO_LOST:
+            return AUDIO_LOST
+        case EndReason.TIMED_OUT:
+            return TIMED_OUT
+        case EndReason.NO_SPEECH | EndReason.ENDPOINT | EndReason.MAX_LENGTH:
+            return NOTHING_AFTER_WAKE  # (the last two are never without speech)
+        case _ as unreachable:
+            assert_never(unreachable)
 
 
 class HandsFreePhase(enum.StrEnum):
@@ -559,10 +572,7 @@ class HandsFree:
         utterance = self._utterance(event.pcm)
         if utterance is None:
             self._restart()
-            message = {
-                EndReason.AUDIO_LOST: AUDIO_LOST,
-                EndReason.TIMED_OUT: TIMED_OUT,
-            }.get(event.reason, NOTHING_AFTER_WAKE)
+            message = _nothing_to_say(event.reason)
             self._notify(lambda observer: observer.problem(message))
             return
         if event.reason is EndReason.MAX_LENGTH:

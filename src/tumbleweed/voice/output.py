@@ -111,6 +111,17 @@ def _fold(text: str) -> tuple[str, list[int]]:
     return "".join(folded), origin
 
 
+def _cut_at_word(text: str, limit: int) -> str:
+    """`text` if it fits in `limit`, else its words that fit whole; nothing if not even one does.
+    A cut inside a word could make a new one (`Jarvisson` cut to `Jarvis`), so it is never made."""
+    if len(text) <= limit:
+        return text
+    if text[limit] == " ":
+        return text[:limit]
+    head = text[:limit]
+    return head.rsplit(" ", 1)[0] if " " in head else ""
+
+
 def _original_end(text: str, origin: list[int], folded_end: int) -> int:
     """Where in `text` a match that ends before `folded_end` in the folded text ends: after the
     character it ends in and the combining marks that belong to it."""
@@ -257,8 +268,15 @@ class SpeechOutput:
                 sentence = self._scrub(sentence, pattern)
             room = self._config.max_reply_chars - self._spoken_chars
             if room <= 0 or len(sentence) > room:
-                sentence = sentence[:room].rsplit(" ", 1)[0] if room > 0 else ""
+                if room <= 0:
+                    sentence = ""
+                elif pattern is not None:
+                    sentence = _cut_at_word(sentence, room)  # never mid-word: see `_cut_at_word`
+                else:
+                    sentence = sentence[:room].rsplit(" ", 1)[0]
                 self._cap_reached()
+            if pattern is not None and sentence:
+                sentence = self._final_check(sentence, pattern)
             if sentence:
                 self._spoken_chars += len(sentence)
                 self._submit(sentence)
@@ -285,17 +303,25 @@ class SpeechOutput:
         pieces: list[str] = []
         taken = 0
         for match in pattern.finditer(folded):
-            if match.end() == match.start():
-                continue
             pieces.append(sentence[taken : origin[match.start()]])
             pieces.append(SILENCED_PHRASE)
             taken = _original_end(sentence, origin, match.end())
         scrubbed = "".join(pieces) + sentence[taken:] if pieces else sentence
-        limit = self._config.max_sentence_chars
-        if len(scrubbed) > limit:
-            scrubbed = scrubbed[:limit].rsplit(" ", 1)[0] or scrubbed[:limit]
+        scrubbed = _cut_at_word(scrubbed, self._config.max_sentence_chars)
         self._previous = _fold(scrubbed)[0]
         return scrubbed
+
+    def _final_check(self, sentence: str, pattern: "re.Pattern[str]") -> str:
+        """The last step before a sentence is submitted, after every cut: if the phrase is in it
+        (a cut can rebuild one from a word it made short), everything from the phrase on is
+        dropped, never replaced, so the sentence cannot grow. This makes it true by construction
+        that no submitted sentence matches the pattern."""
+        folded, origin = _fold(sentence)
+        match = pattern.search(folded)
+        if match is not None:
+            sentence = sentence[: origin[match.start()]].rstrip()
+            self._previous = _fold(sentence)[0]
+        return sentence
 
     def _cap_reached(self) -> None:
         self._accepting = False

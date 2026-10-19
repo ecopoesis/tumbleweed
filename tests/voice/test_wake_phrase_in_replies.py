@@ -2,28 +2,37 @@
 synthesis the configured phrase is replaced, whatever the case and punctuation, as whole words."""
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from tests.voice.support import ManualDispatcher
 from tumbleweed.voice.config import TtsConfig
 from tumbleweed.voice.fake import FakeAudioPlayer, FakeTts
-from tumbleweed.voice.output import SILENCED_PHRASE, SpeechOutput
+from tumbleweed.voice.output import SILENCED_PHRASE, SpeechOutput, _fold, _phrase_pattern
 
 
-def speak(text: str, *, avoid: tuple[str, ...]) -> list[str]:
+def matches(spoken: str, avoid: tuple[str, ...]) -> bool:
+    """Whether a spoken entry, folded as the scrub folds, still holds the phrase."""
+    pattern = _phrase_pattern(avoid)
+    assert pattern is not None
+    return pattern.search(_fold(spoken)[0]) is not None
+
+
+def speak(text: str, *, avoid: tuple[str, ...], config: TtsConfig | None = None) -> list[str]:
     dispatcher = ManualDispatcher()
     tts = FakeTts()
     speech = SpeechOutput(
         backend=tts,
         player=FakeAudioPlayer,
         dispatcher=dispatcher,
-        config=TtsConfig(),
+        config=config or TtsConfig(),
         avoid=avoid,
     )
     try:
         speech.begin_reply()
         speech.feed(text)
         speech.end_reply()
-        dispatcher.pump_until(lambda: tts.spoken != [] and speech.phase.value == "idle")
+        dispatcher.pump_until(lambda: speech.phase.value == "idle")
         dispatcher.settle(0.1)
     finally:
         speech.close()
@@ -178,3 +187,139 @@ def test_a_combining_mark_on_the_last_letter_of_the_phrase_goes_with_it() -> Non
     sentences = speak("Hey Jarviś now, please.", avoid=("hey_jarvis",))
 
     assert " ".join(sentences) == f"{SILENCED_PHRASE} now, please."
+
+
+STOCK = [("hey_jarvis", "heyjarvis"), ("hey_mycroft", "heymycroft"), ("alexa", "alexa")]
+
+
+def lead(length: int) -> str:
+    """A sentence of exactly `length` characters that is no phrase and ends a sentence."""
+    return "a" * (length - 1) + "."
+
+
+@pytest.mark.parametrize(("model", "compact"), STOCK)
+def test_the_reply_cap_never_cuts_a_word_into_the_phrase(model: str, compact: str) -> None:
+    # "<phrase>x." cut where the room ends right after the phrase would be the phrase
+    config = TtsConfig(max_reply_chars=100)
+    first = lead(100 - len(compact))
+    assert len(first) == 100 - len(compact)
+
+    spoken = speak(f"{first} {compact}xyz.", avoid=(model,), config=config)
+
+    assert spoken[0] == first
+    assert not any(matches(entry, (model,)) for entry in spoken)
+    assert " ".join(spoken) == first  # the cut word is not spoken at all
+
+
+def test_the_reproduction_with_punctuation_in_the_phrase() -> None:
+    config = TtsConfig(max_reply_chars=100)
+    first = lead(90)
+
+    spoken = speak(f"{first} Hey,Jarvisson.", avoid=("hey_jarvis",), config=config)
+
+    assert not any(matches(entry, ("hey_jarvis",)) for entry in spoken)
+    assert " ".join(spoken) == first
+
+
+def test_the_sentence_bound_cut_does_not_cut_into_the_phrase_either() -> None:
+    config = TtsConfig(max_sentence_chars=40)
+    text = "w" * 31 + "heyjarvisx and then it goes on"  # the 40th character ends the phrase
+
+    spoken = speak(text, avoid=("hey_jarvis",), config=config)
+
+    assert not any(matches(entry, ("hey_jarvis",)) for entry in spoken)
+
+
+def test_a_cut_at_a_space_still_speaks_the_words_that_fit() -> None:
+    config = TtsConfig(max_reply_chars=100)
+    first = lead(90)
+
+    spoken = speak(f"{first} one two three four.", avoid=("hey_jarvis",), config=config)
+
+    assert " ".join(spoken) == f"{first} one two"
+
+
+def test_a_ligature_before_a_match_is_cut_where_it_really_is() -> None:
+    spoken = speak("\ufb01ne \ufb01ne, hey jarvis is it.", avoid=("hey_jarvis",))
+
+    assert spoken == [f"\ufb01ne \ufb01ne, {SILENCED_PHRASE} is it."]
+
+
+def test_the_text_after_a_straddling_cut_is_scrubbed_in_its_own_coordinates() -> None:
+    spoken = speak("Sure thing, hey. Jarvis, then hey jarvis again.", avoid=("hey_jarvis",))
+
+    assert spoken[0] == "Sure thing, hey."
+    assert spoken[1] == f"then {SILENCED_PHRASE} again."
+
+
+def test_the_previous_sentence_is_remembered_as_it_was_spoken() -> None:
+    spoken = speak("I said hey jarvis and hey. Jarvis is next here.", avoid=("hey_jarvis",))
+
+    assert spoken == [f"I said {SILENCED_PHRASE} and hey.", "is next here."]
+
+
+@settings(
+    max_examples=60,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+)
+@given(
+    pieces=st.lists(
+        st.sampled_from(
+            [
+                "hey",
+                "jarvis",
+                "Jarvis",
+                "jar",
+                "vis",
+                " ",
+                " ",
+                "-",
+                ",",
+                ".",
+                "!",
+                "x",
+                "mycroft",
+                "alexa",
+                "a",
+                "é",
+            ]
+        ),
+        min_size=1,
+        max_size=60,
+    ),
+    model=st.sampled_from(["hey_jarvis", "hey_mycroft", "alexa"]),
+    reply_cap=st.integers(min_value=100, max_value=160),
+    sentence_cap=st.integers(min_value=40, max_value=70),
+)
+def test_no_spoken_entry_ever_holds_the_phrase_whatever_the_text_and_the_caps(
+    pieces: list[str], model: str, reply_cap: int, sentence_cap: int
+) -> None:
+    config = TtsConfig(max_reply_chars=reply_cap, max_sentence_chars=sentence_cap)
+    text = "".join(pieces) * 4
+
+    spoken = speak(text, avoid=(model,), config=config)
+
+    assert not any(matches(entry, (model,)) for entry in spoken)
+    assert all(len(entry) <= sentence_cap for entry in spoken)
+    assert sum(len(entry) for entry in spoken) <= reply_cap
+
+
+def test_the_last_check_drops_from_the_phrase_on_and_never_grows_the_sentence() -> None:
+    speech = SpeechOutput(
+        backend=FakeTts(),
+        player=FakeAudioPlayer,
+        dispatcher=ManualDispatcher(),
+        config=TtsConfig(),
+        avoid=("hey_jarvis",),
+    )
+    pattern = _phrase_pattern(("hey_jarvis",))
+    assert pattern is not None
+    try:
+        checked = speech._final_check("Good déjà vu, Hey Jarvis and more.", pattern)  # noqa: SLF001
+
+        assert checked == "Good déjà vu,"
+        assert speech._previous == "Good deja vu,"  # noqa: SLF001  (what the next sentence follows)
+        assert speech._final_check("Nothing to see here.", pattern) == "Nothing to see here."  # noqa: SLF001
+    finally:
+        speech.close()
