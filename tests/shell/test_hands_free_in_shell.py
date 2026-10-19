@@ -664,3 +664,128 @@ class TestNothingNew:
             text = (source / name).read_text(encoding="utf-8")
             for forbidden in ("SimpleAction", "add_action", "activate_action", "Gio."):
                 assert forbidden not in text, (name, forbidden)
+
+
+class TestFocus:
+    """Any sound can start a hands-free turn: it must never take the keyboard focus (a password
+    typed into the terminal must not land in the chat, where the next Enter would send it)."""
+
+    def terminal_focused(self, h: Handsfree) -> "Gtk.Widget":
+        from tumbleweed.shell._gi import Gtk
+
+        window = h.shell.window
+        show(h.shell)
+        inside = Gtk.Box()
+        inside.set_focusable(True)
+        window.terminal_pane.append(inside)
+        window.terminal_pane.set_visible(True)
+        window.set_focus(inside)
+        assert window.get_focus() is inside
+        return inside
+
+    @pytest.mark.parametrize("edit_before_send", [False, True])
+    def test_a_wake_word_turn_leaves_the_focus_in_the_terminal(
+        self, build: HandsfreeBuilder, edit_before_send: bool
+    ) -> None:
+        h = build(edit_before_send=edit_before_send)
+        inside = self.terminal_focused(h)
+        turn_on(h)
+
+        wake_up(h)
+        say(h)
+
+        if edit_before_send:
+            assert pump_until(lambda: input_text(h.shell) == "hello there")
+        else:
+            assert pump_until(lambda: len(h.responder.requests) == 1)
+        assert h.shell.window.get_focus() is inside
+
+    @pytest.mark.parametrize("edit_before_send", [False, True])
+    def test_nor_does_it_take_the_focus_from_any_other_widget(
+        self, build: HandsfreeBuilder, edit_before_send: bool
+    ) -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        h = build(edit_before_send=edit_before_send)
+        window = h.shell.window
+        show(h.shell)
+        elsewhere = Gtk.Entry()
+        window.chrome.append(elsewhere)
+        window.set_focus(elsewhere)
+        turn_on(h)
+
+        wake_up(h)
+        say(h)
+
+        assert pump_until(lambda: h.stt.heard != [])
+        assert pump_until(lambda: indicator(h) != "Voice: transcribing")
+        focus = window.get_focus()
+        assert focus is not None
+        assert focus is elsewhere or focus.is_ancestor(elsewhere)  # an Entry focuses its Text
+
+    def test_a_turn_from_the_mic_button_that_ends_in_the_terminal_leaves_it_there(
+        self, build: HandsfreeBuilder
+    ) -> None:
+        h = build()
+        inside = self.terminal_focused(h)
+        controls(h).mic_button.set_active(True)
+        assert pump_until(lambda: h.source.capturing)
+        h.source.feed(pcm(1.0))
+
+        controls(h).mic_button.set_active(False)
+
+        assert pump_until(lambda: len(h.responder.requests) == 1)
+        assert h.shell.window.get_focus() is inside
+
+    def test_a_push_to_talk_turn_still_puts_the_focus_in_the_input(
+        self, build: HandsfreeBuilder
+    ) -> None:
+        h = build()
+        window = h.shell.window
+        show(h.shell)
+        window.set_focus(window.status_strip.voice)  # not focusable: nothing to keep
+        controls(h).mic_button.set_active(True)
+        assert pump_until(lambda: h.source.capturing)
+        h.source.feed(pcm(1.0))
+
+        controls(h).mic_button.set_active(False)
+
+        assert pump_until(lambda: len(h.responder.requests) == 1)
+        assert window.get_focus() is window.chat_panel.input_view
+
+
+class TestThinkingAndEditing:
+    def test_a_dictation_waiting_to_be_edited_is_not_a_sent_turn_and_the_edited_send_is_typing(
+        self, build: HandsfreeBuilder
+    ) -> None:
+        from tests.shell.gtk_support import click_send
+
+        h = build(edit_before_send=True)
+        turn_on(h)
+        wake_up(h)
+        say(h)
+        assert pump_until(lambda: input_text(h.shell) == "hello there")
+        assert indicator(h) == "Voice: waiting for the wake word"  # nothing was sent
+
+        click_send(h.shell)  # the user's own send of the edited words: typed, so not THINKING
+
+        assert pump_until(lambda: len(h.responder.requests) == 1)
+        assert indicator(h) == "Voice: waiting for the wake word"
+
+    def test_a_finished_assistant_message_that_is_added_ends_thinking(
+        self, build: HandsfreeBuilder
+    ) -> None:
+        from tumbleweed.core.ids import MessageId
+        from tumbleweed.shell.viewmodel.transcript import MessageState, Role, TranscriptMessage
+
+        h = build()
+        controls(h).set_thinking(True)
+        assert indicator(h) == "Voice: thinking"
+
+        controls(h).reply_watch.message_added(
+            TranscriptMessage(
+                id=MessageId.new(), role=Role.ASSISTANT, text="Done.", state=MessageState.COMPLETE
+            )
+        )
+
+        assert indicator(h) == "Voice: idle"

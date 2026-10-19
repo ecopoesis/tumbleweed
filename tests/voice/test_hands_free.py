@@ -18,6 +18,7 @@ from typing import Protocol
 import pytest
 
 from tests.voice.support import (
+    Clock,
     ManualDispatcher,
     Recorder,
     chunk,
@@ -164,6 +165,7 @@ class Builder(Protocol):
         on_state: Callable[[bool], None] | None = None,
         stream_gate: threading.Event | None = None,
         vad_gate: threading.Event | None = None,
+        clock: Clock | None = None,
     ) -> Rig: ...
 
 
@@ -185,6 +187,7 @@ def build() -> Iterator[Builder]:
         on_state: Callable[[bool], None] | None = None,
         stream_gate: threading.Event | None = None,
         vad_gate: threading.Event | None = None,
+        clock: Clock | None = None,
     ) -> Rig:
         voice_limits = voice_limits or limits(max_utterance_seconds=2)
         dispatcher = ManualDispatcher()
@@ -235,6 +238,7 @@ def build() -> Iterator[Builder]:
             speech=speaking,
             dispatcher=dispatcher,
             limits=voice_limits,
+            **({"clock": clock} if clock is not None else {}),
         )
         hands = HandsFreeRecorder()
         hf.subscribe(hands)
@@ -1096,16 +1100,22 @@ class TestThreads:
         rig = build()
         rig.start()
 
-        rig.hf.close()
+        thread = rig.hf._inference.thread  # noqa: SLF001  (this rig's own thread, not a name)
+        assert thread.is_alive()
 
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            names = {thread.name for thread in threading.enumerate()}
-            if "tumbleweed-hands-free" not in names:
-                break
-            time.sleep(0.01)
-        # other rigs of this module may have left theirs; this one's must not be the only one
-        assert rig.hf.phase is HandsFreePhase.OFF
+        rig.hf.close()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+
+    def test_there_is_no_thread_until_hands_free_is_turned_on(self, build: Builder) -> None:
+        rig = build()
+
+        assert not rig.hf._inference.thread.is_alive()  # noqa: SLF001
+
+        rig.hf.set_enabled(True)
+
+        assert rig.hf._inference.thread.is_alive()  # noqa: SLF001
 
 
 def audio_of(items: list[_Command | bytes] | None) -> bytes:
@@ -1209,10 +1219,148 @@ class TestMailbox:
 def test_the_stream_protocol_is_what_the_fake_implements() -> None:
     stream: AudioStream = FakeAudioStream()
 
-    stream.start(lambda _chunk: None)
+    stream.start(lambda _chunk: None, lambda _message: None)
     stream.stop()
 
 
 def test_window_and_chunk_helpers_make_what_the_fakes_read() -> None:
     assert FakeVad().probability(window(900)) == 0.9
     assert FakeWake().score(chunk(950)) == 0.95
+
+
+def wait_for_inference(rig: Rig, seconds: float = 0.7) -> None:
+    """Let the inference thread go round its loop a few times (it wakes twice a second)."""
+    rig.dispatcher.settle(seconds)
+
+
+class TestADeadCapture:
+    """A capture that dies, or stops delivering, is noticed, and nothing stays silenced."""
+
+    def test_a_capture_that_stops_delivering_is_reported_and_turned_off(
+        self, build: Builder
+    ) -> None:
+        clock = Clock()
+        rig = build(clock=clock)
+        rig.start()
+        rig.stream.feed(chunk(0))  # alive
+        wait_for_inference(rig)
+        assert rig.hf.phase is HandsFreePhase.WAITING
+
+        clock.advance(9)  # nothing has arrived for longer than the liveness bound
+        assert rig.until(lambda: rig.hf.phase is HandsFreePhase.OFF)
+
+        assert rig.hands.problems == ["The microphone stopped delivering audio."]
+        assert rig.until(lambda: not rig.stream.capturing)
+
+    def test_audio_that_keeps_coming_is_never_a_dead_capture(self, build: Builder) -> None:
+        clock = Clock()
+        rig = build(clock=clock)
+        rig.start()
+
+        for _ in range(5):
+            clock.advance(5)
+            rig.stream.feed(chunk(0))
+            wait_for_inference(rig, 0.6)
+
+        assert rig.hf.phase is HandsFreePhase.WAITING
+        assert rig.hands.problems == []
+
+    def test_a_capture_that_reports_an_error_is_turned_off_with_its_message(
+        self, build: Builder
+    ) -> None:
+        rig = build()
+        rig.start()
+
+        rig.stream.fail("The microphone stopped delivering audio.")
+
+        assert rig.until(lambda: rig.hf.phase is HandsFreePhase.OFF)
+        assert rig.hands.problems == ["The microphone stopped delivering audio."]
+        assert rig.until(lambda: not rig.hf.microphone_open)
+
+    def test_a_listening_turn_with_no_audio_ends_by_the_clock_and_replies_are_spoken_again(
+        self, build: Builder
+    ) -> None:
+        clock = Clock()
+        rig = build(clock=clock)
+        rig.start()
+        rig.wake_up()
+        assert rig.speech is not None
+        rig.speech.begin_reply()
+        rig.speech.feed("A reply that arrives while the microphone is open. ")
+        rig.flush()
+        assert rig.tts.spoken == []  # silenced while a turn is being recorded
+
+        wait_for_inference(rig)  # the thread notes when the turn began
+        rig.stream.feed(chunk(0))  # a little audio, then the device goes quiet
+        clock.advance(2 + 3 + 1)  # max_utterance_seconds, the grace, and a little more
+        wait_for_inference(rig)
+        rig.stream.feed(chunk(0))  # keeps the capture itself alive for this test
+
+        assert rig.until(lambda: rig.hf.phase is HandsFreePhase.WAITING)
+        assert rig.hands.problems[-1] == NOTHING_AFTER_WAKE
+        rig.speech.begin_reply()
+        rig.speech.feed("The next reply is spoken, the turn being over. ")
+        rig.speech.end_reply()
+        assert rig.until(lambda: len(rig.tts.spoken) == 1)
+
+    def test_a_late_failure_of_an_earlier_toggle_is_ignored(self, build: Builder) -> None:
+        rig = build()
+        rig.start()
+
+        rig.hf._stream_failed(0, "An old open that failed.")  # noqa: SLF001  (an earlier epoch)
+        rig.flush()
+
+        assert rig.hf.enabled
+        assert rig.hands.problems == []
+
+
+class TestStaleFaults:
+    def test_a_fault_found_after_esc_does_not_turn_hands_free_off(self, build: Builder) -> None:
+        rig = build(wake_error=RuntimeError("boom"))
+        rig.start()
+        rig.flush()
+        rig.stream.feed(chunk(0))
+        assert rig.dispatcher.wait_posted()  # the fault is posted, not yet handled
+
+        rig.hf.cancel()  # the user moved on, with hands-free still on
+        rig.flush()
+
+        assert rig.hf.enabled
+        assert rig.hands.problems == []
+
+    def test_after_a_fault_it_works_again_when_turned_on_again(self, build: Builder) -> None:
+        rig = build(wake_error=RuntimeError("boom"))
+        rig.start()
+        rig.stream.feed(chunk(0))
+        assert rig.until(lambda: rig.hf.phase is HandsFreePhase.OFF)
+        rig.wake.error = None
+        assert rig.until(lambda: not rig.stream.capturing)
+
+        rig.start()
+        rig.wake_up()
+
+        assert rig.hf.phase is HandsFreePhase.LISTENING
+
+    def test_a_mode_that_the_next_replaces_loads_no_models(self) -> None:
+        from tumbleweed.voice.hands_free import _Inference
+
+        loaded: list[int] = []
+
+        def factory() -> HandsFreeEngine:
+            loaded.append(1)
+            raise ModelError("not wanted")
+
+        mailbox = _Mailbox(RING_BYTES)
+        inference = _Inference(
+            mailbox, factory, lambda _events: None, lambda _g, _m: None, listen_limit=5
+        )
+        mailbox.command(_SetMode(EngineMode.WAITING, 1))  # turned on, and off again at once
+        mailbox.command(_SetMode(EngineMode.PAUSED, 2))
+        inference.start()
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+        mailbox.close()
+        inference.thread.join(timeout=5)
+
+        assert loaded == []

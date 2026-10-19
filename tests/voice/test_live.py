@@ -205,9 +205,9 @@ def test_the_wake_word_is_heard_and_other_speech_is_not(
     other = speech_pcm(tmp_path, "The quick brown fox jumps over the lazy dog.") + silence(1)
 
     assert best(wake) > 0.5
-    assert best(other) < 0.5
+    assert best(other) < 0.1
     assert best(silence(3)) < 0.1
-    assert best(noise(3)) < 0.5
+    assert best(noise(3)) < 0.2  # white noise at an RMS of 300 scored 0.14
 
 
 def test_the_loudness_gate_changes_no_score_of_a_chunk_that_is_run(

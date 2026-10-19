@@ -131,3 +131,17 @@ def chunk(level: int = 0) -> bytes:
 def windows(*levels: int) -> bytes:
     """Windows with these levels, one after the other."""
     return b"".join(window(level) for level in levels)
+
+
+@final
+class Clock:
+    """A monotonic clock a test sets: `HandsFree`'s wall-clock bounds read it, not the time."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds

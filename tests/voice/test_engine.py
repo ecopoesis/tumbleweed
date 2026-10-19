@@ -360,3 +360,109 @@ class TestBounds:
 
         with pytest.raises(RuntimeError, match="boom"):
             waiting.feed(chunk(0))
+
+
+def engine_with(wake_config: WakeConfig) -> HandsFreeEngine:
+    built = HandsFreeEngine(
+        wake=FakeWake(),
+        vad=FakeVad(),
+        wake_config=wake_config,
+        vad_config=VAD,
+        max_utterance_bytes=ByteCount(1000 * VAD_WINDOW_BYTES),
+    )
+    built.set_mode(EngineMode.WAITING, GENERATION)
+    return built
+
+
+class TestSpeakingThresholdOne:
+    """A float32 score saturates to exactly 1.0, which `score >= 1.0` would let through."""
+
+    def test_a_saturated_score_is_not_a_wake_word_while_speaking(self) -> None:
+        strict = engine_with(WakeConfig(speaking_threshold=1.0))
+        strict.set_speaking(True)
+
+        assert strict.feed(chunk(1000) * 5) == []  # a score of exactly 1.0, five times
+        assert strict.mode is EngineMode.WAITING
+
+    def test_nor_during_the_holdoff_after_it(self) -> None:
+        strict = engine_with(WakeConfig(speaking_threshold=1.0, speaking_holdoff_ms=160))
+        strict.set_speaking(True)
+        strict.set_speaking(False)
+
+        assert strict.feed(chunk(1000) * 2) == []
+        assert len(strict.feed(chunk(1000))) == 1  # in the clear again
+
+    def test_in_the_clear_it_is_the_ordinary_threshold(self) -> None:
+        strict = engine_with(WakeConfig(speaking_threshold=1.0))
+
+        assert len(strict.feed(chunk(600))) == 1
+
+
+class TestTheHoldoff:
+    def test_a_holdoff_that_is_not_a_whole_number_of_chunks_rounds_up(self) -> None:
+        # 500 ms is 6.25 chunks: seven are guarded, never six
+        guarded = engine_with(WakeConfig(speaking_holdoff_ms=500))
+        guarded.set_speaking(True)
+        guarded.set_speaking(False)
+
+        assert guarded.feed(chunk(600) * 7) == []
+        assert len(guarded.feed(chunk(600))) == 1
+
+    def test_a_wake_word_in_the_holdoff_drops_the_first_250_ms_like_one_while_speaking(
+        self,
+    ) -> None:
+        vad = FakeVad()
+        waiting = engine(vad=vad)
+        waiting.set_speaking(True)
+        waiting.set_speaking(False)  # the reply ended; the speakers are still dying away
+        waiting.feed(chunk(950))
+        assert waiting.feed(windows(*([900] * windows_for(250)))) == []
+
+        assert vad.windows == 0  # the settle time was not heard
+        waiting.feed(window(900))
+        assert vad.windows == 1
+
+
+class TestTheBufferCap:
+    def test_a_turn_whose_audio_the_ring_cap_trimmed_is_given_up(self) -> None:
+        waiting = engine()
+        waiting.feed(chunk(900))
+        waiting.feed(windows(900))
+
+        events = waiting.feed(bytes(RING_BYTES + 10_000))  # more than the ring holds at once
+
+        assert events == [TurnEnded(GENERATION, EndReason.AUDIO_LOST, None)]
+
+    def test_trimming_while_only_waiting_loses_nothing_of_a_turn(self) -> None:
+        waiting = engine()
+
+        assert waiting.feed(bytes(RING_BYTES + 10_000)) == []
+        events = waiting.feed(chunk(900) + talk())
+
+        (_, ended) = events
+        assert isinstance(ended, TurnEnded)
+        assert ended.reason is EndReason.ENDPOINT
+
+
+class TestGivingUp:
+    def test_a_turn_that_lasted_too_long_in_real_time_ends_with_what_was_heard(self) -> None:
+        waiting = engine()
+        waiting.feed(chunk(900))
+        waiting.feed(windows(900, 900, 900))
+
+        (ended,) = waiting.give_up()
+
+        assert isinstance(ended, TurnEnded)
+        assert ended.reason is EndReason.MAX_LENGTH
+        assert ended.pcm is not None
+        assert waiting.mode is EngineMode.PAUSED
+
+    def test_with_nothing_heard_it_is_no_speech(self) -> None:
+        waiting = engine()
+        waiting.feed(chunk(900))
+
+        assert waiting.give_up() == [TurnEnded(GENERATION, EndReason.NO_SPEECH, None)]
+
+    def test_it_is_nothing_unless_listening(self) -> None:
+        assert engine().give_up() == []
+        assert engine(mode=EngineMode.PAUSED).give_up() == []

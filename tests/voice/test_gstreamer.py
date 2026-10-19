@@ -18,6 +18,7 @@ from tumbleweed.voice.errors import AudioError
 from tumbleweed.voice.limits import BYTES_PER_SECOND
 
 try:
+    from tumbleweed.voice._gst import Gst
     from tumbleweed.voice.gstreamer import (
         CaptureSource,
         GStreamerAudioSource,
@@ -156,7 +157,7 @@ class TestTheStream:
         stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
         try:
             started = time.monotonic()
-            stream.start(deliver)
+            stream.start(deliver, lambda _message: None)
             time.sleep(0.8)
             stream.stop()
             elapsed = time.monotonic() - started
@@ -178,7 +179,7 @@ class TestTheStream:
             count += 1
 
         stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
-        stream.start(deliver)
+        stream.start(deliver, lambda _message: None)
         time.sleep(0.3)
         stream.stop()
         seen = count
@@ -192,7 +193,7 @@ class TestTheStream:
         stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
 
         stream.stop()
-        stream.start(lambda _chunk: None)
+        stream.start(lambda _chunk: None, lambda _message: None)
         stream.stop()
         stream.stop()
 
@@ -200,9 +201,9 @@ class TestTheStream:
         first, second = threading.Event(), threading.Event()
         stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
         try:
-            stream.start(lambda _chunk: first.set())
+            stream.start(lambda _chunk: first.set(), lambda _message: None)
             assert first.wait(timeout=5)
-            stream.start(lambda _chunk: second.set())
+            stream.start(lambda _chunk: second.set(), lambda _message: None)
             assert second.wait(timeout=5)
         finally:
             stream.stop()
@@ -211,7 +212,7 @@ class TestTheStream:
         nowhere = GStreamerAudioStream(platform="plan9")
 
         with pytest.raises(AudioError, match="not supported"):
-            nowhere.start(lambda _chunk: None)
+            nowhere.start(lambda _chunk: None, lambda _message: None)
 
     def test_a_real_stream_creates_no_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -226,10 +227,39 @@ class TestTheStream:
 
         stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
         try:
-            stream.start(lambda _chunk: received.set())
+            stream.start(lambda _chunk: received.set(), lambda _message: None)
             assert received.wait(timeout=5)
             time.sleep(0.3)
         finally:
             stream.stop()
 
         assert sorted(tmp_path.rglob("*")) == before
+
+    def test_the_end_of_the_stream_is_reported_as_an_error_not_left_silent(self) -> None:
+        reported: list[str] = []
+        got_audio = threading.Event()
+        stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
+        try:
+            stream.start(lambda _chunk: got_audio.set(), reported.append)
+            assert got_audio.wait(timeout=5)
+
+            assert stream._pipeline is not None  # noqa: SLF001  (to end it, as a device going away does)
+            stream._pipeline.send_event(Gst.Event.new_eos())  # noqa: SLF001
+            deadline = time.monotonic() + 5
+            while not reported and time.monotonic() < deadline:
+                time.sleep(0.01)
+        finally:
+            stream.stop()
+
+        assert reported == ["The microphone stopped delivering audio."]
+
+    def test_stopping_it_reports_nothing(self) -> None:
+        reported: list[str] = []
+        stream = GStreamerAudioStream(kind=CaptureSource.TEST_TONE)
+        stream.start(lambda _chunk: None, reported.append)
+        time.sleep(0.2)
+
+        stream.stop()
+        time.sleep(0.2)
+
+        assert reported == []
