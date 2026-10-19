@@ -785,12 +785,15 @@ nothing is spoken while a turn is recorded; a turn that began while speaking dro
 loopback test feeds the player's output back into the microphone: it scores 0.6, which is the wake
 word in the clear and nothing while speaking. The residual is documented in the README and ARCHITECTURE: a
 loud speaker, or a reply containing the wake word, can pass; headphones, or `speaking_threshold = 1`,
-close it: a speaking threshold of 1 (or more) accepts *no* wake word while a reply is spoken, nor
+close it: a speaking threshold of 1 (the most the configuration allows) accepts *no* wake word while a reply is spoken, nor
 during the holdoff, even though a float32 score can saturate at exactly 1.0 (tested with a saturated
-score). Model output cannot say the wake word either: before synthesis the configured phrase is
-replaced by "the wake word", in any case and with any punctuation between its words, as whole words,
-and across the end of a sentence (the first sentence is already on its way, so what the phrase takes
-from the second is dropped); a phrase spoken in the reply by a model is thus never audible. This amends
+score). Reply text is also cleaned of the phrase as written: before synthesis the configured phrase is
+replaced by "the wake word", in any case, with any punctuation between its words or letters, with
+accents and full-width forms folded, as whole words, and across the end of a sentence (the first
+sentence is already on its way, so what the phrase takes from the second is dropped; this assumes
+phrases of at most two words). Respellings that fool the pattern (a look-alike letter of another
+script, say) can pass, so this is a mitigation and not a guarantee: `speaking_threshold = 1`, or
+headphones, are the control. This amends
 D22 (5), which left echo uncancelled for S08 (D22 itself is as S07 left it). The microphone stays open
 while speaking because the wake word is how the user interrupts.
 (8) *The indicator* (amends D22 (8), which moved THINKING here; D22's text is unchanged): `THINKING` is set by the shell from
@@ -833,12 +836,6 @@ state, and every score of a chunk that is run, is as without the gate (tested wi
 content-dependent fakes and, `live`, with the real models); a chunk that quiet is never the wake word.
 A microphone whose noise floor is above the gate (an RMS of 100) never lets it close, and then costs
 the 10%.
-**Deviations from the plan.** None in scope. The plan allows `webrtcvad`: Silero chosen, above. The
-plan says to "use the `openwakeword` package only if it installs on Python >= 3.12 on macOS and Linux
-(on Linux it currently requires `tflite-runtime`, which has no Python 3.12 wheels)": without an
-unsupported override that drops `tflite-runtime` it does not install on Linux, so the condition is not
-met and the pipeline is run directly, above; its arithmetic is not checked against upstream in CI (only
-by hand, above, and by `live` tests), #134. The mic-active indicator is a label of its own beside the state.
 (14) *Focus, and a capture that dies* (round 1 of review). Any sound can start a hands-free turn, so such
 a turn never moves the keyboard focus: `ChatPanel.dictate(take_focus=False)`, for a turn from a wake
 word (`VoiceInput.wake_turn`) and for any turn that ends while the terminal has the focus; a
@@ -846,11 +843,18 @@ push-to-talk turn elsewhere still puts the focus in the input, as in S06 (tested
 terminal and in another widget, for both `edit_before_send` values). Counting audio cannot bound time
 when the audio stops, so the inference thread also keeps wall-clock bounds (the monotonic clock): a
 capture that has delivered nothing for 8 s is reported and hands-free turned off, a turn that has lasted
-`max_utterance_seconds` plus 3 s ends with what was heard, and `AudioStream.start` takes an
-`on_error` that the GStreamer adapter calls on a bus error or end of stream (tested on Linux with a
-test tone), so no reply stays silenced by a turn that cannot end. The inference thread is started by
+`max_utterance_seconds` plus 3 s ends with what was heard (`TIMED_OUT`, with its own message), and
+`AudioStream.start` takes an `on_error` that the GStreamer adapter calls on a bus error or end of
+stream once the microphone is open (an error while opening is `start`'s, refused in fixed text; tested on
+Linux with a test tone and with no device), so no reply stays silenced by a turn that cannot end. The inference thread is started by
 the first turn-on, not at construction. Audio dropped by the engine's own cap, as by the mailbox's,
 gives the turn up.
+**Deviations from the plan.** None in scope. The plan allows `webrtcvad`: Silero chosen, above. The
+plan says to "use the `openwakeword` package only if it installs on Python ≥ 3.12 on macOS and Linux
+(on Linux it currently requires `tflite-runtime`, which has no Python 3.12 wheels)": without an
+unsupported override that drops `tflite-runtime` it does not install on Linux, so the condition is not
+met and the pipeline is run directly, above; its arithmetic is not checked against upstream in CI (only
+by hand, above, and by `live` tests), #134. The mic-active indicator is a label of its own beside the state.
 **Consequences.** There is no acoustic echo cancellation (above). The wake-word models are
 non-commercial (CC BY-NC-SA); a model of one's own needs a new pinned entry. Models are hash-checked at
 start-up and again when they are loaded, but a session already loaded is not re-checked. Hands-free is
