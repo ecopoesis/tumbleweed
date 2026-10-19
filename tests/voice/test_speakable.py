@@ -76,6 +76,20 @@ class TestSentences:
 
         assert speak(text) == ["We use Dr. Who and e.g. items here.", "Next one now."]
 
+    @pytest.mark.parametrize(
+        "ending", ["5 (ms).", "5 `ms`.", "5 [ms].", "5 *vs*.", "5 _Dr_.", "5 (etc.)."]
+    )
+    def test_a_stop_after_a_word_that_closes_a_mark_still_ends_the_sentence(
+        self, ending: str
+    ) -> None:
+        # The mark before the stop ("(ms)." and so on) means the word is not an abbreviation's.
+        text = f"Timing is {ending} Then more words follow here."
+
+        spoken = speak(text)
+
+        assert len(spoken) == 2
+        assert spoken[1] == "Then more words follow here."
+
     def test_a_sentence_ends_where_a_closing_mark_follows_the_stop(self) -> None:
         assert speak("This is **done now.** Then the next one starts here.") == [
             "This is done now.",

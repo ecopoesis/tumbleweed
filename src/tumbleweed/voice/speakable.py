@@ -81,7 +81,7 @@ def _ends_a_sentence(text: str) -> bool:
     if not bare.endswith(".") or bare.endswith(".."):
         return True
     words = bare[:-1].rsplit(None, 1)
-    return not words or words[-1].lower().strip(_CLOSERS + "([") not in _ABBREVIATIONS
+    return not words or words[-1].lower().lstrip(_CLOSERS + "([") not in _ABBREVIATIONS
 
 
 class _Line(enum.Enum):
