@@ -278,6 +278,10 @@ class SpeechOutput:
             if pattern is not None and sentence:
                 sentence = self._final_check(sentence, pattern)
             if sentence:
+                if pattern is not None:
+                    # What the next sentence is checked against is what is really spoken, after
+                    # every cut; a sentence that came to nothing leaves it as it was.
+                    self._previous = _fold(sentence)[0]
                 self._spoken_chars += len(sentence)
                 self._submit(sentence)
             if not self._accepting:
@@ -294,9 +298,11 @@ class SpeechOutput:
         replacement is longer than a short phrase), which keeps Piper's stdin bounded."""
         folded, origin = _fold(sentence)
         # The reach across a sentence end assumes phrases of at most two words ("hey jarvis"): a
-        # match that straddles the boundary loses only its second part to this sentence.
-        found = pattern.search(f"{self._previous} {folded}")
-        if found is not None and found.start() < len(self._previous) + 1 < found.end():
+        # match that straddles the boundary loses only its second part to this sentence. Again and
+        # again until nothing straddles ("hey. Jarvis Jarvis, ..."): each cut shortens the sentence.
+        while (found := pattern.search(f"{self._previous} {folded}")) is not None and (
+            found.start() < len(self._previous) + 1 < found.end()
+        ):
             cut = _original_end(sentence, origin, found.end() - len(self._previous) - 1)
             sentence = sentence[cut:].lstrip(" ,.;:!?-")
             folded, origin = _fold(sentence)
@@ -307,20 +313,19 @@ class SpeechOutput:
             pieces.append(SILENCED_PHRASE)
             taken = _original_end(sentence, origin, match.end())
         scrubbed = "".join(pieces) + sentence[taken:] if pieces else sentence
-        scrubbed = _cut_at_word(scrubbed, self._config.max_sentence_chars)
-        self._previous = _fold(scrubbed)[0]
-        return scrubbed
+        return _cut_at_word(scrubbed, self._config.max_sentence_chars)
 
     def _final_check(self, sentence: str, pattern: "re.Pattern[str]") -> str:
         """The last step before a sentence is submitted, after every cut: if the phrase is in it
         (a cut can rebuild one from a word it made short), everything from the phrase on is
-        dropped, never replaced, so the sentence cannot grow. This makes it true by construction
-        that no submitted sentence matches the pattern."""
+        dropped, never replaced, so the sentence cannot grow. With the loop in `_scrub` that makes
+        it true by construction that no submitted sentence matches the pattern, and none does
+        together with the sentence submitted before it in the same reply (a reply starts afresh:
+        `begin_reply` forgets the last, and a user turn sits between two replies)."""
         folded, origin = _fold(sentence)
         match = pattern.search(folded)
         if match is not None:
             sentence = sentence[: origin[match.start()]].rstrip()
-            self._previous = _fold(sentence)[0]
         return sentence
 
     def _cap_reached(self) -> None:

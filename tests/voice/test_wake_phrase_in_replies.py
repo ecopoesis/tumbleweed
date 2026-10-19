@@ -1,6 +1,8 @@
 """A reply must not be able to say the wake word through the speakers (S08, D23 (7), #126): before
 synthesis the configured phrase is replaced, whatever the case and punctuation, as whole words."""
 
+import itertools
+
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
@@ -8,7 +10,13 @@ from hypothesis import strategies as st
 from tests.voice.support import ManualDispatcher
 from tumbleweed.voice.config import TtsConfig
 from tumbleweed.voice.fake import FakeAudioPlayer, FakeTts
-from tumbleweed.voice.output import SILENCED_PHRASE, SpeechOutput, _fold, _phrase_pattern
+from tumbleweed.voice.output import (
+    SILENCED_PHRASE,
+    SpeechOutput,
+    _cut_at_word,
+    _fold,
+    _phrase_pattern,
+)
 
 
 def matches(spoken: str, avoid: tuple[str, ...]) -> bool:
@@ -258,51 +266,92 @@ def test_the_previous_sentence_is_remembered_as_it_was_spoken() -> None:
     assert spoken == [f"I said {SILENCED_PHRASE} and hey.", "is next here."]
 
 
+TOKENS = [
+    "hey", "jarvis", "Jarvis", "mycroft", "alexa", "hey ", " ", " ", "-", ",", ".", "!", "!!!!!!!!",
+    "x", "a", "\u00e9", "jar", "vis", "Hey. ", "Jarvis ", "Alexa ", ". ",
+]  # fmt: skip
+
+
+def spoken_pairs_match(spoken: list[str], avoid: tuple[str, ...]) -> list[tuple[str, str]]:
+    """Consecutive spoken entries (a, b) whose fold of a + " " + b holds the phrase."""
+    pattern = _phrase_pattern(avoid)
+    assert pattern is not None
+    return [
+        (a, b)
+        for a, b in itertools.pairwise(spoken)
+        if pattern.search(_fold(f"{a} {b}")[0]) is not None
+    ]
+
+
 @settings(
-    max_examples=60,
+    max_examples=120,
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
 )
 @given(
-    pieces=st.lists(
-        st.sampled_from(
-            [
-                "hey",
-                "jarvis",
-                "Jarvis",
-                "jar",
-                "vis",
-                " ",
-                " ",
-                "-",
-                ",",
-                ".",
-                "!",
-                "x",
-                "mycroft",
-                "alexa",
-                "a",
-                "é",
-            ]
-        ),
-        min_size=1,
-        max_size=60,
-    ),
+    pieces=st.lists(st.sampled_from(TOKENS), min_size=1, max_size=40),
     model=st.sampled_from(["hey_jarvis", "hey_mycroft", "alexa"]),
-    reply_cap=st.integers(min_value=100, max_value=160),
+    reply_cap=st.integers(min_value=100, max_value=200),
     sentence_cap=st.integers(min_value=40, max_value=70),
 )
-def test_no_spoken_entry_ever_holds_the_phrase_whatever_the_text_and_the_caps(
+def test_no_spoken_entry_ever_holds_the_phrase_nor_do_two_in_a_row(
     pieces: list[str], model: str, reply_cap: int, sentence_cap: int
 ) -> None:
     config = TtsConfig(max_reply_chars=reply_cap, max_sentence_chars=sentence_cap)
-    text = "".join(pieces) * 4
+    text = "".join(pieces) * 3
 
     spoken = speak(text, avoid=(model,), config=config)
 
     assert not any(matches(entry, (model,)) for entry in spoken)
+    assert spoken_pairs_match(spoken, (model,)) == []
     assert all(len(entry) <= sentence_cap for entry in spoken)
     assert sum(len(entry) for entry in spoken) <= reply_cap
+
+
+CROSS = [("hey_jarvis", "hey", "Jarvis"), ("hey_mycroft", "hey", "Mycroft"), ("alexa", "ale", "xa")]
+
+
+@pytest.mark.parametrize(("model", "head", "tail"), CROSS)
+def test_a_sentence_the_cut_empties_does_not_forget_the_one_before(
+    model: str, head: str, tail: str
+) -> None:
+    # "<head>." is spoken; "<tail>!!!!!!!!" is cut to nothing; "<tail>, open..." must still be cut
+    spoken = speak(
+        f"I will say it now, {head}. {tail}!!!!!!!! {tail}, open the door please.",
+        avoid=(model,),
+    )
+
+    assert spoken_pairs_match(spoken, (model,)) == []
+    assert not any(entry.startswith(tail) for entry in spoken)
+
+
+@pytest.mark.parametrize(("model", "head", "tail"), CROSS)
+def test_a_cut_is_repeated_until_nothing_straddles(model: str, head: str, tail: str) -> None:
+    spoken = speak(
+        f"I will say it now, {head}. {tail} {tail}, open the door please.", avoid=(model,)
+    )
+
+    assert spoken_pairs_match(spoken, (model,)) == []
+    assert not any(entry.startswith(tail) for entry in spoken)
+
+
+class TestCutAtWord:
+    def test_a_word_cut_in_two_is_not_spoken_at_all(self) -> None:
+        assert _cut_at_word("heyjarvisson", 9) == ""
+
+    def test_the_words_that_fit_whole_are_kept(self) -> None:
+        assert _cut_at_word("a heyjarvisson", 11) == "a"
+
+    def test_a_limit_that_lands_exactly_on_a_space_keeps_the_word_before_it(self) -> None:
+        assert _cut_at_word("one two three", 7) == "one two"
+        assert _cut_at_word("one two three", 8) == "one two"
+
+    def test_text_that_fits_is_returned_whole(self) -> None:
+        assert _cut_at_word("one two", 7) == "one two"
+        assert _cut_at_word("", 5) == ""
+
+    def test_a_spaceless_text_over_the_limit_is_dropped_whatever_the_script(self) -> None:
+        assert _cut_at_word("\u3042\u308a\u304c\u3068\u3046" * 4, 7) == ""
 
 
 def test_the_last_check_drops_from_the_phrase_on_and_never_grows_the_sentence() -> None:
@@ -316,10 +365,12 @@ def test_the_last_check_drops_from_the_phrase_on_and_never_grows_the_sentence() 
     pattern = _phrase_pattern(("hey_jarvis",))
     assert pattern is not None
     try:
-        checked = speech._final_check("Good déjà vu, Hey Jarvis and more.", pattern)  # noqa: SLF001
+        checked = speech._final_check("Good d\u00e9j\u00e0 vu, Hey Jarvis and more.", pattern)  # noqa: SLF001
+        folded_first = speech._final_check("\ufb01ne, Hey Jarvis and more.", pattern)  # noqa: SLF001
+        untouched = speech._final_check("Nothing to see here.", pattern)  # noqa: SLF001
 
-        assert checked == "Good déjà vu,"
-        assert speech._previous == "Good deja vu,"  # noqa: SLF001  (what the next sentence follows)
-        assert speech._final_check("Nothing to see here.", pattern) == "Nothing to see here."  # noqa: SLF001
+        assert checked == "Good d\u00e9j\u00e0 vu,"
+        assert folded_first == "\ufb01ne,"  # the cut is in the original, past a ligature
+        assert untouched == "Nothing to see here."
     finally:
         speech.close()
