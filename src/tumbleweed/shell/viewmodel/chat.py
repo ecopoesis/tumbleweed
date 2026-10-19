@@ -18,9 +18,10 @@ are not thread-safe.
 
 import logging
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import assert_never, final
 
+from tumbleweed.agent.canvas_events import CanvasTurn, display_line
 from tumbleweed.agent.responder import (
     MAX_CONTEXT_TURNS,
     ContextTurn,
@@ -91,13 +92,27 @@ def context_turns(messages: Sequence[TranscriptMessage]) -> tuple[ContextTurn, .
 class _Reply:
     """One reply in flight: it fills one assistant message, and is the sink of its responder."""
 
-    def __init__(self, transcript: Transcript, message_id: MessageId) -> None:
+    def __init__(
+        self, transcript: Transcript, message_id: MessageId, on_closed: Callable[[], None]
+    ) -> None:
         self._transcript = transcript
         self._message_id = message_id
         self._thread = threading.get_ident()
         self._handle: ReplyHandle | None = None
         self._cancel_when_known = False
+        self._on_closed = on_closed
+        self._told = False
         self.closed = False
+
+    def _tell_closed(self) -> None:
+        """Say once that the reply is over, after the transcript shows it so."""
+        if self._told:
+            return
+        self._told = True
+        try:
+            self._on_closed()
+        except Exception:
+            logger.exception("a listener of the end of reply %s failed", self._message_id)
 
     def attach(self, handle: ReplyHandle) -> None:
         """Remember the responder's handle (it arrives after `start` returns).
@@ -121,10 +136,13 @@ class _Reply:
             if self._transcript.streaming == self._message_id:
                 self._transcript.fail(self._message_id, reason)
         finally:
-            if self._handle is not None:
-                self._cancel(self._handle)
-            else:
-                self._cancel_when_known = True
+            try:
+                if self._handle is not None:
+                    self._cancel(self._handle)
+                else:
+                    self._cancel_when_known = True
+            finally:
+                self._tell_closed()
 
     def _cancel(self, handle: ReplyHandle) -> None:
         try:
@@ -160,6 +178,7 @@ class _Reply:
                     self._transcript.finish(self._message_id)
                 finally:
                     self.closed = True
+                    self._tell_closed()
             case ReplyFailed(reason=reason):
                 try:
                     self._transcript.fail(self._message_id, reason)
@@ -169,6 +188,7 @@ class _Reply:
                     self.abort(_BAD_FAILURE)
                 else:
                     self.closed = True
+                    self._tell_closed()
             case _ as unreachable:
                 assert_never(unreachable)
 
@@ -182,6 +202,19 @@ class ChatController:
         self._responder = responder
         self._reply: _Reply | None = None
         self._session_id: SessionId | None = None
+        self._idle_listeners: list[Callable[[], None]] = []
+
+    def add_idle_listener(self, listener: Callable[[], None]) -> None:
+        """Call `listener` each time a reply ends, whichever way, once the transcript shows it
+        (the canvas's event gate starts its next waiting turn from here)."""
+        self._idle_listeners.append(listener)
+
+    def _on_reply_closed(self) -> None:
+        for listener in tuple(self._idle_listeners):
+            try:
+                listener()
+            except Exception:
+                logger.exception("a listener of the end of a reply failed")
 
     def set_session(self, session_id: SessionId | None) -> None:
         """The chat session the next messages belong to; the responder records it with each model
@@ -200,12 +233,30 @@ class ChatController:
         streaming, transcript full) before anything is changed. Once the message is accepted,
         failures of the responder show in the transcript as a failed reply instead.
         """
+        self._start(text, None)
+
+    def start_canvas_turn(self, turn: CanvasTurn) -> None:
+        """Start a reply to a user's action on a canvas tool (S12, `agent` handlers).
+
+        The transcript shows a line of ours that names the handler, and the model is sent the
+        event framed as data (`tumbleweed.agent.canvas_events`). Refused as `send` is, with
+        `TranscriptError` while a reply streams.
+        """
+        self._start(display_line(turn), turn)
+
+    def _start(self, text: str, canvas_turn: CanvasTurn | None) -> None:
         user = self._transcript.add_user(text)
         history = context_turns(self._transcript.messages[:-1])  # everything before this message
-        reply = _Reply(self._transcript, self._transcript.begin_assistant().id)
+        reply = _Reply(
+            self._transcript, self._transcript.begin_assistant().id, self._on_reply_closed
+        )
         self._reply = reply
         request = ReplyRequest(
-            message_id=user.id, text=user.text, history=history, session_id=self._session_id
+            message_id=user.id,
+            text=user.text,
+            history=history,
+            session_id=self._session_id,
+            canvas_turn=canvas_turn,
         )
         try:
             handle = self._responder.start(request, reply)

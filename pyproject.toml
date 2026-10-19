@@ -351,6 +351,12 @@ type = "forbidden"
 source_modules = ["tumbleweed.agent"]
 forbidden_modules = ["tumbleweed.shell"]
 
+[[tool.importlinter.contracts]]
+name = "agent never imports the GTK adapter: the shell hosts the canvas through CanvasHost (S12)"
+type = "forbidden"
+source_modules = ["tumbleweed.agent"]
+forbidden_modules = ["tumbleweed.ui.gtk"]
+
 # Indirect imports count: the view-model may not reach gi through any other module either, so it
 # also cannot import the GTK adapter modules of tumbleweed.shell.
 [[tool.importlinter.contracts]]

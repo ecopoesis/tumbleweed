@@ -10,9 +10,13 @@ that does not validate, a handler that fails or takes too long all come back as 
 `ToolOutcome`, which the loop returns to the model as an error `tool_result`. Results are bounded.
 Only cancellation passes through.
 
-S03 ships no real tools: the registry exists, and is tested, for S12 and S19 to fill. Handlers run
-on the agent's worker thread, not the GTK main thread: a handler that needs the UI marshals to it
-itself (the shell's dispatcher), and never touches a widget directly.
+A handler that fails in a way the model can act on raises `ToolError`: its message is written
+for the model (it may run to several lines, as a spec's problems do) and comes back, bounded, as the
+error result. Any other `TumbleweedError` is cut to one short line.
+
+The registry holds the tools S12 (the canvas) and S19 fill it with. Handlers run on the agent's
+worker thread, not the GTK main thread: a handler that needs the UI marshals to it itself (the
+shell's dispatcher), and never touches a widget directly.
 """
 
 import asyncio
@@ -46,6 +50,14 @@ class ToolName(
     """The name of a tool, in the character set the providers accept."""
 
     __slots__ = ()
+
+
+class ToolError(TumbleweedError):
+    """A tool's expected failure, with a message for the model to read and act on.
+
+    The text must already be safe for the model (bounded, no untrusted input echoed whole); the
+    registry sanitises it and cuts it to `MAX_TOOL_RESULT_BYTES`.
+    """
 
 
 @final
@@ -136,6 +148,8 @@ class ToolRegistry:
             return ToolOutcome(
                 text=f"The tool {name} took too long and was stopped.", is_error=True
             )
+        except ToolError as exc:
+            return ToolOutcome(text=_bounded(str(exc)) or "failed", is_error=True)
         except TumbleweedError as exc:
             # The tool's own, expected failure: its message is ours to show the model, bounded.
             return ToolOutcome(

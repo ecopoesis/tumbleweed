@@ -17,6 +17,7 @@ from tumbleweed.agent.anthropic_provider import (
     build_client,
     response_byte_limit,
 )
+from tumbleweed.agent.canvas import CanvasLink, register_canvas_tools
 from tumbleweed.agent.config import (
     SECRET_ENV_VARIABLES,
     AgentConfig,
@@ -41,10 +42,12 @@ logger = logging.getLogger(__name__)
 @final
 @dataclass(frozen=True)
 class AgentSetup:
-    """The responder to give the shell, and what to call when the shell quits."""
+    """The responder to give the shell, what to call when the shell quits, and the link the
+    window attaches its canvas to (None when the responder has no canvas tools)."""
 
     responder: Responder
     close: Callable[[], None]
+    canvas: CanvasLink | None = None
 
 
 def _nothing() -> None:
@@ -83,10 +86,13 @@ def _build_anthropic(
             prompt_version=SYSTEM_PROMPT_VERSION,
         )
         model = config.model_for(ModelRole.CHAT)
+        registry = ToolRegistry()
+        canvas = CanvasLink(dispatcher)
+        register_canvas_tools(registry, canvas)
         responder = AgentResponder(
             provider=AnthropicProvider(client, effort=config.effort),
             recorder=recorder,
-            registry=ToolRegistry(),
+            registry=registry,
             model=model,
             system_prompt=load_system_prompt(),
             limits=config.limits,
@@ -105,4 +111,4 @@ def _build_anthropic(
             _nothing,
         )
     logger.info("responder: %s (prompt %s)", model, SYSTEM_PROMPT_VERSION)
-    return AgentSetup(responder, responder.close)
+    return AgentSetup(responder, responder.close, canvas)
