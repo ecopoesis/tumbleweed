@@ -804,8 +804,16 @@ sounds like the phrase said slowly ("Alex a" for "alexa"): defensible, and pinne
 reply-cap cut and the sentence-bound cut never split a word (a cut into `Jarvisson` could make
 `Jarvis`): with no space to cut at they speak nothing more; and as the last step before a sentence
 is submitted, after every cut, the folded text is searched again and everything from a match on is
-dropped, so no submitted sentence matches the pattern by construction (a property test says so over
-random text and caps).
+dropped, so no submitted sentence matches the pattern by construction, and, because the cut at a
+sentence
+end is repeated until nothing straddles it and a sentence that came to nothing leaves the memory of
+the
+one before it alone, nor do two consecutive sentences of one reply together (a property test over
+token-biased text and random caps says so, and so do the reproductions for the three stock models).
+Replies are separate: `begin_reply` forgets the last sentence, and a user turn sits between two
+replies. The no-mid-word rule applies only while the phrase is scrubbed, that is with hands-free set
+up: without it D22's cut is as S07 left it. With it, a final sentence over the reply cap that has no
+space in it to cut at (CJK text, say) is dropped rather than partly spoken.
 Respellings that fool the pattern (a look-alike letter of another script, say) can pass, so this is
 a mitigation and not a guarantee: `speaking_threshold = 1`, or headphones, are the control. This
 amends D22 (5), which left echo uncancelled for S08 (D22 itself is as S07 left it). The microphone
@@ -841,7 +849,8 @@ nothing else (no action, nothing in the chrome region). (13) *Performance.*
 the real models, 80 ms chunks paced in real time) and prints the share of one core. On an Apple M3
 Max, without the capture (GStreamer is not installed on the development Mac), in a quiet room (noise
 RMS 50) it measured **0.56%** of a core, and with sound the models cannot skip (noise RMS 400)
-**10.3%** (target 15%; re-measured with the script as committed in this step, which waits for WAITING
+**10.3%** (target 15%; re-measured with the script as committed in this step, which waits for
+WAITING
 and exits 2 for a dead pipeline: 0.53% and 9.86%); idle is the wake word only, since VAD runs only
 in a turn. The 10.3% is not the cost of the models, which take 1.3 ms of CPU per 80 ms chunk in a
 tight loop (1.6%), but of waking a core every 80 ms: a core that wakes that often runs slower than

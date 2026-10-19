@@ -711,7 +711,9 @@ the user's own, and `edit_before_send` (and its forcing over plain http) applies
   phrase's own span, and a scrubbed sentence is cut to `max_sentence_chars`.
   The reply-cap and sentence-bound cuts never split a word, and the folded text is searched again as
   the last step before a sentence is submitted, with everything from a match on dropped: no
-  submitted sentence matches the pattern by construction. That is a mitigation, not a guarantee: a
+  submitted sentence matches the pattern by construction, nor two in a row of one reply (the cut at
+  a
+  sentence end is repeated until nothing straddles it). That is a mitigation, not a guarantee: a
   respelling that fools the pattern (a look-alike letter of another script) can pass, and
   `speaking_threshold = 1`, or headphones, are the control.
 - *Focus and a dead capture.* A hands-free turn never moves the keyboard focus (any sound can start
@@ -1208,7 +1210,8 @@ Each invariant names where it is enforced. Reviews check every change against th
   `max_reply_chars` (default 4000), Piper's audio is capped in bytes as it arrives, its error output
   is kept to 2 KiB, and each sentence has a deadline (default 20 s) and a killed-and-reaped process
   (section 2, "Speech output"). Hands-free (D23): the mailbox between the
-  microphone and the models holds at most 2 s of audio (the oldest dropped first), an utterance at most
+  microphone and the models holds at most 2 s of audio (the oldest dropped first), an utterance at
+  most
   `max_utterance_seconds`, a turn in which nothing is said is given up after
   `wait_for_speech_seconds`, a
   model file is at most 8 MiB, and every wait of the inference thread is at most half a second
@@ -1219,7 +1222,8 @@ Each invariant names where it is enforced. Reviews check every change against th
   process can switch the microphone on through the session bus). Speech output (S07) is the other
   direction and takes no input: its Mute button is a widget too, and the reply it reads is text the
   chat already shows. Hands-free mode (S08) opens the microphone by itself, on the wake word, and
-  changes none of this: what it records goes through the same transcript path (`VoiceInput`) into the
+  changes none of this: what it records goes through the same transcript path (`VoiceInput`) into
+  the
   chat input, its toggle is a widget and not a `GAction`, and the wake word, VAD and models have no
   access to a prompt or picker. Ambient audio can say the wake word, so a hands-free turn can send a
   message the user did not mean (`edit_before_send` holds it for review); it still cannot answer a
