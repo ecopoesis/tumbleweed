@@ -689,6 +689,42 @@ class TestFailures:
         assert watcher.problems == [shown]
         speech.close()
 
+    def test_a_bug_in_synthesis_stops_what_is_queued_behind_it_before_the_main_thread_hears(
+        self, build: BuildRig
+    ) -> None:
+        class Buggy:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def synthesize(self, text: str, abort: AbortSignal) -> SpeechAudio:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("secret detail")
+                return SpeechAudio(b"\x00\x00", sample_rate_hz=22_050, max_bytes=ByteCount(10))
+
+            def close(self) -> None: ...
+
+        dispatcher = ManualDispatcher()  # never pumped until the end: the main thread is deaf
+        backend = Buggy()
+        player = FakeAudioPlayer()
+        speech = SpeechOutput(
+            backend=backend, player=lambda: player, dispatcher=dispatcher, config=TtsConfig()
+        )
+        watcher = Watcher()
+        speech.subscribe(watcher)
+        speech.begin_reply()
+        speech.feed(f"{FIRST} {SECOND} {THIRD} ")
+        deadline = time.monotonic() + 5
+        while backend.calls == 0 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        time.sleep(0.5)  # an absence cannot be waited for: a leak would show in a few milliseconds
+
+        assert backend.calls == 1  # the other two were never synthesised
+        assert player.played == []
+        assert dispatcher.pump_until(lambda: bool(watcher.problems))
+        assert watcher.problems == ["Speech synthesis failed."]
+        speech.close()
+
     def test_a_player_that_cannot_be_made_is_an_error_not_a_crash(self, build: BuildRig) -> None:
         def no_player() -> FakeAudioPlayer:
             raise PlaybackError("Speech output needs GStreamer, which is not installed.")

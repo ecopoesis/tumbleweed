@@ -108,10 +108,11 @@ class ShellWindow(Adw.ApplicationWindow):
         root.append(self.status_strip)
         self.set_content(root)
 
-        # Esc abandons an utterance being recorded, stops speech, or else stops the reply in flight,
-        # wherever the focus is in the window. A shortcut (not a GAction, which would be exported
-        # on the session bus), in the bubble phase: whatever wants Esc first (a popover, an entry)
-        # gets it, and while nothing is recorded, spoken or streaming the key is not consumed.
+        # Esc abandons an utterance being recorded, stops speech (not while the terminal has the
+        # focus: it keeps its Esc), or else stops the reply in flight. A shortcut (not a GAction,
+        # which would be exported on the session bus), in the bubble phase: whatever wants Esc
+        # first (a popover, an entry) gets it, and while nothing is recorded, spoken or streaming
+        # the key is not consumed.
         escape = Gtk.ShortcutController()
         escape.add_shortcut(
             Gtk.Shortcut.new(

@@ -76,7 +76,7 @@ def _build_speech(
 ) -> tuple[SpeechOutput | None, str | None]:
     """Speech output and the notice for the user, if `[voice.tts]` asks for any."""
     if config.tts_problem is not None:
-        return None, f"Speech output is off: {config.tts_problem}"
+        return None, "Speech output is off: [voice.tts] has an invalid setting."
     tts = config.tts
     if not tts.enabled:
         return None, None

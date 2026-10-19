@@ -284,7 +284,7 @@ WHISPER_SERVER_BIN=~/whisper.cpp/build/bin/whisper-server scripts/whisper-server
 
 ```toml
 [voice]
-enabled = true                       # false: no Mic button and no key
+enabled = true                       # false: no Mic button, no key, and no speech output
 stt_url = "http://127.0.0.1:8080"    # whisper-server's address         (TUMBLEWEED_STT_URL)
 language = "auto"                    # or a code such as "en", "de"
 edit_before_send = false             # true: the words wait in the input for you to edit and send

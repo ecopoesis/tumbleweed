@@ -648,7 +648,8 @@ and lose their address, bare addresses become "link", and the words of an inline
 pass (controls to spaces, format characters, surrogates and unassigned code points dropped,
 whitespace collapsed to one line), sentences end at `.`, `!`, `?` or a line end, a run with no boundary
 is cut at 400 characters, a sentence under 12 characters waits for the next so Piper is not started for
-"Sure." alone, and the block-level state is a few characters, so memory is bounded. The reply speaks at
+"Sure." alone, and the block-level state is bounded (a few characters; the run of fence marks is counted up to 64), so
+memory is bounded. The reply speaks at
 most `max_reply_chars` (default 4000); the user is told once that the rest is dropped. (3) *Two workers,
 a generation and an abort signal per reply* (`voice.output.SpeechOutput`, the same shape as
 `VoiceInput`): the synthesis worker and the playback worker run in order, so sentence N+1 is made
@@ -680,8 +681,10 @@ reply, and unmuting is for the next reply. (7) *The shell feeds speech from the 
 a streaming assistant message begins a reply, each growth is fed as new text, completion ends the
 reply (the last sentence is spoken), a failed or cancelled message stops the speech, and a user
 message or a replaced transcript stops it (restored history is never read aloud). Its errors are
-logged and never reach the chat. (8) *Indicator:* SPEAKING is set while a reply is spoken and gives
-way to LISTENING and TRANSCRIBING; THINKING stays unset (S08's state machine owns it, #117). (9)
+logged and never reach the chat. (8) *Indicator* (amends D20 (8): SPEAKING is set here, and THINKING moves to S08, #117): SPEAKING is set only while a sentence is
+queued or playing, so it is off while a code block is being dropped and while the reply waits for its
+next words (Esc is then not spent on nothing), and it gives way to LISTENING and TRANSCRIBING;
+THINKING stays unset. (9)
 *Config:* `[voice.tts]` in the same table but judged on its own: any mistake in it (a relative or `~`
 path, a misspelled key, a limit out of range, a table that is not a table) turns *speech* off, keeps the
 Mic, the key and the speech server, logs the details and shows one fixed message beside the Mic
@@ -691,7 +694,7 @@ out has the same effect; the sample rate is a setting (default 22050), not read 
 (#113). (10) *Speech is off when the whole `[voice]` is,* and there is no mute button without it.
 **Deviations from the plan.** The plan's "or HTTP if documented": subprocess chosen. The sample rate is
 a setting and not read from the voice (#113). The Linux image is unchanged (a real-time `fakesink`
-tests playback; a real Piper is `live`). THINKING is left to S08. Speech needs voice input: `[voice]
+tests playback; a real Piper is `live`). D22 (8) amends D20 (8), which left THINKING for S07: it moves to S08. Speech needs voice input: `[voice]
 enabled = false` turns it off too, and without a configured Piper there is no Mute button. Esc does
 not stop speech while the terminal has the focus. Nothing in scope is missing.
 **Consequences.** Per-sentence start-up cost (#112); the playback worker can be held by a stuck audio

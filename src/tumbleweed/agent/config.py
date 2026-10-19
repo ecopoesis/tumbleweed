@@ -312,9 +312,9 @@ def load_config(environ: Mapping[str, str]) -> TumbleweedConfig:
     return parse_config(text, environ, source=source)
 
 
-def _tts_table(table: object, source: str) -> tuple[dict[str, object], str | None]:
-    """The checked `[voice.tts]` table and no problem, or a switched-off one and a fixed message
-    (never a value, never a key: the details go to the log)."""
+def _tts_table(table: object, source: str) -> tuple[dict[str, object], Literal["invalid"] | None]:
+    """The checked `[voice.tts]` table and no problem, or a switched-off one and "invalid" (the
+    details, never a value, go to the log; the user is told in fixed text by the factory)."""
     try:
         if not isinstance(table, dict):
             raise ValueError("not a table")
@@ -322,7 +322,7 @@ def _tts_table(table: object, source: str) -> tuple[dict[str, object], str | Non
     except (TypeError, ValueError) as exc:
         detail = _problems(exc) if isinstance(exc, ValidationError) else str(exc)[:100]
         logger.warning("speech output is off: invalid [voice.tts] in %s: %s", source, detail)
-        return {"enabled": False}, "[voice.tts] has an invalid setting."
+        return {"enabled": False}, "invalid"
     return table, None
 
 

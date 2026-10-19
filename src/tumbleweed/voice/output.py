@@ -149,7 +149,6 @@ class SpeechOutput:
             return
         self._enqueue(self._chunker.finish())
         self._accepting = False
-        self._idle_if_drained()
 
     # Main thread: what the user does
 

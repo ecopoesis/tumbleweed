@@ -274,6 +274,32 @@ class TestBargeIn:
         pump_until(lambda: False, timeout=0.2)
         assert s.player.interrupted == 0  # and the speech goes on
 
+    def test_the_whole_window_path_leaves_the_speech_alone_with_the_terminal_focused(
+        self, build_speaking: SpeakingBuilder
+    ) -> None:
+        """The capture controller lets Esc go, and the window's own Esc shortcut (which a terminal
+        that did not eat the key would reach) must not stop the speech either."""
+        from tumbleweed.shell._gi import Gdk, Gtk
+
+        s = build_speaking()
+        window = s.shell.window
+        show(s.shell)
+        start_speaking(s)
+        s.responder.sink.emit(ReplyFinished())  # no reply in flight: only the speech is at stake
+        inside = Gtk.Box()
+        inside.set_focusable(True)
+        window.terminal_pane.append(inside)
+        window.terminal_pane.set_visible(True)
+        window.set_focus(inside)
+
+        assert key(s, "key-pressed", Gdk.KEY_Escape, ctrl=False) is False
+        assert window._on_escape(window, None) is False  # noqa: SLF001  (the Esc shortcut's handler)
+
+        assert s.speech.phase is SpeechPhase.SPEAKING
+        pump_until(lambda: False, timeout=0.2)
+        assert s.player.interrupted == 0
+        assert controls(s).cancel_listening() is False
+
     def test_esc_stops_the_speech_when_the_focus_is_not_in_the_terminal(
         self, build_speaking: SpeakingBuilder
     ) -> None:

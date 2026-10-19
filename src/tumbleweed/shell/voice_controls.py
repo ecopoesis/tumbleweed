@@ -104,6 +104,7 @@ class VoiceControls(Gtk.Box):
         self._edit_before_send = edit_before_send
         self._syncing = False  # the button is being set from the phase, not clicked
         self.keys: Gtk.EventControllerKey | None = None
+        self._in_terminal: Callable[[], bool] = lambda: False  # until `install_keys`
 
         self.mic_button = Gtk.ToggleButton(label="Mic")
         self.mic_button.add_css_class("flat")
@@ -142,6 +143,7 @@ class VoiceControls(Gtk.Box):
 
     def install_keys(self, window: Gtk.Window, in_terminal: Callable[[], bool]) -> None:
         """Hold Ctrl+Space to talk, anywhere in `window` but the terminal pane."""
+        self._in_terminal = in_terminal
         self.keys = install_push_to_talk(window, self._voice, in_terminal, self._speech)
 
     # VoiceObserver
@@ -184,13 +186,19 @@ class VoiceControls(Gtk.Box):
     # What the user does
 
     def cancel_listening(self) -> bool:
-        """Abandon the utterance and stop the speech if there are any; True if the key was used
-        for that (Esc)."""
+        """Abandon the utterance and stop the speech (unless the terminal has the focus) if there
+        are any; True if the key was used for that (Esc)."""
         used = False
         if self._voice.phase is not VoicePhase.IDLE:
             self._voice.cancel()
             used = True
-        if self._speech is not None and self._speech.phase is SpeechPhase.SPEAKING:
+        # Not while the terminal has the focus: its Esc is its own (as in the capture controller),
+        # whether or not the terminal widget happens to consume the key before this runs.
+        if (
+            self._speech is not None
+            and self._speech.phase is SpeechPhase.SPEAKING
+            and not self._in_terminal()
+        ):
             self._speech.stop()
             used = True
         return used

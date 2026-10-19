@@ -17,8 +17,8 @@ A reply is untrusted model output. Before any of it reaches a synthesiser it goe
   end, so the first sentence can be spoken while the rest is still arriving. A sentence is at most
   `max_sentence_chars` (cut at a space where there is one), and one shorter than `MIN_CHUNK_CHARS`
   waits for the next so that the synthesiser is not started for "Sure." alone. Memory is bounded:
-  a text with no boundary is cut at `max_sentence_chars`, and the block-level state is a few
-  characters.
+  a text with no boundary is cut at `max_sentence_chars`, and the block-level state is bounded (the
+  first characters of a line, and a run of fence marks counted up to `_MAX_RUN`).
 
 It takes the stream as it comes, in pieces of any size: block syntax is decided at the start of a
 line from the first few characters, so a fence split across two deltas is still a fence.
@@ -46,6 +46,7 @@ _DROPPED: Final = frozenset({"Cf", "Cs", "Co", "Cn"})
 _BLANKS: Final = frozenset({"Cc", "Zl", "Zp"})
 _FENCE_CHARS: Final = "`~"
 _FENCE_MIN: Final = 3
+_MAX_RUN: Final = 64  # a longer run of fence marks is counted as this long: bounded, linear
 _BULLET_CHARS: Final = "-*+"
 
 
@@ -79,7 +80,7 @@ def _ends_a_sentence(text: str) -> bool:
     if not bare.endswith(".") or bare.endswith(".."):
         return True
     words = bare[:-1].rsplit(None, 1)
-    return not words or words[-1].lower().lstrip("([\"'") not in _ABBREVIATIONS
+    return not words or words[-1].lower().strip(_CLOSERS + "([") not in _ABBREVIATIONS
 
 
 class _Line(enum.Enum):
@@ -165,7 +166,7 @@ class SentenceChunker:
             return
         if probe and probe[0] in _FENCE_CHARS and probe == probe[0] * len(probe):
             if char == probe[0]:
-                self._probe = probe + char  # the run goes on: how long is the fence?
+                self._probe = probe if len(probe) >= _MAX_RUN else probe + char  # how long a fence?
                 return
             if len(probe) >= _FENCE_MIN:
                 self._fence = (probe[0], len(probe))  # the rest of the line is its info string
@@ -207,7 +208,7 @@ class SentenceChunker:
         assert self._fence is not None  # noqa: S101  (the caller checked)
         mark, length = self._fence
         if char == mark and probe == mark * len(probe):
-            self._probe = probe + char
+            self._probe = probe if len(probe) >= _MAX_RUN else probe + char
             return
         if probe and char in " \t" and probe == mark * len(probe) and len(probe) >= length:
             self._probe = ""

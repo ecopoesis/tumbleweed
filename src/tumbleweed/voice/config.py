@@ -29,7 +29,7 @@ characters; the files are checked when the voice is built, `voice.piper`), so th
 refused when the file is read, with a message that does not repeat it.
 """
 
-from typing import Final, final
+from typing import Final, Literal, final
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -97,9 +97,9 @@ class VoiceConfig(BaseModel):
     edit_before_send: bool = False
     limits: VoiceLimits = VoiceLimits()
     tts: TtsConfig = TtsConfig()
-    tts_problem: str | None = None
-    """Set by the loader (`agent.config`) when `[voice.tts]` was invalid: speech is then off, and
-    this fixed text is what the user is told. Not a file setting."""
+    tts_problem: Literal["invalid"] | None = None
+    """Set by the loader (`agent.config`) when `[voice.tts]` was invalid: speech is then off and the
+    factory tells the user in fixed text. Not a file setting."""
 
     @field_validator("stt_url")
     @classmethod

@@ -1,6 +1,8 @@
 """What is spoken of a reply (S07): Markdown and code are stripped, the text is made safe, and it is
 chunked into sentences as it streams, the same whatever size the pieces of the stream are."""
 
+import time
+
 import pytest
 
 from tumbleweed.voice.speakable import (
@@ -68,6 +70,11 @@ class TestSentences:
     )
     def test_an_abbreviation_does_not_end_a_sentence(self, text: str) -> None:
         assert speak(text) == [text]
+
+    def test_an_abbreviation_is_one_when_marked_up_too(self) -> None:
+        text = "We use **Dr.** Who and _e.g._ items here. Next one now."
+
+        assert speak(text) == ["We use Dr. Who and e.g. items here.", "Next one now."]
 
     def test_a_sentence_ends_where_a_closing_mark_follows_the_stop(self) -> None:
         assert speak("This is **done now.** Then the next one starts here.") == [
@@ -141,6 +148,41 @@ class TestMarkdown:
         reply = "````\n```  \nsecret code\n```\nmore secret\n````\nDone now, all good."
 
         assert speak(reply) == ["Done now, all good."]
+
+    def test_a_backtick_line_inside_a_tilde_fence_does_not_close_it(self) -> None:
+        reply = "Before the code.\n~~~\n```\nsecret code\n```\n~~~\nAfter it all is spoken."
+
+        assert speak(reply) == ["Before the code.", "After it all is spoken."]
+
+    def test_a_tilde_line_inside_a_backtick_fence_does_not_close_it(self) -> None:
+        reply = "Before the code.\n```\n~~~\nsecret code\n~~~\n```\nAfter it all is spoken."
+
+        assert speak(reply) == ["Before the code.", "After it all is spoken."]
+
+    def test_the_opening_length_counts_with_an_info_string_too(self) -> None:
+        reply = "Before the code.\n````python\n```\nsecret()\n```\n````\nAfter it all is spoken."
+
+        assert speak(reply) == ["Before the code.", "After it all is spoken."]
+
+    def test_a_huge_run_of_fence_marks_is_bounded_and_fast(self) -> None:
+        chunker = SentenceChunker(max_sentence_chars=400)
+        started = time.monotonic()
+
+        chunker.feed("`" * 70_000)  # one line of marks, no end yet
+
+        assert len(chunker._probe) <= 64  # noqa: SLF001  (the bound is the point)
+        inside = SentenceChunker(max_sentence_chars=400)
+        inside.feed("```\n" + "`" * 70_000)  # a run of marks on a line inside a fence
+        assert len(inside._probe) <= 64  # noqa: SLF001
+        assert time.monotonic() - started < 10  # linear: a quadratic copy would take minutes
+        reply = (
+            "Before it is here.\n"
+            + "`" * 70_000
+            + "\ncode\n"
+            + "`" * 70_000
+            + "\nAfter it is done."
+        )
+        assert speak(reply) == ["Before it is here.", "After it is done."]
 
     def test_a_fence_line_with_words_after_the_marks_does_not_close_it(self) -> None:
         assert speak(

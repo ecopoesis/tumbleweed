@@ -91,7 +91,7 @@ class TestTheTable:
     def test_a_bad_tts_table_turns_speech_off_and_nothing_else(self, text: str) -> None:
         config = parse(text)  # does not raise: the rest of [voice] is fine
 
-        assert config.tts_problem == "[voice.tts] has an invalid setting."
+        assert config.tts_problem == "invalid"
         assert config.tts.configured is False
         assert config.enabled is True
 
