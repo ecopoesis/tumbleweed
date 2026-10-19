@@ -463,3 +463,79 @@ def test_a_touch_on_a_text_view_is_claimed_and_focuses_it(echo_shell: Shell) -> 
     touch[0].emit("pressed", 1, 0.0, 0.0)
 
     assert view.is_focus()
+
+
+def test_a_press_that_opens_a_context_menu_on_this_platform_is_claimed_whatever_its_button() -> (
+    None
+):
+    # macOS opens the menu on Ctrl+click: the primary button. GDK says so with
+    # `triggers_context_menu`, and the guard goes by that as well as by the button.
+    from tumbleweed.shell._gi import Gdk, Gtk
+    from tumbleweed.ui.gtk.guard import _opens_menu, on_press
+
+    class Gesture:
+        def __init__(self) -> None:
+            self.states: list[Gtk.EventSequenceState] = []
+
+        def set_state(self, state: Gtk.EventSequenceState) -> bool:
+            self.states.append(state)
+            return True
+
+    class Selectable:
+        dropped = 0
+
+        def select_region(self, start_pos: int, end_pos: int) -> None:
+            self.dropped += 1
+
+    menu, plain = Gesture(), Gesture()
+    text = Selectable()
+
+    on_press(Gdk.BUTTON_PRIMARY, menu, text, triggers_menu=True)
+    on_press(Gdk.BUTTON_PRIMARY, plain, text)
+
+    assert menu.states == [Gtk.EventSequenceState.CLAIMED]
+    assert plain.states == []
+    assert text.dropped == 1  # only the ordinary press dropped the selection
+
+    class Event:
+        def __init__(self, opens: bool) -> None:
+            self.opens = opens
+
+        def triggers_context_menu(self) -> bool:
+            return self.opens
+
+    class Click:
+        def __init__(self, event: Event | None) -> None:
+            self.event = event
+
+        def get_current_event(self) -> Event | None:
+            return self.event
+
+    assert _opens_menu(Click(Event(True))) is True  # type: ignore[arg-type]  # a stand-in
+    assert _opens_menu(Click(Event(False))) is False  # type: ignore[arg-type]
+    assert _opens_menu(Click(None)) is False  # type: ignore[arg-type]
+
+
+def test_a_selection_in_a_text_view_cannot_start_a_drag_with_an_icon(echo_shell: Shell) -> None:
+    # A drag starts from a press inside a selection. The capture-phase press (the real handler)
+    # drops it first, and nothing the drag would show (a drag icon is a surface) exists after.
+    from tumbleweed.shell._gi import Gtk
+
+    show(echo_shell, "hostile")
+    (view, *_rest) = text_views(echo_shell)
+    buffer = view.get_buffer()
+    buffer.set_text("drag this text away", -1)
+    buffer.select_range(buffer.get_iter_at_offset(0), buffer.get_iter_at_offset(9))
+    pointer = [
+        c
+        for c in view.observe_controllers()
+        if isinstance(c, Gtk.GestureClick)
+        and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
+        and not c.get_touch_only()
+    ]
+    pointer[0].emit("pressed", 1, 0.0, 0.0)
+    pump(0.2)
+
+    assert not buffer.get_has_selection()
+    assert not [w for w in descendants(echo_shell.window) if isinstance(w, Gtk.DragIcon)]
+    assert_no_surface(echo_shell)

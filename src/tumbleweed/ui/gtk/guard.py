@@ -36,12 +36,23 @@ class _Claimable(Protocol):
     def set_state(self, state: Gtk.EventSequenceState) -> bool: ...
 
 
-def on_press(button: int, gesture: _Claimable, text: _Selectable) -> None:
-    """What a press of `button` does in the capture phase: see the module docstring."""
-    if button == Gdk.BUTTON_SECONDARY:
+def on_press(
+    button: int, gesture: _Claimable, text: _Selectable, *, triggers_menu: bool = False
+) -> None:
+    """What a press of `button` does in the capture phase: see the module docstring.
+
+    `triggers_menu` is what GDK says of the event (Ctrl+click on macOS opens a context menu
+    though the button is the primary one): such a press is claimed like a secondary one."""
+    if button == Gdk.BUTTON_SECONDARY or triggers_menu:
         gesture.set_state(Gtk.EventSequenceState.CLAIMED)
     else:
         text.select_region(0, 0)
+
+
+def _opens_menu(gesture: Gtk.GestureClick) -> bool:
+    """Whether GDK takes the press for the one that opens a context menu on this platform."""
+    event = gesture.get_current_event()
+    return event is not None and event.triggers_context_menu()
 
 
 class _Focusable(Protocol):
@@ -84,7 +95,9 @@ def harden_text(widget: Gtk.Editable, connect: _Connect) -> None:
 
     def pressed(gesture: object, _presses: object, _x: object, _y: object) -> None:
         if isinstance(gesture, Gtk.GestureClick):
-            on_press(gesture.get_current_button(), gesture, widget)
+            on_press(
+                gesture.get_current_button(), gesture, widget, triggers_menu=_opens_menu(gesture)
+            )
 
     def touched(gesture: object, _presses: object, _x: object, _y: object) -> None:
         if isinstance(gesture, Gtk.GestureClick):
@@ -132,7 +145,12 @@ def harden_text_view(view: Gtk.TextView, connect: _Connect) -> None:
 
     def pressed(gesture: object, _presses: object, _x: object, _y: object) -> None:
         if isinstance(gesture, Gtk.GestureClick):
-            on_press(gesture.get_current_button(), gesture, selection)
+            on_press(
+                gesture.get_current_button(),
+                gesture,
+                selection,
+                triggers_menu=_opens_menu(gesture),
+            )
 
     def touched(gesture: object, _presses: object, _x: object, _y: object) -> None:
         if isinstance(gesture, Gtk.GestureClick):
