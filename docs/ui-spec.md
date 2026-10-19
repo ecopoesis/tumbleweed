@@ -680,10 +680,10 @@ has the reasons.
 - **`image`** shows the file an `ImageRef` names. The host passes a resolver that reads it
   (`RenderedTool(spec, images=...)`; with none every image says that images are not available): the
   ref is a file name and nothing else, opened without following links (see section 6), and what
-  comes back is at most 8 MiB. Those bytes are *looked at before they are decoded*: the magic number
+  comes back is at most `8 MiB`. Those bytes are *looked at before they are decoded*: the magic number
   must be a PNG, a JPEG or a still WebP (an SVG is none, whatever the file is called, and an animated
   WebP is refused), and the size in the header must be at most 8,192 pixels a side and 16,777,216
-  pixels (width times height times 4 bytes is at most 64 MiB decoded). Only then do the bytes go to a
+  pixels (width times height times 4 bytes is at most `64 MiB` decoded). Only then do the bytes go to a
   decoder, pinned to the format that was found, on a worker thread: the interface never waits for a
   file or a decode. What is refused, missing or broken is a line of fixed text in the image's place
   (`The image was not found.`, `The image is not allowed.`, `The image is too large.`,
@@ -693,8 +693,8 @@ has the reasons.
   longer holds. An image is scaled down to fit 480 pixels, never up, and `alt` is for assistive
   technology only (it is not displayed).
 - **`table`** is a `Gtk.ColumnView` of the columns and rows of a `table` entry, rebuilt when the
-  entry changes. At most 1,000 rows are shown; a cell shows at most 256 characters (then ` (cut)`) on
-  one line (line ends become spaces), a column name at most 64; every text goes through the display
+  entry changes. At most `1,000` rows are shown; a cell shows at most `256` characters (then ` (cut)`) on
+  one line (line ends become spaces), a column name at most `64`; every text goes through the display
   transform and into a label with `set_text`, and all of it counts in the tool's text budget, so
   rows that do not fit are left out, the table ends in `(more rows not shown)`, and they are added
   when room appears. Columns are typed: `int` and `float` cells are right-aligned and a `bool` reads
