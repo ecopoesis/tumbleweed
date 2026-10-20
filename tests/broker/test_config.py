@@ -215,7 +215,7 @@ class TestTheSettings:
             {"prompt_window": timedelta(0)},
             {"prompt_window": timedelta(days=2)},
             {"prompt_timeout": timedelta(hours=2)},
-            {"prompt_timeout": MAX_PROMPT_TIMEOUT + timedelta(seconds=1)},
+            {"prompt_timeout": timedelta(seconds=121)},  # (the number, not the constant)
             {"owner_prompts_per_window": 0},
             {"sandbox_path": ""},
             {"sandbox_path": "a\0b"},
