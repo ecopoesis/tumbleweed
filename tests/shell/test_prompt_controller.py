@@ -165,6 +165,13 @@ class TestNotAtOnce:
         assert rig.view.armed == [True]
 
 
+def click(rig: Rig, card: PromptCard, decision: AllowDecision | DenyDecision = DENY) -> bool:
+    """A whole click as the window sees it: the press, the release, and the button's click."""
+    rig.controller.pointer_pressed()
+    rig.controller.pointer_released()
+    return rig.controller.choose(card.prompt, decision)
+
+
 class TestNotWhileSomethingElseIsHappening:
     def test_a_stream_of_clicks_is_never_taken_until_there_has_been_a_quiet_gap(
         self, rig: Rig
@@ -174,14 +181,13 @@ class TestNotWhileSomethingElseIsHappening:
 
         for _ in range(12):  # 2.4 s of clicks, 200 ms apart
             rig.timers.advance(0.2)
-            rig.controller.disturbed()  # the press, which reaches the window before the button
-            assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+            assert not click(rig, card, ALLOW_TASK)
 
         assert rig.answers.given == []
         rig.timers.advance(ARM_SECONDS - 0.01)
-        assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # not yet a whole delay of quiet
-        rig.timers.advance(0.01)
-        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+        assert not click(rig, card, ALLOW_TASK)  # not yet a whole delay of quiet
+        rig.timers.advance(ARM_SECONDS)
+        assert click(rig, card, ALLOW_TASK)
 
     def test_a_press_that_began_before_the_prompt_took_answers_is_no_click_however_long_it_is_held(
         self, rig: Rig
@@ -189,43 +195,93 @@ class TestNotWhileSomethingElseIsHappening:
         """Press and hold ("hold to confirm", a model's tool): the click comes on the release."""
         card = rig.offer()
         rig.timers.advance(0.1)
-        rig.controller.disturbed()  # the press lands on a button that has just appeared
+        rig.controller.pointer_pressed()  # lands on a button that has just appeared
 
         rig.timers.advance(0.8)  # held until the prompt is armed
         assert rig.controller.armed()
+        rig.controller.pointer_released()
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # ... and released: no click
 
-        rig.controller.disturbed()  # the user's own press, on a prompt that takes answers
-        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+        assert click(rig, card, ALLOW_TASK)  # the user's own, on a prompt that takes answers
 
-    def test_a_key_held_from_before_the_prompt_took_answers_is_no_activation(
-        self, rig: Rig
-    ) -> None:
+    def test_a_key_during_the_hold_does_not_end_it(self, rig: Rig) -> None:
+        """ "Hold and type the word": a key that is not the button's activation, pressed once the
+        prompt is armed, must not make the held press count."""
         card = rig.offer()
         rig.timers.advance(0.1)
-        rig.controller.disturbed()  # Enter or Space, pressed while the prompt arrived
+        rig.controller.pointer_pressed()
         rig.timers.advance(0.8)
+
+        rig.controller.key_pressed()  # Shift, a letter: armed, no key held
+        rig.controller.key_released()
+        rig.controller.pointer_released()
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+        assert rig.answers.given == []
+
+    def test_a_second_button_during_the_hold_does_not_end_it(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.pointer_pressed()
+        rig.timers.advance(0.8)
+
+        rig.controller.pointer_pressed()  # another button, with the first still down
+        rig.controller.pointer_released()
+        rig.controller.pointer_released()
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_a_pointer_press_during_a_held_key_does_not_end_it_either(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.key_pressed()  # Enter or Space, pressed while the prompt arrived
+        rig.timers.advance(0.8)
+
+        rig.controller.pointer_pressed()  # armed, fresh pointer: it is not the key's life
+        rig.controller.pointer_released()
+        rig.controller.key_released()
 
         assert not rig.controller.choose(card.prompt, DENY)
         assert rig.answers.given == []
 
+    def test_a_press_that_ended_in_no_click_does_not_cost_the_next_deliberate_click(
+        self, rig: Rig
+    ) -> None:
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.pointer_pressed()  # pressed on something else, while disarmed ...
+        rig.controller.pointer_released()  # ... and released outside any button: no click
+        rig.arm()
+
+        assert click(rig, card, ALLOW_TASK)  # the next press is the user's own
+
+    def test_a_key_that_ended_in_no_activation_does_not_cost_the_next_one(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.key_pressed()
+        rig.controller.key_released()
+        rig.arm()
+
+        rig.controller.key_pressed()  # Enter on the focused button, deliberately
+        rig.controller.key_released()
+        assert rig.controller.choose(card.prompt, DENY)
+
     def test_a_held_press_does_not_open_the_picker_either(self, rig: Rig) -> None:
         card = rig.offer(pick_card())
         rig.timers.advance(0.1)
-        rig.controller.disturbed()
+        rig.controller.pointer_pressed()
         rig.timers.advance(0.8)
+        rig.controller.pointer_released()
 
         assert not rig.controller.can_act(card.prompt)
-        rig.controller.disturbed()
+        rig.controller.pointer_pressed()
         assert rig.controller.can_act(card.prompt)
 
     def test_a_press_on_a_prompt_that_takes_answers_does_not_disarm_it(self, rig: Rig) -> None:
         card = rig.offer()
         rig.arm()
 
-        rig.controller.disturbed()  # the user's own click on the button
-
-        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+        assert click(rig, card, ALLOW_TASK)  # the user's own click on the button
 
     def test_the_window_coming_to_the_front_starts_the_delay_again(self, rig: Rig) -> None:
         card = rig.offer()
@@ -239,7 +295,21 @@ class TestNotWhileSomethingElseIsHappening:
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
         rig.arm()
         assert rig.view.armed[-1:] == [True]
-        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+        assert click(rig, card, ALLOW_TASK)
+
+    def test_the_press_that_activates_the_window_and_is_held_ends_in_no_click(
+        self, rig: Rig
+    ) -> None:
+        """The press may be delivered before the window's activation is: armed when it comes,
+        disarmed a moment later, and held past the delay."""
+        card = rig.offer()
+        rig.arm()
+        rig.controller.pointer_pressed()  # (armed: it looks like the user's own)
+        rig.controller.reactivated()  # ... but this was the click that brought the window up
+        rig.timers.advance(0.8)
+        rig.controller.pointer_released()
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
     def test_the_delay_counts_from_the_first_frame_not_from_the_queueing(self, rig: Rig) -> None:
         card = rig.offer()

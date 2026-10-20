@@ -172,9 +172,23 @@ class _Entry:
         self.cancel_deadline: Callable[[], None] = _nothing
         self.cancel_arming: Callable[[], None] = _nothing
         self.shown_at: float | None = None
-        # The press (or key) that is in progress began while the prompt was not armed: the click it
-        # ends in is not taken, however long it was held. (A click comes on the release.)
-        self.pressed_disarmed = False
+        # A press (or a key) that began while the prompt was not armed ends in no click, however
+        # long it is held (a click comes on the release). A pointer and a key have a life of their
+        # own each: a key pressed during a held press, or a second button, does not end it. A flag
+        # is cleared only by a refused click, or by a new press that begins on a prompt that takes
+        # answers with nothing of that kind held.
+        self.pointer_disarmed = False
+        self.key_disarmed = False
+        self.pointers_down = 0
+        self.key_down = False
+
+    @property
+    def held_from_disarmed(self) -> bool:
+        return self.pointer_disarmed or self.key_disarmed
+
+    def forget_held(self) -> None:
+        self.pointer_disarmed = False
+        self.key_disarmed = False
 
 
 def _nothing() -> None:
@@ -235,25 +249,57 @@ class PromptController:
             self._next()
         return True
 
-    def disturbed(self) -> None:
-        """A press or a key reached the window. If the prompt is not armed yet the delay starts
+    def pointer_pressed(self) -> None:
+        """A pointer button went down in the window. If the prompt is not armed yet the delay starts
         again, so that clicks aimed at where its buttons appear (a stream of them, a model's tool
         can make one) are never taken until the user has stopped for the whole delay, and the click
-        that such a press ends in, however long it was held, is not taken either."""
+        that such a press ends in, however long it is held, is not taken either. A press that
+        begins on a prompt that takes answers, with no button already down, is the user's own."""
         entry = self._current
         if entry is None:
             return
-        if self.armed():
-            entry.pressed_disarmed = False  # a press on a prompt that takes answers: the user's
+        fresh = entry.pointers_down == 0
+        entry.pointers_down += 1
+        if not self.armed():
+            entry.pointer_disarmed = True
+            self._restart_arming(entry)
+        elif fresh:
+            entry.pointer_disarmed = False
+
+    def pointer_released(self) -> None:
+        """A button came up (or the press was cancelled). The click, if there is one, follows."""
+        if self._current is not None:
+            self._current.pointers_down = max(0, self._current.pointers_down - 1)
+
+    def key_pressed(self) -> None:
+        """The same for a key (a held Enter or Space activates the button with the focus). A key
+        never ends a press that is held from before the prompt was armed."""
+        entry = self._current
+        if entry is None:
             return
-        entry.pressed_disarmed = True
-        self._restart_arming(entry)
+        fresh = not entry.key_down
+        entry.key_down = True
+        if not self.armed():
+            entry.key_disarmed = True
+            self._restart_arming(entry)
+        elif fresh:
+            entry.key_disarmed = False
+
+    def key_released(self) -> None:
+        if self._current is not None:
+            self._current.key_down = False
 
     def reactivated(self) -> None:
         """The window became the active one: a click that brought it to the front may be about to
-        land on a button of the prompt, which has not been seen since. The delay starts again."""
-        if self._current is not None:
-            self._restart_arming(self._current)
+        land on a button of the prompt, which has not been seen since (and the press that did it
+        may have been delivered before this, so it counts as begun disarmed). The delay starts
+        again."""
+        entry = self._current
+        if entry is not None:
+            entry.pointer_disarmed = True
+            entry.pointers_down = 0  # (releases can be lost with the focus)
+            entry.key_down = False
+            self._restart_arming(entry)
 
     def mark_drawn(self, prompt: PromptId) -> None:
         """The prompt's first frame is on screen (or about to be): the delay counts from here, not
@@ -278,8 +324,8 @@ class PromptController:
         entry = self._current
         if entry is None or entry.card.prompt != prompt:
             return False
-        if entry.pressed_disarmed:  # a press held from before it took answers ends in this click
-            entry.pressed_disarmed = False
+        if entry.held_from_disarmed:  # a press held from before it took answers ends in this click
+            entry.forget_held()
             return False
         return self.armed()
 
@@ -289,8 +335,8 @@ class PromptController:
         entry = self._current
         if entry is None or entry.card.prompt != prompt:
             return False
-        if entry.pressed_disarmed:  # a press that began before the prompt took answers ends here
-            entry.pressed_disarmed = False
+        if entry.held_from_disarmed:  # a press that began before the prompt took answers ends here
+            entry.forget_held()
             return False
         if not self.armed():
             return False

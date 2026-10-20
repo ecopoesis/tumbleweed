@@ -725,26 +725,27 @@ def test_push_to_talk_is_the_only_window_key_controller_outside_the_terminal_mod
 
 
 def test_the_prompts_key_controller_only_counts_presses_and_reads_no_key() -> None:
-    """The prompt (S18) watches the window's presses and keys to restart its 750 ms; what it
-    connects to `key-pressed` is a lambda that takes `*_args` and uses none of them."""
+    """The prompt (S18) watches the window's keys to restart its 750 ms and to know when one is
+    held; what it connects to `key-pressed` and `key-released` are lambdas that take `*_args` and
+    use none of them (no key, keycode or state is read)."""
     tree = ast.parse((SOURCE / "shell/prompt_chrome.py").read_text())
-    handlers = [
-        call.args[1]
+    handlers = {
+        str(_constant(call.args[0])): call.args[1]
         for call in ast.walk(tree)
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Attribute)
         and call.func.attr == "connect"
         and isinstance(call.func.value, ast.Name)
         and call.func.value.id == "keys"
-    ]
+    }
 
-    assert len(handlers) == 1
-    (handler,) = handlers
-    assert isinstance(handler, ast.Lambda)
-    assert handler.args.vararg is not None
-    assert not handler.args.args
-    used = {n.id for n in ast.walk(handler.body) if isinstance(n, ast.Name)}
-    assert handler.args.vararg.arg not in used  # the key, the keycode and the state are not read
+    assert sorted(handlers) == ["key-pressed", "key-released"]
+    for handler in handlers.values():
+        assert isinstance(handler, ast.Lambda)
+        assert handler.args.vararg is not None
+        assert not handler.args.args
+        used = {n.id for n in ast.walk(handler.body) if isinstance(n, ast.Name)}
+        assert handler.args.vararg.arg not in used  # the key, the keycode and the state unread
 
 
 def test_the_push_to_talk_controller_reads_nothing_but_the_key_and_the_modifiers() -> None:

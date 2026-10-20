@@ -337,7 +337,7 @@ class TestClicksThatAreNotTheUsers:
     of clicks aimed at the place where "Allow" appears never finds it armed."""
 
     @staticmethod
-    def press(window: "Gtk.Window") -> None:
+    def gesture(window: "Gtk.Window") -> "Gtk.GestureClick":
         from tumbleweed.shell._gi import Gtk
 
         gestures = [
@@ -347,21 +347,49 @@ class TestClicksThatAreNotTheUsers:
             and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
         ]
         assert len(gestures) == 1
-        gestures[0].emit("pressed", 1, 5.0, 5.0)
+        return gestures[0]
+
+    @classmethod
+    def down(cls, window: "Gtk.Window") -> None:
+        cls.gesture(window).emit("pressed", 1, 5.0, 5.0)
+
+    @classmethod
+    def up(cls, window: "Gtk.Window") -> None:
+        cls.gesture(window).emit("released", 1, 5.0, 5.0)
+
+    @classmethod
+    def press(cls, window: "Gtk.Window") -> None:
+        cls.down(window)
+        cls.up(window)
 
     @staticmethod
-    def key(window: "Gtk.Window") -> bool:
-        from tumbleweed.shell._gi import Gdk, Gtk
+    def keys(window: "Gtk.Window") -> "list[Gtk.EventControllerKey]":
+        from tumbleweed.shell._gi import Gtk
 
-        keys = [
+        found = [
             c
             for c in window.observe_controllers()
             if isinstance(c, Gtk.EventControllerKey)
             and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
             and c.get_widget() is window
         ]
-        assert keys
-        return any(bool(k.emit("key-pressed", Gdk.KEY_a, 0, Gdk.ModifierType(0))) for k in keys)
+        assert found
+        return found
+
+    @classmethod
+    def key(cls, window: "Gtk.Window") -> bool:
+        from tumbleweed.shell._gi import Gdk
+
+        return any(
+            bool(k.emit("key-pressed", Gdk.KEY_a, 0, Gdk.ModifierType(0))) for k in cls.keys(window)
+        )
+
+    @classmethod
+    def key_up(cls, window: "Gtk.Window") -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        for k in cls.keys(window):
+            k.emit("key-released", Gdk.KEY_a, 0, Gdk.ModifierType(0))
 
     def test_a_stream_of_presses_never_arms_the_prompt_until_it_stops(
         self, build_prompt_shell: Builder
@@ -393,13 +421,85 @@ class TestClicksThatAreNotTheUsers:
         once = buttons(shell.window.prompt_banner)["Allow once"]
 
         shell.timers.advance(0.1)
-        self.press(shell.window)  # lands on the button where it has just appeared ...
+        self.down(shell.window)  # lands on the button where it has just appeared ...
         shell.timers.advance(0.8)  # ... and is held until the prompt takes answers
+        self.up(shell.window)
         once.emit("clicked")  # the release
         assert answers.given == []
 
         self.press(shell.window)  # the user's own, deliberate press
         once.emit("clicked")
+        assert len(answers.given) == 1
+
+    def test_a_key_during_the_hold_does_not_end_it(self, build_prompt_shell: Builder) -> None:
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        once = buttons(shell.window.prompt_banner)["Allow once"]
+
+        shell.timers.advance(0.1)
+        self.down(shell.window)
+        shell.timers.advance(0.8)
+        self.key(shell.window)  # a letter, once armed ("hold and type the word")
+        self.key_up(shell.window)
+        self.up(shell.window)
+        once.emit("clicked")
+
+        assert answers.given == []
+
+    def test_a_press_that_ended_in_no_click_does_not_cost_the_next_one(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """Only true if the release is seen: without it the next press is "not fresh"."""
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        once = buttons(shell.window.prompt_banner)["Allow once"]
+
+        shell.timers.advance(0.1)
+        self.press(shell.window)  # on something else, released: no click on a button
+        shell.timers.advance(ARM_SECONDS)
+        self.press(shell.window)
+        once.emit("clicked")
+
+        assert len(answers.given) == 1
+
+    def test_a_cancelled_press_is_over_too(self, build_prompt_shell: Builder) -> None:
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        once = buttons(shell.window.prompt_banner)["Allow once"]
+
+        shell.timers.advance(0.1)
+        self.down(shell.window)
+        self.gesture(shell.window).emit("stopped")  # the sequence was cancelled: no release
+        shell.timers.advance(ARM_SECONDS)
+        self.press(shell.window)
+        once.emit("clicked")
+
+        assert len(answers.given) == 1
+
+    def test_a_key_that_ended_in_no_activation_does_not_cost_the_next_one(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        deny = shell.window.prompt_banner.deny_button
+        assert deny is not None
+
+        shell.timers.advance(0.1)
+        self.key(shell.window)
+        self.key_up(shell.window)  # (without the release the next key is "not fresh")
+        shell.timers.advance(ARM_SECONDS)
+        self.key(shell.window)
+        self.key_up(shell.window)
+        deny.emit("clicked")
+
         assert len(answers.given) == 1
 
     def test_activating_the_window_starts_the_delay_again_and_dims_the_buttons(

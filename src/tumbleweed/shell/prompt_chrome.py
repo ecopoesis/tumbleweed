@@ -160,11 +160,14 @@ class PromptBanner(Gtk.Box):
         presses = Gtk.GestureClick()
         presses.set_button(0)
         presses.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        presses.connect("pressed", lambda *_args: self._disturbed())
+        presses.connect("pressed", lambda *_args: self._pointer_pressed())
+        presses.connect("released", lambda *_args: self._pointer_released())
+        presses.connect("stopped", lambda *_args: self._pointer_released())  # cancelled
         window.add_controller(presses)
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        keys.connect("key-pressed", lambda *_args: self._disturbed())  # False: not consumed
+        keys.connect("key-pressed", lambda *_args: self._key_pressed())  # False: not consumed
+        keys.connect("key-released", lambda *_args: self._key_released())
         window.add_controller(keys)
         window.connect("notify::is-active", self._on_active_changed)
 
@@ -227,10 +230,22 @@ class PromptBanner(Gtk.Box):
             self._controller.mark_drawn(card.prompt)
         return False  # once
 
-    def _disturbed(self) -> bool:
+    def _pointer_pressed(self) -> None:
         if self._controller is not None:
-            self._controller.disturbed()
+            self._controller.pointer_pressed()
+
+    def _pointer_released(self) -> None:
+        if self._controller is not None:
+            self._controller.pointer_released()
+
+    def _key_pressed(self) -> bool:
+        if self._controller is not None:
+            self._controller.key_pressed()
         return False
+
+    def _key_released(self) -> None:
+        if self._controller is not None:
+            self._controller.key_released()
 
     def _on_active_changed(self, window: Gtk.Window, _pspec: object) -> None:
         # Not while our own dialog is open: the window lost the focus to it, and getting it back
