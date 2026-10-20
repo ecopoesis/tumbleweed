@@ -293,6 +293,7 @@ class PromptBanner(Gtk.Box):
             return  # the prompt ended (timeout, withdrawn) while the dialog was open
         self._picking = False
         self._guard.picking = False
+        self._guard.close_surfaces()  # the dialog is done: whatever else appeared meanwhile goes
         controller = self._controller
         if controller is None:
             return

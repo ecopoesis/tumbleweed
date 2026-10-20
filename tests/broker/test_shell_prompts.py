@@ -178,6 +178,28 @@ class TestWhoCanAnswer:
 
         run(scenario)
 
+    def test_two_answers_sent_together_make_one_decision(self) -> None:
+        async def scenario() -> None:
+            async with running(ask_shell=True) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                task = await task_of(client)
+
+                pending = await asked(client, task, rig)
+                shown = await shell.next_prompt()
+                replies = await asyncio.gather(
+                    allow(client, shown, scope="once"), allow(client, shown, scope="task")
+                )
+                outcome = await pending
+
+                assert [type(reply) for reply in replies].count(PromptAnswered) == 1
+                assert [type(reply) for reply in replies].count(Refused) == 1
+                assert outcome.granted
+                assert len(rig.audit_of(GrantDecision)) == 1
+                assert rig.rows("select count(*) from grants") == [(1,)]
+
+        run(scenario)
+
     def test_a_replay_cannot_answer_the_next_prompt_for_the_same_request(self) -> None:
         async def scenario() -> None:
             async with running(ask_shell=True) as rig:

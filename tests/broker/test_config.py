@@ -168,6 +168,15 @@ class TestTheSettings:
         assert config.require_scope_limits is True
         assert config.retention == timedelta(days=7)
 
+    def test_a_task_may_cause_five_prompts_in_ten_minutes_and_a_prompt_waits_two_minutes(
+        self, home_world: World
+    ) -> None:
+        config = config_for(home_world)
+
+        assert config.prompts_per_window == 5
+        assert config.prompt_window == timedelta(minutes=10)
+        assert config.prompt_timeout == timedelta(minutes=2)
+
     def test_the_directories_are_the_ones_of_the_architecture(self, home_world: World) -> None:
         config = config_for(home_world)
 
@@ -186,6 +195,12 @@ class TestTheSettings:
             {"max_live_tasks": True},
             {"max_concurrent_runs": 1000},
             {"max_runs_per_task": 0},
+            {"prompts_per_window": 0},
+            {"prompts_per_window": True},
+            {"prompts_per_window": 10_001},
+            {"prompt_window": timedelta(0)},
+            {"prompt_window": timedelta(days=2)},
+            {"prompt_timeout": timedelta(hours=2)},
             {"sandbox_path": ""},
             {"sandbox_path": "a\0b"},
         ],

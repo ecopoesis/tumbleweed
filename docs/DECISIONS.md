@@ -1072,3 +1072,56 @@ caches it yet (a follow-up issue). An event turn needs the chat to be idle: the 
 message while one streams, as before. A pending event outlives a "new session"; the next turn goes
 into whichever session is current. The model sees the handler's name in the transcript line it
 gets as history, which is the identifier the model itself chose.
+
+## D25 — Trusted permission prompts: two requests, one answer per prompt and connection, a controller with no GTK, a locked window (2026-10-19, accepted)
+
+**Context.** S18 lets the broker ask the user, in a form a model cannot imitate (I5), whether a task
+may read a place, use the network, or have the user pick something for it, and lets the user answer
+only with the keyboard or the pointer (I10). S17 left the prompt interface and the wire for broker to
+shell requests to this step, and #60, #61 and #90 were opened for it. **Decision.** (1) *A prompt is two
+requests.* `show_prompt` (broker to shell) is acknowledged at once or refused `busy`; the user's
+answer is `answer_prompt` (shell to broker), a request of its own. No handler waits for a person (a
+handler has seconds, a user may take minutes), so the transport's timeouts never deny anyone, which
+is what #60 needed of the prompt; the broker takes a prompt down with `close_prompt` when its own
+timeout ends the wait, and the shell's copy of the deadline (`expires_in_ms`) denies when it passes.
+The generic parts of #60 (a deadline in every request frame, a cancel frame) are not done: nothing
+else needs them yet, and the issue stays open for runs. (2) *Who may answer.* A `PromptId` is the
+random, prefixed ID of `core.ids` (unguessable) and is taken out of the broker's waiting set by the
+first answer that counts (single use). The broker keeps each prompt under the `Owner`, the IPC
+connection the daemon gave the task's owner, and takes an answer only from it: another connection's
+answer, even with the right ID, is `Refused(unknown_prompt)` and leaves the prompt waiting, so a
+second process cannot cancel a prompt by guessing at one. `ConnectionId` of the registry is the
+composition wire between two tool instances, not this, so the "same connection" rule uses the
+broker's `Owner`; no ID type was added. (3) *Directions (#61).* A `Role` on the connection limits
+what each end serves and sends; the wire keeps one union and a handler's match is not split by
+direction, nor is the typed request-to-response pairing done; #61 stays open for those. (4) *The rate
+limit is the broker's.* At most 5 prompts per task in 10 minutes, counted when a prompt is asked (a
+picker counts), denied without asking beyond that, with fixed text for the model and an audit entry
+(`rate_limited`); the broker owns the tasks and the reply to the model, and the limit then holds for
+any prompt interface. (5) *Timeouts.* The broker waits 120 s (it was 60: a user who opens the picker
+needs the time), `BrokerClient.request_grant` waits 150 s, and a timeout is a denial on both sides.
+(6) *The shell is a controller and widgets.* `PromptController` has no GTK and holds I5's rules: one
+prompt at a time, in order, at most 8; answers ignored for 750 ms by its own clock, read when the
+answer arrives; a deadline that denies, shown or waiting; the card built from the structure. The
+banner in the chrome region draws it and reports clicks. While a prompt is pending a guard makes the
+canvas and the side panel insensitive (the chat's labels are selectable, so they open a menu),
+pops down every popover, closes every toplevel but the window (and any that appears), and gives the
+focus back afterwards (#53). The chat is therefore not usable while a prompt is up; it comes back
+the moment the last one is gone. Nothing is a `GAction` (#54, tested against a private bus with a
+prompt pending and the picker open). (7) *The picker* is a request (`fs.pick`, file or folder), a
+prompt with no capability, a `Gtk.FileDialog` opened by the user's click on "Choose", and the
+chosen path is received text: the broker resolves it and issues it like any other grant (deny
+rules, taint rule, cap), with `origin = picker`. A write is never offered (S16's gate). (8) *#90:*
+Ctrl+Q and F9 are disabled with Ctrl+L while the terminal has the focus, so the terminal gets them;
+the shell is quit from the chat, the window or a signal. **Deviations from the plan.** None in scope.
+The rate limit is in the broker and not the shell (the plan lists it with the shell's behaviours);
+the shell does not connect to the broker yet (S19), so `window.broker_prompts` is the handler the
+connection will be made with, and the tests connect it to a real daemon. **Not done.** #86 (which
+grant failed, revoke or ask again) is S19's and S24's; #98 (lowering an imported tool's taint) needs
+only a new subject next to `capability` and `pick` in `GrantPrompt` and an access variant on the
+wire, and is not started. A picker for a net-tainted task is refused after the user has chosen, not
+before: nothing can be decided without a path. **Consequences.** A prompt that waits behind another
+may be shown with little of its time left, and is denied by its deadline if so. The audit entry
+does not carry the `PromptId`. The picker's dialog is exempt from the guard only while it is open.
+The test of the real `Gtk.FileDialog` is the session-bus test, which opens it; every other test
+uses a picker with nobody at it.

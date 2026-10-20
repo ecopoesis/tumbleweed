@@ -182,10 +182,17 @@ concurrently, on that one connection.
   Versions must be equal. Before the handshake a server reads one frame of at most 4 KiB within 5 s.
 - **Correlation.** A request carries an `IpcRequestId` chosen by its sender, and the answer
   carries the same id. An answer counts only for a request that is waiting on the same
-  connection: ids mean nothing on any other, which is what S18's "answers only from the
-  connection the prompt was sent on" relies on. An answer that matches no waiting request is
+  connection: ids mean nothing on any other. An answer that matches no waiting request is
   ignored (it may have lost a race with a timeout), and a peer that reuses an id still in
-  progress ends the connection.
+  progress ends the connection. Which *prompt* an answer is for is a different matter, and not the
+  transport's: the broker keeps each prompt under the connection it sent it to (I5, D25).
+- **Directions (#61, D25).** Requests go one way each. `BROKER_SERVES` are what the shell asks the
+  broker (including `answer_prompt`, the user's answer), `SHELL_SERVES` what the broker asks the
+  shell (`show_prompt`, `close_prompt`); `ping` and `echo` go both ways. A connection made with a
+  `Role` (the broker's server and the shell's client always are) answers a request of the other
+  direction with `unsupported_request` before its handler sees it, and `call` refuses to send one
+  that no peer of the other role serves. The wire still has one union of requests, which is all a
+  frame can say; a handler's exhaustive match is not split by direction (what remains of #61).
 - **Bounds (I9).** Per connection and direction, 32 requests in flight; a request counts until
   its reply has been written to the transport. Callers wait 30 s for an answer, writing the
   request included; handlers get 25 s to produce one, so that the callee's `timeout` error
@@ -395,11 +402,13 @@ the broker imports the agent or an LLM (I2).
   was being made is inherited, as is the taint of one that ended meanwhile (I12).
 - **Grants and prompts.** `request_grant` canonicalises the path once, decides with
   `policy.decide`, and only when no grant covers it and policy allows one asks a
-  `PromptInterface`. Until S18 that is `AutoDeny`, so nothing can be granted without a user. A
-  prompt gets the structured capability, the scopes it may offer (`once`, `task`: `tool` needs
-  S24's saved tools) and the model's reason as text to be quoted. Its answer is checked against
-  what was offered; a timeout (60 s), an exception, a scope not offered and an answer that is not
-  one of the two kinds are all a denial. The grant is issued by `policy.issue_grant` after the
+  `PromptInterface`: `ShellPrompts` (S18), which asks the shell that made the task over its
+  connection, or `AutoDeny` for a broker with nobody to ask, so nothing can be granted without a
+  user. A prompt gets the structured capability (or, for a request for the picker, `fs.pick` and
+  no path), the scopes it may offer (`once`, `task`: `tool` needs S24's saved tools) and the
+  model's reason as text to be quoted. Its answer is checked against what was offered; a timeout
+  (120 s), an exception, a scope not offered, an answer that is not one of the two kinds and a
+  picker answered without a choice (or any other prompt answered with one) are all a denial. The grant is issued by `policy.issue_grant` after the
   deny rules are rebuilt, against the path as it was resolved *before* the prompt, so what the user
   saw is what is recorded. Beyond S16's rules the broker refuses, at decision time and without
   asking, what the sandbox would refuse to mount (section 7). A once grant that has been used up is
@@ -492,12 +501,27 @@ the broker imports the agent or an LLM (I2).
 - **Connections (#59, #60, #61).** The daemon serves at most 8 connections. A request may take as
   long as the longest run plus its setup (`handler_timeout` 170 s). A connection that receives
   nothing for 90 s while nothing is in progress is closed, and `BrokerClient` pings every 30 s,
-  so a quiet shell is not idle and a dead one does not keep its slot. What S17 does *not* do: the
-  caller's deadline does not travel with a request and a caller that gives up cannot cancel it
-  (#60: a run ends at its own limit, and the connection ending cancels it; S18's prompts need
-  this); and request bodies still share one union for both directions (#61: S18 adds the first
-  broker-to-shell requests). `BrokerClient` gives the typed request-to-response pairing at the API
-  a caller uses.
+  so a quiet shell is not idle and a dead one does not keep its slot. The caller's deadline does
+  not travel with a request and a caller that gives up cannot cancel it (#60: a run ends at its
+  own limit, and the connection ending cancels it); the prompt does not need it (below).
+  Requests go one way each (see Directions). `BrokerClient` gives the typed request-to-response
+  pairing at the API a caller uses.
+- **The trusted prompt (S18, D25).** A prompt is two requests, so that no handler waits for a
+  person. The broker sends `show_prompt` (a fresh `PromptId`, the task and tool, the access as the
+  broker resolved it, the scopes, the model's reason, and `expires_in_ms`) to the connection that
+  made the task; the shell acknowledges at once, or refuses `busy` when its queue is full, which is
+  a denial. The user's answer comes back as `answer_prompt(prompt, allow(scope, picked) | deny)`.
+  The broker keeps each prompt under the connection it sent it to and takes an answer only from
+  that one, once: another connection's answer, a replay, an unknown or an answered or closed id is
+  `Refused(unknown_prompt)`, and the other connection's attempt leaves the prompt as it was. When
+  the broker's timeout ends the wait it sends `close_prompt`; when the shell's connection ends,
+  whatever waits for it is denied at once. **At most 5 prompts per task in 10 minutes**
+  (`prompts_per_window`, `prompt_window`; a picker counts): the rest are denied without asking, with
+  fixed text for the model, and audited (`rate_limited`). A request may ask for the **picker**
+  (`fs.pick`, file or folder): the shell opens a `Gtk.FileDialog` when the user presses "Choose",
+  and the path the user picks (received text, so not a decision already made) is resolved and issued
+  like any other: deny rules, taint rule and grant cap apply, the grant records `origin = picker`,
+  and the audit entry has the picked path. Nothing here knows about GTK or voice.
 - **Development.** `BrokerConnector` connects and, if nobody is there, starts `python -I -m
   tumbleweed.broker.daemon` detached, from `/`, with a minimal environment of its own (never the
   shell's: the API key is not passed on, I6; `-I` and the working directory keep a module planted
@@ -1097,7 +1121,7 @@ audited.
 - **Writes are off until undo exists.** Until snapshots ship (S21), policy refuses every
   `fs.write` grant; the sandbox writes only to its own workspace.
 - **Decisions** come from static policy, existing grants, or a **trusted permission prompt**.
-  A prompt may instead be a **trusted file/folder picker** (`Gtk.FileDialog` in chrome):
+  A prompt may instead be a **trusted file/folder picker** (`Gtk.FileDialog` in chrome, S18):
   picking is itself the user's grant decision, and it doubles as the handoff's fallback
   file browser.
 
@@ -1191,6 +1215,28 @@ Each invariant names where it is enforced. Reviews check every change against th
   prompts per task are rate-limited (beyond the limit, requests are auto-denied and the model
   is told why). Prompt IDs are unguessable and single-use. The broker accepts an answer only
   from the connection it sent the prompt to.
+  **The prompt (S18, D25).** `tumbleweed.shell.viewmodel.prompts.PromptController` (no GTK) holds
+  the rules and `tumbleweed.shell.prompt_chrome.PromptBanner` draws them in the chrome region.
+  *What is shown*: our heading, "From task ..." (and the tool, if one asked), one sentence per kind
+  of access ("The assistant asks to read this file or folder and all in it:", full network access,
+  choose a file or a folder) and the path on a line of its own, spelled out where it has a control
+  or format character; then "The assistant says (its own words, not checked):" and the reason
+  quoted, as one plain line of at most 300 characters (control, format and separator characters
+  become a space; a cut ends in an ellipsis). Every string goes in with `set_text`, markup and
+  mnemonics off. The styling is a set of classes (`tw-trusted-*`) that a spec cannot name: the spec
+  model has no field for a class, a name or a region, and a test renders a hostile spec and looks.
+  *When it takes answers*: not for 750 ms after it is shown, by the controller's clock, read when
+  the answer arrives (a late timer cannot arm it early); the buttons are dimmed until then. Deny
+  has the focus. *One at a time*: the rest wait in order, at most 8 in all (a ninth is refused
+  and denied by the broker); each has the broker's deadline (`expires_in_ms`) from the moment it
+  arrived, and past it the shell answers `deny(prompt_timeout)` and takes it down, shown or
+  waiting. *While pending* (`tumbleweed.shell.prompt_guard`, #53): the canvas and the side panel
+  (the chat, whose labels are selectable and so open a menu) are insensitive, every popover under
+  the window is popped down, every toplevel but the shell's is closed and any that appears is
+  closed at once (the picker's own dialog is let through while it is open), and the focus
+  comes back to where it was when the last prompt is gone. The buttons are plain widgets and
+  nothing in the prompt is a `GAction` (#54: `tests/shell/test_session_bus.py` lists everything the
+  shell exports with a prompt pending and the picker open, and activates all of it).
 - **I6 — Secrets stay out.** The API key never enters model context, logs, the invocation
   log, sandboxes (environment is cleared), workspaces or tool packages.
   The agent takes the key out of the process environment when it starts (so no child process
@@ -1276,7 +1322,10 @@ Each invariant names where it is enforced. Reviews check every change against th
   chat input, its toggle is a widget and not a `GAction`, and the wake word, VAD and models have no
   access to a prompt or picker. Ambient audio can say the wake word, so a hands-free turn can send a
   message the user did not mean (`edit_before_send` holds it for review); it still cannot answer a
-  prompt.
+  prompt. The prompt's side of this (S18): `PromptController.choose` is called by the prompt's own
+  buttons and by nothing else (an AST tripwire in `tests/shell/test_prompt_isolation.py`), so a
+  spoken "allow" is a chat message and a prompt that was pending still is
+  (`tests/shell/test_voice_in_shell.py`).
 - **I11 — Workspaces are hostile.** Trusted code never follows symlinks inside a workspace
   (component-wise `O_NOFOLLOW` / `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`) and caps
   what it reads. Workspace references are relative and validated.
@@ -1419,7 +1468,8 @@ src/tumbleweed/
   ui/gtk/     GTK4 adapter that renders specs
   shell/      Adw application, window, chat panel, trusted prompts, terminal pane, canvas host
               (`canvas_tools`: the instances on the canvas)
-  shell/viewmodel/  transcript view-model, chat controller, terminal choices and spawner (no GTK)
+  shell/viewmodel/  transcript view-model, chat controller, terminal choices and spawner, and the
+              trusted prompt's controller (`prompts`) (no GTK)
   agent/      agent loop, tool registry, LLM providers, invocation recorder, prompts, config;
               the `Responder` interface the shell is built against (`agent/responder.py`);
               the canvas tools and the `CanvasHost` protocol (`canvas`), the event snapshot,
@@ -1438,9 +1488,10 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   model is data, used by the broker that stores it and the shell that builds drafts.
 - `broker` and `sandbox` never import `agent`, `shell`, `voice`, `ui.gtk` or any LLM SDK.
 - `sandbox` never imports `broker`.
-- `broker` imports `ipc` only in its daemon layer (`service`, `daemon`, `client`, `toolscli`); the
-  policy core, storage and audit modules never do, nor do they import the daemon layer; `ipc` never
-  imports `broker`.
+- `broker` imports `ipc` only in its daemon layer (`service`, `daemon`, `client`, `shellprompts`,
+  `toolscli`); the policy core, storage and audit modules never do, nor do they import the daemon
+  layer (`shellprompts`, which asks the shell, does not import `service`, `daemon` or `client`);
+  `ipc` never imports `broker`.
 - `core`, `ipc`, `ui.spec`, `ui.runtime`, `ui.images`, `agent`, `history`, `broker` and `sandbox`
   never import `gi`; `ui.runtime` and `ui.images` also never import `ui.gtk` or the shell, so they
   cannot reach GTK through them. `voice` imports it only in `voice._gst`, the pin of the GStreamer

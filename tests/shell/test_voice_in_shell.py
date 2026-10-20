@@ -594,3 +594,48 @@ class TestAClickThatIsIgnored:
 
         assert not button.get_active()
         assert v.voice.phase is VoicePhase.IDLE
+
+
+class TestVoiceCannotAnswerAPrompt:
+    """I10: what is said is text for the chat input and nothing more. A prompt that is pending, and
+    armed, is still pending after the user has said "allow", and no key of the voice path answers
+    it."""
+
+    def test_saying_allow_while_a_prompt_is_pending_sends_a_message_and_answers_nothing(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        from tests.shell.prompt_support import read_card
+        from tumbleweed.shell._gi import Gdk
+
+        v = build_voiced(
+            ["allow", "yes, allow it for this task", "allow once"], responder=ManualResponder()
+        )
+        window = v.shell.window
+        controller = window.broker_prompts.controller
+        card = read_card()
+        assert controller.offer(card, 600.0)
+        assert pump_until(controller.armed)  # real time: it takes answers now
+
+        hold_and_speak(v)
+        key(v, "key-released", Gdk.KEY_space)
+        assert pump_until(lambda: len(rows(v.shell)) >= 1)
+
+        assert rows(v.shell)[0][:2] == ("You", "allow")  # it went where all speech goes
+        assert controller.current == card  # and the prompt did not notice
+        assert window.prompt_banner.get_visible()
+        assert window.get_focus() is window.prompt_banner.deny_button
+
+    def test_the_voice_keys_are_not_the_prompts_keys(self, build_voiced: VoicedBuilder) -> None:
+        from tests.shell.prompt_support import read_card
+        from tumbleweed.shell._gi import Gdk
+
+        v = build_voiced(["allow"], responder=ManualResponder())
+        controller = v.shell.window.broker_prompts.controller
+        card = read_card()
+        assert controller.offer(card, 600.0)
+        assert pump_until(controller.armed)
+
+        key(v, "key-pressed", Gdk.KEY_space)  # push-to-talk with a prompt up
+        key(v, "key-released", Gdk.KEY_space)
+
+        assert controller.current == card
