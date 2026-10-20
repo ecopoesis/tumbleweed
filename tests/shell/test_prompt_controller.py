@@ -1,6 +1,8 @@
 """The prompt's state machine, without a window (S18, I5, I10): one at a time, ignoring answers
 for 750 ms, a deadline that is a denial, and what is shown made from the structure."""
 
+from collections.abc import Callable
+
 import pytest
 
 from tests.shell.prompt_support import (
@@ -143,6 +145,17 @@ class TestNotAtOnce:
         rig.arm()
         assert rig.controller.choose(second.prompt, DENY)
 
+    def test_a_choice_made_after_its_prompt_was_taken_down_is_no_answer(self, rig: Rig) -> None:
+        """The dialog of a picker may outlive its prompt by a moment: its late choice is nothing."""
+        card = rig.offer(pick_card())
+        rig.arm()
+
+        rig.controller.withdraw(card.prompt)
+        late = AllowDecision(kind="allow", scope="task", picked="/home/u/Documents")
+
+        assert not rig.controller.choose(card.prompt, late)
+        assert rig.answers.given == []
+
     def test_the_view_is_told_when_the_prompt_is_armed(self, rig: Rig) -> None:
         rig.offer()
         assert rig.view.armed == []
@@ -150,6 +163,95 @@ class TestNotAtOnce:
         rig.arm()
 
         assert rig.view.armed == [True]
+
+
+class TestNotWhileSomethingElseIsHappening:
+    def test_a_stream_of_clicks_is_never_taken_until_there_has_been_a_quiet_gap(
+        self, rig: Rig
+    ) -> None:
+        """A model's tool can put a button where "Allow" will appear and click it, over and over."""
+        card = rig.offer()
+
+        for _ in range(12):  # 2.4 s of clicks, 200 ms apart
+            rig.timers.advance(0.2)
+            rig.controller.disturbed()  # the press, which reaches the window before the button
+            assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+        assert rig.answers.given == []
+        rig.timers.advance(ARM_SECONDS - 0.01)
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # not yet a whole delay of quiet
+        rig.timers.advance(0.01)
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_a_press_on_a_prompt_that_takes_answers_does_not_disarm_it(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+
+        rig.controller.disturbed()  # the user's own click on the button
+
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_the_window_coming_to_the_front_starts_the_delay_again(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        assert rig.controller.armed()
+
+        rig.controller.reactivated()  # a click that brought the window up may land on a button
+
+        assert not rig.controller.armed()
+        assert rig.view.armed[-1:] == [False]
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+        rig.arm()
+        assert rig.view.armed[-1:] == [True]
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_the_delay_counts_from_the_first_frame_not_from_the_queueing(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.timers.advance(ARM_SECONDS - 0.05)  # painting was slow
+
+        rig.controller.mark_drawn(card.prompt)
+        rig.timers.advance(0.1)
+
+        assert not rig.controller.armed()
+        assert not rig.controller.choose(card.prompt, DENY)
+        rig.timers.advance(ARM_SECONDS)
+        assert rig.controller.choose(card.prompt, DENY)
+
+    def test_a_frame_of_another_prompt_changes_nothing(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+
+        rig.controller.mark_drawn(PromptId.new())
+
+        assert rig.controller.choose(card.prompt, DENY)
+
+    def test_a_timer_that_runs_before_the_clock_has_got_there_looks_again(self) -> None:
+        """The scheduler's clock and the controller's are not the same clock: if the timer runs
+        early the buttons must not stay dimmed for good."""
+        clock = Clock()
+        pending: list[tuple[float, Callable[[], None]]] = []
+
+        class Lagging:
+            def call_later(
+                self, seconds: float, callback: Callable[[], None]
+            ) -> Callable[[], None]:
+                pending.append((seconds, callback))
+                return lambda: None
+
+        view = FakeView()
+        controller = PromptController(view, Answers(), Lagging(), clock)
+        controller.offer(read_card(), 60.0)
+        clock.now += 0.5  # the controller's clock is behind the timer's
+        _seconds, arm = next((s, c) for s, c in pending if s == ARM_SECONDS)
+
+        arm()  # fires early
+
+        assert view.armed == []  # not armed, and not claimed to be
+        again = pending[-1]
+        assert 0 < again[0] <= ARM_SECONDS - 0.5 + 0.01  # it looks again for what is left
+        clock.now += again[0]
+        again[1]()
+        assert view.armed == [True]
 
 
 class TestOnlyOneAnswerCounts:
@@ -300,6 +402,16 @@ class TestWhatIsShown:
         card = card_of(show_message(access=ReadAccess(kind="fs.read", path="/home/u/a‮b\x1b[2Jc​d")))
 
         assert card.path == "/home/u/a\\u{202E}b\\u{001B}[2Jc\\u{200B}d"
+
+    @pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+    def test_a_line_or_paragraph_separator_in_a_path_is_spelled_out_not_a_line_break(
+        self, separator: str
+    ) -> None:
+        card = card_of(
+            show_message(access=ReadAccess(kind="fs.read", path=f"/home/u/Photos{separator}x"))
+        )
+
+        assert card.path == f"/home/u/Photos\\u{{{ord(separator):04X}}}x"
 
     def test_the_reason_is_one_plain_line(self) -> None:
         separators = chr(0x2028) + chr(0x200B) + chr(0x202E) + "\x00\x1b"

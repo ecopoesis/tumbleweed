@@ -15,7 +15,9 @@ accepts one only from a click on the prompt that is shown (`tumbleweed.shell.vie
 """
 
 import asyncio
+import contextlib
 import logging
+import threading
 import time
 from collections.abc import Callable
 from datetime import timedelta
@@ -74,6 +76,12 @@ async def on_main_thread[T](dispatcher: MainThreadDispatcher, work: Callable[[],
     return await done
 
 
+def _log_failure(sent: "concurrent.futures.Future[None]") -> None:
+    """An answer that failed for a reason we did not foresee is logged, not lost with its future."""
+    if not sent.cancelled() and (error := sent.exception()) is not None:
+        _log.error("sending an answer to a prompt failed", exc_info=error)
+
+
 @final
 class BrokerPrompts:
     """The request handler of the shell's end of the broker connection, with its controller."""
@@ -90,11 +98,18 @@ class BrokerPrompts:
         # Where each prompt came from, so that its answer goes back on that connection. Main thread.
         self._routes: dict[PromptId, tuple[Connection, asyncio.AbstractEventLoop]] = {}
         self._sending: set[concurrent.futures.Future[None]] = set()
+        self._closed = False
+        # One watcher per connection that has sent a prompt, on that connection's loop: when the
+        # connection ends, its prompts are taken down (nobody is left to answer them). Under a
+        # lock: they are made on the loops' threads and cancelled by `close` on the main one.
+        self._watchers: dict[Connection, tuple[asyncio.Task[None], asyncio.AbstractEventLoop]] = {}
+        self._lock = threading.Lock()
 
     async def __call__(self, request: RequestBody, connection: Connection, /) -> ResponseBody:
         match request:
             case ShowPrompt():
                 loop = asyncio.get_running_loop()
+                self._watch(connection, loop)
                 taken = await on_main_thread(
                     self._dispatcher, lambda: self._show(request, connection, loop)
                 )
@@ -113,15 +128,44 @@ class BrokerPrompts:
                 raise RequestRefused(ErrorCode.UNSUPPORTED_REQUEST, "not a shell request")
 
     def close(self) -> None:
-        """The window is closing: take every prompt down. Main thread."""
+        """The window is closing: take every prompt down, and take no more. Main thread."""
+        self._closed = True
         self.controller.close()
         self._routes.clear()
+        with self._lock:
+            watchers, self._watchers = list(self._watchers.values()), {}
+        for task, loop in watchers:
+            with contextlib.suppress(RuntimeError):  # the loop is gone: so is the task
+                loop.call_soon_threadsafe(task.cancel)
+
+    def _watch(self, connection: Connection, loop: asyncio.AbstractEventLoop) -> None:
+        """On the connection's loop: see to it that its prompts do not outlive it."""
+        with self._lock:
+            if self._closed or connection in self._watchers:
+                return
+            task = loop.create_task(self._lost_when_closed(connection), name="prompt-watch")
+            self._watchers[connection] = (task, loop)
+
+    async def _lost_when_closed(self, connection: Connection) -> None:
+        await connection.wait_closed()
+        with self._lock:
+            self._watchers.pop(connection, None)
+        self._dispatcher.post(lambda: self._lost(connection))
+
+    def _lost(self, connection: Connection) -> None:
+        """Main thread: the connection ended, so what it asked of the user is not asked any more
+        (an Allow now would answer nobody; the broker denied it when the connection went)."""
+        gone = [prompt for prompt, (owner, _loop) in self._routes.items() if owner is connection]
+        for prompt in gone:
+            self._withdraw(prompt)
 
     # --- on the main thread ----------------------------------------------------------------
 
     def _show(
         self, request: ShowPrompt, connection: Connection, loop: asyncio.AbstractEventLoop
     ) -> bool:
+        if self._closed or connection.is_closed:
+            return False
         card = card_of(request)
         if not self.controller.offer(card, request.expires_in_ms / 1000):
             return False
@@ -145,6 +189,7 @@ class BrokerPrompts:
             return
         self._sending.add(sent)
         sent.add_done_callback(self._sending.discard)
+        sent.add_done_callback(_log_failure)
 
     @staticmethod
     async def _send(connection: Connection, request: AnswerPrompt) -> None:

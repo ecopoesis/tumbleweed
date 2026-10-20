@@ -5,11 +5,12 @@ a menu, a dialog, a tooltip are surfaces of their own, which no allocation conta
 creates none from a spec (`tumbleweed.ui.gtk.guard`); this is the second line, for whatever else
 could be on screen when a prompt arrives, and for what could appear while it is there:
 
-- the parts of the window that show model-supplied content (the canvas and the side panel with the
-  chat, whose labels are selectable and so open a menu) are made insensitive, so they take no
-  pointer or keyboard input and open nothing;
+- everything in the window but the chrome (the canvas, the side panel with the chat, whose labels
+  are selectable and so open a menu, the terminal pane and the status strip) is made insensitive,
+  so that it takes no pointer or keyboard input and opens nothing; F12 does not move the focus to
+  the terminal either (`ShellWindow`);
 - every popover under the window is popped down, and every toplevel that is not the shell's window
-  is closed, when the prompt appears, and any that appears while it is pending is closed at once
+  is closed, when the prompt appears, and any new one while it is pending is closed at once
   (the picker's own dialog is let through, while it is open);
 - the focus is taken from whatever had it (the caller puts it on Deny) and given back when the last
   prompt is gone, to where it was or, if that is gone, to the chat input.

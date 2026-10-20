@@ -8,9 +8,10 @@ makes it the one thing on screen a model cannot imitate:
   (`RESERVED_CLASSES`) that nothing from a spec can name: a spec chooses from a closed set of
   components and has no way to set a CSS class (`tests/shell/test_prompt_chrome.py` renders a
   hostile spec and looks);
-- what is granted is drawn from the card's structure, by our code, in our words; the path is data,
-  shown in its own labelled line, and the model's reason is quoted, labelled as the assistant's, one
-  plain line and capped (`viewmodel.prompts`);
+- what is granted is drawn from the card's structure, by our code, in our words; the path is
+  data, shown in its own labelled line, and the model's reason is set apart as a quotation (with no
+  quotation marks: none of its characters can close one), labelled as the assistant's, one plain
+  line and capped (`viewmodel.prompts`);
 - every string that is not ours goes in with `set_text` (`plain_label`), never as markup (I4);
 - Deny has the focus when the prompt appears, and the buttons ignore input for the first 750 ms
   (the controller decides; `set_armed` only dims them), so a key or click meant for something else a
@@ -72,14 +73,15 @@ _PICK_LABEL: Final[dict[Scope, str]] = {
 
 
 class FilePicker(Protocol):
-    """Lets the user choose a file or folder: `done` gets its path, or None if they did not."""
+    """Lets the user choose a file or folder: `done` gets its path, or None if they did not.
+    Returns what closes the dialog, for a prompt that ends while it is open."""
 
     def pick(
         self,
         parent: Gtk.Window,
         choose: Literal["file", "folder"],
         done: Callable[[str | None], None],
-    ) -> None: ...
+    ) -> Callable[[], None]: ...
 
 
 @final
@@ -91,8 +93,9 @@ class GtkFilePicker:
         parent: Gtk.Window,
         choose: Literal["file", "folder"],
         done: Callable[[str | None], None],
-    ) -> None:
+    ) -> Callable[[], None]:
         dialog = Gtk.FileDialog()
+        cancellable = Gio.Cancellable()
         dialog.set_title(_PICK_TITLE[choose])
         dialog.set_modal(True)
 
@@ -110,9 +113,10 @@ class GtkFilePicker:
             done(chosen.get_path() or None)  # None if it is not a local file
 
         if choose == "folder":
-            dialog.select_folder(parent, None, finished)
+            dialog.select_folder(parent, cancellable, finished)
         else:
-            dialog.open(parent, None, finished)
+            dialog.open(parent, cancellable, finished)
+        return cancellable.cancel
 
 
 @functools.cache
@@ -148,7 +152,21 @@ class PromptBanner(Gtk.Box):
         self._buttons: list[Gtk.Button] = []
         self._deny: Gtk.Button | None = None
         self._picking = False
+        self._cancel_picker: Callable[[], None] | None = None
         self.note = plain_label("", wrap=True, css_classes=["caption"])
+        # Whatever reaches the window while the prompt is not yet armed starts its delay again
+        # (a stream of clicks aimed at where a button will appear is never taken), and so does the
+        # window coming to the front. They only watch: the events go on to whoever they were for.
+        presses = Gtk.GestureClick()
+        presses.set_button(0)
+        presses.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        presses.connect("pressed", lambda *_args: self._disturbed())
+        window.add_controller(presses)
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", lambda *_args: self._disturbed())  # False: not consumed
+        window.add_controller(keys)
+        window.connect("notify::is-active", self._on_active_changed)
 
     def bind(self, controller: PromptController) -> None:
         """Whose prompts these are (the controller is made with this banner as its view)."""
@@ -169,12 +187,13 @@ class PromptBanner(Gtk.Box):
     # --- PromptView ------------------------------------------------------------------------
 
     def present(self, card: PromptCard) -> None:
+        self._end_picker()
         self._card = card
-        self._picking = False
-        self._guard.picking = False
         self._rebuild(card)
         self.set_visible(True)
         self._guard.engage()
+        # The delay counts from the first frame, not from now: a slow first paint must not eat it.
+        self.add_tick_callback(lambda _widget, _clock: self._first_frame(card))
         self.set_armed(False)
         if self._deny is not None:
             self._window.set_focus(self._deny)  # Deny, not whatever had the focus (I5)
@@ -187,14 +206,35 @@ class PromptBanner(Gtk.Box):
                 button.add_css_class(DISARMED_CLASS)
 
     def clear(self) -> None:
+        self._end_picker()
         self._card = None
-        self._picking = False
-        self._guard.picking = False
         self._deny = None
         self._buttons = []
         self._empty()
         self.set_visible(False)
         self._guard.release()
+
+    def _end_picker(self) -> None:
+        """Close the picker's dialog, if one is open: its prompt is over."""
+        cancel, self._cancel_picker = self._cancel_picker, None
+        self._picking = False
+        self._guard.picking = False
+        if cancel is not None:
+            cancel()
+
+    def _first_frame(self, card: PromptCard) -> bool:
+        if self._card is card and self._controller is not None:
+            self._controller.mark_drawn(card.prompt)
+        return False  # once
+
+    def _disturbed(self) -> bool:
+        if self._controller is not None:
+            self._controller.disturbed()
+        return False
+
+    def _on_active_changed(self, window: Gtk.Window, _pspec: object) -> None:
+        if window.is_active() and self._controller is not None:
+            self._controller.reactivated()
 
     # --- drawing ---------------------------------------------------------------------------
 
@@ -221,8 +261,10 @@ class PromptBanner(Gtk.Box):
                 css_classes=["caption", "dim-label"],
             )
         )
-        quoted = f"“{display_text(card.reason)}”" if card.reason else "(no reason given)"
-        self.append(plain_label(quoted, wrap=True, css_classes=[REASON_CLASS]))
+        # No quotation marks: the block, set apart by its rule and its italics under the label
+        # above, is the quotation, so no character of the reason can close it.
+        shown = display_text(card.reason) if card.reason else "(no reason given)"
+        self.append(plain_label(shown, wrap=True, css_classes=[REASON_CLASS]))
         self.append(self._button_row(card))
         self.note = plain_label(
             "Answer with the keyboard or the mouse. No answer means Deny.",
@@ -286,11 +328,14 @@ class PromptBanner(Gtk.Box):
         choose: Literal["file", "folder"] = "file" if card.kind == "pick_file" else "folder"
         self._picking = True
         self._guard.picking = True  # the dialog is a toplevel of ours, not a stranger
-        self._picker.pick(self._window, choose, lambda path: self._picked(card, scope, path))
+        self._cancel_picker = self._picker.pick(
+            self._window, choose, lambda path: self._picked(card, scope, path)
+        )
 
     def _picked(self, card: PromptCard, scope: Scope, path: str | None) -> None:
         if self._card is not card:
             return  # the prompt ended (timeout, withdrawn) while the dialog was open
+        self._cancel_picker = None
         self._picking = False
         self._guard.picking = False
         self._guard.close_surfaces()  # the dialog is done: whatever else appeared meanwhile goes

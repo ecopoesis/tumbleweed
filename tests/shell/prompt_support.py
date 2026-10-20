@@ -106,13 +106,19 @@ class FakePicker:
 
     def __init__(self) -> None:
         self.asked: list[Literal["file", "folder"]] = []
+        self.cancelled = 0
         self._done: list[Callable[[str | None], None]] = []
 
     def pick(
         self, parent: object, choose: Literal["file", "folder"], done: Callable[[str | None], None]
-    ) -> None:
+    ) -> Callable[[], None]:
         self.asked.append(choose)
         self._done.append(done)
+
+        def cancel() -> None:
+            self.cancelled += 1  # (a real dialog then calls `done(None)` itself)
+
+        return cancel
 
     def finish(self, path: str | None) -> None:
         self._done.pop(0)(path)

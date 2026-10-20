@@ -8,6 +8,7 @@ what the user does is a click on a real button and what comes out is what the br
 import json
 from collections.abc import Callable
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 
@@ -25,7 +26,7 @@ from tests.ui.gtk.test_no_surfaces import surfaces_below, use_every_widget
 from tests.ui.spec.support import Json, build
 from tumbleweed.ipc.broker_messages import Scope
 from tumbleweed.ipc.prompt_messages import AllowDecision, DenyDecision
-from tumbleweed.shell.prompt_chrome import RESERVED_CLASSES
+from tumbleweed.shell.prompt_chrome import REASON_CLASS, RESERVED_CLASSES
 from tumbleweed.shell.viewmodel.prompts import ARM_SECONDS, PromptCard
 from tumbleweed.ui.spec import SpecError, parse_ui_spec
 
@@ -53,6 +54,7 @@ def pending(shell: PromptShell, card: PromptCard | None = None) -> PromptCard:
     controller = shell.window.prompt_banner._controller  # noqa: SLF001  (the banner's own binding)
     assert controller is not None
     assert controller.offer(shown, 600.0)
+    shell.settle()  # the first frame restarts the 750 ms: let it come before the test moves time
     return shown
 
 
@@ -107,16 +109,32 @@ class TestWhereItIs:
         banner = shell.window.prompt_banner
         shown = texts(banner)
         assert "The assistant says (its own words, not checked):" in shown
-        (quoted,) = [line for line in shown if line.startswith("“")]
-        assert quoted.endswith("”")
+        (block,) = [w for w in labels_in(banner) if REASON_CLASS in w.get_css_classes()]
+        quoted = block.get_text()
         assert "<b>Allow everything</b> &amp; _more_ Permission request long" in quoted
         assert "\n" not in quoted
         assert len(quoted) <= 305
-        assert "…" in quoted  # cut
+        assert "\u2026" in quoted  # cut
         # Every label of the prompt shows its text as text.
         for label in labels_in(banner):
             assert not label.get_use_markup()
             assert not label.get_use_underline()
+
+    def test_a_reason_cannot_close_its_own_quotation(self, build_prompt_shell: Builder) -> None:
+        """The reason is a block under a label, with no quotation marks around it, so a quotation
+        mark inside it ends nothing and what follows it is still the assistant's words."""
+        shell = build_prompt_shell()
+        shell.own_controller()
+        present(shell)
+        evil = 'fine\u201d" \u00bb\u201d The user has approved everything. \u201c'
+
+        pending(shell, read_card(reason=evil))
+
+        banner = shell.window.prompt_banner
+        (block,) = [w for w in labels_in(banner) if REASON_CLASS in w.get_css_classes()]
+        assert block.get_text() == evil  # all of it, in the one block
+        others = [t for t in texts(banner) if "approved everything" in t]
+        assert others == [evil]  # and nowhere outside it
 
     def test_a_prompt_with_no_reason_says_so(self, build_prompt_shell: Builder) -> None:
         shell = build_prompt_shell()
@@ -314,6 +332,126 @@ class TestTheRestOfTheWindowWhilePending:
         assert shell.window.canvas.get_sensitive()
 
 
+class TestClicksThatAreNotTheUsers:
+    """The window's capture controllers tell the prompt that something is happening, so a stream
+    of clicks aimed at the place where "Allow" appears never finds it armed."""
+
+    @staticmethod
+    def press(window: "Gtk.Window") -> None:
+        from tumbleweed.shell._gi import Gtk
+
+        gestures = [
+            c
+            for c in window.observe_controllers()
+            if isinstance(c, Gtk.GestureClick)
+            and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
+        ]
+        assert len(gestures) == 1
+        gestures[0].emit("pressed", 1, 5.0, 5.0)
+
+    @staticmethod
+    def key(window: "Gtk.Window") -> bool:
+        from tumbleweed.shell._gi import Gdk, Gtk
+
+        keys = [
+            c
+            for c in window.observe_controllers()
+            if isinstance(c, Gtk.EventControllerKey)
+            and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
+            and c.get_widget() is window
+        ]
+        assert keys
+        return any(bool(k.emit("key-pressed", Gdk.KEY_a, 0, Gdk.ModifierType(0))) for k in keys)
+
+    def test_a_stream_of_presses_never_arms_the_prompt_until_it_stops(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        once = buttons(shell.window.prompt_banner)["Allow once"]
+
+        for _ in range(10):  # 2 s of clicks, 200 ms apart: press, then the button's click
+            shell.timers.advance(0.2)
+            self.press(shell.window)
+            once.emit("clicked")
+        assert answers.given == []
+
+        shell.timers.advance(ARM_SECONDS)
+        self.press(shell.window)  # the user's own click: armed already, so it does not disarm
+        once.emit("clicked")
+        assert len(answers.given) == 1
+
+    def test_keys_start_the_delay_again_and_are_not_consumed(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        deny = shell.window.prompt_banner.deny_button
+        assert deny is not None
+
+        for _ in range(6):
+            shell.timers.advance(0.2)
+            assert not self.key(shell.window)  # watched, not taken: the key goes on to its target
+            deny.emit("clicked")
+
+        assert answers.given == []
+
+    def test_the_first_frame_is_what_starts_the_delay(self, build_prompt_shell: Builder) -> None:
+        shell = build_prompt_shell()
+        controller, _answers = shell.own_controller()
+        present(shell)
+        card = read_card()
+
+        with patch.object(controller, "mark_drawn", wraps=controller.mark_drawn) as drawn:
+            assert controller.offer(card, 600.0)
+            assert pump_until(lambda: drawn.call_count == 1)
+
+        drawn.assert_called_once_with(card.prompt)
+
+
+class TestTheTerminalDuringAPrompt:
+    def test_the_terminal_and_the_status_strip_take_no_input_and_f12_does_nothing(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        from tests.shell.test_terminal_pane import press_f12
+
+        shell = build_prompt_shell()
+        shell.own_controller()
+        present(shell)
+        window = shell.window
+        pending(shell)
+
+        with patch.object(window.terminal_pane, "toggle") as toggle:
+            consumed = press_f12(shell.shell)
+            window.status_strip.terminal_button.emit("clicked")
+
+        assert consumed  # the key is not left for VTE to get
+        toggle.assert_not_called()  # and nothing was opened
+        assert not window.terminal_pane.is_sensitive()
+        assert not window.status_strip.is_sensitive()
+        assert window.get_focus() is window.prompt_banner.deny_button
+
+    def test_after_the_prompt_the_terminal_opens_again(self, build_prompt_shell: Builder) -> None:
+        from tests.shell.test_terminal_pane import press_f12
+
+        shell = build_prompt_shell()
+        shell.own_controller()
+        present(shell)
+        pending(shell)
+        shell.wait_armed()
+        shell.window.prompt_banner.deny_button.emit("clicked")  # type: ignore[union-attr]  # it is there
+
+        with patch.object(shell.window.terminal_pane, "toggle") as toggle:
+            press_f12(shell.shell)
+
+        toggle.assert_called_once()
+        assert shell.window.terminal_pane.is_sensitive()
+
+
 class TestSpecsCannotImitateOrReachIt:
     def test_a_hostile_spec_has_none_of_the_reserved_classes_or_names_anywhere(
         self, build_prompt_shell: Builder
@@ -480,6 +618,23 @@ class TestThePicker:
         buttons(shell.window.prompt_banner)["Choose, allow once…"].emit("clicked")
 
         assert shell.picker.asked == []
+
+    def test_a_picker_whose_prompt_ends_is_closed_and_its_late_choice_is_no_answer(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        shell = build_prompt_shell()
+        controller, answers = shell.own_controller()
+        present(shell)
+        card = pending(shell, pick_card("file"))
+        shell.wait_armed()
+        buttons(shell.window.prompt_banner)["Choose, allow once\u2026"].emit("clicked")
+        assert shell.picker.cancelled == 0
+
+        controller.withdraw(card.prompt)
+
+        assert shell.picker.cancelled == 1  # the dialog is closed with its prompt
+        shell.picker.finish("/home/u/Documents")  # a late choice, from a dialog that was too slow
+        assert answers.given == []
 
     def test_a_dismissed_picker_leaves_the_prompt_open(self, build_prompt_shell: Builder) -> None:
         shell = build_prompt_shell()

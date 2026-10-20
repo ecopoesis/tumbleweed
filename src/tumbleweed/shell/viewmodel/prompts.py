@@ -12,7 +12,10 @@ What it holds to, in the order of the invariant (I5):
 - **Not at once.** A prompt ignores every answer for its first `ARM_SECONDS`: a click or an Enter
   that was meant for whatever was under the pointer or the focus a moment ago cannot answer it.
   The clock is the controller's own and is read when the answer arrives, so a late timer cannot
-  arm a prompt early.
+  arm a prompt early. The delay starts again when the prompt is first drawn (`mark_drawn`), when
+  the window is activated (`reactivated`) and on every press or key that reaches the window while
+  the prompt is not yet armed (`disturbed`): a stream of clicks aimed at where a button will
+  appear is never taken until there has been a quiet gap of the whole delay.
 - **No answer is a denial.** Every prompt has the deadline the broker gave it (`expires_in`), and
   past it the shell answers `deny(prompt_timeout)` and takes the prompt down: shown or waiting.
 - **What is shown is built from the structure.** `card_of` turns the wire message into a card of a
@@ -53,6 +56,8 @@ MAX_QUEUED: Final = 8
 MAX_REASON_SHOWN: Final = 300
 """The most characters of the model's reason that are shown (I5: capped)."""
 _ELLIPSIS: Final = "…"
+
+_SPELLED_OUT: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 
 type CardKind = Literal["read", "write", "network", "pick_file", "pick_folder"]
 
@@ -98,10 +103,14 @@ def visible(text: str) -> str:
     """`text` with every character that is not safe to show spelled out as `\\u{XXXX}`.
 
     For what must be shown whole and exactly (a path): nothing is dropped, so the user sees what
-    would be granted, and nothing can hide.
+    would be granted, and nothing can hide. That is every control (Cc), format (Cf, bidi overrides
+    and zero-width characters), surrogate, private-use and unassigned character and the line and
+    paragraph separators (Zl, Zp), which would break the line: the categories of
+    `core.types.WorkspaceRelPath`, and the rest of C.
     """
     return "".join(
-        f"\\u{{{ord(char):04X}}}" if unicodedata.category(char)[0] == "C" else char for char in text
+        f"\\u{{{ord(char):04X}}}" if unicodedata.category(char) in _SPELLED_OUT else char
+        for char in text
     )
 
 
@@ -223,6 +232,26 @@ class PromptController:
             self._next()
         return True
 
+    def disturbed(self) -> None:
+        """A press or a key reached the window. If the prompt is not armed yet the delay starts
+        again, so that clicks aimed at where its buttons appear (a stream of them, a model's tool
+        can make one) are never taken until the user has stopped for the whole delay."""
+        entry = self._current
+        if entry is not None and not self.armed():
+            self._restart_arming(entry)
+
+    def reactivated(self) -> None:
+        """The window became the active one: a click that brought it to the front may be about to
+        land on a button of the prompt, which has not been seen since. The delay starts again."""
+        if self._current is not None:
+            self._restart_arming(self._current)
+
+    def mark_drawn(self, prompt: PromptId) -> None:
+        """The prompt's first frame is on screen (or about to be): the delay counts from here, not
+        from when it was queued, so a slow first paint does not eat it."""
+        if self._current is not None and self._current.card.prompt == prompt:
+            self._restart_arming(self._current)
+
     def withdraw(self, prompt: PromptId) -> None:
         """The broker took the prompt down (its own deadline, or the request is gone): take it
         down without answering."""
@@ -306,10 +335,25 @@ class PromptController:
             return
         entry = self._queue.popleft()
         self._current = entry
-        entry.shown_at = self._clock()
-        entry.cancel_arming = self._scheduler.call_later(ARM_SECONDS, lambda: self._arm(entry))
+        self._start_arming(entry)
         self._view.present(entry.card)
 
+    def _start_arming(self, entry: _Entry) -> None:
+        entry.cancel_arming()
+        entry.shown_at = self._clock()
+        entry.cancel_arming = self._scheduler.call_later(ARM_SECONDS, lambda: self._arm(entry))
+
+    def _restart_arming(self, entry: _Entry) -> None:
+        self._start_arming(entry)
+        self._view.set_armed(False)
+
     def _arm(self, entry: _Entry) -> None:
-        if entry is self._current:
-            self._view.set_armed(self.armed())
+        if entry is not self._current:
+            return
+        if self.armed():
+            self._view.set_armed(True)
+            return
+        # The timer ran before the clock got there (they are not the same clock): look again then.
+        started = self._clock() if entry.shown_at is None else entry.shown_at
+        remaining = max(ARM_SECONDS - (self._clock() - started), 0.01)
+        entry.cancel_arming = self._scheduler.call_later(remaining, lambda: self._arm(entry))

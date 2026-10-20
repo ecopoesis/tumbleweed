@@ -134,12 +134,14 @@ class ShellWindow(Adw.ApplicationWindow):
         body.append(self._side)
 
         # The trusted prompt (S18): drawn in the chrome region, answered by the user only, and while
-        # it is pending the canvas and the side panel (model content) take no input and no surface
-        # of theirs stays open. The broker's requests reach it through `broker_prompts`, which the
-        # broker connection's handler is (the shell connects in S19).
+        # it is pending everything but the chrome takes no input and no surface of theirs stays
+        # open. The broker's requests reach it through `broker_prompts`, which is the broker
+        # connection's handler (the shell connects in S19).
         wiring = PromptWiring() if prompt_wiring is None else prompt_wiring
         self.prompt_guard = PromptGuard(
-            self, (self.canvas, self._side), self._focus_input_unless_closing
+            self,
+            (self.canvas, self._side, self.terminal_pane, self.status_strip),
+            self._focus_input_unless_closing,
         )
         self.prompt_banner = PromptBanner(self, self.prompt_guard, wiring.picker)
         self.chrome.append(self.prompt_banner)
@@ -206,11 +208,15 @@ class ShellWindow(Adw.ApplicationWindow):
         self.terminal_pane.focus_terminal()
 
     def _on_terminal_key(self, _widget: Gtk.Widget, _args: object) -> bool:
-        self._toggle_terminal()
+        # F12 would move the focus off Deny and put a shell in front of the prompt's window part:
+        # not while a prompt is pending (the key is still consumed, so VTE does not get it).
+        if not self.prompt_guard.engaged:
+            self._toggle_terminal()
         return True
 
     def _on_terminal_clicked(self, _button: Gtk.Button) -> None:
-        self._toggle_terminal()
+        if not self.prompt_guard.engaged:
+            self._toggle_terminal()
 
     def _on_terminal_visibility(self, pane: Gtk.Widget, _pspec: object) -> None:
         if not pane.get_visible() and not self._closing:

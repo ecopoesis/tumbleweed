@@ -33,7 +33,7 @@ cannot make the broker "show" a prompt or the shell "answer" one.
 """
 
 from enum import StrEnum
-from typing import Annotated, Final, Literal, final
+from typing import Annotated, Final, Literal, assert_never, final
 
 from pydantic import Field
 
@@ -189,12 +189,24 @@ DIAGNOSTICS: Final[tuple[type[Request], ...]] = (Ping, Echo)
 
 def serves(role: Role) -> tuple[type[Request], ...]:
     """The request types an end with `role` serves, diagnostics apart."""
-    return BROKER_SERVES if role is Role.BROKER else SHELL_SERVES
+    match role:
+        case Role.BROKER:
+            return BROKER_SERVES
+        case Role.SHELL:
+            return SHELL_SERVES
+        case _:
+            assert_never(role)
 
 
 def sends(role: Role) -> tuple[type[Request], ...]:
     """The request types an end with `role` may send: what the other end serves."""
-    return SHELL_SERVES if role is Role.BROKER else BROKER_SERVES
+    match role:
+        case Role.BROKER:
+            return SHELL_SERVES
+        case Role.SHELL:
+            return BROKER_SERVES
+        case _:
+            assert_never(role)
 
 
 __all__ = [

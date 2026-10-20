@@ -77,7 +77,12 @@ class PromptShell:
         self.window.prompt_banner.bind(controller)
         return controller, answers
 
+    def settle(self) -> None:
+        """Let the prompt be drawn: the delay counts from its first frame, which restarts it."""
+        pump(0.15)
+
     def wait_armed(self) -> None:
+        self.settle()
         self.timers.advance(ARM_SECONDS)
 
 

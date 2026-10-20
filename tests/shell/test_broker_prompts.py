@@ -330,8 +330,14 @@ class TestWhatTheShellRefuses:
         run(scenario)
 
 
-class TestAnAnswerThatCannotBeSent:
-    def test_an_answer_to_a_connection_that_has_gone_is_dropped_without_a_fuss(
+async def until(check: Callable[[], bool]) -> None:
+    async with asyncio.timeout(WAIT):
+        while not check():  # noqa: ASYNC110  (a bounded poll of the shell's main thread)
+            await asyncio.sleep(0.01)
+
+
+class TestAPromptDoesNotOutliveItsConnection:
+    def test_the_prompts_of_a_connection_that_ends_are_taken_down(
         self, sock_path: SocketPath
     ) -> None:
         async def scenario() -> None:
@@ -340,17 +346,121 @@ class TestAnAnswerThatCannotBeSent:
                 try:
                     message = show_message()
                     await to_shell.call(message, PromptShown)
-                    shell.user_waits()
-                    await client.close()  # the broker is gone before the user decides
+                    assert shell.act(lambda: shell.prompts.controller.current) is not None
 
-                    deny = DenyDecision(kind="deny", reason="user_denied")
-                    taken = shell.act(lambda: shell.prompts.controller.choose(message.prompt, deny))
-                    await asyncio.sleep(0.1)
+                    await client.close()  # the broker is gone (or the shell lost it)
+                    await until(lambda: shell.act(lambda: shell.prompts.controller.current) is None)
 
-                    assert taken  # the prompt came down all the same
+                    assert shell.view.cleared >= 1
+                    assert broker.answers.empty()  # nobody was answered: nobody is there
+                    shell.user_waits(3600)
                     assert broker.answers.empty()
-                    assert shell.prompts.controller.current is None
                 finally:
+                    await server.close()
+
+        run(scenario)
+
+    def test_a_new_connection_gets_its_prompt_shown_not_a_ghost_in_front_of_it(
+        self, sock_path: SocketPath
+    ) -> None:
+        async def scenario() -> None:
+            with shell_end() as shell:
+                server, _broker, to_shell, client = await pair(sock_path, shell)
+                try:
+                    await to_shell.call(show_message(reason="from the old broker"), PromptShown)
+                    await client.close()
+                    await until(lambda: shell.act(lambda: shell.prompts.controller.current) is None)
+
+                    again = await connect(sock_path, shell.prompts, role=Role.SHELL)
+                    try:
+                        fresh = await next_connection(server, not_in=frozenset({to_shell}))
+                        new = show_message(reason="from the new broker")
+                        await fresh.call(new, PromptShown)
+
+                        current = shell.act(lambda: shell.prompts.controller.current)
+                        assert current is not None
+                        assert current.prompt == new.prompt
+                        assert shell.prompts.controller.queued == 0
+                    finally:
+                        await again.close()
+                finally:
+                    await server.close()
+
+        run(scenario)
+
+    def test_a_prompt_waiting_behind_a_lost_connections_comes_up_when_it_is_taken_down(
+        self, sock_path: SocketPath
+    ) -> None:
+        async def scenario() -> None:
+            with shell_end() as shell:
+                server, _broker, first_end, first = await pair(sock_path, shell)
+                try:
+                    second = await connect(sock_path, shell.prompts, role=Role.SHELL)
+                    second_end = await next_connection(server, not_in=frozenset({first_end}))
+                    old, new = show_message(), show_message()
+                    await first_end.call(old, PromptShown)
+                    await second_end.call(new, PromptShown)
+
+                    await first.close()
+                    await until(
+                        lambda: (
+                            (shown := shell.act(lambda: shell.prompts.controller.current))
+                            is not None
+                            and shown.prompt == new.prompt
+                        )
+                    )
+
+                    shell.user_waits()
+                    allow = AllowDecision(kind="allow", scope="once", picked=None)
+                    assert shell.act(lambda: shell.prompts.controller.choose(new.prompt, allow))
+                    await second.close()
+                finally:
+                    await server.close()
+
+        run(scenario)
+
+    def test_a_closed_window_takes_no_more_prompts(self, sock_path: SocketPath) -> None:
+        async def scenario() -> None:
+            with shell_end() as shell:
+                server, _broker, to_shell, client = await pair(sock_path, shell)
+                try:
+                    shell.act(shell.prompts.close)
+
+                    refused = await to_shell.call(show_message(), Refused)
+
+                    assert refused.reason == "busy"
+                    assert shell.view.shown == []
+                finally:
+                    await client.close()
+                    await server.close()
+
+        run(scenario)
+
+
+class TestAnAnswerThatCannotBeSent:
+    def test_an_answer_that_loses_its_connection_on_the_way_is_dropped_without_a_fuss(
+        self, sock_path: SocketPath, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async def scenario() -> None:
+            with shell_end() as shell:
+                server, _broker, to_shell, client = await pair(sock_path, shell)
+                try:
+                    message = show_message()
+                    await to_shell.call(message, PromptShown)
+                    shell.user_waits()
+                    deny = DenyDecision(kind="deny", reason="user_denied")
+
+                    taken = shell.act(lambda: shell.prompts.controller.choose(message.prompt, deny))
+                    await to_shell.close()  # the broker goes in the same moment
+                    await asyncio.sleep(0.2)
+                    await until(lambda: shell.act(lambda: shell.prompts.controller.current) is None)
+
+                    assert taken  # the user's decision was taken; whether it got there is the
+                    assert not [
+                        r for r in caplog.records if r.levelname == "ERROR"
+                    ]  # broker's loss
+                finally:
+                    await client.close()
                     await server.close()
 
         run(scenario)
