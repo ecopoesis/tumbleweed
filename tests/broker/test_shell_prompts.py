@@ -309,6 +309,20 @@ class TestNoAnswerIsADenial:
 
         run(scenario)
 
+    def test_a_users_deny_is_the_only_denial_that_says_the_user_did_not_allow_it(self) -> None:
+        async def scenario() -> None:
+            async with running(ask_shell=True) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                task = await task_of(client)
+
+                pending = await asked(client, task, rig)
+                await deny(client, await shell.next_prompt())
+
+                assert (await pending).message == "the user did not allow it"
+
+        run(scenario)
+
     def test_the_shells_own_timeout_denial_is_a_denial_with_its_reason(self) -> None:
         async def scenario() -> None:
             async with running(ask_shell=True) as rig:
@@ -519,6 +533,39 @@ class TestThePicker:
 
         run(scenario)
 
+    def test_a_protected_place_that_is_picked_is_in_the_audit_with_its_path(self) -> None:
+        async def scenario() -> None:
+            async with running(ask_shell=True) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                task = await task_of(client)
+
+                pending = asyncio.create_task(client.request_pick(task, RunId.new(), "folder", "x"))
+                await allow(client, await shell.next_prompt(), picked=str(rig.home / ".ssh"))
+                await pending
+
+                (entry,) = rig.audit_of(GrantDecision)
+                assert entry.path == str(rig.home / ".ssh")  # what the user picked, resolved
+
+        run(scenario)
+
+    def test_a_choice_that_is_not_there_is_audited_with_the_path_it_resolved_to(self) -> None:
+        async def scenario() -> None:
+            async with running(ask_shell=True) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                task = await task_of(client)
+
+                pending = asyncio.create_task(client.request_pick(task, RunId.new(), "file", "x"))
+                await allow(client, await shell.next_prompt(), picked=str(rig.home / "nowhere"))
+                await pending
+
+                (entry,) = rig.audit_of(GrantDecision)
+                assert entry.path == str(rig.home / "nowhere")
+                assert (entry.outcome, entry.reason) == ("denied", "ungrantable")
+
+        run(scenario)
+
     def test_a_task_that_has_the_network_is_not_asked_to_pick_a_file(self) -> None:
         async def scenario() -> None:
             async with running(ask_shell=True) as rig:
@@ -639,8 +686,62 @@ class TestTheAllowanceFollowsTheLineage:
 
                 outcome = await client.request_read(two, RunId.new(), photos(rig), "x")
 
-                assert "too many permission requests" in outcome.message  # `two` has had 1 of 2
+                assert (
+                    "too many permission requests in all" in outcome.message
+                )  # not "for this task"
+                assert "this task" not in outcome.message
+                assert rig.audit_of(GrantDecision)[-1].reason == "rate_limited_connection"
                 assert len(shell.shown) == 3
+
+        run(scenario)
+
+    def test_ending_the_predecessor_first_does_not_start_the_allowance_over(self) -> None:
+        async def scenario() -> None:
+            async with running(
+                ask_shell=True, config=lambda c: replace_config(c, prompts_per_window=2)
+            ) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                first = await task_of(client)
+                for _ in range(2):
+                    pending = await asked(client, first, rig)
+                    await deny(client, await shell.next_prompt())
+                    await pending
+                await client.end_task(first)  # ended first, then the successor names it
+
+                second = (await client.start_task(previous=first)).task
+                outcome = await client.request_read(second, RunId.new(), photos(rig), "x")
+                rig.clock.advance(timedelta(minutes=10))  # and the memory of it is bounded
+                third = (await client.start_task(previous=first)).task
+                later = await asked(client, third, rig)
+                await deny(client, await shell.next_prompt())
+                await later
+
+                assert "too many permission requests for this task" in outcome.message
+                assert len(shell.shown) == 3
+
+        run(scenario)
+
+    def test_nobody_inherits_the_allowance_of_another_connections_task(self) -> None:
+        async def scenario() -> None:
+            async with running(
+                ask_shell=True, config=lambda c: replace_config(c, prompts_per_window=1)
+            ) as rig:
+                shell, other_shell = FakeShell(), FakeShell()
+                client = await rig.client(handler=shell)
+                other = await rig.client(handler=other_shell)
+                first = await task_of(client)
+                pending = await asked(client, first, rig)
+                await deny(client, await shell.next_prompt())
+                await pending
+                await client.end_task(first)
+
+                mine = (await other.start_task()).task
+                pending = await asked(other, mine, rig)
+                await deny(other, await other_shell.next_prompt())
+                await pending
+
+                assert len(other_shell.shown) == 1
 
         run(scenario)
 

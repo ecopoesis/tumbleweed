@@ -17,6 +17,7 @@ from tumbleweed.broker.shellprompts import ShellPrompts
 from tumbleweed.core.ids import RunId, TaskId
 from tumbleweed.ipc.client import connect
 from tumbleweed.ipc.connection import Connection
+from tumbleweed.ipc.errors import ErrorCode
 from tumbleweed.ipc.messages import RequestBody, ResponseBody, Role
 from tumbleweed.ipc.server import IpcServer
 from tumbleweed.ipc.sockdir import SocketDirectory
@@ -76,6 +77,50 @@ def test_a_prompt_that_does_not_answer_in_time_is_taken_down_in_case_the_shell_h
 
                 assert answer == Denied(reason="prompt_failed")
                 assert [shown.prompt for shown in shell.shown] == shell.closed
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
+
+
+def test_a_shell_too_busy_to_run_the_request_is_not_told_to_close_a_prompt() -> None:
+    async def scenario() -> None:
+        with short_directory() as directory:
+            socket = SocketDirectory(directory, create=True).socket_path("direct")
+            shell = FakeShell()
+            shell.fail_with = ErrorCode.TOO_MANY_REQUESTS  # its handler never ran
+            prompts = ShellPrompts(timeout=timedelta(seconds=60))
+            async with (
+                IpcServer(socket, _noop, role=Role.BROKER) as server,
+                await connect(socket, shell, role=Role.SHELL),
+            ):
+                prompts.attach(Owner(1), await next_connection(server))
+
+                answer = await prompts.ask(prompt(), Owner(1))
+                await prompts.close()
+
+                assert answer == Denied(reason="prompt_failed")
+                assert shell.closed == []
+
+    asyncio.run(asyncio.wait_for(scenario(), 20))
+
+
+def test_any_other_failure_of_the_shell_after_it_took_the_prompt_closes_it() -> None:
+    async def scenario() -> None:
+        with short_directory() as directory:
+            socket = SocketDirectory(directory, create=True).socket_path("direct")
+            shell = FakeShell()
+            shell.fail_with = ErrorCode.INTERNAL
+            prompts = ShellPrompts(timeout=timedelta(seconds=60))
+            async with (
+                IpcServer(socket, _noop, role=Role.BROKER) as server,
+                await connect(socket, shell, role=Role.SHELL),
+            ):
+                prompts.attach(Owner(1), await next_connection(server))
+
+                answer = await prompts.ask(prompt(), Owner(1))
+                await shell.wait_closed()
+
+                assert answer == Denied(reason="prompt_failed")
+                assert shell.closed == [shell.shown[0].prompt]
 
     asyncio.run(asyncio.wait_for(scenario(), 20))
 

@@ -38,6 +38,7 @@ class FakeShell:
         self.closed: list[PromptId] = []
         self.busy = False
         self.delay = 0.0  # how long it takes to acknowledge a prompt it has taken
+        self.fail_with: ErrorCode | None = None  # answer a prompt with this error instead
         self._arrived: asyncio.Queue[ShowPrompt] = asyncio.Queue()
         self._closed_event = asyncio.Event()
 
@@ -48,6 +49,8 @@ class FakeShell:
                     return Refused(kind="refused", reason="busy", message="the queue is full")
                 self.shown.append(request)
                 self._arrived.put_nowait(request)
+                if self.fail_with is not None:
+                    raise RequestRefused(self.fail_with, "the shell failed")
                 if self.delay:
                     await asyncio.sleep(self.delay)
                 return PromptShown(kind="prompt_shown")

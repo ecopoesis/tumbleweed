@@ -10,8 +10,14 @@ import pytest
 from tests.broker.rig import scratch_home
 from tests.broker.support import World, make_world, resolve
 from tumbleweed.broker import DenyRelation, DenyRules
-from tumbleweed.broker.client import PROMPT_WAIT
-from tumbleweed.broker.config import MAX_PROMPT_TIMEOUT, BrokerConfig
+from tumbleweed.broker.config import (
+    FS_CALLS_PER_PROMPT,
+    MAX_PROMPT_TIMEOUT,
+    PROMPT_MARGIN,
+    PROMPT_SLACK,
+    PROMPT_WAIT,
+    BrokerConfig,
+)
 from tumbleweed.broker.daemon import ipc_limits
 from tumbleweed.broker.deny import DenyMatch
 from tumbleweed.core.errors import InvalidValueError
@@ -185,11 +191,29 @@ class TestTheSettings:
         timeout the caller sees while the broker still asks, and an Allow after it would make a
         grant nobody hears about (#60)."""
         config = config_for(home_world, prompt_timeout=MAX_PROMPT_TIMEOUT)
-        margin = timedelta(seconds=30)
+        spent = config.prompt_timeout + FS_CALLS_PER_PROMPT * config.fs_timeout
 
-        assert config.prompt_timeout + margin <= PROMPT_WAIT
-        assert ipc_limits(config).handler_timeout >= config.prompt_timeout + margin
+        assert spent + PROMPT_SLACK <= PROMPT_WAIT  # the caller outwaits everything one takes
+        assert ipc_limits(config).handler_timeout >= spent + PROMPT_MARGIN
         assert IpcLimits().request_timeout < PROMPT_WAIT  # (the default is for everything else)
+
+    def test_the_file_system_calls_around_a_prompt_are_inside_the_wait_too(
+        self, home_world: World
+    ) -> None:
+        """A grant request spends `fs_timeout` three times around the prompt: with a long one the
+        caller would give up while the broker still asked (and an Allow would be a lost grant)."""
+        longest = (PROMPT_WAIT - MAX_PROMPT_TIMEOUT - PROMPT_SLACK) / FS_CALLS_PER_PROMPT
+        ok = config_for(home_world, prompt_timeout=MAX_PROMPT_TIMEOUT, fs_timeout=longest)
+        assert ipc_limits(ok).handler_timeout >= PROMPT_WAIT
+
+        with pytest.raises(InvalidValueError):
+            config_for(
+                home_world,
+                prompt_timeout=MAX_PROMPT_TIMEOUT,
+                fs_timeout=longest + timedelta(seconds=1),
+            )
+        with pytest.raises(InvalidValueError):
+            config_for(home_world, fs_timeout=timedelta(minutes=5))
 
     def test_the_directories_are_the_ones_of_the_architecture(self, home_world: World) -> None:
         config = config_for(home_world)

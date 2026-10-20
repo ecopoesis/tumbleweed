@@ -47,10 +47,19 @@ from tumbleweed.sandbox.policy import (
 
 DEFAULT_RETENTION: Final = timedelta(days=7)
 MAX_PROMPT_TIMEOUT: Final = timedelta(seconds=120)
-"""The longest a prompt may wait. The shell's client waits this and a margin for an answer
-(`client.PROMPT_WAIT`) and the daemon's handlers get it and a margin (`daemon.ipc_limits`): a longer
-wait would end in a transport timeout the caller sees while the broker still asks, and an Allow
-after that would make a grant the caller never hears about (#60)."""
+"""The longest a prompt may wait."""
+PROMPT_MARGIN: Final = timedelta(seconds=30)
+PROMPT_WAIT: Final = MAX_PROMPT_TIMEOUT + PROMPT_MARGIN
+"""How long a caller of `request_grant` waits (`client`), and the most one request may spend: the
+prompt's wait and the file system calls around it (`FS_CALLS_PER_PROMPT`, each bounded by
+`fs_timeout`). `BrokerConfig` refuses settings whose sum is longer, and the daemon's handlers get
+at least that: otherwise a transport timeout would reach the caller while the broker still asks, and
+an Allow after it would make a grant the caller never hears about (#60)."""
+PROMPT_SLACK: Final = timedelta(seconds=5)
+"""What must be left of `PROMPT_WAIT` after the prompt and the file system calls."""
+FS_CALLS_PER_PROMPT: Final = 3
+"""A grant request resolves the path and builds the deny rules before the prompt and builds the
+rules again after it (a picker resolves after it and builds rules once more)."""
 _MAX_EXTRA: Final = 64
 
 
@@ -113,6 +122,11 @@ class BrokerConfig:
         _require_duration("prompt_timeout", self.prompt_timeout, maximum=MAX_PROMPT_TIMEOUT)
         _require_duration("prompt_window", self.prompt_window, maximum=timedelta(days=1))
         _require_duration("run_grace", self.run_grace, maximum=timedelta(minutes=5))
+        if self.prompt_timeout + FS_CALLS_PER_PROMPT * self.fs_timeout + PROMPT_SLACK > PROMPT_WAIT:
+            raise InvalidValueError(
+                "prompt_timeout and the file system calls around a prompt "
+                f"({FS_CALLS_PER_PROMPT} x fs_timeout) and {PROMPT_SLACK} must fit in {PROMPT_WAIT}"
+            )
         for name in ("prompts_per_window", "owner_prompts_per_window"):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= 10_000:

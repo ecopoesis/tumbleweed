@@ -24,7 +24,7 @@ from datetime import timedelta
 from types import TracebackType
 from typing import Final, Literal, Self, final
 
-from tumbleweed.broker.config import MAX_PROMPT_TIMEOUT
+from tumbleweed.broker.config import PROMPT_WAIT
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId
 from tumbleweed.core.types import ToolVersion, WorkspaceRelPath
@@ -82,9 +82,6 @@ _log = logging.getLogger(__name__)
 HEARTBEAT: Final = timedelta(seconds=30)
 """How often a quiet connection is pinged. The broker's idle timeout is three times this."""
 _PING_TIMEOUT: Final = timedelta(seconds=10)
-PROMPT_WAIT: Final = MAX_PROMPT_TIMEOUT + timedelta(seconds=30)
-"""How long `request_grant` waits: the longest prompt timeout the broker allows and some margin,
-so that a user who takes their time is not denied by the transport (#60)."""
 _RUN_SETUP: Final = timedelta(seconds=60)
 
 

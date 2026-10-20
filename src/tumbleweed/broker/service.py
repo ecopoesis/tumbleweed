@@ -227,8 +227,10 @@ from tumbleweed.tools import (
 _log = logging.getLogger(__name__)
 
 MAX_GRANTS_PER_TASK: Final = 64
+_MAX_ENDED_ALLOWANCES: Final = 1024
 _DENIAL_MESSAGES: Final = {
     "rate_limited": "too many permission requests for this task; wait a while before asking again",
+    "rate_limited_connection": "too many permission requests in all; wait a while before asking",
     "prompt_timeout": "the user did not answer in time",
     "no_prompt_ui": "there is nobody to ask here",
     "prompt_busy": "the user could not be asked just now: too many questions are waiting",
@@ -464,6 +466,9 @@ class BrokerService:
         self._config = config
         self._monotonic = monotonic
         self._owner_prompts: dict[Owner, _Budget] = {}  # one connection's ceiling over its tasks
+        # The allowances of tasks that ended, for `prompt_window`, so that ending a task and then
+        # starting one with `previous` does not start over: task -> (owner, allowance, ended).
+        self._ended_prompts: dict[TaskId, tuple[Owner, _Budget, float]] = {}
         self._store = store
         self._tools = tools
         self._audit = audit_log
@@ -717,7 +722,6 @@ class BrokerService:
 
     def connection_closed(self, owner: Owner) -> None:
         """End every task of a connection that has gone (revoking its grants, stopping its runs)."""
-        self._owner_prompts.pop(owner, None)
         for live in [live for live in self._live.values() if live.owner == owner]:
             try:
                 with self._atomic() as entries:
@@ -728,6 +732,9 @@ class BrokerService:
                 _log.exception("a task of a closed connection could not be ended on record")
             finally:
                 self._apply_ended(live)
+        # The connection's allowances go with it (a reconnect starts a new one: #146's follow-up).
+        self._owner_prompts.pop(owner, None)
+        self._ended_prompts = {t: k for t, k in self._ended_prompts.items() if k[0] != owner}
 
     # --- the tool store ------------------------------------------------------------------------
 
@@ -896,6 +903,7 @@ class BrokerService:
     def _apply_ended(self, live: _Live) -> None:
         """Make an ended task unusable in memory and stop its runs."""
         self._live.pop(live.state.task, None)
+        self._remember_allowance(live)
         live.state = live.state.end()
         live.grants.clear()
         for future in list(live.running):
@@ -1001,7 +1009,8 @@ class BrokerService:
         budget = (
             replaced.prompts
             if replaced is not None
-            else self._new_budget(self._config.prompts_per_window)
+            else self._ended_allowance(owner, request.previous)
+            or self._new_budget(self._config.prompts_per_window)
         )
         self._live[task] = _Live(owner=owner, state=state, workspace=identity, prompts=budget)
         return TaskStarted(kind="task_started", task=task, taint=_taint_names(state.taint))
@@ -1062,18 +1071,42 @@ class BrokerService:
             raise _Refuse("unknown_prompt", "no such prompt")
         return PromptAnswered(kind="prompt_answered")
 
+    def _remember_allowance(self, live: _Live) -> None:
+        """Keep an ended task's allowance for `prompt_window` (at most `_MAX_ENDED_ALLOWANCES`)."""
+        now = self._monotonic()
+        window = self._config.prompt_window.total_seconds()
+        self._ended_prompts = {
+            task: kept for task, kept in self._ended_prompts.items() if now - kept[2] < window
+        }
+        while len(self._ended_prompts) >= _MAX_ENDED_ALLOWANCES:
+            del self._ended_prompts[next(iter(self._ended_prompts))]  # the oldest
+        self._ended_prompts[live.state.task] = (live.owner, live.prompts, now)
+
+    def _ended_allowance(self, owner: Owner, previous: TaskId | None) -> _Budget | None:
+        """The allowance of `previous`, an ended task of `owner`'s that ended within the window."""
+        kept = None if previous is None else self._ended_prompts.get(previous)
+        if kept is None or kept[0] != owner:
+            return None
+        if self._monotonic() - kept[2] >= self._config.prompt_window.total_seconds():
+            return None
+        return kept[1]
+
     def _new_budget(self, limit: int) -> _Budget:
         return _Budget(limit, self._config.prompt_window)
 
-    def _rate_limited(self, live: _Live) -> bool:
-        """Whether the task has used up its prompts for now (I5: 5 in 10 minutes, by default): the
-        rest are denied without asking, and the model is told why. A task that asks for permission
-        over and over is the user's attention under attack, or a loop. The allowance is the
-        lineage's (a task that replaces another has what is left of it) and the connection has a
-        ceiling over all its tasks, so that tasks started from nothing do not multiply it. Does not
-        count this one."""
+    def _rate_limited(self, live: _Live) -> str | None:
+        """Why the task may not be asked now, or None (I5: 5 in 10 minutes, by default): the rest
+        are denied without asking, and the model is told which limit it hit. A task that asks for
+        permission over and over is the user's attention under attack, or a loop. The allowance is
+        the lineage's (a task that replaces another, or one that replaces an ended one within the
+        window, has what is left of it) and the connection has a ceiling over all its tasks, so that
+        tasks started from nothing do not multiply it. Does not count this one."""
         now = self._monotonic()
-        return live.prompts.exhausted(now) or self._owner_budget(live.owner).exhausted(now)
+        if live.prompts.exhausted(now):
+            return "rate_limited"
+        if self._owner_budget(live.owner).exhausted(now):
+            return "rate_limited_connection"
+        return None
 
     def _count_prompt(self, live: _Live) -> None:
         now = self._monotonic()
@@ -1137,10 +1170,8 @@ class BrokerService:
         if self._held(live) >= MAX_GRANTS_PER_TASK:  # before asking: nobody is asked in vain
             self._audit_denied(request, capability, path_text, "grant_cap")
             raise _Refuse("busy", "the task holds as many grants as it may")
-        if self._rate_limited(live):
-            return self._denied(
-                request, capability, path_text, "rate_limited", _DENIAL_MESSAGES["rate_limited"]
-            )
+        if (limit := self._rate_limited(live)) is not None:
+            return self._denied(request, capability, path_text, limit, _denial_message(limit))
         self._count_prompt(live)
         answer = await self._ask(prompt, owner)
         if isinstance(answer, Denied):
@@ -1174,10 +1205,8 @@ class BrokerService:
         if self._held(live) >= MAX_GRANTS_PER_TASK:
             self._audit_denied(request, capability, None, "grant_cap")
             raise _Refuse("busy", "the task holds as many grants as it may")
-        if self._rate_limited(live):
-            return self._denied(
-                request, capability, None, "rate_limited", _DENIAL_MESSAGES["rate_limited"]
-            )
+        if (limit := self._rate_limited(live)) is not None:
+            return self._denied(request, capability, None, limit, _denial_message(limit))
         self._count_prompt(live)
         prompt = GrantPrompt(
             task=request.task,
