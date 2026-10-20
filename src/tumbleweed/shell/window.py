@@ -192,6 +192,8 @@ class ShellWindow(Adw.ApplicationWindow):
         self._side_action = self._add_action("toggle-side-panel", self._toggle_side_panel)
         self.connect("close-request", self._on_close_request)
         self.set_focus(self.chat_panel.input_view)
+        # Last, so that they run first: they see every key and button, F12's shortcut included.
+        self.prompt_banner.install_controllers()
 
     @property
     def side_panel_visible(self) -> bool:

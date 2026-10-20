@@ -68,7 +68,7 @@ _IGNORED: Final = (
     "That was ignored: the prompt had only just appeared, or the click began before it was "
     "ready. Try again."
 )
-_TOUCH: Final = InputId("pointer", 1000)  # (touch has no button: one id for it)
+_FIRST_TOUCH: Final = 1000  # (a touch has no button: its ids start above any)
 _PICK_TITLE: Final = {"file": "Choose a file to share", "folder": "Choose a folder to share"}
 _SCOPE_LABEL: Final[dict[Scope, str]] = {"once": "Allow once", "task": "Allow for this task"}
 _PICK_LABEL: Final[dict[Scope, str]] = {
@@ -158,23 +158,32 @@ class PromptBanner(Gtk.Box):
         self._deny: Gtk.Button | None = None
         self._picking = False
         self._cancel_picker: Callable[[], None] | None = None
+        self._touches: list[tuple[Gdk.EventSequence, int]] = []
+        self._next_touch = _FIRST_TOUCH
         self.note = plain_label("", wrap=True, css_classes=["caption"])
-        # What goes down and up in the window is reported to the controller, which holds the
-        # arming invariant (`viewmodel.prompts`): every pointer button and touch (exactly, from
-        # the press and release events themselves: a gesture's "stopped" is not a release, it fires
-        # from the double-click timer during any hold), every key by its hardware code (never as a
-        # character), and the window gaining and losing the focus. They only watch: the events go
-        # on to whoever they were for.
+        window.connect("notify::is-active", self._on_active_changed)
+
+    def install_controllers(self) -> None:
+        """Watch what goes down and up in the window. Called by the window when everything else
+        has added its controllers: the last added runs first, so these see every event, a key
+        that a shortcut takes (F12) included.
+
+        What is reported to the controller, which holds the arming invariant
+        (`viewmodel.prompts`): every pointer button and touch (exactly, from the press and release
+        events themselves: a gesture's "stopped" is not a release, it fires from the double-click
+        timer during any hold; a touch by its own sequence), every key by its hardware code (never
+        as a character), and the window gaining and losing the focus. They only watch: the events
+        go on to whoever they were for.
+        """
         pointer = Gtk.EventControllerLegacy()
         pointer.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         pointer.connect("event", self._on_pointer_event)
-        window.add_controller(pointer)
+        self._window.add_controller(pointer)
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         keys.connect("key-pressed", lambda _c, _keyval, keycode, _state: self._key_down(keycode))
         keys.connect("key-released", lambda _c, _keyval, keycode, _state: self._key_up(keycode))
-        window.add_controller(keys)
-        window.connect("notify::is-active", self._on_active_changed)
+        self._window.add_controller(keys)
 
     def bind(self, controller: PromptController) -> None:
         """Whose prompts these are (the controller is made with this banner as its view)."""
@@ -235,29 +244,50 @@ class PromptBanner(Gtk.Box):
             self._controller.mark_drawn(card.prompt)
         return False  # once
 
-    def _on_pointer_event(self, _controller: Gtk.EventControllerLegacy, event: Gdk.Event) -> bool:
-        button = event.get_button() if isinstance(event, Gdk.ButtonEvent) else 0
-        self.pointer_event(event.get_event_type(), button)
+    def _on_pointer_event(
+        self, _controller: Gtk.EventControllerLegacy, event: Gdk.Event | None
+    ) -> bool:
+        """A Gdk event to what `pointer_event` takes: the button, or the id of the touch's own
+        sequence (made when it begins, dropped when it ends)."""
+        if event is None:  # (GTK can run a controller with nothing: there is nothing to see)
+            return False
+        kind = event.get_event_type()
+        if kind in (Gdk.EventType.BUTTON_PRESS, Gdk.EventType.BUTTON_RELEASE):
+            self.pointer_event(kind, event.get_button())
+        elif kind in (
+            Gdk.EventType.TOUCH_BEGIN,
+            Gdk.EventType.TOUCH_END,
+            Gdk.EventType.TOUCH_CANCEL,
+        ):
+            self.pointer_event(kind, self._touch_id(event.get_event_sequence(), kind))
         return False  # never consumed
 
-    def pointer_event(self, kind: Gdk.EventType, button: int) -> None:
-        """What the window's pointer events come to: a button or touch going down or up (exactly),
-        a touch cancelled, a grab broken."""
+    def _touch_id(self, sequence: Gdk.EventSequence, kind: Gdk.EventType) -> int:
+        for known, ident in self._touches:
+            if known == sequence:
+                if kind != Gdk.EventType.TOUCH_BEGIN:
+                    self._touches.remove((known, ident))
+                return ident
+        ident = self._next_touch
+        self._next_touch += 1
+        if kind == Gdk.EventType.TOUCH_BEGIN:
+            self._touches.append((sequence, ident))
+        return ident  # (an end or cancel of a touch not seen begin: an id that is not held)
+
+    def pointer_event(self, kind: Gdk.EventType, code: int) -> None:
+        """What the window's pointer events come to: a button (`code` its number) or a touch (its
+        id) going down or up, exactly, or a touch cancelled."""
         controller = self._controller
         if controller is None:
             return
-        if kind == Gdk.EventType.BUTTON_PRESS:
-            controller.input_began(InputId("pointer", button))
-        elif kind == Gdk.EventType.BUTTON_RELEASE:
-            controller.input_ended(InputId("pointer", button))
-        elif kind == Gdk.EventType.TOUCH_BEGIN:
-            controller.input_began(_TOUCH)
-        elif kind == Gdk.EventType.TOUCH_END:
-            controller.input_ended(_TOUCH)
+        which = InputId("pointer", code)
+        if kind in (Gdk.EventType.BUTTON_PRESS, Gdk.EventType.TOUCH_BEGIN):
+            controller.input_began(which)
+        elif kind in (Gdk.EventType.BUTTON_RELEASE, Gdk.EventType.TOUCH_END):
+            controller.input_ended(which)
+            self._event_over()
         elif kind == Gdk.EventType.TOUCH_CANCEL:
-            controller.input_ended(_TOUCH, cancelled=True)
-        elif kind == Gdk.EventType.GRAB_BROKEN:
-            controller.pointers_cancelled()
+            controller.input_ended(which, cancelled=True)
 
     def _key_down(self, keycode: int) -> bool:
         if self._controller is not None:
@@ -267,6 +297,14 @@ class PromptBanner(Gtk.Box):
     def _key_up(self, keycode: int) -> None:
         if self._controller is not None:
             self._controller.input_ended(InputId("key", keycode))
+            self._event_over()
+
+    def _event_over(self) -> None:
+        """A release is over with its click once the event has been dispatched: when the main loop
+        is idle again."""
+        controller = self._controller
+        if controller is not None:
+            GLib.idle_add(controller.event_done)
 
     def _on_active_changed(self, window: Gtk.Window, _pspec: object) -> None:
         controller = self._controller

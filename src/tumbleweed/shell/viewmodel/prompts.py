@@ -11,27 +11,37 @@ What it holds to, in the order of the invariant (I5):
   last one only when that one is answered, withdrawn or expired.
 - **Not at once, and not from an input that was already under way.** The arming invariant:
 
-  (A) An Allow or a Choose (anything that can lead to a grant) is accepted only if the user input
-  that produced it (the pointer press whose release clicked it, or the key press that activated
-  it) began while the prompt was armed and after the last arming restart, and no input that began
-  while the prompt was disarmed (or before a restart) is still held.
+  (A) An Allow or a Choose (anything that can lead to a grant) is accepted only if the input that
+  produced it (the pointer press whose release clicked it, or the key press that activated it)
+  began while the prompt was armed and after the last arming restart, and no input that began while
+  the prompt was disarmed, or before a restart, is still held, as far as the window has seen
+  (pointers are tracked until their release arrives, keys until it arrives or the window loses the
+  focus). A click that a release completes is refused if the input that is released is tainted,
+  whichever input produced it (fail closed).
   (B) A Deny is never refused because of an input that is held, or of how an input began: a Deny
-  cannot become a grant. It is ignored only in the first `ARM_SECONDS` (the plan: early clicks and
-  Enter presses are ignored), and it still needs a real click or key (I10).
+  cannot become a grant. It is ignored whenever the prompt is disarmed (the 750 ms after it
+  appears or after any restart; the plan: early clicks and Enter presses are ignored), and it
+  still needs a real click or key (I10).
   (C) Nothing makes the prompt refuse a deliberate Allow for good: an input that begins after the
   prompt is armed, with nothing tainted held, is accepted, of either kind and after any other input
-  (typing, a window activation). A refusal of an Allow is shown to the user, by the view.
+  (typing, a window activation). A refusal of an Allow is shown to the user, by the view. The
+  cases that fail closed instead are the documented ones: an input whose release was lost (a
+  pointer is replaced by its next press of the same button; a key is forgotten when the window
+  loses the focus), and a click completed by a tainted input's release.
 
-  How: every pointer button, touch and key that goes down is recorded with whether the prompt was
-  armed and in which *epoch* (every restart of the delay starts a new one: the prompt shown, first
-  drawn, the window activated, any input that begins while disarmed). An input is *tainted* if it
-  began disarmed or in an earlier epoch. A release remembers whether the input that ended was
-  tainted, for the click that follows. Held inputs are counted exactly (identity, not flags): a
-  second button, a key or Enter on the focused Deny cannot end the hold of another input, and
-  auto-repeat is not a new press. Losing the focus cancels what is held (GTK cancels it); a release
-  that never comes otherwise fails closed (the prompt refuses Allows until the input is released
-  again, the window is deactivated, or the prompt ends, and the broker's deadline denies).
-  The delay itself restarts at the same events, so the 750 ms are of quiet.
+  How: every pointer button, touch (one identity per sequence) and key that goes down is recorded
+  with whether the prompt was armed and in which *epoch* (every restart of the delay starts a new
+  one: the prompt shown, first drawn, the window activated, any input that begins while
+  disarmed). An input is *tainted* if it began disarmed or in an earlier epoch, and so is one that
+  comes up with no record (it went down before the prompt, or before a focus loss). Held inputs
+  are tracked exactly by identity, not by flags: a second button, a key or Enter on the focused
+  Deny cannot end the hold of another input, and auto-repeat is not a new press. Pointer records
+  survive a focus loss (GTK does not cancel a press when the window is deactivated: the grab goes
+  on and its release arrives); keys are forgotten (their release goes to the other window). A
+  release is remembered for the click that follows it in the same event, and forgotten with the
+  next input or `event_done`. When too many inputs are held to record, Allows are refused until
+  they are not (fail closed). The delay itself restarts at the same events, so the 750 ms are of
+  quiet.
 - **No answer is a denial.** Every prompt has the deadline the broker gave it (`expires_in`), and
   past it the shell answers `deny(prompt_timeout)` and takes the prompt down: shown or waiting.
 - **What is shown is built from the structure.** `card_of` turns the wire message into a card of a
@@ -236,7 +246,8 @@ class PromptController:
         self._queue: deque[_Entry] = deque()
         self._epoch = 0  # advances at every restart of the delay
         self._held: dict[InputId, _Held] = {}
-        self._ended_tainted = False  # the input that came up last began tainted: its click is out
+        self._overflowed = False  # more inputs went down than are recorded
+        self._release = False  # the input that came up in this event began tainted
 
     @property
     def current(self) -> PromptCard | None:
@@ -280,40 +291,45 @@ class PromptController:
         If the prompt is not armed the delay starts again (a stream of clicks aimed at where a
         button will appear is never taken, and neither is one that is held), and the input is
         recorded as having begun disarmed. A key that is already down is auto-repeat, not a new
-        press. A pointer that is down and is pressed again lost its release: if what was recorded
-        was tainted it stays so (fail closed), otherwise this is a new press.
+        press. A pointer that is already down cannot go down again: its release was lost, and this
+        press replaces the record (the next deliberate press heals a lost release).
         """
+        self._release = False  # a new input: whatever was released has had its click
         entry = self._current
         armed = self.armed()
         before = self._held.get(which)
-        if before is not None and (which.kind == "key" or self._tainted(before)):
-            if entry is not None and not armed:
-                self._restart_arming(entry)
-            return
         if entry is not None and not armed:
             self._restart_arming(entry)
-        if len(self._held) >= _MAX_HELD:
-            del self._held[next(iter(self._held))]
+        if before is not None and which.kind == "key":
+            return
+        if before is None and len(self._held) >= _MAX_HELD:
+            self._overflowed = True  # not recorded: fail closed until fewer are held
+            return
         self._held[which] = _Held(armed=armed, epoch=self._epoch)
-        self._ended_tainted = False  # a new input: the one that ended before has had its click
 
     def input_ended(self, which: InputId, *, cancelled: bool = False) -> None:
-        """The input came up. The click it makes, if any, follows: it is taken only if this input
-        was not tainted. A cancelled one (a grab broken, a touch cancelled) makes no click."""
+        """The input came up. The click it makes, if any, follows in the same event, and is taken
+        only if this input was not tainted: one that comes up with no record is (it went down
+        before the prompt, or before the window lost the focus). A cancelled one (a touch
+        cancelled) makes no click."""
         held = self._held.pop(which, None)
-        self._ended_tainted = not cancelled and (held is None or self._tainted(held))
+        if not self._held:
+            self._overflowed = False
+        self._release = not cancelled and (held is None or self._tainted(held))
 
-    def pointers_cancelled(self) -> None:
-        """Every pointer press is over without a click (a grab was broken)."""
-        for which in [which for which in self._held if which.kind == "pointer"]:
-            del self._held[which]
-        self._ended_tainted = False
+    def event_done(self) -> None:
+        """The event is over (the view calls it when the main loop is idle again): a release has
+        had its click, if it was to have one."""
+        self._release = False
 
     def deactivated(self) -> None:
-        """The window lost the focus: what was held is cancelled (GTK cancels it), so nothing that
-        was down stays recorded, and a release that never came cannot refuse Allows for good."""
-        self._held.clear()
-        self._ended_tainted = False
+        """The window lost the focus. The keys that are down are forgotten (their release goes to
+        the window that has the focus now, and a key never released here must not refuse Allows
+        for good); a pointer press is not (GTK does not cancel it: the grab goes on and its
+        release arrives here)."""
+        for which in [which for which in self._held if which.kind == "key"]:
+            del self._held[which]
+        self._release = False
 
     def reactivated(self) -> None:
         """The window became the active one: a click that brought it to the front may be about to
@@ -351,15 +367,16 @@ class PromptController:
     def choose(self, prompt: PromptId, decision: PromptDecision) -> bool:
         """The user's decision on the prompt that is shown. Ignored (False) unless that is
         `prompt`, the decision is one it offers and the arming invariant holds: an Allow needs (A),
-        a Deny only that the prompt is armed (B)."""
+        a Deny only that the prompt is armed (B). The answer of the picker is the user's choice in
+        the trusted dialog, which a click that passed `can_act` opened: it needs no input of this
+        window (a stray release from the dialog must not refuse it)."""
         entry = self._current
         if entry is None or entry.card.prompt != prompt:
             return False
         if isinstance(decision, AllowDecision):
-            if not self._grant_input_clean():
+            if decision.picked is None and not self._grant_input_clean():
                 return False
         elif not self.armed():
-            self._ended_tainted = False
             return False
         match decision:
             case AllowDecision():
@@ -423,7 +440,6 @@ class PromptController:
             return
         entry = self._queue.popleft()
         self._current = entry
-        self._ended_tainted = False
         self._start_arming(entry)
         self._view.present(entry.card)
 
@@ -433,12 +449,13 @@ class PromptController:
         return not held.armed or held.epoch != self._epoch
 
     def _grant_input_clean(self) -> bool:
-        """(A): armed, no tainted input held, and the input whose click this is was not tainted.
-        The click is used up either way."""
-        ended_tainted, self._ended_tainted = self._ended_tainted, False
+        """(A): armed, no tainted input held (or too many to record), and the release whose click
+        this is, if it is one, not tainted. The release is used up either way."""
+        released_tainted, self._release = self._release, False
         return (
             self.armed()
-            and not ended_tainted
+            and not released_tainted
+            and not self._overflowed
             and not any(self._tainted(held) for held in self._held.values())
         )
 
