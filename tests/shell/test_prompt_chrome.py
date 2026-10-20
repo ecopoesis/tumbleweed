@@ -549,27 +549,26 @@ class TestInputsThatAreNotTheUsers:
 
     def test_two_fingers_are_two_inputs_of_their_own(self, build_prompt_shell: Builder) -> None:
         """Each touch has the identity of its own event sequence, so one finger coming up does not
-        make the other's end look like a release with no record."""
+        make the other's end look like a release with no record (and so a tainted click)."""
         from tumbleweed.shell._gi import Gdk
 
         shell = build_prompt_shell()
-        _controller, answers = shell.own_controller()
+        controller, _answers = shell.own_controller()
         present(shell)
-        pending(shell)
+        card = pending(shell, pick_card("file"))  # (the picker's button: a click that goes on)
         shell.wait_armed()
         banner = shell.window.prompt_banner
-        once = buttons(banner)["Allow once"]
         first, second = object(), object()
 
-        for kind, sequence in (
-            (Gdk.EventType.TOUCH_BEGIN, first),
-            (Gdk.EventType.TOUCH_BEGIN, second),
-            (Gdk.EventType.TOUCH_END, first),
-        ):
+        def touch(kind: "Gdk.EventType", sequence: object) -> None:
             banner._on_pointer_event(None, FakeEvent(kind, sequence=sequence))  # type: ignore[arg-type]  # noqa: SLF001  (a fake event)
-        once.emit("clicked")  # the tap of the first finger
 
-        assert len(answers.given) == 1
+        touch(Gdk.EventType.TOUCH_BEGIN, first)
+        touch(Gdk.EventType.TOUCH_BEGIN, second)
+        touch(Gdk.EventType.TOUCH_END, first)
+        assert controller.can_act(card.prompt)  # the first finger's tap
+        touch(Gdk.EventType.TOUCH_END, second)
+        assert controller.can_act(card.prompt)  # and the second's: its record was its own
 
     def test_the_window_events_are_translated_to_inputs(self, build_prompt_shell: Builder) -> None:
         """A Gdk event to a button or touch going down or up (a fake event stands in for it)."""

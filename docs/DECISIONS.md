@@ -1129,54 +1129,65 @@ and more, with a test that keeps them so); the reason set apart as a quotation w
 marks, so none of its characters can close one. The 750 ms are governed by this invariant, which
 three rounds of flag patches (a held press, a key during it, Enter on the focused Deny, a refused
 click clearing the wrong flag, a gesture's "stopped") showed had to be stated and not approximated:
-**(A) An Allow/Choose (anything that can lead to a grant) is accepted only if the user input that
-produced it, the pointer press whose release clicked it or the key press that activated it, began
-while the prompt was armed and after the last arming restart, and no input that began while disarmed
-is still held. (B) A Deny is never refused because of an input that is held or how one began, since
-a Deny cannot become a grant; it still needs a real click or key (I10) and is ignored only in the
-first 750 ms, which the plan asks (early clicks and Enter presses are ignored). (C) Nothing refuses
-a deliberate Allow for good: an input that begins after arming with nothing tainted held is
-accepted, of either kind and after any other input (typing, a window activation); a refusal of an
-Allow is shown in a note.** It is implemented by recording every pointer button, touch and key that
-goes down with whether the prompt was armed and in which epoch (every restart of the delay starts
-one: the prompt shown, first drawn, the window activated, any input that begins while disarmed); an
-input is tainted if it began disarmed or in an earlier epoch; held inputs are counted exactly by
+**(A) An Allow or a Choose (anything that can lead to a grant) is accepted only if the input that
+produced it (the pointer press whose release clicked it, or the key press that activated it) began
+while the prompt was armed and after the last arming restart, and no input that began while the
+prompt was disarmed, or before a restart, is still held, as far as the window has seen (pointers are
+tracked until their release arrives, keys until it arrives or the window loses the focus). A click
+that a release completes is refused if the input that is released is tainted, whichever input
+produced it (fail closed). (B) A Deny is never refused because of an input that is held, or of how
+an input began: a Deny cannot become a grant. It is ignored whenever the prompt is disarmed (the 750
+ms after it appears or after any restart; the plan: early clicks and Enter presses are ignored), and
+it still needs a real click or key (I10). (C) Nothing makes the prompt refuse a deliberate Allow for
+good: an input that begins after the prompt is armed, with nothing tainted held, is accepted, of
+either kind and after any other input (typing, a window activation). A refusal of an Allow is shown
+to the user, by the view. The cases that fail closed instead are the documented ones: an input whose
+release was lost (a pointer is replaced by its next press of the same button; a key is forgotten
+when the window loses the focus), and a click completed by a tainted input's release.** It is
+implemented by recording every pointer button, touch (one identity per sequence) and key that goes
+down with whether the prompt was armed and in which epoch (every restart of the delay starts one:
+the prompt shown, first drawn, the window activated, any input that begins while disarmed); an input
+is tainted if it began disarmed or in an earlier epoch, and so is one that comes up with no record
+(it went down before the prompt, or before a focus loss). Held inputs are tracked exactly by
 identity, so a second button, a key, Enter on the focused Deny or an auto-repeat cannot end the hold
-of another input; a release remembers whether the input that ended was tainted, for the click that
-follows. Losing the focus cancels what was held (GTK cancels it), and a release that otherwise never
-comes fails closed: Allows are refused until it is released again, the window is deactivated or the
-prompt ends, and the broker's deadline denies. The window reports exact press and release events (a
-gesture's "stopped" is not a release: it fires from the double-click timer during any hold of 400
-ms), key hardware codes as opaque numbers (no key is read as a character: a tripwire test holds
-that) and the focus coming and going. A model-based property test
-(`tests/shell/test_prompt_arming_model.py`) drives random interleavings against a reference model
-written from (A) to (C); the round-3 controller fails it, in both directions. The banner in the
-chrome region draws the card and reports clicks. While a prompt is pending a guard makes everything
-but the chrome insensitive (the canvas, the chat, whose labels are selectable and so open a menu,
-the terminal pane and the status strip's Terminal button; F12 does nothing); the strip's voice
-buttons stay usable, because turning the microphone off with the pointer must always work and cannot
-answer a prompt. It pops down every popover, closes every toplevel but the window (and any new one),
-and gives the focus back afterwards (#53). The chat is therefore not usable while a prompt is up; it
-comes back the moment the last one is gone. A prompt does not outlive its connection: when it ends,
-or the loop it ran on is torn down, its prompts are taken down. Nothing is a `GAction` (#54, tested
-against a private bus with a prompt pending and the picker open). (7) *The picker* is a request
-(`fs.pick`, file or folder), a prompt with no capability, a `Gtk.FileDialog` opened by the user's
-click on "Choose" (and closed with its prompt), and the chosen path is received text: the broker
-resolves it and issues it like any other grant (deny rules, taint rule, cap), with `origin =
-picker`. A write is never offered (S16's gate). (8) *#90:* Ctrl+Q and F9 are disabled with Ctrl+L
-while the terminal has the focus, so the terminal gets them; the shell is quit from the chat, the
-window or a signal. (9) *Not yet.* The prompt's `tool` is always null: the wire has no tool binding
-until S24 (D17). **Deviations from the plan.** The rate limit is in the broker and not the shell;
-the shell does not connect to the broker yet (S19), so `window.broker_prompts` is the handler the
-connection will be made with, and the tests connect it to a real daemon; the chat, the terminal and
-its button are locked as well as the canvas. **Not done.** #86 (which grant failed, revoke or ask
-again) is S19's and S24's; #98 (lowering an imported tool's taint) needs only a new subject next to
-`capability` and `pick` in `GrantPrompt` and an access variant on the wire, and is not started. A
-picker for a net-tainted task is refused before the user is asked (what is picked is `fs`); every
-other check on the picked path can only be made after the user has chosen. **Consequences.** A
-prompt that waits behind another may be shown with little of its time left, and is denied by its
-deadline if so (#145). The audit entry does not carry the `PromptId` (#143). A picker's denial
-before its choice resolves (the resolve itself failed) has no path in the audit; one after it has
-the resolved path. The picker's dialog is exempt from the guard only while it is open. The test of
-the real `Gtk.FileDialog` is the session-bus test, which opens it; every other test uses a picker
-with nobody at it. D17 (8) and (9) are as S17 left them.
+of another input; a release is remembered for the click in its own event and forgotten with the next
+input or the end of the event; pointer records survive a focus loss (GTK does not cancel a press
+when the window is deactivated: the grab goes on and its release arrives) and keys are forgotten
+(their release goes to the other window); too many held inputs to record refuse Allows (fail closed)
+instead of evicting one; the picker's answer is the user's choice in the trusted dialog and needs no
+input of the window. The window reports exact press and release events (a gesture's "stopped" is not
+a release: it fires from the double-click timer during any hold of 400 ms), key hardware codes as
+opaque numbers (no key is read as a character: a tripwire test holds that), and the focus coming and
+going; its controllers are added last so that they run first and see every key, F12 included. A
+model-based property test (`tests/shell/test_prompt_arming_model.py`, deterministic) drives random
+interleavings against a reference model that tracks what is physically down apart from what the
+window was told, and that is written from (A) to (C) and from what GTK does; the controller of
+849f26f and that of 5dd2ad5 both fail it. The banner in the chrome region draws the card and reports
+clicks. While a prompt is pending a guard makes everything but the chrome insensitive (the canvas,
+the chat, whose labels are selectable and so open a menu, the terminal pane and the status strip's
+Terminal button; F12 does nothing); the strip's voice buttons stay usable, because turning the
+microphone off with the pointer must always work and cannot answer a prompt. It pops down every
+popover, closes every toplevel but the window (and any new one), and gives the focus back afterwards
+(#53). The chat is therefore not usable while a prompt is up; it comes back the moment the last one
+is gone. A prompt does not outlive its connection: when it ends, or the loop it ran on is torn down,
+its prompts are taken down. Nothing is a `GAction` (#54, tested against a private bus with a prompt
+pending and the picker open). (7) *The picker* is a request (`fs.pick`, file or folder), a prompt
+with no capability, a `Gtk.FileDialog` opened by the user's click on "Choose" (and closed with its
+prompt), and the chosen path is received text: the broker resolves it and issues it like any other
+grant (deny rules, taint rule, cap), with `origin = picker`. A write is never offered (S16's gate).
+(8) *#90:* Ctrl+Q and F9 are disabled with Ctrl+L while the terminal has the focus, so the terminal
+gets them; the shell is quit from the chat, the window or a signal. (9) *Not yet.* The prompt's
+`tool` is always null: the wire has no tool binding until S24 (D17). **Deviations from the plan.**
+The rate limit is in the broker and not the shell; the shell does not connect to the broker yet
+(S19), so `window.broker_prompts` is the handler the connection will be made with, and the tests
+connect it to a real daemon; the chat, the terminal and its button are locked as well as the canvas.
+**Not done.** #86 (which grant failed, revoke or ask again) is S19's and S24's; #98 (lowering an
+imported tool's taint) needs only a new subject next to `capability` and `pick` in `GrantPrompt` and
+an access variant on the wire, and is not started. A picker for a net-tainted task is refused before
+the user is asked (what is picked is `fs`); every other check on the picked path can only be made
+after the user has chosen. **Consequences.** A prompt that waits behind another may be shown with
+little of its time left, and is denied by its deadline if so (#145). The audit entry does not carry
+the `PromptId` (#143). A picker's denial before its choice resolves (the resolve itself failed) has
+no path in the audit; one after it has the resolved path. The picker's dialog is exempt from the
+guard only while it is open. The test of the real `Gtk.FileDialog` is the session-bus test, which
+opens it; every other test uses a picker with nobody at it. D17 (8) and (9) are as S17 left them.

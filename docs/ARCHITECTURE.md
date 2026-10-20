@@ -1252,37 +1252,52 @@ Each invariant names where it is enforced. Reviews check every change against th
   (`tw-trusted-*`) that a spec cannot name: the spec model has no field for a class, a name or a
   region, and a test renders a hostile spec and looks. *When it takes answers*: the arming
   invariant. **(A) An Allow or a Choose (anything that can lead to a grant) is accepted only if the
-  user input that produced it (the pointer press whose release clicked it, or the key press that
+  input that produced it (the pointer press whose release clicked it, or the key press that
   activated it) began while the prompt was armed and after the last arming restart, and no input
-  that began while disarmed is still held. (B) A Deny is never refused because of an input that is
-  held or how one began (it cannot become a grant), and is ignored only in the first 750 ms. (C)
-  Nothing refuses a deliberate Allow for good: an input that begins after arming with nothing
-  tainted held is accepted, of either kind and after any other input; a refusal is shown in a
-  note.** The 750 ms are of quiet, by the controller's clock, read when the answer arrives (a late
-  timer cannot arm it early); the buttons are dimmed until then. The delay starts again at the first
-  frame, when the window is activated (not while the picker's own dialog is open: the window only
-  lost the focus to it) and at any input that begins while disarmed. Every pointer button, touch and
-  key that is down is tracked exactly, from the press and release events themselves (not a gesture's
-  "stopped", which fires during any hold of 400 ms), by identity (keys by hardware code, never read
-  as characters), and is tainted if it began disarmed or before a restart; a second button, a key
-  (Enter on the focused Deny too) or auto-repeat cannot end the hold of another input; a window that
-  loses the focus forgets what was held. `tests/shell/test_prompt_arming_model.py` checks (A) to (C)
-  over random sequences. Deny has the focus. *One at a time*: the rest wait in order, at most 8 in
-  all (a ninth is refused and denied by the broker); each has the broker's deadline
-  (`expires_in_ms`) from the moment it arrived, and past it the shell answers `deny(prompt_timeout)`
-  and takes it down, shown or waiting. A prompt does not outlive its connection: when the connection
-  ends (or the loop it ran on is torn down) its prompts are taken down (the next one, of a live
-  connection, comes up), and after the window is closed none is taken. *While pending*
-  (`tumbleweed.shell.prompt_guard`, #53): everything but the chrome (the canvas, the side panel with
-  the chat, whose labels are selectable and so open a menu, the terminal pane and the strip's
-  Terminal button) is insensitive and F12 does nothing; the strip's voice buttons stay usable,
-  because turning the microphone off with the pointer must always work and nothing there can answer
-  a prompt. Every popover under the window is popped down, every toplevel but the shell's is closed
-  and any that appears is closed at once (the picker's own dialog is let through while it is open,
-  and is closed with its prompt), and the focus comes back to where it was when the last prompt is
-  gone. The buttons are plain widgets and nothing in the prompt is a `GAction` (#54:
-  `tests/shell/test_session_bus.py` lists everything the shell exports with a prompt pending and the
-  picker open, and activates all of it).
+  that began while the prompt was disarmed, or before a restart, is still held, as far as the window
+  has seen (pointers are tracked until their release arrives, keys until it arrives or the window
+  loses the focus). A click that a release completes is refused if the input that is released is
+  tainted, whichever input produced it (fail closed). (B) A Deny is never refused because of an
+  input that is held, or of how an input began: a Deny cannot become a grant. It is ignored whenever
+  the prompt is disarmed (the 750 ms after it appears or after any restart; the plan: early clicks
+  and Enter presses are ignored), and it still needs a real click or key (I10). (C) Nothing makes
+  the prompt refuse a deliberate Allow for good: an input that begins after the prompt is armed,
+  with nothing tainted held, is accepted, of either kind and after any other input (typing, a window
+  activation). A refusal of an Allow is shown to the user, by the view. The cases that fail closed
+  instead are the documented ones: an input whose release was lost (a pointer is replaced by its
+  next press of the same button; a key is forgotten when the window loses the focus), and a click
+  completed by a tainted input's release.** The 750 ms are of quiet, by the controller's clock, read
+  when the answer arrives (a late timer cannot arm it early); the buttons are dimmed until then. The
+  delay starts again at the first frame, when the window is activated (not while the picker's own
+  dialog is open: the window only lost the focus to it) and at any input that begins while disarmed.
+  It is implemented by recording every pointer button, touch (one identity per sequence) and key
+  that goes down with whether the prompt was armed and in which epoch (every restart of the delay
+  starts one: the prompt shown, first drawn, the window activated, any input that begins while
+  disarmed); an input is tainted if it began disarmed or in an earlier epoch, and so is one that
+  comes up with no record (it went down before the prompt, or before a focus loss). Held inputs are
+  tracked exactly by identity, so a second button, a key, Enter on the focused Deny or an
+  auto-repeat cannot end the hold of another input; a release is remembered for the click in its own
+  event and forgotten with the next input or the end of the event; pointer records survive a focus
+  loss (GTK does not cancel a press when the window is deactivated: the grab goes on and its release
+  arrives) and keys are forgotten (their release goes to the other window); too many held inputs to
+  record refuse Allows (fail closed) instead of evicting one; the picker's answer is the user's
+  choice in the trusted dialog and needs no input of the window.
+  `tests/shell/test_prompt_arming_model.py` checks (A) to (C) over random sequences. Deny has the
+  focus. *One at a time*: the rest wait in order, at most 8 in all (a ninth is refused and denied by
+  the broker); each has the broker's deadline (`expires_in_ms`) from the moment it arrived, and past
+  it the shell answers `deny(prompt_timeout)` and takes it down, shown or waiting. A prompt does not
+  outlive its connection: when the connection ends (or the loop it ran on is torn down) its prompts
+  are taken down (the next one, of a live connection, comes up), and after the window is closed none
+  is taken. *While pending* (`tumbleweed.shell.prompt_guard`, #53): everything but the chrome (the
+  canvas, the side panel with the chat, whose labels are selectable and so open a menu, the terminal
+  pane and the strip's Terminal button) is insensitive and F12 does nothing; the strip's voice
+  buttons stay usable, because turning the microphone off with the pointer must always work and
+  nothing there can answer a prompt. Every popover under the window is popped down, every toplevel
+  but the shell's is closed and any that appears is closed at once (the picker's own dialog is let
+  through while it is open, and is closed with its prompt), and the focus comes back to where it was
+  when the last prompt is gone. The buttons are plain widgets and nothing in the prompt is a
+  `GAction` (#54: `tests/shell/test_session_bus.py` lists everything the shell exports with a prompt
+  pending and the picker open, and activates all of it).
 - **I6 — Secrets stay out.** The API key never enters model context, logs, the invocation
   log, sandboxes (environment is cleared), workspaces or tool packages.
   The agent takes the key out of the process environment when it starts (so no child process

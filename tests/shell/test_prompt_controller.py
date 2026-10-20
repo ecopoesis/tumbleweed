@@ -481,11 +481,12 @@ class TestTheArmingInvariant:
         card = rig.offer()
         rig.timers.advance(0.1)
         keys = [InputId("key", code) for code in range(100, 100 + 65)]
-        for key in keys:
-            rig.controller.input_began(key)  # (the first of them tainted: disarmed)
+        rig.controller.input_began(keys[0])  # the oldest, tainted: it began disarmed
         rig.arm()
+        for key in keys[1:]:
+            rig.controller.input_began(key)  # clean, and 64 of them: one too many to record
 
-        assert not click(rig, card, ALLOW_TASK)
+        assert not click(rig, card, ALLOW_TASK)  # (evicting the tainted one would accept it)
         for key in keys:
             rig.controller.input_ended(key)
         assert click(rig, card, ALLOW_TASK)
@@ -555,6 +556,17 @@ class TestTheArmingInvariant:
         rig.controller.input_ended(shift)  # completes the activation, in the same event
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_a_release_that_clicked_nothing_is_forgotten_by_the_next_input(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.input_began(LETTER)
+        rig.controller.input_ended(LETTER)  # tainted, and nothing clicked
+        rig.arm()
+
+        rig.controller.input_began(ENTER)  # the next input: its own activation is its own
+
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
 
     def test_a_release_is_forgotten_by_the_next_input_and_by_the_end_of_the_event(
         self, rig: Rig
