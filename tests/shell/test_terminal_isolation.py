@@ -697,7 +697,7 @@ def test_the_window_module_uses_a_shortcut_controller_not_a_key_controller() -> 
 # the event), so the handler names include `speech`. Since S08 it also takes Esc while a hands-free
 # turn is being recorded (it reads that machine's phase, never the event): `hands_free`, `hearing`.
 PUSH_TO_TALK_MODULE = "shell/voice_controls.py"
-OTHER_KEY_CONTROLLER_MODULES = ["shell/chat_panel.py"]
+OTHER_KEY_CONTROLLER_MODULES = ["shell/chat_panel.py", "shell/prompt_chrome.py"]
 PUSH_TO_TALK_HANDLER_NAMES = frozenset(
     {
         "Gdk", "Gtk", "keyval", "state", "in_terminal", "held", "voice", "_RELEASE_KEYS",
@@ -722,6 +722,29 @@ def test_push_to_talk_is_the_only_window_key_controller_outside_the_terminal_mod
     )
 
     assert users == sorted([*OTHER_KEY_CONTROLLER_MODULES, PUSH_TO_TALK_MODULE])
+
+
+def test_the_prompts_key_controller_only_counts_presses_and_reads_no_key() -> None:
+    """The prompt (S18) watches the window's presses and keys to restart its 750 ms; what it
+    connects to `key-pressed` is a lambda that takes `*_args` and uses none of them."""
+    tree = ast.parse((SOURCE / "shell/prompt_chrome.py").read_text())
+    handlers = [
+        call.args[1]
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "connect"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "keys"
+    ]
+
+    assert len(handlers) == 1
+    (handler,) = handlers
+    assert isinstance(handler, ast.Lambda)
+    assert handler.args.vararg is not None
+    assert not handler.args.args
+    used = {n.id for n in ast.walk(handler.body) if isinstance(n, ast.Name)}
+    assert handler.args.vararg.arg not in used  # the key, the keycode and the state are not read
 
 
 def test_the_push_to_talk_controller_reads_nothing_but_the_key_and_the_modifiers() -> None:
