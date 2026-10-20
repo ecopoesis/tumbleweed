@@ -76,14 +76,14 @@ class TestCanvasTurn:
         assert earlier.assistant == "Done"
 
 
-def explode() -> None:
+def explode(by_user: bool) -> None:
     raise ZeroDivisionError
 
 
 class TestIdleListeners:
     def listener(self, controller: ChatController) -> list[bool]:
         calls: list[bool] = []
-        controller.add_idle_listener(lambda: calls.append(controller.busy))
+        controller.add_idle_listener(lambda _by_user: calls.append(controller.busy))
         return calls
 
     def test_a_finished_reply_tells_the_listener_after_the_transcript_shows_it(self) -> None:
@@ -127,3 +127,18 @@ class TestIdleListeners:
 
         assert calls == [False]
         assert "listener" in caplog.text
+
+
+def test_the_listener_is_told_whether_the_user_cancelled() -> None:
+    controller, _, responder = make()
+    told: list[bool] = []
+    controller.add_idle_listener(told.append)
+
+    controller.send("one")
+    responder.sink.emit(ReplyFinished())
+    controller.send("two")
+    responder.sink.emit(ReplyFailed(reason="no"))
+    controller.send("three")
+    controller.cancel()
+
+    assert told == [False, False, True]

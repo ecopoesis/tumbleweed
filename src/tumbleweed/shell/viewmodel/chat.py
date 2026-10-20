@@ -93,7 +93,7 @@ class _Reply:
     """One reply in flight: it fills one assistant message, and is the sink of its responder."""
 
     def __init__(
-        self, transcript: Transcript, message_id: MessageId, on_closed: Callable[[], None]
+        self, transcript: Transcript, message_id: MessageId, on_closed: Callable[[bool], None]
     ) -> None:
         self._transcript = transcript
         self._message_id = message_id
@@ -102,6 +102,7 @@ class _Reply:
         self._cancel_when_known = False
         self._on_closed = on_closed
         self._told = False
+        self._by_user = False
         self.closed = False
 
     def _tell_closed(self) -> None:
@@ -110,7 +111,7 @@ class _Reply:
             return
         self._told = True
         try:
-            self._on_closed()
+            self._on_closed(self._by_user)
         except Exception:
             logger.exception("a listener of the end of reply %s failed", self._message_id)
 
@@ -124,7 +125,7 @@ class _Reply:
         if self._cancel_when_known:
             self._cancel(handle)
 
-    def abort(self, reason: str) -> None:
+    def abort(self, reason: str, *, by_user: bool = False) -> None:
         """Fail the reply with `reason` if its message is still streaming, and stop the responder.
 
         A no-op once closed. The responder is stopped even if failing the message raises.
@@ -132,6 +133,7 @@ class _Reply:
         if self.closed:
             return
         self.closed = True
+        self._by_user = by_user
         try:
             if self._transcript.streaming == self._message_id:
                 self._transcript.fail(self._message_id, reason)
@@ -202,17 +204,18 @@ class ChatController:
         self._responder = responder
         self._reply: _Reply | None = None
         self._session_id: SessionId | None = None
-        self._idle_listeners: list[Callable[[], None]] = []
+        self._idle_listeners: list[Callable[[bool], None]] = []
 
-    def add_idle_listener(self, listener: Callable[[], None]) -> None:
+    def add_idle_listener(self, listener: Callable[[bool], None]) -> None:
         """Call `listener` each time a reply ends, whichever way, once the transcript shows it
-        (the canvas's event gate starts its next waiting turn from here)."""
+        (the canvas's event gate starts its next waiting turn from here). The argument says
+        whether the user cancelled the reply."""
         self._idle_listeners.append(listener)
 
-    def _on_reply_closed(self) -> None:
+    def _on_reply_closed(self, by_user: bool) -> None:
         for listener in tuple(self._idle_listeners):
             try:
-                listener()
+                listener(by_user)
             except Exception:
                 logger.exception("a listener of the end of a reply failed")
 
@@ -274,4 +277,4 @@ class ChatController:
     def cancel(self) -> None:
         """Stop the reply in flight, if any, marking it failed (partial text is kept)."""
         if self._reply is not None:
-            self._reply.abort("Cancelled.")
+            self._reply.abort("Cancelled.", by_user=True)

@@ -2,8 +2,9 @@
 
 `show_ui(spec, placement)` validates the spec with `validate_ui_spec` on the agent's worker thread,
 then has the canvas render it; a spec that does not validate is never rendered, and its problems
-(at most ten, each naming where it is and what is wrong, none echoing the input) go back to the
-model as the error result so that it can correct itself and call again. `patch_state(instance,
+(at most ten, each naming where it is and what is wrong; no value is echoed, though a location may
+show a field name of at most 40 characters) go back to the model as the error result so that it
+can correct itself and call again. `patch_state(instance,
 patch)` changes the state of a tool that is on the canvas: the whole patch is checked against the
 spec and applied, or none of it is, and it never fires a handler (ARCHITECTURE section 4).
 
@@ -15,7 +16,9 @@ make room). A patch for an instance that is no longer on the canvas is an error 
 The canvas is the GTK main thread's, and the tools run on the worker thread, so the two meet in
 `CanvasLink`: it posts each call to the main thread through the shell's dispatcher and waits (at
 most `HOST_TIMEOUT`) for the answer. The host is attached after the window exists (the agent is
-built first), so a call before that, or after the window closed, is a tool error, not a hang.
+built first), so a call before that, or after the window closed, is a tool error, not a hang. If
+the caller stops waiting before the main thread has started the call, the call is not made; one
+that is already running is not undone.
 This module imports no GTK; `tumbleweed.shell.canvas_tools` implements `CanvasHost`.
 """
 
@@ -66,8 +69,8 @@ class CanvasHost(Protocol):
     def show(self, spec: UiSpec, placement: Placement) -> ShownTool: ...
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
-        """Apply `patch` to the instance; the keys it changed. Raises `SpecError` (refused, whole)
-        or `UnknownInstanceError`."""
+        """Apply `patch` to the instance; the keys whose value changed, computed entries
+        included. Raises `SpecError` (refused, whole) or `UnknownInstanceError`."""
         ...
 
 
@@ -203,7 +206,7 @@ def register_canvas_tools(registry: ToolRegistry, link: CanvasLink) -> None:
                 f"There is no tool {arguments.instance} on the canvas now: it was replaced or "
                 "closed. Call show_ui to show it again."
             ) from None
-        return "Updated: " + (", ".join(changed) if changed else "nothing (no entry changed)") + "."
+        return "Updated: " + (", ".join(changed) if changed else "nothing (no value changed)") + "."
 
     registry.register(
         ToolName("show_ui"),

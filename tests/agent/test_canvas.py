@@ -55,8 +55,10 @@ class FakeCanvas:
         runtime = self.runtimes.get(instance)
         if runtime is None:
             raise UnknownInstanceError("gone")
+        before = runtime.store.snapshot()
         runtime.patch_state(patch)
-        return tuple(StateKey(key) for key in patch)
+        after = runtime.store.snapshot()
+        return tuple(key for key, value in after.items() if before[key] != value)
 
 
 def call(name: str, **arguments: JsonValue) -> FakeToolCall:
@@ -196,7 +198,10 @@ class TestPatchState:
 
             (result,) = tool_results(rig, 2)
             assert not result.is_error
-            assert result.content == "Updated: bill."
+            # What changed, the computed entries that follow from it included; not what did not.
+            assert result.content.startswith("Updated: bill, tip_amount, total, per_person")
+            assert "people" not in result.content
+            assert "tip_percent" not in result.content
             runtime = canvas.runtimes[instance]
             assert runtime.store.value(StateKey("bill")) == 200.0
             assert runtime.store.value(StateKey("total")) == 236.0
@@ -291,3 +296,21 @@ class TestLink:
         dispatcher.drain(settle=0.01)  # the main thread gets to it too late
 
         assert canvas.shown == []  # the model was told it took too long: nothing shows up now
+
+
+class TestPatchReportsChanges:
+    def test_a_patch_that_changes_nothing_says_so(self) -> None:
+        instance = ToolInstanceId.new()
+        canvas = FakeCanvas((instance,))
+        script = [
+            FakeTurn(tool_calls=(call("show_ui", spec=TIP),)),
+            FakeTurn(
+                tool_calls=(call("patch_state", instance=str(instance), patch={"bill": 50.0}),)
+            ),
+            FakeTurn(chunks=("ok",)),
+        ]
+        with canvas_rig(script, canvas) as rig:
+            rig.send_and_wait("same")
+
+            (result,) = tool_results(rig, 2)
+            assert result.content == "Updated: nothing (no value changed)."

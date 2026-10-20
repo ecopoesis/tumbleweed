@@ -31,6 +31,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Final, Literal, Protocol, final
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
@@ -106,7 +107,11 @@ class CanvasTurn(BaseModel):
 
 
 def _dumps(value: JsonValue) -> str:
-    return json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    """`value` as the model receives it, and so as every cap measures it: ASCII only, and `<`, `>`
+    and `&` as six-byte escapes (valid JSON, and nothing in the text can close the frame). One
+    encoder both measures and writes, so a cap is a bound on the frame."""
+    text = json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
+    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
 def _json_of(value: StateValue) -> JsonValue:
@@ -209,7 +214,7 @@ def frame_turn(turn: CanvasTurn) -> str:
         "state": event.state.values,
         "state_entries_dropped": event.state.dropped,
     }
-    body = _dumps(document).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    body = _dumps(document)
     return f"{_FRAME_INTRO}\n{_FRAME_OPEN}\n{body}\n{_FRAME_CLOSE}"
 
 
@@ -242,6 +247,13 @@ class Scheduler(Protocol):
 
 
 @final
+@dataclass(frozen=True)
+class _Waiting:
+    build: Callable[[], CanvasEvent]
+    coalesced: int
+
+
+@final
 class EventGate:
     """Decides when the events of `agent` handlers become turns. See the module docstring."""
 
@@ -257,9 +269,10 @@ class EventGate:
         self._scheduler = scheduler
         self._clock = clock
         self._interval = MIN_TURN_INTERVAL if min_interval is None else min_interval
-        self._waiting: dict[ToolInstanceId, CanvasTurn] = {}
+        self._waiting: dict[ToolInstanceId, _Waiting] = {}
         self._last_start: dict[ToolInstanceId, float] = {}
         self._cancel_timer: Callable[[], None] | None = None
+        self._timer_at = 0.0
         self._closed = False
 
     @property
@@ -267,21 +280,30 @@ class EventGate:
         """How many instances have an event waiting."""
         return len(self._waiting)
 
-    def submit(self, event: CanvasEvent) -> None:
-        """A user's event: start a turn for it now, or keep it (the newest of its instance)."""
+    def submit(self, instance: ToolInstanceId, build: Callable[[], CanvasEvent]) -> None:
+        """A user's event: start a turn for it now, or keep it (the newest of its instance).
+
+        `build` makes the event, with its snapshot, and is called only when the turn starts, so
+        an event that a newer one replaces costs no serialisation.
+        """
         if self._closed:
             return
-        before = self._waiting.get(event.instance)
-        folded = 0 if before is None else before.coalesced + 1
+        before = self._waiting.get(instance)
         if before is None and len(self._waiting) >= MAX_WAITING:
             logger.warning("dropped a canvas event: %d instances are waiting", MAX_WAITING)
             return
-        folded = min(folded, MAX_COALESCED)
-        self._waiting[event.instance] = CanvasTurn(event=event, coalesced=folded)
+        folded = 0 if before is None else min(before.coalesced + 1, MAX_COALESCED)
+        self._waiting[instance] = _Waiting(build, folded)
         self._dispatch()
 
-    def turn_ended(self) -> None:
-        """A reply ended (the controller says so): the next waiting event may start."""
+    def turn_ended(self, cancelled: bool = False) -> None:
+        """A reply ended (the controller says so): the next waiting event may start.
+
+        If the user cancelled it, they stopped the agent: what waits is dropped, and no event
+        starts a turn until the user acts on a control again.
+        """
+        if cancelled:
+            self._waiting.clear()
         self._dispatch()
 
     def forget(self, instance: ToolInstanceId) -> None:
@@ -306,30 +328,37 @@ class EventGate:
             return  # a reply that ends calls `turn_ended`
         now = self._clock()
         soonest: float | None = None
-        for instance, turn in self._waiting.items():
+        for instance, waiting in self._waiting.items():
             last = self._last_start.get(instance)
             ready_at = 0.0 if last is None else last + self._interval
             if ready_at <= now:
                 del self._waiting[instance]
                 self._last_start[instance] = now
                 self._cancel_pending_timer()
-                self._start(turn)
+                if not self._start(waiting):
+                    self._dispatch()  # the others still get their chance (and their timer)
                 return
             soonest = ready_at if soonest is None else min(soonest, ready_at)
-        if soonest is not None and self._cancel_timer is None:
+        if soonest is not None and (self._cancel_timer is None or soonest < self._timer_at):
+            self._cancel_pending_timer()  # a newly waiting instance may be due before the armed one
+            self._timer_at = soonest
             self._cancel_timer = self._scheduler.call_later(soonest - now, self._on_timer)
 
     def _on_timer(self) -> None:
         self._cancel_timer = None
         self._dispatch()
 
-    def _start(self, turn: CanvasTurn) -> None:
+    def _start(self, waiting: "_Waiting") -> bool:
         try:
-            self._port.start_canvas_turn(turn)
+            self._port.start_canvas_turn(
+                CanvasTurn(event=waiting.build(), coalesced=waiting.coalesced)
+            )
         except Exception:
-            # The turn could not start (the chat refused it): the user sees nothing wrong with the
-            # tool, and the next event gets its chance.
+            # The turn could not start (the chat refused it, or the state could not be written):
+            # the user sees nothing wrong with the tool, and the next event gets its chance.
             logger.exception("a canvas event could not start a turn")
+            return False
+        return True
 
 
 @final
@@ -343,14 +372,18 @@ class AgentEventSink:
     def send(
         self, handler: AgentHandler, event: UiEvent, state: Mapping[StateKey, StateValue]
     ) -> None:
+        # The serialisation waits until the turn starts (and is skipped if a newer event replaces
+        # this one): `state` is the runtime's copy, which nothing changes.
+        note = None if handler.note is None else str(handler.note)
         self._gate.submit(
-            CanvasEvent(
+            self._instance,
+            lambda: CanvasEvent(
                 instance=self._instance,
                 handler=handler.name,
                 component=event.component,
                 event=event.event,
                 bind=event.bind,
-                note=None if handler.note is None else str(handler.note),
+                note=note,
                 state=snapshot_of(state),
-            )
+            ),
         )

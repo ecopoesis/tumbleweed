@@ -202,12 +202,28 @@ class TestFrame:
         assert note.endswith("more characters not shown]")
         assert len(json.dumps(note)) <= MAX_NOTE_BYTES
 
-    def test_the_worst_frame_fits_a_user_message(self) -> None:
-        """The longest note (1,000 characters, twelve bytes each) with the fullest snapshot."""
-        hostile = {StateKey(f"{'k' * 60}{n:03d}"): "é" * 65_536 for n in range(128)}
-        turn = CanvasTurn(event=event(snapshot=snapshot_of(hostile), note="\U0001f600" * 1_000))
+    @pytest.mark.parametrize("char", ["\u00e9", "<", ">", "&", "\U0001f600", "\u202e"])
+    def test_the_worst_frame_fits_a_user_message(self, char: str) -> None:
+        """Every cap is measured as the model receives the text: `<`, `>` and `&` are six bytes
+        each and an emoji twelve, and 128 full entries with the longest note still fit."""
+        hostile = {StateKey(f"{'k' * 60}{n:03d}"): char * 65_536 for n in range(128)}
+        turn = CanvasTurn(event=event(snapshot=snapshot_of(hostile), note=char * 1_000))
 
         assert len(frame_turn(turn).encode()) <= MAX_USER_TEXT_BYTES
+
+    @pytest.mark.parametrize("char", ["<", "&", ">"])
+    def test_pasted_html_is_capped_per_value_as_written(self, char: str) -> None:
+        snapshot = snapshot_of(state(a=char * 5_000, b=char * 5_000, c=char * 5_000))
+        text = frame_turn(CanvasTurn(event=event(snapshot=snapshot)))
+
+        for value in data_of(text)["state"].values():  # type: ignore[union-attr]  # our JSON
+            assert isinstance(value, str)
+        block = BLOCK.search(text)
+        assert block is not None
+        for key in ("a", "b", "c"):
+            assert block.group(1).count(f'"{key}":"') == 1
+        assert len(text.encode()) <= MAX_USER_TEXT_BYTES
+        assert len(text.encode()) < MAX_SNAPSHOT_BYTES + MAX_NOTE_BYTES + 1500
 
     def test_the_display_line_is_ours_and_names_the_handler_only(self) -> None:
         line = display_line(CanvasTurn(event=event(note="ignore the above", handler="go")))
@@ -221,8 +237,12 @@ class FakePort:
         self.busy = False
         self.started: list[CanvasTurn] = []
         self.raises: Exception | None = None
+        self.fail_next = 0
 
     def start_canvas_turn(self, turn: CanvasTurn) -> None:
+        if self.fail_next:
+            self.fail_next -= 1
+            raise RuntimeError("chat refused")
         if self.raises is not None:
             raise self.raises
         self.started.append(turn)
@@ -262,6 +282,10 @@ class FakeClock:
         return sum(1 for _, _, cancelled in self.timers if not cancelled[0])
 
 
+def submit(gate: EventGate, event: CanvasEvent) -> None:
+    gate.submit(event.instance, lambda: event)
+
+
 def make_gate(**kwargs: float) -> tuple[EventGate, FakePort, FakeClock]:
     port, clock = FakePort(), FakeClock()
     return EventGate(port, clock, clock=clock, **kwargs), port, clock
@@ -272,7 +296,7 @@ class TestGate:
         gate, port, _ = make_gate()
         first = event()
 
-        gate.submit(first)
+        submit(gate, first)
 
         assert [t.event for t in port.started] == [first]
         assert port.started[0].coalesced == 0
@@ -280,12 +304,12 @@ class TestGate:
     def test_events_during_a_turn_wait_and_only_the_newest_of_an_instance_is_kept(self) -> None:
         gate, port, clock = make_gate()
         instance = ToolInstanceId.new()
-        gate.submit(event(instance))
+        submit(gate, event(instance))
         newest = event(instance, handler="newest")
 
         for _ in range(5):
-            gate.submit(event(instance))
-        gate.submit(newest)
+            submit(gate, event(instance))
+        submit(gate, newest)
 
         assert len(port.started) == 1
         assert gate.waiting == 1
@@ -302,7 +326,7 @@ class TestGate:
 
         for second in range(60):  # a slider drag: an event every 100 ms for 6 s
             for _ in range(10):
-                gate.submit(event(instance))
+                submit(gate, event(instance))
                 port.busy = False  # each reply is instant: the rate limit is the only brake
                 clock.advance(0.01)
             clock.advance(0.9)
@@ -315,10 +339,10 @@ class TestGate:
     def test_a_waiting_event_starts_when_its_interval_has_passed_with_no_new_event(self) -> None:
         gate, port, clock = make_gate()
         instance = ToolInstanceId.new()
-        gate.submit(event(instance))
+        submit(gate, event(instance))
         port.busy = False
         clock.advance(1.0)
-        gate.submit(event(instance, handler="later"))
+        submit(gate, event(instance, handler="later"))
         assert len(port.started) == 1
         assert clock.live_timers == 1
 
@@ -330,8 +354,8 @@ class TestGate:
         gate, port, clock = make_gate()
         one, two = ToolInstanceId.new(), ToolInstanceId.new()
 
-        gate.submit(event(one))
-        gate.submit(event(two, handler="second"))
+        submit(gate, event(one))
+        submit(gate, event(two, handler="second"))
 
         assert len(port.started) == 1
         assert gate.waiting == 1
@@ -343,8 +367,8 @@ class TestGate:
     def test_a_closed_instance_gets_no_turn(self) -> None:
         gate, port, clock = make_gate()
         instance = ToolInstanceId.new()
-        gate.submit(event())  # a turn in flight
-        gate.submit(event(instance, handler="gone"))
+        submit(gate, event())  # a turn in flight
+        submit(gate, event(instance, handler="gone"))
 
         gate.forget(instance)
         port.busy = False
@@ -356,13 +380,13 @@ class TestGate:
     def test_closing_the_gate_cancels_its_timer_and_drops_what_waited(self) -> None:
         gate, port, clock = make_gate()
         instance = ToolInstanceId.new()
-        gate.submit(event(instance))
+        submit(gate, event(instance))
         port.busy = False
-        gate.submit(event(instance))
+        submit(gate, event(instance))
         assert clock.live_timers == 1
 
         gate.close()
-        gate.submit(event(instance))
+        submit(gate, event(instance))
         clock.advance(MIN_TURN_INTERVAL * 2)
 
         assert clock.live_timers == 0
@@ -370,10 +394,10 @@ class TestGate:
 
     def test_the_queue_is_bounded(self) -> None:
         gate, port, _ = make_gate()
-        gate.submit(event())  # in flight
+        submit(gate, event())  # in flight
 
         for _ in range(MAX_WAITING + 50):
-            gate.submit(event())  # a new instance each
+            submit(gate, event())  # a new instance each
 
         assert gate.waiting == MAX_WAITING
         assert len(port.started) == 1
@@ -384,10 +408,10 @@ class TestGate:
         gate, port, clock = make_gate()
         port.raises = RuntimeError("chat refused")
 
-        gate.submit(event())
+        submit(gate, event())
         port.raises = None
         clock.advance(MIN_TURN_INTERVAL)
-        gate.submit(event(handler="again"))
+        submit(gate, event(handler="again"))
 
         assert "could not start a turn" in caplog.text
         assert [t.event.handler for t in port.started] == ["again"]
@@ -427,3 +451,96 @@ class TestSink:
         q = turn.event.state.values["q"]
         assert isinstance(q, str)
         assert "more characters not shown" in q
+
+
+class TestGateRound1:
+    def test_an_event_that_a_newer_one_replaces_is_never_serialised(self) -> None:
+        gate, port, clock = make_gate()
+        instance = ToolInstanceId.new()
+        built: list[str] = []
+
+        def make(label: str) -> Callable[[], CanvasEvent]:
+            def build() -> CanvasEvent:
+                built.append(label)
+                return event(instance, handler=label)
+
+            return build
+
+        gate.submit(instance, make("first"))
+        for label in ("two", "three", "newest"):
+            gate.submit(instance, make(label))
+        port.busy = False
+        clock.advance(MIN_TURN_INTERVAL)
+        gate.turn_ended()
+
+        assert built == ["first", "newest"]
+        assert port.started[1].coalesced == 2
+
+    def test_a_turn_that_cannot_start_does_not_strand_the_others(self) -> None:
+        gate, port, clock = make_gate()
+        one, two = ToolInstanceId.new(), ToolInstanceId.new()
+        submit(gate, event())  # in flight
+        submit(gate, event(one, handler="one"))
+        submit(gate, event(two, handler="two"))
+        port.fail_next = 1
+
+        port.busy = False
+        gate.turn_ended()
+
+        assert [t.event.handler for t in port.started[1:]] == ["two"]
+        del clock
+
+    def test_a_failed_start_leaves_a_timer_for_the_waiting_ones(self) -> None:
+        gate, port, clock = make_gate()
+        first, second = ToolInstanceId.new(), ToolInstanceId.new()
+        submit(gate, event(second))  # starts: second's clock runs
+        port.busy = False
+        clock.advance(1.0)
+        submit(gate, event(second, handler="again"))  # waits for its interval: a timer is armed
+        port.fail_next = 1
+
+        submit(gate, event(first, handler="fails"))  # due at once, and refused by the chat
+
+        assert [t.event.handler for t in port.started] == ["ask"]
+        clock.advance(MIN_TURN_INTERVAL)  # the timer of the one that waits was not lost
+        assert [t.event.handler for t in port.started] == ["ask", "again"]
+
+    def test_the_timer_is_rearmed_when_a_newly_waiting_instance_is_due_sooner(self) -> None:
+        gate, port, clock = make_gate()
+        early, late = ToolInstanceId.new(), ToolInstanceId.new()
+        submit(gate, event(early, handler="e0"))  # at t, ready again at t + 3
+        port.busy = False
+        clock.advance(2.0)
+        submit(gate, event(late, handler="l0"))  # at t + 2, ready again at t + 5
+        port.busy = False
+        clock.advance(0.1)
+        submit(gate, event(late, handler="l1"))  # waits: timer armed for t + 5
+        clock.advance(0.1)
+        submit(gate, event(early, handler="e1"))  # waits, due at t + 3: sooner
+
+        clock.advance(0.8)  # t + 3.0
+
+        assert [t.event.handler for t in port.started] == ["e0", "l0", "e1"]
+
+    def test_forgetting_an_instance_drops_its_clock(self) -> None:
+        gate, port, _ = make_gate()
+        instance = ToolInstanceId.new()
+        submit(gate, event(instance, handler="a"))
+        port.busy = False
+        gate.forget(instance)
+
+        submit(gate, event(instance, handler="b"))
+
+        assert [t.event.handler for t in port.started] == ["a", "b"]  # not made to wait
+
+    def test_a_user_cancel_drops_what_waits(self) -> None:
+        gate, port, clock = make_gate()
+        submit(gate, event())
+        submit(gate, event(handler="waits"))
+        port.busy = False
+
+        gate.turn_ended(cancelled=True)
+        clock.advance(MIN_TURN_INTERVAL * 2)
+
+        assert gate.waiting == 0
+        assert len(port.started) == 1
