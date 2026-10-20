@@ -990,13 +990,15 @@ the tools run on the agent's worker (D9), and an `agent` handler on `on_change` 
 entry could cost a model turn per tick (#57). **Decision.** (1) *Validation on the worker, rendering
 on the main thread.* `show_ui(spec, placement)` runs `validate_ui_spec` where the call arrives; a
 spec that does not validate is never rendered, and its problems (at most ten, each saying where and
-what, none echoing the input: `SpecError.problems`) come back as the error result, as a new
+what; no value is echoed, though a location may show a field name of at most 40 characters:
+`SpecError.problems`) come back as the error result, as a new
 `ToolError` (a tool's expected failure, whose message is for the model: several lines, bounded to
 the tool result limit, where any other `TumbleweedError` is still cut to one short line). A valid
 spec is handed to the canvas through `CanvasLink` (`tumbleweed.agent.canvas`), which posts the call
 to the main thread through the dispatcher and waits at most 10 s; if the caller stops waiting first
-(the registry's timeout, a cancelled reply) the late call does nothing, so the model is never told
-"took too long" about a tool that then appears. The link is attached by the window after it exists
+(the registry's timeout, a cancelled reply) before the main thread has started the call, the call
+is not made; one already running is not undone, so in that narrow case a tool can appear that the
+model was told took too long. The link is attached by the window after it exists
 (the agent is built first) and detached when it closes; a call with none is a tool error, not a
 hang. The agent imports no GTK: the canvas is a `CanvasHost` protocol, implemented by
 `tumbleweed.shell.canvas_tools`, and a contract says `agent` never imports `ui.gtk`. `patch_state`
@@ -1021,17 +1023,25 @@ of ours, `Used "<handler>" in a canvas tool.`, with the handler's name (a valida
 never the data; a later turn's history carries that line and the reply, not the data. The turn is
 sent as the user role, because that is the only role a turn can start with, and the system prompt
 and the frame both say what is inside is data. (4) *Capped snapshot (#57).* A string value is cut
-to 1,024 bytes as written and ends in a note of how much was not shown; a list, table, JSON, image
+to 1,024 bytes and ends in a note of how much was not shown; a list, table, JSON, image
 or file value over that is replaced by `{"omitted": <kind>, "bytes": n}`; the whole is at most
 6 KiB: the biggest values that are still shown go first, then the last entries are left out and
-counted (`state_entries_dropped`). A handler's note is cut at 2 KiB as written. The worst frame is
-about 9 KiB, under the 16 KiB of a user message (tested at the worst case). (5) *Rate limit and
+counted (`state_entries_dropped`). A handler's note is cut at 2 KiB. Every cap is
+measured on the text the model receives: one encoder writes the frame's JSON and measures it,
+escaping every non-ASCII character and `<`, `>` and `&` (six bytes each, so pasted HTML is six times
+its length), so a cap bounds the frame. The worst frame, 128 full entries of any one character and
+the longest note, is 8.7 KiB, under the 16 KiB of a user message (tested for each character that
+costs more than one byte). The snapshot is serialised when the turn starts, not at each event, so
+an event that a newer one replaces costs nothing. (5) *Rate limit and
 coalescing (#57).* The `EventGate` starts a turn for an instance at most once every 3 s, and one at
 a time over all: an event that arrives while a reply is in flight, or too soon after its
 instance's last turn, waits, a newer event of the same instance replaces it (the newest state is
 the one that matters), and the turn says how many it replaces (`earlier_events_replaced`). At most
 one event waits per instance, 64 in all. A reply that ends (finished, failed, cancelled, refused)
-tells the gate through the chat controller's idle listeners, which is how the next one starts; a
+tells the gate through the chat controller's idle listeners, which is how the next one starts,
+except that a reply the user cancelled (Escape) drops what waits: the user stopped the agent, and
+no event restarts it until they act on a control again. A turn the chat refuses does not strand
+the others, and a timer is re-armed when a newly waiting instance is due sooner than the armed one; a
 timer (`GLib.timeout_add`, injected, so tests run on a manual clock) covers the interval. (6)
 *Sandbox controls are disabled, with a reason in the tool.* While no sandbox is connected
 (`UiRuntime.sandbox_connected`: S20 connects one), a control whose handler is of kind `sandbox` is
@@ -1049,7 +1059,9 @@ numbered sections of `docs/ui-spec.md` that carry what the schema cannot say (na
 numbers, components, expressions, handlers, the cross-checks, the limits, and the tip calculator as
 a worked example), with a drift test and `--write`/`--check` like the schema's. The system prompt
 is a new file, `system_v2.md` (the canvas, `agent` handlers, canvas events as data), and v2 ends
-with that reference; v1 stays as it was. The reference is about 42 KB, bounded at 64 KiB apart from
+with that reference; v1 stays as it was. Because the reference is regenerated when the docs or the
+models change, the invocation log records `v2.<8 hex of the sha256 of the whole prompt>`
+(`system_prompt_label`), so a changed reference is a different label under the same version. The reference is about 42 KB, bounded at 64 KiB apart from
 the prompt's 16 KiB. **Deviations from the plan.** None in scope. The plan names no limits for the
 snapshot and no instance cap: those are the numbers above. #62's docs item (the enum rule) was
 already in `docs/ui-spec.md` sections 7 and 10, so the generated prompt carries it; the rest of

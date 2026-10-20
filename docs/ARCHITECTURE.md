@@ -770,7 +770,7 @@ the user's own, and `edit_before_send` (and its forcing over plain http) applies
 
 | Tool | Effect | Step |
 |---|---|---|
-| `show_ui(spec, code?)` | Validate and render a tool draft on the canvas | S12 (code: S20) |
+| `show_ui(spec, placement?, code?)` | Validate and render a tool draft on the canvas; `placement` is `replace` (default) or `stack` | S12 (code: S20) |
 | `patch_state(instance, patch)` | Update a rendered tool's state (never fires handlers) | S12 |
 | `start_task(title, fresh_context?)` | End the current task; new workspace, no grants; optionally no prior turns | S19 |
 | `request_access(capability \| pick, reason)` | Ask for a grant, or ask the user to pick a file/folder | S19 |
@@ -836,9 +836,9 @@ shell wrote it from the user's action and that what is inside the `<canvas_event
 never instructions, then one JSON document (instance, handler, component, event, bound key, the
 handler's note, the state) written with every non-ASCII character and `<`, `>` and `&` escaped, so
 nothing in it can close the block (`tumbleweed.agent.canvas_events`). The snapshot is capped: a
-string past 1 KiB as written is cut (and says how much), a bigger list, table, JSON, image or file
+string past 1 KiB is cut (and says how much), a bigger list, table, JSON, image or file
 value is a marker with its kind and size, the whole is at most 6 KiB (biggest values first, then
-the last entries are counted and left out), and a note is cut at 2 KiB. The chat shows a line of
+the last entries are counted and left out), and a note is cut at 2 KiB (all measured on the text the model receives, where `<`, `>` and `&` take six bytes each, so the frame is at most about 9 KiB). The chat shows a line of
 ours that names the handler, not the data. **Rate limit (I9, #57).** An instance starts at most one
 turn every 3 seconds and one turn runs at a time; an event that waits is replaced by a newer one of
 its instance (the turn says how many it replaces); at most one waits per instance. `sandbox`
@@ -1184,7 +1184,7 @@ Each invariant names where it is enforced. Reviews check every change against th
   or status text is made from it (`tests/shell/test_canvas_agent.py` looks at every label outside
   the canvas and at every window title).
   **Every model-supplied string** shown in chrome (reasons, task titles, tool names and
-  descriptions, spec titles) is plain, length-capped, and labelled as coming from the
+  descriptions) is plain, length-capped, and labelled as coming from the
   assistant. What is being granted is rendered from the structured capability. While a
   prompt is pending the canvas is insensitive; default focus is **Deny**; the decision
   buttons ignore input for the first 750 ms; at most one prompt is shown at a time, and

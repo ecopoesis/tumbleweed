@@ -740,7 +740,7 @@ A handler has a `name` and a `kind`.
 - **`agent`** sends the event and a snapshot of the state to the agent as untrusted input (S12).
   `note` is the author's hint about what the event means, and is data too. The agent gets the
   event in a frame that says it is data, with the whole state as it was at the event, capped: a
-  string longer than 1 KiB as written is cut (and says how much was not shown), a list, table, JSON,
+  string longer than 1 KiB (as the model receives it, where `<`, `>` and `&` take six bytes each) is cut (and says how much was not shown), a list, table, JSON,
   image or file value over that is replaced by a marker that names its kind and size, and the whole
   snapshot is at most 6 KiB, the biggest values going first, then the last entries counted and left
   out (`tumbleweed.agent.canvas_events`). A tool instance starts at most one turn every 3 seconds,

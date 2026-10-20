@@ -813,7 +813,7 @@ A handler has a `name` and a `kind`.
 - **`agent`** sends the event and a snapshot of the state to the agent as untrusted input (S12).
   `note` is the author's hint about what the event means, and is data too. The agent gets the
   event in a frame that says it is data, with the whole state as it was at the event, capped: a
-  string longer than 1 KiB as written is cut (and says how much was not shown), a list, table, JSON,
+  string longer than 1 KiB (as the model receives it, where `<`, `>` and `&` take six bytes each) is cut (and says how much was not shown), a list, table, JSON,
   image or file value over that is replaced by a marker that names its kind and size, and the whole
   snapshot is at most 6 KiB, the biggest values going first, then the last entries counted and left
   out (`tumbleweed.agent.canvas_events`). A tool instance starts at most one turn every 3 seconds,
@@ -939,7 +939,7 @@ one means, is `tumbleweed.ui/2`.
   return `SpecError.problems` to the model; `UiSpec.validate_patch(patch, current=...)` for
   `patch_state`; the system prompt section is generated from the models' JSON Schema and this
   page (`tumbleweed.agent.spec_prompt`, committed as `prompts/ui_spec_v1.md`, drift-tested), and
-  carries the rules the schema cannot (sections 4, 5, 7 to 11, and the tip calculator of section 2).
+  carries the rules the schema cannot (sections 3 to 5 and 7 to 11, and the tip calculator of section 2).
   **A change to this page's sections 2 to 5 or 7 to 11 changes the prompt:** regenerate it with
   `uv run python -m tumbleweed.agent.spec_prompt --write`. The host is `tumbleweed.agent.canvas`
   (`show_ui`, `patch_state`, `CanvasHost`) and the events are `tumbleweed.agent.canvas_events`.
