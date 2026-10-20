@@ -736,7 +736,7 @@ class TestTheAllowanceFollowsTheLineage:
                 await pending
                 await client.end_task(first)
 
-                mine = (await other.start_task()).task
+                mine = (await other.start_task(previous=first)).task  # names a stranger's task
                 pending = await asked(other, mine, rig)
                 await deny(other, await other_shell.next_prompt())
                 await pending
