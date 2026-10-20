@@ -637,9 +637,10 @@ class TestVoiceCannotAnswerAPrompt:
         assert pump_until(controller.armed)
 
         assert v.shell.window.status_strip.is_sensitive()
-        for button in (controls_.mic_button, controls_.mute_button, controls_.hands_free_button):
-            if button is not None:
-                assert button.is_sensitive()  # turning the voice off cannot answer a prompt
+        # This setup has push-to-talk only: the speech and hands-free buttons are not built.
+        assert controls_.mute_button is None
+        assert controls_.hands_free_button is None
+        assert controls_.mic_button.is_sensitive()  # turning the voice off cannot answer a prompt
         assert not v.shell.window.status_strip.terminal_button.is_sensitive()  # F12's twin is inert
 
     def test_the_voice_keys_are_not_the_prompts_keys(self, build_voiced: VoicedBuilder) -> None:

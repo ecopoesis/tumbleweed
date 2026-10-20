@@ -197,6 +197,18 @@ class TestTheSettings:
         assert ipc_limits(config).handler_timeout >= spent + PROMPT_MARGIN
         assert IpcLimits().request_timeout < PROMPT_WAIT  # (the default is for everything else)
 
+    def test_the_handlers_cover_a_prompt_and_its_file_system_calls_even_with_a_short_grace(
+        self, home_world: World
+    ) -> None:
+        """The run bound alone (the longest run, its grace and 30 s) is shorter than what a
+        prompt can take with a slow file system, once the run grace is small."""
+        config = config_for(home_world, run_grace=timedelta(milliseconds=1))
+        run_bound = timedelta(seconds=120) + config.run_grace + timedelta(seconds=30)
+        asking = config.prompt_timeout + FS_CALLS_PER_PROMPT * config.fs_timeout + PROMPT_MARGIN
+
+        assert asking > run_bound
+        assert ipc_limits(config).handler_timeout == asking
+
     def test_the_file_system_calls_around_a_prompt_are_inside_the_wait_too(
         self, home_world: World
     ) -> None:

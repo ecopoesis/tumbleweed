@@ -16,8 +16,12 @@ import pytest
 from tests.broker.fake_shell import FakeShell, allow, answer, deny
 from tests.broker.rig import Rig, replace_config, running, until
 from tests.ipc.bounded import run
+from tumbleweed.broker import service as service_module
 from tumbleweed.broker.audit import GrantDecision, TaskEnded
-from tumbleweed.broker.client import BrokerClient
+from tumbleweed.broker.client import BrokerClient, BrokerRefused
+from tumbleweed.broker.errors import FsTimeoutError
+from tumbleweed.broker.service import BrokerService
+from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.ids import PromptId, RunId, TaskId
 from tumbleweed.ipc.broker_messages import (
     GrantOutcome,
@@ -549,6 +553,58 @@ class TestThePicker:
 
         run(scenario)
 
+    def test_an_error_after_the_choice_is_resolved_is_audited_with_its_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            async def broken(*_args: object) -> object:
+                raise InvalidValueError("something about the grant")
+
+            monkeypatch.setattr(BrokerService, "_issue_after_prompt", broken)
+            async with running(ask_shell=True) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                task = await task_of(client)
+                chosen = rig.home / "Documents"
+
+                pending = asyncio.create_task(client.request_pick(task, RunId.new(), "folder", "x"))
+                await allow(client, await shell.next_prompt(), picked=str(chosen))
+                with pytest.raises(BrokerRefused):
+                    await pending
+
+                (entry,) = rig.audit_of(GrantDecision)
+                assert entry.path == str(chosen)  # what the user picked, resolved
+                assert entry.outcome == "denied"
+
+        run(scenario)
+
+    def test_a_choice_that_cannot_be_resolved_at_all_is_audited_without_a_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Stated in D25: nothing was resolved, so nothing canonical can be recorded, and the raw
+        text of a choice is not copied into the log."""
+
+        async def scenario() -> None:
+            async def hung(*_args: object) -> object:
+                raise FsTimeoutError("the file system did not answer")
+
+            monkeypatch.setattr(BrokerService, "_resolve", hung)
+            async with running(ask_shell=True) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                task = await task_of(client)
+
+                pending = asyncio.create_task(client.request_pick(task, RunId.new(), "file", "x"))
+                await allow(client, await shell.next_prompt(), picked=str(rig.home / "Documents"))
+                with pytest.raises(BrokerRefused):
+                    await pending
+
+                (entry,) = rig.audit_of(GrantDecision)
+                assert entry.path is None
+                assert entry.outcome == "denied"
+
+        run(scenario)
+
     def test_a_choice_that_is_not_there_is_audited_with_the_path_it_resolved_to(self) -> None:
         async def scenario() -> None:
             async with running(ask_shell=True) as rig:
@@ -742,6 +798,62 @@ class TestTheAllowanceFollowsTheLineage:
                 await pending
 
                 assert len(other_shell.shown) == 1
+
+        run(scenario)
+
+    def test_one_connections_churn_evicts_nothing_of_anothers_and_eviction_is_oldest_first(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def scenario() -> None:
+            monkeypatch.setattr(service_module, "_MAX_ENDED_PER_OWNER", 2)
+            async with running(
+                ask_shell=True, config=lambda c: replace_config(c, prompts_per_window=1)
+            ) as rig:
+                shell, other_shell = FakeShell(), FakeShell()
+                client = await rig.client(handler=shell)
+                other = await rig.client(handler=other_shell)
+
+                async def used_and_ended(who: BrokerClient, shown: FakeShell) -> TaskId:
+                    task = await task_of(who)
+                    pending = await asked(who, task, rig)
+                    await deny(who, await shown.next_prompt())
+                    await pending
+                    await who.end_task(task)
+                    return task
+
+                theirs = await used_and_ended(other, other_shell)
+                first, second, third = [await used_and_ended(client, shell) for _ in range(3)]
+                shown_before = len(shell.shown)
+
+                # `first` was evicted (the oldest of two kept): a successor starts a fresh one ...
+                fresh = (await client.start_task(previous=first)).task
+                pending = await asked(client, fresh, rig)
+                await deny(client, await shell.next_prompt())
+                await pending
+                # ... `third` is kept, and so is the other connection's, whatever `client` churned.
+                kept = (await client.start_task(previous=third)).task
+                held = await client.request_read(kept, RunId.new(), photos(rig), "x")
+                mine = (await other.start_task(previous=theirs)).task
+                other_held = await other.request_read(mine, RunId.new(), photos(rig), "x")
+
+                assert second != first
+                assert len(shell.shown) == shown_before + 1  # only the evicted lineage asked
+                assert "too many permission requests for this task" in held.message
+                assert "too many permission requests for this task" in other_held.message
+
+        run(scenario)
+
+    def test_a_connections_kept_allowances_go_when_it_closes(self) -> None:
+        async def scenario() -> None:
+            async with running(ask_shell=True) as rig:
+                client = await rig.client(handler=FakeShell())
+                task = await task_of(client)
+                await client.end_task(task)
+                service = rig.daemon.service
+                assert service._ended_prompts  # noqa: SLF001  (the point of the test)
+
+                await client.close()
+                await until(lambda: not service._ended_prompts)  # noqa: SLF001
 
         run(scenario)
 

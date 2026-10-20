@@ -791,9 +791,9 @@ class TestThePicker:
 
         with patch.object(shell.window, "is_active", return_value=True):
             shell.window.notify("is-active")  # back from the dialog ...
-        shell.picker.finish("/home/u/Documents")  # ... and then its answer
 
-        assert controller.armed() or answers.given
+        assert controller.armed()  # coming back from the dialog did not disarm the prompt
+        shell.picker.finish("/home/u/Documents")
         assert answers.given == [
             (card.prompt, AllowDecision(kind="allow", scope="once", picked="/home/u/Documents"))
         ]

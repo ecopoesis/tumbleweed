@@ -79,7 +79,10 @@ class BrokerConfig:
     - `fs_timeout`: how long a decision-time or run-time file system call may take, one that
       reads or walks paths. `delete_timeout`: the same for deleting a workspace.
     - `prompt_timeout`: how long a prompt may wait for the user, at most `MAX_PROMPT_TIMEOUT`; a
-      timeout is a denial.
+      timeout is a denial. It and `fs_timeout` are limited together: a grant request spends the
+      prompt and three file system calls (`FS_CALLS_PER_PROMPT`), and those and `PROMPT_SLACK` must
+      fit in `PROMPT_WAIT` (150 s), which is what a caller waits. With the default `prompt_timeout`
+      that leaves `fs_timeout` at most about 8.3 s; a shorter prompt leaves more.
     - `prompts_per_window`, `prompt_window`: how many prompts a task may cause in that long (I5:
       5 in 10 minutes); the rest are denied without asking, and the model is told why. A task that
       replaces another has what is left of the allowance of the one it replaces.

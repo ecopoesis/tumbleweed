@@ -227,7 +227,7 @@ from tumbleweed.tools import (
 _log = logging.getLogger(__name__)
 
 MAX_GRANTS_PER_TASK: Final = 64
-_MAX_ENDED_ALLOWANCES: Final = 1024
+_MAX_ENDED_PER_OWNER: Final = 256
 _DENIAL_MESSAGES: Final = {
     "rate_limited": "too many permission requests for this task; wait a while before asking again",
     "rate_limited_connection": "too many permission requests in all; wait a while before asking",
@@ -466,9 +466,11 @@ class BrokerService:
         self._config = config
         self._monotonic = monotonic
         self._owner_prompts: dict[Owner, _Budget] = {}  # one connection's ceiling over its tasks
-        # The allowances of tasks that ended, for `prompt_window`, so that ending a task and then
-        # starting one with `previous` does not start over: task -> (owner, allowance, ended).
-        self._ended_prompts: dict[TaskId, tuple[Owner, _Budget, float]] = {}
+        # The allowances of tasks that ended, for `prompt_window` and at most `_MAX_ENDED_PER_OWNER`
+        # per connection (so that one connection's churn evicts nothing of another's), so that
+        # ending a task and then starting one with `previous` does not start over:
+        # owner -> task -> (allowance, when it ended).
+        self._ended_prompts: dict[Owner, dict[TaskId, tuple[_Budget, float]]] = {}
         self._store = store
         self._tools = tools
         self._audit = audit_log
@@ -732,9 +734,9 @@ class BrokerService:
                 _log.exception("a task of a closed connection could not be ended on record")
             finally:
                 self._apply_ended(live)
-        # The connection's allowances go with it (a reconnect starts a new one: #146's follow-up).
+        # The connection's allowances go with it (a reconnect starts a new one: #147).
         self._owner_prompts.pop(owner, None)
-        self._ended_prompts = {t: k for t, k in self._ended_prompts.items() if k[0] != owner}
+        self._ended_prompts.pop(owner, None)
 
     # --- the tool store ------------------------------------------------------------------------
 
@@ -1072,24 +1074,29 @@ class BrokerService:
         return PromptAnswered(kind="prompt_answered")
 
     def _remember_allowance(self, live: _Live) -> None:
-        """Keep an ended task's allowance for `prompt_window` (at most `_MAX_ENDED_ALLOWANCES`)."""
+        """Keep an ended task's allowance for `prompt_window`, `_MAX_ENDED_PER_OWNER` per connection
+        (the oldest goes first: a lineage whose allowance was evicted starts a fresh per-task
+        allowance, still under its connection's ceiling)."""
         now = self._monotonic()
         window = self._config.prompt_window.total_seconds()
-        self._ended_prompts = {
-            task: kept for task, kept in self._ended_prompts.items() if now - kept[2] < window
+        kept = {
+            task: entry
+            for task, entry in self._ended_prompts.get(live.owner, {}).items()
+            if now - entry[1] < window
         }
-        while len(self._ended_prompts) >= _MAX_ENDED_ALLOWANCES:
-            del self._ended_prompts[next(iter(self._ended_prompts))]  # the oldest
-        self._ended_prompts[live.state.task] = (live.owner, live.prompts, now)
+        while len(kept) >= _MAX_ENDED_PER_OWNER:
+            del kept[next(iter(kept))]
+        kept[live.state.task] = (live.prompts, now)
+        self._ended_prompts[live.owner] = kept
 
     def _ended_allowance(self, owner: Owner, previous: TaskId | None) -> _Budget | None:
         """The allowance of `previous`, an ended task of `owner`'s that ended within the window."""
-        kept = None if previous is None else self._ended_prompts.get(previous)
-        if kept is None or kept[0] != owner:
+        kept = None if previous is None else self._ended_prompts.get(owner, {}).get(previous)
+        if kept is None:
             return None
-        if self._monotonic() - kept[2] >= self._config.prompt_window.total_seconds():
+        if self._monotonic() - kept[1] >= self._config.prompt_window.total_seconds():
             return None
-        return kept[1]
+        return kept[0]
 
     def _new_budget(self, limit: int) -> _Budget:
         return _Budget(limit, self._config.prompt_window)
