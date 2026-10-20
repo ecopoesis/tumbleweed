@@ -843,6 +843,26 @@ class TestTheAllowanceFollowsTheLineage:
 
         run(scenario)
 
+    def test_kept_allowances_older_than_the_window_are_dropped_when_the_next_task_ends(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            async with running(ask_shell=True) as rig:
+                client = await rig.client(handler=FakeShell())
+                old = await task_of(client)
+                await client.end_task(old)
+                service = rig.daemon.service
+                assert list(service._ended_prompts[next(iter(service._ended_prompts))]) == [old]  # noqa: SLF001
+
+                rig.clock.advance(timedelta(minutes=10, seconds=1))
+                newer = await task_of(client)
+                await client.end_task(newer)
+
+                (kept,) = service._ended_prompts.values()  # noqa: SLF001
+                assert list(kept) == [newer]  # the old one aged out: memory is bounded by time too
+
+        run(scenario)
+
     def test_a_connections_kept_allowances_go_when_it_closes(self) -> None:
         async def scenario() -> None:
             async with running(ask_shell=True) as rig:

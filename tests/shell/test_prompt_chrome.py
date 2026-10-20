@@ -332,35 +332,27 @@ class TestTheRestOfTheWindowWhilePending:
         assert shell.window.canvas.get_sensitive()
 
 
-class TestClicksThatAreNotTheUsers:
-    """The window's capture controllers tell the prompt that something is happening, so a stream
-    of clicks aimed at the place where "Allow" appears never finds it armed."""
+class TestInputsThatAreNotTheUsers:
+    """The window reports what goes down and up to the prompt's controller, which holds the arming
+    invariant (`viewmodel.prompts`, `test_prompt_arming_model`): a stream of clicks aimed at where
+    "Allow" appears never finds it armed, a press held from before ends in no click, and so on."""
 
     @staticmethod
-    def gesture(window: "Gtk.Window") -> "Gtk.GestureClick":
-        from tumbleweed.shell._gi import Gtk
+    def down(shell: PromptShell, button: int = 1) -> None:
+        from tumbleweed.shell._gi import Gdk
 
-        gestures = [
-            c
-            for c in window.observe_controllers()
-            if isinstance(c, Gtk.GestureClick)
-            and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
-        ]
-        assert len(gestures) == 1
-        return gestures[0]
+        shell.window.prompt_banner.pointer_event(Gdk.EventType.BUTTON_PRESS, button)
 
-    @classmethod
-    def down(cls, window: "Gtk.Window") -> None:
-        cls.gesture(window).emit("pressed", 1, 5.0, 5.0)
+    @staticmethod
+    def up(shell: PromptShell, button: int = 1) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        shell.window.prompt_banner.pointer_event(Gdk.EventType.BUTTON_RELEASE, button)
 
     @classmethod
-    def up(cls, window: "Gtk.Window") -> None:
-        cls.gesture(window).emit("released", 1, 5.0, 5.0)
-
-    @classmethod
-    def press(cls, window: "Gtk.Window") -> None:
-        cls.down(window)
-        cls.up(window)
+    def press(cls, shell: PromptShell, button: int = 1) -> None:
+        cls.down(shell, button)
+        cls.up(shell, button)
 
     @staticmethod
     def keys(window: "Gtk.Window") -> "list[Gtk.EventControllerKey]":
@@ -377,19 +369,45 @@ class TestClicksThatAreNotTheUsers:
         return found
 
     @classmethod
-    def key(cls, window: "Gtk.Window") -> bool:
+    def key_down(cls, window: "Gtk.Window", keycode: int = 38) -> bool:
         from tumbleweed.shell._gi import Gdk
 
         return any(
-            bool(k.emit("key-pressed", Gdk.KEY_a, 0, Gdk.ModifierType(0))) for k in cls.keys(window)
+            bool(k.emit("key-pressed", Gdk.KEY_a, keycode, Gdk.ModifierType(0)))
+            for k in cls.keys(window)
         )
 
     @classmethod
-    def key_up(cls, window: "Gtk.Window") -> None:
+    def key_up(cls, window: "Gtk.Window", keycode: int = 38) -> None:
         from tumbleweed.shell._gi import Gdk
 
         for k in cls.keys(window):
-            k.emit("key-released", Gdk.KEY_a, 0, Gdk.ModifierType(0))
+            k.emit("key-released", Gdk.KEY_a, keycode, Gdk.ModifierType(0))
+
+    def test_the_window_has_the_controllers_that_report_inputs_and_no_gesture_to_miscount_them(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """A gesture's "stopped" fires from the double-click timer during any hold of 400 ms: it
+        is not a release, so none of ours is a gesture."""
+        from tumbleweed.shell._gi import Gtk
+
+        window = build_prompt_shell().window
+        controllers = list(window.observe_controllers())
+
+        capturing = [
+            c
+            for c in controllers
+            if isinstance(c, Gtk.Gesture)
+            and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
+        ]
+        assert capturing == []  # (the window has gestures of its own, in the bubble phase)
+        legacy = [
+            c
+            for c in controllers
+            if isinstance(c, Gtk.EventControllerLegacy)
+            and c.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE
+        ]
+        assert legacy  # the prompt's, which sees every pointer event before its target does
 
     def test_a_stream_of_presses_never_arms_the_prompt_until_it_stops(
         self, build_prompt_shell: Builder
@@ -400,20 +418,22 @@ class TestClicksThatAreNotTheUsers:
         pending(shell)
         once = buttons(shell.window.prompt_banner)["Allow once"]
 
-        for _ in range(10):  # 2 s of clicks, 200 ms apart: press, then the button's click
+        for _ in range(10):  # 2 s of clicks, 200 ms apart: press, release, the button's click
             shell.timers.advance(0.2)
-            self.press(shell.window)
+            self.press(shell)
             once.emit("clicked")
         assert answers.given == []
+        assert "was ignored" in shell.window.prompt_banner.note.get_text()  # never silent
 
         shell.timers.advance(ARM_SECONDS)
-        self.press(shell.window)  # the user's own click: armed already, so it does not disarm
+        self.press(shell)  # the user's own click: armed already
         once.emit("clicked")
         assert len(answers.given) == 1
 
-    def test_a_press_held_from_before_the_prompt_took_answers_ends_in_no_click(
+    def test_a_press_held_past_400_ms_and_past_the_delay_ends_in_no_click(
         self, build_prompt_shell: Builder
     ) -> None:
+        """Nothing times a hold out: it is counted until its release event, however long."""
         shell = build_prompt_shell()
         _controller, answers = shell.own_controller()
         present(shell)
@@ -421,15 +441,38 @@ class TestClicksThatAreNotTheUsers:
         once = buttons(shell.window.prompt_banner)["Allow once"]
 
         shell.timers.advance(0.1)
-        self.down(shell.window)  # lands on the button where it has just appeared ...
+        self.down(shell)  # lands on the button where it has just appeared ...
+        pump(0.5)  # (real time: longer than GTK's double-click time)
         shell.timers.advance(0.8)  # ... and is held until the prompt takes answers
-        self.up(shell.window)
+        self.up(shell)
         once.emit("clicked")  # the release
         assert answers.given == []
 
-        self.press(shell.window)  # the user's own, deliberate press
+        self.press(shell)  # the user's own, deliberate press
         once.emit("clicked")
         assert len(answers.given) == 1
+
+    def test_enter_on_the_focused_deny_during_a_held_press_is_a_deny(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        once = buttons(shell.window.prompt_banner)["Allow once"]
+        deny = shell.window.prompt_banner.deny_button
+        assert deny is not None
+
+        shell.timers.advance(0.1)
+        self.down(shell)  # held on Allow from before the prompt was armed
+        shell.timers.advance(0.8)
+        self.key_down(shell.window, 36)  # Enter, with the focus on Deny
+        deny.emit("clicked")
+        self.key_up(shell.window, 36)
+        self.up(shell)
+        once.emit("clicked")  # (the prompt is gone: nothing answers this)
+
+        assert [d.kind for _, d in answers.given] == ["deny"]
 
     def test_a_key_during_the_hold_does_not_end_it(self, build_prompt_shell: Builder) -> None:
         shell = build_prompt_shell()
@@ -439,11 +482,11 @@ class TestClicksThatAreNotTheUsers:
         once = buttons(shell.window.prompt_banner)["Allow once"]
 
         shell.timers.advance(0.1)
-        self.down(shell.window)
+        self.down(shell)
         shell.timers.advance(0.8)
-        self.key(shell.window)  # a letter, once armed ("hold and type the word")
+        self.key_down(shell.window)  # a letter, once armed ("hold and type the word")
         self.key_up(shell.window)
-        self.up(shell.window)
+        self.up(shell)
         once.emit("clicked")
 
         assert answers.given == []
@@ -451,7 +494,7 @@ class TestClicksThatAreNotTheUsers:
     def test_a_press_that_ended_in_no_click_does_not_cost_the_next_one(
         self, build_prompt_shell: Builder
     ) -> None:
-        """Only true if the release is seen: without it the next press is "not fresh"."""
+        """Only true if the release is seen: without it the button stays "held"."""
         shell = build_prompt_shell()
         _controller, answers = shell.own_controller()
         present(shell)
@@ -459,25 +502,32 @@ class TestClicksThatAreNotTheUsers:
         once = buttons(shell.window.prompt_banner)["Allow once"]
 
         shell.timers.advance(0.1)
-        self.press(shell.window)  # on something else, released: no click on a button
+        self.press(shell)  # on something else, released: no click on a button
         shell.timers.advance(ARM_SECONDS)
-        self.press(shell.window)
+        self.press(shell)
         once.emit("clicked")
 
         assert len(answers.given) == 1
 
-    def test_a_cancelled_press_is_over_too(self, build_prompt_shell: Builder) -> None:
+    def test_a_touch_that_is_cancelled_and_a_grab_that_is_broken_are_over_too(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
         shell = build_prompt_shell()
         _controller, answers = shell.own_controller()
         present(shell)
         pending(shell)
-        once = buttons(shell.window.prompt_banner)["Allow once"]
+        banner = shell.window.prompt_banner
+        once = buttons(banner)["Allow once"]
 
         shell.timers.advance(0.1)
-        self.down(shell.window)
-        self.gesture(shell.window).emit("stopped")  # the sequence was cancelled: no release
+        banner.pointer_event(Gdk.EventType.TOUCH_BEGIN, 0)
+        banner.pointer_event(Gdk.EventType.TOUCH_CANCEL, 0)
+        self.down(shell)
+        banner.pointer_event(Gdk.EventType.GRAB_BROKEN, 0)
         shell.timers.advance(ARM_SECONDS)
-        self.press(shell.window)
+        self.press(shell)
         once.emit("clicked")
 
         assert len(answers.given) == 1
@@ -489,16 +539,14 @@ class TestClicksThatAreNotTheUsers:
         _controller, answers = shell.own_controller()
         present(shell)
         pending(shell)
-        deny = shell.window.prompt_banner.deny_button
-        assert deny is not None
+        once = buttons(shell.window.prompt_banner)["Allow once"]
 
         shell.timers.advance(0.1)
-        self.key(shell.window)
-        self.key_up(shell.window)  # (without the release the next key is "not fresh")
+        self.key_down(shell.window)
+        self.key_up(shell.window)  # (without the release the key stays "held")
         shell.timers.advance(ARM_SECONDS)
-        self.key(shell.window)
-        self.key_up(shell.window)
-        deny.emit("clicked")
+        self.key_down(shell.window, 36)
+        once.emit("clicked")  # Enter on the focused button, deliberately
 
         assert len(answers.given) == 1
 
@@ -524,6 +572,26 @@ class TestClicksThatAreNotTheUsers:
         once.emit("clicked")
         assert answers.given == []
 
+    def test_losing_the_focus_forgets_what_was_held(self, build_prompt_shell: Builder) -> None:
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        once = buttons(shell.window.prompt_banner)["Allow once"]
+        shell.timers.advance(0.1)
+        self.down(shell)  # its release goes to another window
+
+        with patch.object(shell.window, "is_active", return_value=False):
+            shell.window.notify("is-active")
+        with patch.object(shell.window, "is_active", return_value=True):
+            shell.window.notify("is-active")
+        pump(0.05)
+        shell.timers.advance(ARM_SECONDS)
+        self.press(shell)
+        once.emit("clicked")
+
+        assert len(answers.given) == 1
+
     def test_keys_start_the_delay_again_and_are_not_consumed(
         self, build_prompt_shell: Builder
     ) -> None:
@@ -536,7 +604,8 @@ class TestClicksThatAreNotTheUsers:
 
         for _ in range(6):
             shell.timers.advance(0.2)
-            assert not self.key(shell.window)  # watched, not taken: the key goes on to its target
+            assert not self.key_down(shell.window)  # watched, not taken: the key goes on
+            self.key_up(shell.window)
             deny.emit("clicked")
 
         assert answers.given == []

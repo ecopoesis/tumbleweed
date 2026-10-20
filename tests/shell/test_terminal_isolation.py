@@ -724,10 +724,11 @@ def test_push_to_talk_is_the_only_window_key_controller_outside_the_terminal_mod
     assert users == sorted([*OTHER_KEY_CONTROLLER_MODULES, PUSH_TO_TALK_MODULE])
 
 
-def test_the_prompts_key_controller_only_counts_presses_and_reads_no_key() -> None:
-    """The prompt (S18) watches the window's keys to restart its 750 ms and to know when one is
-    held; what it connects to `key-pressed` and `key-released` are lambdas that take `*_args` and
-    use none of them (no key, keycode or state is read)."""
+def test_the_prompts_key_controller_reads_only_the_hardware_code_of_a_key() -> None:
+    """The prompt (S18) tracks which keys are held (to know when none is) and so reads the hardware
+    code, as an opaque number: the lambdas connected to `key-pressed` and `key-released` take
+    `(controller, keyval, keycode, state)` and use `keycode` only. No key is read as a character,
+    and the pointer controller handles no key event at all."""
     tree = ast.parse((SOURCE / "shell/prompt_chrome.py").read_text())
     handlers = {
         str(_constant(call.args[0])): call.args[1]
@@ -742,10 +743,17 @@ def test_the_prompts_key_controller_only_counts_presses_and_reads_no_key() -> No
     assert sorted(handlers) == ["key-pressed", "key-released"]
     for handler in handlers.values():
         assert isinstance(handler, ast.Lambda)
-        assert handler.args.vararg is not None
-        assert not handler.args.args
+        assert [a.arg for a in handler.args.args] == ["_c", "_keyval", "keycode", "_state"]
         used = {n.id for n in ast.walk(handler.body) if isinstance(n, ast.Name)}
-        assert handler.args.vararg.arg not in used  # the key, the keycode and the state unread
+        assert used & {"_keyval", "_state", "_c"} == set()  # only the code is read
+
+    pointer = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name in {"_on_pointer_event", "pointer_event"}
+    )
+    names = {n.attr for n in ast.walk(pointer) if isinstance(n, ast.Attribute)}
+    assert not {name for name in names if name.startswith(("KEY_", "get_key"))}
 
 
 def test_the_push_to_talk_controller_reads_nothing_but_the_key_and_the_modifiers() -> None:
