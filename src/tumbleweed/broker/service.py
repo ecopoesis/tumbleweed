@@ -1109,12 +1109,16 @@ class BrokerService:
     ) -> ResponseBody:
         """The trusted picker: the user chooses a file or folder and the choice is the grant (S18).
 
-        Nothing can be decided before the user chooses, so the grant cap and the rate limit are the
-        only checks before the prompt; the choice is then resolved and goes through the same
-        issuance as any other grant (the deny rules, the write gate, the taint rule, the cap).
+        Nothing about the path can be decided before the user chooses, so before the prompt there
+        are only the checks that do not need it (a net-tainted task can be given no file, the grant
+        cap, the rate limit); the choice is then resolved and goes through the same issuance as any
+        other grant (the deny rules, the write gate, the taint rule, the cap).
         """
         capability = CapabilityKind.FS_READ
         live = self._owned(owner, request.task)
+        if TaintKind.NET in live.state.taint:  # whatever is picked is `fs`: do not ask in vain
+            conflict = TaintConflict(held=TaintKind.NET, wanted=TaintKind.FS)
+            return self._denied(request, capability, None, conflict.kind, describe(conflict))
         if self._held(live) >= MAX_GRANTS_PER_TASK:
             self._audit_denied(request, capability, None, "grant_cap")
             raise _Refuse("busy", "the task holds as many grants as it may")

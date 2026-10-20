@@ -1119,8 +1119,8 @@ the shell does not connect to the broker yet (S19), so `window.broker_prompts` i
 connection will be made with, and the tests connect it to a real daemon. **Not done.** #86 (which
 grant failed, revoke or ask again) is S19's and S24's; #98 (lowering an imported tool's taint) needs
 only a new subject next to `capability` and `pick` in `GrantPrompt` and an access variant on the
-wire, and is not started. A picker for a net-tainted task is refused after the user has chosen, not
-before: nothing can be decided without a path. **Consequences.** A prompt that waits behind another
+wire, and is not started. A picker for a net-tainted task is refused before the user is asked (what is
+picked is `fs`); every other check on the picked path can only be made after the user has chosen. **Consequences.** A prompt that waits behind another
 may be shown with little of its time left, and is denied by its deadline if so. The audit entry
 does not carry the `PromptId`. The picker's dialog is exempt from the guard only while it is open.
 The test of the real `Gtk.FileDialog` is the session-bus test, which opens it; every other test

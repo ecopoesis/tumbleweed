@@ -518,6 +518,24 @@ class TestThePicker:
 
         run(scenario)
 
+    def test_a_task_that_has_the_network_is_not_asked_to_pick_a_file(self) -> None:
+        async def scenario() -> None:
+            async with running(ask_shell=True) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                task = await task_of(client)
+                pending = asyncio.create_task(client.request_network(task, RunId.new(), "net"))
+                await allow(client, await shell.next_prompt(), scope="task")
+                assert (await pending).granted
+
+                outcome = await client.request_pick(task, RunId.new(), "folder", "files too")
+
+                assert not outcome.granted
+                assert len(shell.shown) == 1  # nobody was asked to choose what would be refused
+                assert rig.audit_of(GrantDecision)[-1].reason == "taint_conflict"
+
+        run(scenario)
+
     def test_a_pick_prompt_answered_without_a_choice_is_a_denial(self) -> None:
         async def scenario() -> None:
             async with running(ask_shell=True) as rig:
