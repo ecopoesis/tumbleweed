@@ -1,5 +1,132 @@
 {
   "$defs": {
+    "AllowDecision": {
+      "additionalProperties": false,
+      "description": "The user allowed it, for `scope`. `picked` is what they chose in the picker (a picker prompt\nonly: the broker refuses an answer to any other prompt that holds one).",
+      "properties": {
+        "kind": {
+          "const": "allow",
+          "title": "Kind",
+          "type": "string"
+        },
+        "picked": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Picked"
+        },
+        "scope": {
+          "enum": [
+            "once",
+            "task"
+          ],
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "scope",
+        "picked"
+      ],
+      "title": "AllowDecision",
+      "type": "object"
+    },
+    "AnswerPrompt": {
+      "additionalProperties": false,
+      "description": "The user's decision on `prompt`.",
+      "properties": {
+        "decision": {
+          "discriminator": {
+            "mapping": {
+              "allow": "#/$defs/AllowDecision",
+              "deny": "#/$defs/DenyDecision"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/AllowDecision"
+            },
+            {
+              "$ref": "#/$defs/DenyDecision"
+            }
+          ],
+          "title": "Decision"
+        },
+        "kind": {
+          "const": "answer_prompt",
+          "title": "Kind",
+          "type": "string"
+        },
+        "prompt": {
+          "pattern": "^prm_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Prompt",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "prompt",
+        "decision"
+      ],
+      "title": "AnswerPrompt",
+      "type": "object"
+    },
+    "ClosePrompt": {
+      "additionalProperties": false,
+      "description": "The prompt is over; take it down. Answered `PromptClosed` even if it is already gone.",
+      "properties": {
+        "kind": {
+          "const": "close_prompt",
+          "title": "Kind",
+          "type": "string"
+        },
+        "prompt": {
+          "pattern": "^prm_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Prompt",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "prompt"
+      ],
+      "title": "ClosePrompt",
+      "type": "object"
+    },
+    "DenyDecision": {
+      "additionalProperties": false,
+      "description": "The user did not allow it, or nobody could be asked.",
+      "properties": {
+        "kind": {
+          "const": "deny",
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "user_denied",
+            "prompt_timeout"
+          ],
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "reason"
+      ],
+      "title": "DenyDecision",
+      "type": "object"
+    },
     "DirEntry": {
       "additionalProperties": false,
       "description": "One name in a directory. A symlink is reported as one and never followed.",
@@ -508,6 +635,31 @@
       "title": "NetworkAccess",
       "type": "object"
     },
+    "PickAccess": {
+      "additionalProperties": false,
+      "description": "`fs.read` of whatever the user picks: no path is named, the user chooses a file or a folder\nin the trusted picker (S18) and the choice is the grant. A pick is a read: never a write.",
+      "properties": {
+        "choose": {
+          "enum": [
+            "file",
+            "folder"
+          ],
+          "title": "Choose",
+          "type": "string"
+        },
+        "kind": {
+          "const": "fs.pick",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "choose"
+      ],
+      "title": "PickAccess",
+      "type": "object"
+    },
     "Ping": {
       "additionalProperties": false,
       "description": "Are you there? Answered with `Pong`.",
@@ -538,6 +690,53 @@
         "kind"
       ],
       "title": "Pong",
+      "type": "object"
+    },
+    "PromptAnswered": {
+      "additionalProperties": false,
+      "description": "The broker took the answer.",
+      "properties": {
+        "kind": {
+          "const": "prompt_answered",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "PromptAnswered",
+      "type": "object"
+    },
+    "PromptClosed": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "prompt_closed",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "PromptClosed",
+      "type": "object"
+    },
+    "PromptShown": {
+      "additionalProperties": false,
+      "description": "The shell has the prompt (shown, or queued behind the one it shows).",
+      "properties": {
+        "kind": {
+          "const": "prompt_shown",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "PromptShown",
       "type": "object"
     },
     "ReadAccess": {
@@ -668,7 +867,8 @@
             "unavailable",
             "timeout",
             "failed",
-            "conflict"
+            "conflict",
+            "unknown_prompt"
           ],
           "title": "Reason",
           "type": "string"
@@ -689,6 +889,8 @@
         "body": {
           "discriminator": {
             "mapping": {
+              "answer_prompt": "#/$defs/AnswerPrompt",
+              "close_prompt": "#/$defs/ClosePrompt",
               "echo": "#/$defs/Echo",
               "end_task": "#/$defs/EndTask",
               "export_tool": "#/$defs/ExportTool",
@@ -702,6 +904,7 @@
               "request_grant": "#/$defs/RequestGrant",
               "revoke_grant": "#/$defs/RevokeGrant",
               "run_in_sandbox": "#/$defs/RunInSandbox",
+              "show_prompt": "#/$defs/ShowPrompt",
               "show_tool": "#/$defs/ShowTool",
               "start_task": "#/$defs/StartTask"
             },
@@ -752,6 +955,15 @@
             },
             {
               "$ref": "#/$defs/ImportTool"
+            },
+            {
+              "$ref": "#/$defs/AnswerPrompt"
+            },
+            {
+              "$ref": "#/$defs/ShowPrompt"
+            },
+            {
+              "$ref": "#/$defs/ClosePrompt"
             }
           ],
           "title": "Body"
@@ -777,11 +989,12 @@
     },
     "RequestGrant": {
       "additionalProperties": false,
-      "description": "Ask for `access` for `run` of `task`. The user decides, in a trusted prompt (I2).\n\n`reason` is model text: the broker bounds it and shows it as quoted, never as a fact.",
+      "description": "Ask for `access` for `run` of `task`. The user decides, in a trusted prompt or picker (I2).\n\n`reason` is model text: the broker bounds it and shows it as quoted, never as a fact.",
       "properties": {
         "access": {
           "discriminator": {
             "mapping": {
+              "fs.pick": "#/$defs/PickAccess",
               "fs.read": "#/$defs/ReadAccess",
               "fs.write": "#/$defs/WriteAccess",
               "net.full": "#/$defs/NetworkAccess"
@@ -797,6 +1010,9 @@
             },
             {
               "$ref": "#/$defs/NetworkAccess"
+            },
+            {
+              "$ref": "#/$defs/PickAccess"
             }
           ],
           "title": "Access"
@@ -844,6 +1060,9 @@
               "file_content": "#/$defs/FileContent",
               "grant_outcome": "#/$defs/GrantOutcome",
               "pong": "#/$defs/Pong",
+              "prompt_answered": "#/$defs/PromptAnswered",
+              "prompt_closed": "#/$defs/PromptClosed",
+              "prompt_shown": "#/$defs/PromptShown",
               "refused": "#/$defs/Refused",
               "revoked": "#/$defs/Revoked",
               "run_result": "#/$defs/RunResult",
@@ -895,6 +1114,15 @@
             },
             {
               "$ref": "#/$defs/ToolImported"
+            },
+            {
+              "$ref": "#/$defs/PromptShown"
+            },
+            {
+              "$ref": "#/$defs/PromptClosed"
+            },
+            {
+              "$ref": "#/$defs/PromptAnswered"
             },
             {
               "$ref": "#/$defs/Refused"
@@ -1127,6 +1355,101 @@
         "mounted_grants"
       ],
       "title": "RunResult",
+      "type": "object"
+    },
+    "ShowPrompt": {
+      "additionalProperties": false,
+      "description": "Ask the user. `scopes` are the grant scopes the user may choose from, `expires_in_ms` how\nlong the broker will wait, from now: the shell denies when it has passed.",
+      "properties": {
+        "access": {
+          "discriminator": {
+            "mapping": {
+              "fs.pick": "#/$defs/PickAccess",
+              "fs.read": "#/$defs/ReadAccess",
+              "fs.write": "#/$defs/WriteAccess",
+              "net.full": "#/$defs/NetworkAccess"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ReadAccess"
+            },
+            {
+              "$ref": "#/$defs/WriteAccess"
+            },
+            {
+              "$ref": "#/$defs/NetworkAccess"
+            },
+            {
+              "$ref": "#/$defs/PickAccess"
+            }
+          ],
+          "title": "Access"
+        },
+        "expires_in_ms": {
+          "maximum": 3600000,
+          "minimum": 1,
+          "title": "Expires In Ms",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "show_prompt",
+          "title": "Kind",
+          "type": "string"
+        },
+        "prompt": {
+          "pattern": "^prm_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Prompt",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 500,
+          "title": "Reason",
+          "type": "string"
+        },
+        "scopes": {
+          "items": {
+            "enum": [
+              "once",
+              "task"
+            ],
+            "type": "string"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "title": "Scopes",
+          "type": "array"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "pattern": "^tool_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool"
+        }
+      },
+      "required": [
+        "kind",
+        "prompt",
+        "task",
+        "tool",
+        "access",
+        "scopes",
+        "reason",
+        "expires_in_ms"
+      ],
+      "title": "ShowPrompt",
       "type": "object"
     },
     "ShowTool": {

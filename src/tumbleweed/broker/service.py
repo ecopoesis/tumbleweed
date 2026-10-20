@@ -48,12 +48,13 @@ import dataclasses
 import itertools
 import logging
 import os
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
-from typing import Final, Literal, NewType, Protocol, assert_never, final
+from typing import Final, Literal, Protocol, assert_never, final
 
 from tumbleweed.broker.audit import (
     MAX_AUDITED_IDS,
@@ -102,6 +103,7 @@ from tumbleweed.broker.fsworker import FsWorker
 from tumbleweed.broker.grants import (
     Grant,
     GrantOrigin,
+    GrantScope,
     OnceGrant,
     RunContext,
     RunTrigger,
@@ -109,6 +111,7 @@ from tumbleweed.broker.grants import (
     ToolGrant,
 )
 from tumbleweed.broker.identity import FsIdentity
+from tumbleweed.broker.owner import Owner
 from tumbleweed.broker.paths import ResolvedPath, StoredPath
 from tumbleweed.broker.policy import (
     AccessRequest,
@@ -150,6 +153,7 @@ from tumbleweed.ipc.broker_messages import (
     ListDir,
     ListWorkspace,
     NetworkAccess,
+    PickAccess,
     ReadAccess,
     ReadFile,
     ReadWorkspaceFile,
@@ -169,6 +173,14 @@ from tumbleweed.ipc.broker_messages import (
 from tumbleweed.ipc.broker_messages import TaskEnded as TaskEndedReply
 from tumbleweed.ipc.errors import ErrorCode, RequestRefused
 from tumbleweed.ipc.messages import Echo, Ping, RequestBody, ResponseBody
+from tumbleweed.ipc.prompt_messages import (
+    AllowDecision,
+    AnswerPrompt,
+    ClosePrompt,
+    DenyDecision,
+    PromptAnswered,
+    ShowPrompt,
+)
 from tumbleweed.ipc.tool_messages import (
     ExportTool,
     ImportTool,
@@ -213,10 +225,13 @@ from tumbleweed.tools import (
 
 _log = logging.getLogger(__name__)
 
-Owner = NewType("Owner", int)
-"""One IPC connection, as far as the service is concerned: the daemon makes one per connection."""
-
 MAX_GRANTS_PER_TASK: Final = 64
+_DENIAL_MESSAGES: Final = {
+    "rate_limited": "too many permission requests for this task; wait a while before asking again",
+    "prompt_timeout": "the user did not answer in time",
+    "no_prompt_ui": "there is nobody to ask here",
+}
+_DENIED_BY_USER: Final = "the user did not allow it"
 _PROBE_WAIT: Final = timedelta(seconds=15)
 _SWEEP_BATCH: Final = 100
 _UNAVAILABLE_AUDIT: Final = "the audit log is unavailable, so nothing is done"
@@ -230,6 +245,12 @@ class Sandbox(Protocol):
     async def limits_plan(self) -> LimitsPlan: ...
 
     async def aclose(self) -> None: ...
+
+
+def _denial_message(reason: str) -> str:
+    """What the model is told when a request is denied: fixed text for the reasons that are ours
+    (never the user's words, never a path)."""
+    return _DENIAL_MESSAGES.get(reason, _DENIED_BY_USER)
 
 
 class _Refuse(Exception):  # noqa: N818  (it is an answer, not a failure)
@@ -253,6 +274,7 @@ class _Live:
     runs: set[RunId] = field(default_factory=set)
     pending_runs: set[RunId] = field(default_factory=set)  # reserved, not yet authorised
     running: set["asyncio.Future[ResponseBody]"] = field(default_factory=set)
+    prompted: deque[datetime] = field(default_factory=deque)  # when each prompt was asked
 
 
 @dataclass(slots=True)
@@ -656,7 +678,9 @@ class BrokerService:
                 return self._export_tool(request)
             case ImportTool():
                 return self._import_tool(request)
-            case Ping() | Echo():
+            case AnswerPrompt():
+                return self._answer_prompt(owner, request)
+            case ShowPrompt() | ClosePrompt() | Ping() | Echo():
                 raise RequestRefused(ErrorCode.UNSUPPORTED_REQUEST, "not a broker request")
             case _:
                 assert_never(request)
@@ -986,9 +1010,38 @@ class BrokerService:
         rules: DenyRules = await self._fs.call(partial(DenyRules.build, self._deny))
         return rules
 
+    def _answer_prompt(self, owner: Owner, request: AnswerPrompt) -> ResponseBody:
+        """Hand the user's answer to the prompt interface, which takes it only from the connection
+        the prompt was sent to, and only once (I5): any other is `unknown_prompt`."""
+        decision = request.decision
+        answer: PromptAnswer
+        match decision:
+            case AllowDecision():
+                answer = Allowed(scope=GrantScope(decision.scope), picked=decision.picked)
+            case DenyDecision():
+                answer = Denied(reason=decision.reason)
+            case _:
+                assert_never(decision)
+        if not self._prompts.answer(owner, request.prompt, answer):
+            raise _Refuse("unknown_prompt", "no such prompt")
+        return PromptAnswered(kind="prompt_answered")
+
+    def _rate_limited(self, live: _Live) -> bool:
+        """Whether the task has used up its prompts for now (I5: 5 in 10 minutes, by default): the
+        rest are denied without asking, and the model is told why. A task that asks for permission
+        over and over is the user's attention under attack, or a loop. Does not count this one."""
+        now = self._now()
+        recent = live.prompted
+        while recent and now - recent[0] >= self._config.prompt_window:
+            recent.popleft()
+        return len(recent) >= self._config.prompts_per_window
+
     async def _request_grant(self, owner: Owner, request: RequestGrant) -> ResponseBody:
         self._owned(owner, request.task)
-        capability, resolved = await self._access_target(request)
+        access = request.access
+        if isinstance(access, PickAccess):
+            return await self._request_pick(owner, request, access)
+        capability, resolved = await self._access_target(access)
         rules = await self._rules()
         context = RunContext(run=request.run, trigger=RunTrigger.MODEL, tool=None)
         asked = AccessRequest(task=request.task, run=context, capability=capability, path=resolved)
@@ -1032,16 +1085,69 @@ class BrokerService:
         if self._held(live) >= MAX_GRANTS_PER_TASK:  # before asking: nobody is asked in vain
             self._audit_denied(request, capability, path_text, "grant_cap")
             raise _Refuse("busy", "the task holds as many grants as it may")
-        answer = await self._ask(prompt)
+        if self._rate_limited(live):
+            return self._denied(
+                request, capability, path_text, "rate_limited", _DENIAL_MESSAGES["rate_limited"]
+            )
+        live.prompted.append(self._now())
+        answer = await self._ask(prompt, owner)
         if isinstance(answer, Denied):
             return self._denied(
-                request, capability, path_text, answer.reason, "the user did not allow it"
+                request, capability, path_text, answer.reason, _denial_message(answer.reason)
             )
         try:
-            return await self._issue_after_prompt(owner, request, asked, answer, path_text)
+            return await self._issue_after_prompt(
+                owner, request, asked, answer, path_text, GrantOrigin.PROMPT
+            )
         except (_Refuse, PathError, FsTimeoutError, InvalidValueError) as error:
             # Whoever asked is told why, and the log says that the user's yes was not acted on.
             self._audit_denied(request, capability, path_text, _why(error))
+            raise
+
+    async def _request_pick(
+        self, owner: Owner, request: RequestGrant, access: PickAccess
+    ) -> ResponseBody:
+        """The trusted picker: the user chooses a file or folder and the choice is the grant (S18).
+
+        Nothing can be decided before the user chooses, so the grant cap and the rate limit are the
+        only checks before the prompt; the choice is then resolved and goes through the same
+        issuance as any other grant (the deny rules, the write gate, the taint rule, the cap).
+        """
+        capability = CapabilityKind.FS_READ
+        live = self._owned(owner, request.task)
+        if self._held(live) >= MAX_GRANTS_PER_TASK:
+            self._audit_denied(request, capability, None, "grant_cap")
+            raise _Refuse("busy", "the task holds as many grants as it may")
+        if self._rate_limited(live):
+            return self._denied(
+                request, capability, None, "rate_limited", _DENIAL_MESSAGES["rate_limited"]
+            )
+        live.prompted.append(self._now())
+        prompt = GrantPrompt(
+            task=request.task,
+            run=request.run,
+            pick=access.choose,
+            scopes=frozenset({GrantScope.ONCE, GrantScope.TASK}),
+            reason=request.reason,
+        )
+        answer = await self._ask(prompt, owner)
+        if isinstance(answer, Denied):
+            return self._denied(
+                request, capability, None, answer.reason, _denial_message(answer.reason)
+            )
+        if answer.picked is None:  # a picker prompt is answered with a choice, or denied
+            return self._denied(request, capability, None, "prompt_failed", _DENIED_BY_USER)
+        try:
+            resolved = await self._resolve(answer.picked)
+            context = RunContext(run=request.run, trigger=RunTrigger.MODEL, tool=None)
+            asked = AccessRequest(
+                task=request.task, run=context, capability=capability, path=resolved
+            )
+            return await self._issue_after_prompt(
+                owner, request, asked, answer, resolved.text, GrantOrigin.PICKER
+            )
+        except (_Refuse, PathError, FsTimeoutError, InvalidValueError) as error:
+            self._audit_denied(request, capability, None, _why(error))
             raise
 
     async def _issue_after_prompt(
@@ -1051,6 +1157,7 @@ class BrokerService:
         asked: AccessRequest,
         answer: Allowed,
         path_text: str | None,
+        origin: GrantOrigin,
     ) -> ResponseBody:
         capability = asked.capability
         rules = await self._rules()  # rebuilt at issuance (S16): the list may have grown
@@ -1061,7 +1168,7 @@ class BrokerService:
             live.state,
             asked,
             scope=answer.scope,
-            origin=GrantOrigin.PROMPT,
+            origin=origin,
             grant_id=GrantId.new(),
             rules=rules,
             now=self._now(),
@@ -1101,9 +1208,9 @@ class BrokerService:
                 assert_never(issuance)
 
     async def _access_target(
-        self, request: RequestGrant
+        self, access: ReadAccess | WriteAccess | NetworkAccess
     ) -> tuple[CapabilityKind, ResolvedPath | None]:
-        match request.access:
+        match access:
             case ReadAccess(path=text):
                 return CapabilityKind.FS_READ, await self._resolve(text)
             case WriteAccess(path=text):
@@ -1113,14 +1220,14 @@ class BrokerService:
             case _ as unreachable:
                 assert_never(unreachable)
 
-    async def _ask(self, prompt: GrantPrompt) -> PromptAnswer:
+    async def _ask(self, prompt: GrantPrompt, owner: Owner) -> PromptAnswer:
         """The user's answer, or a denial: a timeout, a failure or an answer that is not allowed
         by what was offered all deny."""
         limit = asyncio.timeout(self._config.prompt_timeout.total_seconds())
         answer: object
         try:
             async with limit:
-                answer = await self._prompts.ask(prompt)
+                answer = await self._prompts.ask(prompt, owner)
         except TimeoutError:
             if limit.expired():
                 return Denied(reason="prompt_timeout")
@@ -1132,6 +1239,10 @@ class BrokerService:
         if isinstance(answer, Allowed):
             if answer.scope not in prompt.scopes:
                 return Denied(reason="scope_not_offered")
+            if (answer.picked is None) != (prompt.pick is None):
+                # A choice answers the picker and nothing else: the user did not choose a path for
+                # a prompt that named one, and a picker is not answered without a choice.
+                return Denied(reason="prompt_failed")
             return answer
         if isinstance(answer, Denied):
             return answer

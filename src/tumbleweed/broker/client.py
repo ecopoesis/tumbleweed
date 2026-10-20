@@ -22,7 +22,7 @@ import sys
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import timedelta
 from types import TracebackType
-from typing import Final, Self, final
+from typing import Final, Literal, Self, final
 
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId
@@ -36,6 +36,7 @@ from tumbleweed.ipc.broker_messages import (
     ListDir,
     ListWorkspace,
     NetworkAccess,
+    PickAccess,
     ReadAccess,
     ReadFile,
     ReadWorkspaceFile,
@@ -53,7 +54,7 @@ from tumbleweed.ipc.broker_messages import (
     WriteAccess,
 )
 from tumbleweed.ipc.client import connect
-from tumbleweed.ipc.connection import Connection
+from tumbleweed.ipc.connection import Connection, RequestHandler
 from tumbleweed.ipc.errors import (
     ConnectionClosedError,
     IpcConnectError,
@@ -61,7 +62,7 @@ from tumbleweed.ipc.errors import (
     UnexpectedResponseError,
 )
 from tumbleweed.ipc.limits import IpcLimits
-from tumbleweed.ipc.messages import Ping, Pong, RequestBody, Response
+from tumbleweed.ipc.messages import Ping, Pong, RequestBody, Response, Role
 from tumbleweed.ipc.peercred import PeerCredentialsProvider
 from tumbleweed.ipc.sockdir import SocketPath
 from tumbleweed.ipc.tool_messages import (
@@ -80,8 +81,9 @@ _log = logging.getLogger(__name__)
 HEARTBEAT: Final = timedelta(seconds=30)
 """How often a quiet connection is pinged. The broker's idle timeout is three times this."""
 _PING_TIMEOUT: Final = timedelta(seconds=10)
-_PROMPT_WAIT: Final = timedelta(seconds=90)
-"""How long `request_grant` waits: the broker's prompt timeout (60 s) and some margin."""
+_PROMPT_WAIT: Final = timedelta(seconds=150)
+"""How long `request_grant` waits: the broker's prompt timeout (120 s) and some margin, so that a
+user who takes their time is not denied by the transport (#60)."""
 _RUN_SETUP: Final = timedelta(seconds=60)
 
 
@@ -113,9 +115,17 @@ class BrokerClient:
         limits: IpcLimits | None = None,
         credentials: PeerCredentialsProvider | None = None,
         heartbeat: timedelta = HEARTBEAT,
+        handler: RequestHandler | None = None,
     ) -> Self:
-        """Connect to the broker's socket (same-uid check and handshake included)."""
-        connection = await connect(path, limits=limits, credentials=credentials)
+        """Connect to the broker's socket (same-uid check and handshake included).
+
+        `handler` answers what the broker asks the shell (`ShowPrompt`, `ClosePrompt`, S18); a
+        client without one, like `tumbleweed-tools`, serves nothing and the broker denies a prompt
+        for its tasks.
+        """
+        connection = await connect(
+            path, handler, limits=limits, credentials=credentials, role=Role.SHELL
+        )
         return cls(connection, heartbeat=heartbeat)
 
     @property
@@ -202,6 +212,14 @@ class BrokerClient:
 
     async def request_write(self, task: TaskId, run: RunId, path: str, reason: str) -> GrantOutcome:
         return await self.request_grant(task, run, WriteAccess(kind="fs.write", path=path), reason)
+
+    async def request_pick(
+        self, task: TaskId, run: RunId, choose: Literal["file", "folder"], reason: str
+    ) -> GrantOutcome:
+        """Ask the user to choose a file or folder in the picker; the choice is the grant."""
+        return await self.request_grant(
+            task, run, PickAccess(kind="fs.pick", choose=choose), reason
+        )
 
     async def request_network(self, task: TaskId, run: RunId, reason: str) -> GrantOutcome:
         return await self.request_grant(task, run, NetworkAccess(kind="net.full"), reason)
@@ -341,6 +359,7 @@ class BrokerConnector:
         spawn: Spawn | None = None,
         limits: IpcLimits | None = None,
         credentials: PeerCredentialsProvider | None = None,
+        handler: RequestHandler | None = None,
         first_delay: timedelta = timedelta(milliseconds=100),
         max_delay: timedelta = timedelta(seconds=5),
         give_up: timedelta = timedelta(seconds=30),
@@ -349,6 +368,7 @@ class BrokerConnector:
         self._spawn = spawn
         self._limits = limits
         self._credentials = credentials
+        self._handler = handler
         self._first_delay = first_delay
         self._max_delay = max_delay
         self._give_up = give_up
@@ -362,7 +382,10 @@ class BrokerConnector:
         while True:
             try:
                 return await BrokerClient.connect(
-                    self._path, limits=self._limits, credentials=self._credentials
+                    self._path,
+                    limits=self._limits,
+                    credentials=self._credentials,
+                    handler=self._handler,
                 )
             except IpcConnectError:
                 if loop.time() + delay >= deadline:
