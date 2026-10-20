@@ -26,7 +26,8 @@ from tumbleweed.ui.gtk.text import TextBlock
 from tumbleweed.ui.images import ImageResolver
 from tumbleweed.ui.runtime import Change, Dispatch, UiEvent, UiRuntime, Value
 from tumbleweed.ui.spec.components import Component
-from tumbleweed.ui.spec.names import StateKey
+from tumbleweed.ui.spec.handlers import SandboxHandler
+from tumbleweed.ui.spec.names import HandlerName, StateKey
 from tumbleweed.ui.spec.state import StateValue
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ class BuildContext:
         self.images = images
         self.decoder = decoder
         self.decls = runtime.spec.declarations()
+        self._handlers = runtime.spec.handlers_by_name()
         self.build_child = build_child
         self._bindings: list[_Binding] = []
         self._by_key: dict[StateKey, list[_Binding]] = {}
@@ -239,13 +241,26 @@ class BuildContext:
         """The user edited a widget. Ignored while the runtime is the one changing it."""
         if self.updating:
             return None
+        if event is not None and self.is_unavailable(event):
+            event = None  # the value is still the user's to edit; the handler is not to fire
         return self._guarded(lambda: self.runtime.user_input(key, value, event=event))
 
     def user_event(self, event: UiEvent) -> Dispatch | None:
         """The user clicked or pressed Enter."""
         if self.updating:
             return None
+        if self.is_unavailable(event):
+            return Dispatch.NO_SINK
         return self._guarded(lambda: self.runtime.user_event(event))
+
+    def is_unavailable(self, event: UiEvent) -> bool:
+        """Whether `event` names a `sandbox` handler while none can run (until S20): it does
+        not fire, whatever reaches the widget (the control is disabled as well)."""
+        return not self.runtime.sandbox_connected and self.names_sandbox_handler(event.handler)
+
+    def names_sandbox_handler(self, name: HandlerName | None) -> bool:
+        """Whether `name` is a `sandbox` handler of this spec."""
+        return name is not None and isinstance(self._handlers.get(name), SandboxHandler)
 
     @staticmethod
     def _guarded(action: Callable[[], Dispatch]) -> Dispatch:

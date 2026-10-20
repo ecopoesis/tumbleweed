@@ -73,6 +73,7 @@ from tumbleweed.ui.spec.values import ImageRef, Table
 
 WARNING_CLASS = "warning"
 WARNING_ICON = "dialog-warning-symbolic"
+SANDBOX_UNAVAILABLE = "This control runs code in a sandbox, which is not available yet."
 TITLE_WIDTH_CHARS = 32  # a tab's title is this wide at most, then an ellipsis
 
 
@@ -540,8 +541,65 @@ def _dropdown(component: Dropdown, ctx: BuildContext) -> Gtk.Widget:
     return choices
 
 
+def _handlers_of(component: Component) -> tuple[HandlerName | None, ...]:
+    """The handlers a component names, whichever event."""
+    match component:
+        case Button():
+            return (component.on_click,)
+        case Entry():
+            return (component.on_change, component.on_activate)
+        case Switch() | Check() | Slider() | Spin() | Dropdown() | TextView():
+            return (component.on_change,)
+        case (
+            Box()
+            | Grid()
+            | Label()
+            | Heading()
+            | Progress()
+            | Separator()
+            | Image()
+            | TableView()
+            | Tabs()
+            | Expander()
+        ):
+            return ()
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def _disabled_with_reason(widget: Gtk.Widget) -> Gtk.Widget:
+    """`widget` insensitive, in a box with the reason in plain text under it, in the tool itself.
+
+    Never a tooltip (D14: a tooltip is a surface of its own, #53). This is the explanation, not the
+    guard: `BuildContext` withholds a sandbox handler's events whatever reaches the widget. The box
+    takes over the control's expansion and alignment, so the layout stays as the spec made it.
+    """
+    widget.set_sensitive(False)
+    column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    column.set_hexpand(widget.get_hexpand())
+    column.set_vexpand(widget.get_vexpand())
+    column.set_halign(widget.get_halign())
+    column.set_valign(widget.get_valign())
+    column.append(widget)
+    column.append(line_label(SANDBOX_UNAVAILABLE, css_classes=["dim-label", "caption"]))
+    return column
+
+
 def build_widget(component: Component, path: str, ctx: BuildContext) -> Gtk.Widget:
-    """The widget for `component`, which stands at `path` in the spec (`root.children[1]`)."""
+    """The widget for `component`, which stands at `path` in the spec (`root.children[1]`).
+
+    A control whose handler is a `sandbox` one is built disabled, with an explanation under it,
+    until a sandbox can run (S20): `widget_at(path)` of such a control is the box holding both.
+    """
+    widget = _build_widget(component, path, ctx)
+    if not ctx.runtime.sandbox_connected and any(
+        ctx.names_sandbox_handler(name) for name in _handlers_of(component)
+    ):
+        return _disabled_with_reason(widget)
+    return widget
+
+
+def _build_widget(component: Component, path: str, ctx: BuildContext) -> Gtk.Widget:
     match component:
         case Box():
             return _box(component, path, ctx)

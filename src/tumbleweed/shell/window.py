@@ -18,11 +18,15 @@ canvas in a plain vertical box, so the canvas cannot overlap it (I5, see `chrome
 from collections.abc import Callable
 from typing import final
 
+from tumbleweed.agent.canvas import CanvasLink
+from tumbleweed.agent.canvas_events import EventGate
 from tumbleweed.agent.responder import Responder
 from tumbleweed.shell._gi import Adw, Gio, Gtk
 from tumbleweed.shell.canvas import CanvasView
+from tumbleweed.shell.canvas_tools import CanvasTools
 from tumbleweed.shell.chat_panel import ChatPanel
 from tumbleweed.shell.chrome import ChromeRegion
+from tumbleweed.shell.dispatch import GlibScheduler
 from tumbleweed.shell.speech_feed import SpeechFeed
 from tumbleweed.shell.status_strip import StatusStrip
 from tumbleweed.shell.terminal_pane import TerminalPane, default_settings
@@ -50,9 +54,11 @@ class ShellWindow(Adw.ApplicationWindow):
         open_history: HistoryOpener | None = None,
         voice: VoiceSetup | None = None,
         terminal: TerminalSettings | None = None,
+        canvas_link: CanvasLink | None = None,
     ) -> None:
         super().__init__(application=application)
         self._closing = False
+        self._canvas_link = canvas_link
         self.set_title(WINDOW_TITLE)
         self.set_default_size(*DEFAULT_SIZE)
 
@@ -63,6 +69,14 @@ class ShellWindow(Adw.ApplicationWindow):
         self.session.start()
         self.chrome = ChromeRegion()
         self.canvas = CanvasView()
+        # What the model shows on the canvas (S12): `show_ui` and `patch_state` reach it through the
+        # link, and a user's action on an `agent` handler comes back through the gate, which
+        # decides when it becomes a turn.
+        self.event_gate = EventGate(self.controller, GlibScheduler())
+        self.controller.add_idle_listener(self.event_gate.turn_ended)
+        self.canvas_tools = CanvasTools(self.canvas, self.event_gate)
+        if canvas_link is not None:
+            canvas_link.attach(self.canvas_tools)
         self.chat_panel = ChatPanel(self.controller, self.transcript, self.session)
         self.chat_panel.set_size_request(SIDE_PANEL_WIDTH, -1)
         self.status_strip = StatusStrip()
@@ -215,20 +229,26 @@ class ShellWindow(Adw.ApplicationWindow):
         calls this: the `close-request` handler does, and so does the application when it quits.
         """
         self._closing = True
+        if self._canvas_link is not None:
+            self._canvas_link.detach()
         try:
-            if self._speech_feed is not None:
-                self.transcript.unsubscribe(self._speech_feed)
-            if self.voice_controls is not None:
-                self.transcript.unsubscribe(self.voice_controls.reply_watch)
-                self.voice_controls.shutdown()
+            self.event_gate.close()
+            self.canvas_tools.close()
         finally:
             try:
-                self.chat_panel.shutdown()
+                if self._speech_feed is not None:
+                    self.transcript.unsubscribe(self._speech_feed)
+                if self.voice_controls is not None:
+                    self.transcript.unsubscribe(self.voice_controls.reply_watch)
+                    self.voice_controls.shutdown()
             finally:
                 try:
-                    self.terminal_pane.shutdown()
+                    self.chat_panel.shutdown()
                 finally:
-                    self.session.close()
+                    try:
+                        self.terminal_pane.shutdown()
+                    finally:
+                        self.session.close()
 
     def _on_close_request(self, _window: Gtk.Window) -> bool:
         self.shutdown()

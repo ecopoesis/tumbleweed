@@ -17,6 +17,7 @@ from tumbleweed.agent.anthropic_provider import (
     build_client,
     response_byte_limit,
 )
+from tumbleweed.agent.canvas import CanvasLink, register_canvas_tools
 from tumbleweed.agent.config import (
     SECRET_ENV_VARIABLES,
     AgentConfig,
@@ -28,7 +29,11 @@ from tumbleweed.agent.config import (
 )
 from tumbleweed.agent.echo import EchoResponder
 from tumbleweed.agent.errors import AgentError, describe_unexpected
-from tumbleweed.agent.prompts import SYSTEM_PROMPT_VERSION, load_system_prompt
+from tumbleweed.agent.prompts import (
+    SYSTEM_PROMPT_VERSION,
+    load_system_prompt,
+    system_prompt_label,
+)
 from tumbleweed.agent.recorder import InvocationRecorder, JsonlInvocationLog
 from tumbleweed.agent.responder import Responder
 from tumbleweed.agent.runtime import AgentResponder, MainThreadDispatcher, UnavailableResponder
@@ -41,10 +46,12 @@ logger = logging.getLogger(__name__)
 @final
 @dataclass(frozen=True)
 class AgentSetup:
-    """The responder to give the shell, and what to call when the shell quits."""
+    """The responder to give the shell, what to call when the shell quits, and the link the
+    window attaches its canvas to (None when the responder has no canvas tools)."""
 
     responder: Responder
     close: Callable[[], None]
+    canvas: CanvasLink | None = None
 
 
 def _nothing() -> None:
@@ -80,13 +87,16 @@ def _build_anthropic(
         )
         recorder = InvocationRecorder(
             JsonlInvocationLog(shell_data_dir(environ) / "invocations.jsonl"),
-            prompt_version=SYSTEM_PROMPT_VERSION,
+            prompt_version=system_prompt_label(),
         )
         model = config.model_for(ModelRole.CHAT)
+        registry = ToolRegistry()
+        canvas = CanvasLink(dispatcher)
+        register_canvas_tools(registry, canvas)
         responder = AgentResponder(
             provider=AnthropicProvider(client, effort=config.effort),
             recorder=recorder,
-            registry=ToolRegistry(),
+            registry=registry,
             model=model,
             system_prompt=load_system_prompt(),
             limits=config.limits,
@@ -105,4 +115,4 @@ def _build_anthropic(
             _nothing,
         )
     logger.info("responder: %s (prompt %s)", model, SYSTEM_PROMPT_VERSION)
-    return AgentSetup(responder, responder.close)
+    return AgentSetup(responder, responder.close, canvas)

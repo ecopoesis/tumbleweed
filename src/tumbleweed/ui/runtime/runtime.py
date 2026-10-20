@@ -59,6 +59,12 @@ class UiRuntime:
     def spec(self) -> UiSpec:
         return self.store.spec
 
+    @property
+    def sandbox_connected(self) -> bool:
+        """Whether a `sandbox` handler has anywhere to go (S20); the renderer disables the
+        controls of those handlers while it has not."""
+        return self._sandbox is not None
+
     def user_input(self, key: StateKey, value: Value, *, event: UiEvent | None = None) -> Dispatch:
         """The user edited the widget bound to `key`: write `value`, then fire `event`'s handler.
 

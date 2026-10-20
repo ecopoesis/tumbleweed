@@ -31,6 +31,7 @@ from typing import Annotated, Literal, Protocol, final
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from tumbleweed.agent.canvas_events import CanvasTurn
 from tumbleweed.agent.limits import MAX_REPLY_BYTES, MAX_USER_TEXT_BYTES
 from tumbleweed.core.ids import MessageId, SessionId
 
@@ -63,6 +64,9 @@ class ReplyRequest(BaseModel):
     history: tuple[ContextTurn, ...] = Field(default=(), max_length=MAX_CONTEXT_TURNS)
     session_id: SessionId | None = None
     """The chat session this belongs to, if the shell keeps one; recorded with every model call."""
+    canvas_turn: CanvasTurn | None = None
+    """Set when the turn is a user's action on a canvas tool, not something the user typed: then
+    `text` is the line the chat shows, and the model is sent the event framed as data (S12)."""
 
 
 @final

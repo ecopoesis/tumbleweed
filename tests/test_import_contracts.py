@@ -108,6 +108,12 @@ VIOLATIONS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
         "agent never imports gi",
         (),
     ),
+    "the agent imports the GTK adapter": (
+        "agent/canvas.py",
+        "import tumbleweed.ui.gtk.render",
+        "agent never imports the GTK adapter",
+        (),
+    ),
     "the agent imports the shell": (
         "agent/echo.py",
         "import tumbleweed.shell.viewmodel.transcript",

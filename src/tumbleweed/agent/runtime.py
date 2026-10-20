@@ -33,6 +33,7 @@ import threading
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Final, Protocol, final
 
+from tumbleweed.agent.canvas_events import frame_turn
 from tumbleweed.agent.context import fit_history, history_budget
 from tumbleweed.agent.errors import AgentBusyError, AgentError, LimitError, describe_unexpected
 from tumbleweed.agent.limits import MAX_USER_TEXT_BYTES, AgentLimits
@@ -191,7 +192,10 @@ class AgentResponder:
             raise AgentBusyError("The agent has shut down.")
         if self._active is not None:
             raise AgentBusyError("A reply is already in progress.")
-        if len(request.text.encode("utf-8", errors="replace")) > MAX_USER_TEXT_BYTES:
+        # An event of a canvas tool is sent to the model as data in a frame of ours; what the user
+        # typed is sent as it is.
+        text = request.text if request.canvas_turn is None else frame_turn(request.canvas_turn)
+        if len(text.encode("utf-8", errors="replace")) > MAX_USER_TEXT_BYTES:
             raise LimitError(f"The message is larger than {MAX_USER_TEXT_BYTES // 1024} KiB.")
         self._worker.ensure_started()
         run = _Run(sink)
@@ -200,7 +204,7 @@ class AgentResponder:
             history = fit_history(
                 self._system_prompt,
                 request.history,
-                request.text,
+                text,
                 budget=history_budget(self._limits.max_turn_output_tokens),
             )
             loop = AgentLoop(
@@ -212,7 +216,7 @@ class AgentResponder:
                 system_prompt=self._system_prompt,
                 limits=self._limits,
             )
-            run.future = self._worker.submit(self._drive(run, loop, history, request.text))
+            run.future = self._worker.submit(self._drive(run, loop, history, text))
         except BaseException:
             self._active = None
             raise

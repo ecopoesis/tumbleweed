@@ -280,12 +280,12 @@ class TestPhotoAdjuster:
         brightness.set_value(60.0)
         contrast.set_value(-30.0)
         switch.set_active(True)
-        assert labels_text(tool)[-2] == "Brightness 60, contrast -30, grayscale"
+        assert labels_text(tool)[-3] == "Brightness 60, contrast -30, grayscale"
 
         reset.emit("clicked")
 
         assert (brightness.get_value(), contrast.get_value(), switch.get_active()) == (0, 0, False)
-        assert labels_text(tool)[-2] == "Brightness 0, contrast 0"
+        assert labels_text(tool)[-3] == "Brightness 0, contrast 0"
 
     def test_a_click_with_no_sink_does_nothing_and_does_not_fail(self) -> None:
         from tumbleweed.shell._gi import Gtk

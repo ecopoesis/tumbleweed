@@ -132,8 +132,9 @@ def make_rig(
     registry: ToolRegistry | None = None,
     limits: AgentLimits | None = None,
     provider: LlmProvider | None = None,
+    dispatcher: ManualDispatcher | None = None,
 ) -> Iterator[Rig]:
-    dispatcher = ManualDispatcher()
+    dispatcher = dispatcher or ManualDispatcher()
     fake = FakeProvider(script)
     log = MemoryLog()
     responder = AgentResponder(

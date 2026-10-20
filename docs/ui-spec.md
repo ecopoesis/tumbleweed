@@ -807,8 +807,21 @@ A handler has a `name` and a `kind`.
   debounced), and coalesces events that arrive while a call is in flight. At most one call per tool instance runs at a time (I9). The spec holds no code and
   does not say whether the module exists: the tool package does (S23). There is no field for source,
   a command, a path, an environment, the network or a timeout; the broker's policy decides those.
+  Until S20 connects a sandbox, the renderer builds a control whose handler is a `sandbox` one
+  disabled, with a plain line under it that says it needs a sandbox that is not available yet
+  (never a tooltip), and no event of it is passed on (S12).
 - **`agent`** sends the event and a snapshot of the state to the agent as untrusted input (S12).
-  `note` is the author's hint about what the event means, and is data too.
+  `note` is the author's hint about what the event means, and is data too. The agent gets the
+  event in a frame that says it is data, with the whole state as it was at the event, capped: a
+  string longer than 1 KiB (as the model receives it, where `<`, `>` and `&` take six bytes each) is cut (and says how much was not shown), a list, table, JSON,
+  image or file value over that is replaced by a marker that names its kind and size, and the whole
+  snapshot is at most 6 KiB, the biggest values going first, then the last entries counted and left
+  out (`tumbleweed.agent.canvas_events`). A tool instance starts at most one turn every 3 seconds,
+  and one turn runs at a time: an event that arrives sooner waits, and a newer event of the same
+  instance replaces it, so a handler on `on_change` of a slider or an entry costs a few turns, not
+  one per tick. A handler author does not choose any of this: there is no field for it.
+  A control whose handler is `agent` or `set` works the same on every host; the agent's answer
+  comes back as a message and any `show_ui` or `patch_state` it makes, never as a handler.
 
 Handlers fire only when a user acts on a widget. A change of state from anywhere else (a
 computed entry updating, a `set` or sandbox result, `patch_state`, the model) never fires a
@@ -924,8 +937,12 @@ one means, is `tumbleweed.ui/2`.
   `ImageResolver` (`tumbleweed.ui.images`: S19 passes the broker's) for the images.
 - **Agent (S12).** `parse_ui_spec` for text and `validate_ui_spec` for a tool call's arguments;
   return `SpecError.problems` to the model; `UiSpec.validate_patch(patch, current=...)` for
-  `patch_state`; the system prompt section is generated from `schemas/ui-spec.v1.json` and this
-  page, and must carry the rules the schema cannot (section 4's text and numbers, paths).
+  `patch_state`; the system prompt section is generated from the models' JSON Schema and this
+  page (`tumbleweed.agent.spec_prompt`, committed as `prompts/ui_spec_v1.md`, drift-tested), and
+  carries the rules the schema cannot (sections 3 to 5 and 7 to 11, and the tip calculator of section 2).
+  **A change to this page's sections 2 to 5 or 7 to 11 changes the prompt:** regenerate it with
+  `uv run python -m tumbleweed.agent.spec_prompt --write`. The host is `tumbleweed.agent.canvas`
+  (`show_ui`, `patch_state`, `CanvasHost`) and the events are `tumbleweed.agent.canvas_events`.
 - **Sandboxed code (S20).** `validate_patch(result, current=..., only=handler.outputs)` on every
   result; the debounce floor and the one call in flight of [section 9](#9-handlers).
 - **Tool store and composition (S23, S25).** `PortType` and `port_type_of`, `ImageRef`, `FileRef`,

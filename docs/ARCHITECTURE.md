@@ -149,7 +149,8 @@ on them).
 - **Tool instances.** Each `ToolInstanceId` belongs to the task that created it. When that
   task ends, its instances become inert: `set` handlers and computed state still work
   locally, but `sandbox` and `agent` handlers are disabled until the tool is reopened into
-  the current task.
+  the current task. (S12 makes the instances and puts up to four on the canvas, `replace` or
+  `stack`; they belong to no task until S19 adds tasks.)
 - **Where the sandbox boundary sits.** The agent loop itself runs in the trusted shell
   process because it never executes model output; every *action* it takes is confined
   (grant-checked by the broker; code runs in bubblewrap). This deliberately differs from
@@ -761,13 +762,15 @@ the user's own, and `edit_before_send` (and its forcing over plain http) applies
 4. Tool calls that touch privilege go to the broker. The broker decides by policy, asks the
    user through a trusted prompt if needed, and records the decision in the audit log.
 5. Generated tools render on the canvas. UI events either update state locally, run a
-   sandboxed handler, or are sent back to the agent as a new (untrusted) event.
+   sandboxed handler, or are sent back to the agent as a new (untrusted) event: a turn whose
+   model-side text is the event, framed as data, with a capped state snapshot, started at most
+   once every 3 seconds per tool instance (section 4, "The agent and the canvas").
 
 ### Model-facing tools (v1 target set)
 
 | Tool | Effect | Step |
 |---|---|---|
-| `show_ui(spec, code?)` | Validate and render a tool draft on the canvas | S12 (code: S20) |
+| `show_ui(spec, placement?, code?)` | Validate and render a tool draft on the canvas; `placement` is `replace` (default) or `stack` | S12 (code: S20) |
 | `patch_state(instance, patch)` | Update a rendered tool's state (never fires handlers) | S12 |
 | `start_task(title, fresh_context?)` | End the current task; new workspace, no grants; optionally no prior turns | S19 |
 | `request_access(capability \| pick, reason)` | Ask for a grant, or ask the user to pick a file/folder | S19 |
@@ -816,6 +819,31 @@ patch, sandbox, computed), and only a user's action on a widget fires a handler.
 widgets (S11, D21) are an image (resolved by an injected `ImageResolver`, inspected, and only then
 decoded, on a worker thread), a table (a column view of plain-text cells), a text view, tabs and an
 expander; each is bounded like the rest and none creates a surface.
+
+### The agent and the canvas (S12, D24)
+
+`show_ui(spec, placement)` validates the spec (`validate_ui_spec`) on the agent's worker thread and
+returns the problems to the model if it does not validate; otherwise `CanvasLink`
+(`tumbleweed.agent.canvas`) posts it to the main thread, where `CanvasTools`
+(`tumbleweed.shell.canvas_tools`, the `CanvasHost`) renders it as a **tool instance**: a
+`ToolInstanceId`, a runtime of its own and a card with the title above it. `replace` closes every
+instance and shows the new one alone, `stack` adds it below (at most four; the oldest closes).
+`patch_state(instance, patch)` is checked whole by `UiSpec.validate_patch` on the main thread and
+never fires a handler. The agent imports no GTK (a contract); the shell implements the host.
+
+An `agent` handler's event reaches the model as a turn whose text is ours: a paragraph saying the
+shell wrote it from the user's action and that what is inside the `<canvas_event>` tags is data,
+never instructions, then one JSON document (instance, handler, component, event, bound key, the
+handler's note, the state) written with every non-ASCII character and `<`, `>` and `&` escaped, so
+nothing in it can close the block (`tumbleweed.agent.canvas_events`). The snapshot is capped: a
+string past 1 KiB is cut (and says how much), a bigger list, table, JSON, image or file
+value is a marker with its kind and size, the whole is at most 6 KiB (biggest values first, then
+the last entries are counted and left out), and a note is cut at 2 KiB (all measured on the text the model receives, where `<`, `>` and `&` take six bytes each, so the frame is at most about 9 KiB). The chat shows a line of
+ours that names the handler, not the data. **Rate limit (I9, #57).** An instance starts at most one
+turn every 3 seconds and one turn runs at a time; an event that waits is replaced by a newer one of
+its instance (the turn says how many it replaces); at most one waits per instance. `sandbox`
+handlers have nowhere to go until S20: their controls are built disabled, with the reason in the
+tool, and no event of one is passed on while no sandbox is connected.
 
 ## 5. Saved tools
 
@@ -1149,10 +1177,14 @@ Each invariant names where it is enforced. Reviews check every change against th
   off, no tooltip is ever set, and `tests/ui/gtk/test_no_surfaces.py`
   looks for any toplevel, native surface, popover-bearing widget, tooltip or drag source besides
   the shell's own window after every golden spec and a hostile one has been rendered and used.
-  Whatever later adds a widget to the renderer or a tooltip (S12's disabled `sandbox` handlers)
-  keeps to this, or says why a surface is contained.
+  Whatever later adds a widget to the renderer or a tooltip keeps to this, or says why a surface is
+  contained: S12's disabled `sandbox` controls give their reason as a plain line in the tool, never
+  a tooltip. **A spec's title is shown on the canvas only** (a plain label in the tool's card,
+  `tumbleweed.shell.canvas_tools`): the window title is a constant of ours, and no chrome, chat row
+  or status text is made from it (`tests/shell/test_canvas_agent.py` looks at every label outside
+  the canvas and at every window title).
   **Every model-supplied string** shown in chrome (reasons, task titles, tool names and
-  descriptions, spec titles) is plain, length-capped, and labelled as coming from the
+  descriptions) is plain, length-capped, and labelled as coming from the
   assistant. What is being granted is rendered from the structured capability. While a
   prompt is pending the canvas is insensitive; default focus is **Deny**; the decision
   buttons ignore input for the first 750 ms; at most one prompt is shown at a time, and
@@ -1385,10 +1417,13 @@ src/tumbleweed/
   ui/runtime/ state store, expression interpreter, bindings, handler dispatch (no GTK)
   ui/images.py image rules: what may be decoded, the resolver Protocol and its contract (no GTK)
   ui/gtk/     GTK4 adapter that renders specs
-  shell/      Adw application, window, chat panel, trusted prompts, terminal pane
+  shell/      Adw application, window, chat panel, trusted prompts, terminal pane, canvas host
+              (`canvas_tools`: the instances on the canvas)
   shell/viewmodel/  transcript view-model, chat controller, terminal choices and spawner (no GTK)
   agent/      agent loop, tool registry, LLM providers, invocation recorder, prompts, config;
-              the `Responder` interface the shell is built against (`agent/responder.py`)
+              the `Responder` interface the shell is built against (`agent/responder.py`);
+              the canvas tools and the `CanvasHost` protocol (`canvas`), the event snapshot,
+              frame and gate (`canvas_events`), the generated spec reference (`spec_prompt`)
   voice/      audio capture, STT, TTS, VAD, wake word
   history/    chat persistence
   broker/     daemon, service, client, policy, grants, paths, tasks, workspaces, store, audit,
@@ -1414,7 +1449,9 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   The one edge between `agent` and `voice` is configuration: `agent.config` holds the loader of the
   one file and imports `voice.config` (the `[voice]` model), and `voice.factory` imports
   `agent.config` to read it; a contract lets `agent` import nothing else of `voice`.
-- `agent` never imports `shell`; the shell depends on the agent through interfaces.
+- `agent` never imports `shell`; the shell depends on the agent through interfaces. It never
+  imports `ui.gtk` either: it reads `ui.spec` and `ui.runtime` (the spec, the runtime's event types)
+  and the shell hosts the canvas behind `CanvasHost` (S12).
 - `history` never imports `shell` or `agent`; the shell depends on it through `ChatHistory`.
 - The Anthropic SDK is imported only by `agent.anthropic_provider`; the rest of the agent, and
   everything else, uses the `LlmProvider` interface (D3). Its HTTP library, `httpx2`, and that
