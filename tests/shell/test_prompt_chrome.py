@@ -332,6 +332,23 @@ class TestTheRestOfTheWindowWhilePending:
         assert shell.window.canvas.get_sensitive()
 
 
+class FakeEvent:
+    """Stands in for a `Gdk.Event`: the controller only asks it what it is, its button and its
+    touch sequence."""
+
+    def __init__(self, kind: object, button: int = 1, sequence: object = None) -> None:
+        self._kind, self._button, self._sequence = kind, button, sequence
+
+    def get_event_type(self) -> object:
+        return self._kind
+
+    def get_button(self) -> int:
+        return self._button
+
+    def get_event_sequence(self) -> object:
+        return self._sequence
+
+
 class TestInputsThatAreNotTheUsers:
     """The window reports what goes down and up to the prompt's controller, which holds the arming
     invariant (`viewmodel.prompts`, `test_prompt_arming_model`): a stream of clicks aimed at where
@@ -509,7 +526,7 @@ class TestInputsThatAreNotTheUsers:
 
         assert len(answers.given) == 1
 
-    def test_a_touch_that_is_cancelled_and_a_grab_that_is_broken_are_over_too(
+    def test_a_touch_that_is_cancelled_is_over_without_a_click(
         self, build_prompt_shell: Builder
     ) -> None:
         from tumbleweed.shell._gi import Gdk
@@ -522,14 +539,82 @@ class TestInputsThatAreNotTheUsers:
         once = buttons(banner)["Allow once"]
 
         shell.timers.advance(0.1)
-        banner.pointer_event(Gdk.EventType.TOUCH_BEGIN, 0)
-        banner.pointer_event(Gdk.EventType.TOUCH_CANCEL, 0)
-        self.down(shell)
-        banner.pointer_event(Gdk.EventType.GRAB_BROKEN, 0)
+        banner.pointer_event(Gdk.EventType.TOUCH_BEGIN, 1000)
+        banner.pointer_event(Gdk.EventType.TOUCH_CANCEL, 1000)
         shell.timers.advance(ARM_SECONDS)
         self.press(shell)
         once.emit("clicked")
 
+        assert len(answers.given) == 1
+
+    def test_two_fingers_are_two_inputs_of_their_own(self, build_prompt_shell: Builder) -> None:
+        """Each touch has the identity of its own event sequence, so one finger coming up does not
+        make the other's end look like a release with no record."""
+        from tumbleweed.shell._gi import Gdk
+
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        shell.wait_armed()
+        banner = shell.window.prompt_banner
+        once = buttons(banner)["Allow once"]
+        first, second = object(), object()
+
+        for kind, sequence in (
+            (Gdk.EventType.TOUCH_BEGIN, first),
+            (Gdk.EventType.TOUCH_BEGIN, second),
+            (Gdk.EventType.TOUCH_END, first),
+        ):
+            banner._on_pointer_event(None, FakeEvent(kind, sequence=sequence))  # type: ignore[arg-type]  # noqa: SLF001  (a fake event)
+        once.emit("clicked")  # the tap of the first finger
+
+        assert len(answers.given) == 1
+
+    def test_the_window_events_are_translated_to_inputs(self, build_prompt_shell: Builder) -> None:
+        """A Gdk event to a button or touch going down or up (a fake event stands in for it)."""
+        from tumbleweed.shell._gi import Gdk
+
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        banner = shell.window.prompt_banner
+        once = buttons(banner)["Allow once"]
+
+        def event(kind: "Gdk.EventType", button: int = 1) -> None:
+            banner._on_pointer_event(None, FakeEvent(kind, button=button))  # type: ignore[arg-type]  # noqa: SLF001
+
+        shell.timers.advance(0.1)
+        event(Gdk.EventType.BUTTON_PRESS)  # disarmed
+        event(Gdk.EventType.BUTTON_RELEASE)
+        once.emit("clicked")
+        assert answers.given == []  # tainted: the press began before the prompt took answers
+
+        shell.timers.advance(ARM_SECONDS)
+        event(Gdk.EventType.BUTTON_PRESS, 3)  # the right button, armed
+        event(Gdk.EventType.BUTTON_RELEASE, 3)
+        once.emit("clicked")
+        assert len(answers.given) == 1
+
+    def test_a_release_is_forgotten_when_the_main_loop_is_idle_again(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """A tainted release that started no click must not refuse a later activation (a timer's)
+        that no input of its own produced."""
+        shell = build_prompt_shell()
+        controller, answers = shell.own_controller()
+        present(shell)
+        card = pending(shell)
+        shell.timers.advance(0.1)
+        self.press(shell, 2)  # tainted, and no button clicked
+        shell.timers.advance(ARM_SECONDS)
+
+        assert pump_until(lambda: True)  # the idle callback runs
+        pump(0.05)
+        assert controller.choose(
+            card.prompt, AllowDecision(kind="allow", scope="once", picked=None)
+        )
         assert len(answers.given) == 1
 
     def test_a_key_that_ended_in_no_activation_does_not_cost_the_next_one(
@@ -572,14 +657,16 @@ class TestInputsThatAreNotTheUsers:
         once.emit("clicked")
         assert answers.given == []
 
-    def test_losing_the_focus_forgets_what_was_held(self, build_prompt_shell: Builder) -> None:
+    def test_losing_the_focus_forgets_the_keys_that_were_down(
+        self, build_prompt_shell: Builder
+    ) -> None:
         shell = build_prompt_shell()
         _controller, answers = shell.own_controller()
         present(shell)
         pending(shell)
         once = buttons(shell.window.prompt_banner)["Allow once"]
         shell.timers.advance(0.1)
-        self.down(shell)  # its release goes to another window
+        self.key_down(shell.window, 36)  # its release goes to another window
 
         with patch.object(shell.window, "is_active", return_value=False):
             shell.window.notify("is-active")
@@ -591,6 +678,58 @@ class TestInputsThatAreNotTheUsers:
         once.emit("clicked")
 
         assert len(answers.given) == 1
+
+    def test_a_press_held_across_a_focus_loss_still_ends_in_no_click(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """GTK does not cancel a pointer press when the window is deactivated: the release still
+        arrives, with the press recorded as tainted (and, unrecorded, as tainted too)."""
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        once = buttons(shell.window.prompt_banner)["Allow once"]
+        shell.timers.advance(0.1)
+        self.down(shell)  # on Allow, while disarmed
+
+        with patch.object(shell.window, "is_active", return_value=False):
+            shell.window.notify("is-active")
+        with patch.object(shell.window, "is_active", return_value=True):
+            shell.window.notify("is-active")
+        pump(0.05)
+        shell.timers.advance(ARM_SECONDS)
+        self.up(shell)  # ... and released on it, after the prompt took answers
+        once.emit("clicked")
+
+        assert answers.given == []
+
+    def test_the_prompts_controllers_run_before_the_f12_shortcut_so_they_see_every_key(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """The first controller of the window runs first, and one that handles an event (a
+        shortcut) ends the run: the prompt's must come before the capture shortcuts."""
+        from tumbleweed.shell._gi import Gtk
+
+        order = list(build_prompt_shell().window.observe_controllers())
+        capture = Gtk.PropagationPhase.CAPTURE
+        key = next(
+            i
+            for i, c in enumerate(order)
+            if isinstance(c, Gtk.EventControllerKey) and c.get_propagation_phase() == capture
+        )
+        pointer = next(
+            i
+            for i, c in enumerate(order)
+            if isinstance(c, Gtk.EventControllerLegacy) and c.get_propagation_phase() == capture
+        )
+        shortcuts = [
+            i
+            for i, c in enumerate(order)
+            if isinstance(c, Gtk.ShortcutController) and c.get_propagation_phase() == capture
+        ]
+
+        assert shortcuts  # (F12's is one)
+        assert max(key, pointer) < min(shortcuts)
 
     def test_keys_start_the_delay_again_and_are_not_consumed(
         self, build_prompt_shell: Builder
@@ -867,26 +1006,23 @@ class TestThePicker:
             (card.prompt, AllowDecision(kind="allow", scope="once", picked="/home/u/Documents"))
         ]
 
-    def test_a_choice_that_is_not_taken_says_so_and_the_prompt_stays_usable(
+    def test_a_choice_in_the_dialog_is_taken_whatever_the_window_saw_meanwhile(
         self, build_prompt_shell: Builder
     ) -> None:
+        """The click on Choose passed the arming check and opened the dialog; the choice is made
+        there, so a stray release or a restart of the delay in the window does not refuse it."""
         shell = build_prompt_shell()
         controller, answers = shell.own_controller()
         present(shell)
-        pending(shell, pick_card("file"))
+        card = pending(shell, pick_card("file"))
         shell.wait_armed()
         buttons(shell.window.prompt_banner)["Choose, allow once\u2026"].emit("clicked")
-        controller.reactivated()  # something disarmed it meanwhile
+        TestInputsThatAreNotTheUsers.up(shell, 3)  # a release from the dialog, with no press seen
+        controller.reactivated()  # and something restarted the delay meanwhile
 
         shell.picker.finish("/home/u/Documents")
 
-        assert answers.given == []
-        assert "was not taken" in shell.window.prompt_banner.note.get_text()
-        assert shell.window.prompt_banner.get_visible()
-        shell.wait_armed()
-        buttons(shell.window.prompt_banner)["Choose, allow once\u2026"].emit("clicked")
-        shell.picker.finish("/home/u/Documents")  # and the choice can be made again
-        assert len(answers.given) == 1
+        assert [(p, d.kind) for p, d in answers.given] == [(card.prompt, "allow")]
 
     def test_a_dismissed_picker_leaves_the_prompt_open(self, build_prompt_shell: Builder) -> None:
         shell = build_prompt_shell()

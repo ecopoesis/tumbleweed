@@ -181,6 +181,13 @@ def click(rig: Rig, card: PromptCard, decision: AllowDecision | DenyDecision = D
     return rig.controller.choose(card.prompt, decision)
 
 
+def click_other(rig: Rig, card: PromptCard) -> bool:
+    """A whole click of another button, with whatever else is down staying down."""
+    rig.controller.input_began(RIGHT)
+    rig.controller.input_ended(RIGHT)
+    return rig.controller.choose(card.prompt, ALLOW_TASK)
+
+
 def tap(rig: Rig, key: InputId) -> None:
     rig.controller.input_began(key)
     rig.controller.input_ended(key)
@@ -271,17 +278,32 @@ class TestTheArmingInvariant:
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
-    def test_a_second_press_of_the_same_button_does_not_free_a_held_one(self, rig: Rig) -> None:
-        """Lost releases and a second touch look the same: what was recorded as tainted stays."""
+    def test_a_second_press_of_a_held_button_is_a_lost_release_and_replaces_the_record(
+        self, rig: Rig
+    ) -> None:
+        """A button cannot go down twice: its release was lost (a drag that took it), and the next
+        press, the user's deliberate one, is a press of its own."""
         card = rig.offer()
         rig.timers.advance(0.1)
-        rig.controller.input_began(LEFT)
+        rig.controller.input_began(LEFT)  # held from before, its release never comes
         rig.timers.advance(0.8)
 
-        rig.controller.input_began(LEFT)
+        rig.controller.input_began(LEFT)  # the user's own press, armed
         rig.controller.input_ended(LEFT)
 
-        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_a_release_that_was_lost_before_any_prompt_does_not_refuse_the_next_prompt(
+        self, rig: Rig
+    ) -> None:
+        """Realistic: a drag from the chat's text takes the release. The next prompt's first
+        deliberate click is a new press of the same button."""
+        rig.controller.input_began(LEFT)  # no prompt: it is recorded, tainted
+        card = rig.offer()
+        rig.arm()
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # (still down, as far as seen)
+
+        assert click(rig, card, ALLOW_TASK)  # the next press heals it
 
     def test_a_pointer_press_during_a_held_key_does_not_end_it_either(self, rig: Rig) -> None:
         card = rig.offer()
@@ -376,17 +398,42 @@ class TestTheArmingInvariant:
 
         assert click(rig, card, ALLOW_TASK)
 
-    def test_losing_the_focus_cancels_what_was_held_so_a_lost_release_cannot_wedge_it(
+    def test_a_key_down_when_the_focus_is_lost_is_forgotten_so_its_lost_release_cannot_wedge_it(
         self, rig: Rig
     ) -> None:
         card = rig.offer()
         rig.timers.advance(0.1)
-        rig.controller.input_began(LEFT)  # held, and its release goes to another window
+        rig.controller.input_began(ENTER)  # held, and its release goes to another window
         rig.controller.deactivated()
         rig.controller.reactivated()
         rig.arm()
 
         assert click(rig, card, ALLOW_TASK)
+
+    def test_a_press_held_across_a_focus_loss_still_ends_in_no_click(self, rig: Rig) -> None:
+        """GTK does not cancel a pointer press when the window is deactivated: its release
+        arrives. The press began disarmed and is still held, as far as the window has seen."""
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.input_began(LEFT)
+        rig.controller.deactivated()
+        rig.controller.reactivated()
+        rig.arm()
+
+        assert not click_other(rig, card)  # a clean press of another button, with it still down
+        rig.controller.input_ended(LEFT)  # its release
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    @pytest.mark.parametrize("which", [LEFT, SPACE])
+    def test_a_release_with_no_record_is_tainted(self, rig: Rig, which: InputId) -> None:
+        """It went down before the prompt, or before a focus loss forgot it: its click is not
+        taken. (The only defence of a key held across a focus loss.)"""
+        card = rig.offer()
+        rig.arm()
+
+        rig.controller.input_ended(which)
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
     def test_a_press_that_is_cancelled_makes_no_click_and_is_forgotten(self, rig: Rig) -> None:
         card = rig.offer()
@@ -408,15 +455,117 @@ class TestTheArmingInvariant:
 
         assert rig.controller.choose(card.prompt, ALLOW_TASK)
 
-    def test_a_broken_grab_cancels_every_pointer_press(self, rig: Rig) -> None:
+    def test_a_touch_is_one_input_of_its_own_and_two_fingers_are_two(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        first, second = InputId("pointer", 1000), InputId("pointer", 1001)
+
+        rig.controller.input_began(first)
+        rig.controller.input_began(second)  # a second finger, armed too
+        rig.controller.input_ended(first)
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)  # the tap of the first finger
+
+    def test_a_tainted_finger_is_not_freed_by_another_ending(self, rig: Rig) -> None:
         card = rig.offer()
         rig.timers.advance(0.1)
-        rig.controller.input_began(LEFT)
-        rig.controller.input_began(RIGHT)
-        rig.controller.pointers_cancelled()
+        first, second = InputId("pointer", 1000), InputId("pointer", 1001)
+        rig.controller.input_began(first)  # down while disarmed, still down
+        rig.arm()
+        rig.controller.input_began(second)
+        rig.controller.input_ended(second)
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # the first is still down
+
+    def test_more_inputs_than_are_recorded_refuse_allows_until_they_are_up(self, rig: Rig) -> None:
+        """Fail closed: nothing is evicted to make room, as the oldest may be the tainted one."""
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        keys = [InputId("key", code) for code in range(100, 100 + 65)]
+        for key in keys:
+            rig.controller.input_began(key)  # (the first of them tainted: disarmed)
         rig.arm()
 
+        assert not click(rig, card, ALLOW_TASK)
+        for key in keys:
+            rig.controller.input_ended(key)
         assert click(rig, card, ALLOW_TASK)
+
+    def test_a_stray_release_from_the_picker_dialog_does_not_refuse_the_choice(
+        self, rig: Rig
+    ) -> None:
+        card = rig.offer(pick_card())
+        rig.arm()
+        rig.controller.input_began(LEFT)
+        rig.controller.input_ended(LEFT)
+        assert rig.controller.can_act(card.prompt)  # the click on Choose opened the dialog
+
+        rig.controller.input_ended(RIGHT)  # a release that arrives from the dialog, unrecorded
+        chosen = AllowDecision(kind="allow", scope="task", picked="/home/u/Documents")
+
+        assert rig.controller.choose(card.prompt, chosen)
+
+    # -- who produced a keyboard click -------------------------------------------------------------
+
+    def test_a_tainted_keys_release_does_not_leave_a_stale_refusal_for_an_auto_repeat(
+        self, rig: Rig
+    ) -> None:
+        """Round 5 (Sonnet): Space down disarmed, Enter down on Allow once armed, Space up, Enter's
+        auto-repeat: the Enter press was clean and nothing tainted is held."""
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.input_began(SPACE)  # disarmed: tainted
+        rig.timers.advance(0.85)
+        rig.controller.input_began(ENTER)  # armed, clean
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # Space is still down
+        rig.controller.input_ended(SPACE)  # (its release completes the activation: refused too)
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+        rig.controller.event_done()
+
+        rig.controller.input_began(ENTER)  # the keyboard repeats it: an activation of its own
+
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_an_activation_that_a_timer_makes_is_not_refused_for_an_earlier_release(
+        self, rig: Rig
+    ) -> None:
+        """Round 5 (security): Shift down disarmed, wait, Enter down on Allow, Shift released, then
+        Enter's activation (the 250 ms timer) with nothing tainted held."""
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        shift = InputId("key", 50)
+        rig.controller.input_began(shift)
+        rig.timers.advance(0.8)
+        rig.controller.input_began(ENTER)  # clean
+        rig.controller.input_ended(shift)
+        rig.controller.event_done()  # (the release has had its click, if it was to have one)
+
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)  # the timer's click
+
+    def test_a_click_that_a_tainted_release_completes_is_refused_whoever_produced_it(
+        self, rig: Rig
+    ) -> None:
+        """GTK finishes a keyboard activation on any key's release. Fail closed: if the key that
+        comes up began tainted, the click is not taken (the documented case)."""
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        shift = InputId("key", 50)
+        rig.controller.input_began(shift)  # tainted
+        rig.timers.advance(0.8)
+        rig.controller.input_began(ENTER)  # clean, on the focused Allow
+        rig.controller.input_ended(shift)  # completes the activation, in the same event
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_a_release_is_forgotten_by_the_next_input_and_by_the_end_of_the_event(
+        self, rig: Rig
+    ) -> None:
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.input_began(LETTER)
+        rig.controller.input_ended(LETTER)  # tainted, and nothing clicked
+        rig.arm()
+        rig.controller.event_done()
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)  # nothing is pending any more
 
     # -- activation and the first frame --------------------------------------------------------
 
