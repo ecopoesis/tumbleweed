@@ -75,11 +75,21 @@ class Clock:
 
     def __init__(self) -> None:
         self.now = START
+        self.mono = 0.0  # the monotonic clock: it only goes forward, whatever the wall clock does
 
     def __call__(self) -> datetime:
         return self.now
 
+    def monotonic(self) -> float:
+        """The same time for the monotonic clock of the broker (the rate limit reads it)."""
+        return self.mono
+
     def advance(self, by: timedelta) -> None:
+        self.now += by
+        self.mono += by.total_seconds()
+
+    def jump_wall_clock(self, by: timedelta) -> None:
+        """The wall clock is set (a user, NTP, a resume): the monotonic one has not moved."""
         self.now += by
 
 
@@ -263,6 +273,7 @@ class Rig:
             prompts=self.prompts,
             sandbox=self.sandbox,
             clock=self.clock,
+            monotonic=self.clock.monotonic,
         )
 
 
@@ -302,6 +313,7 @@ async def running(
             require_scope_limits=require_scope_limits,
             require_landlock=False,
             prompts_per_window=10_000,  # the rate limit has tests of its own
+            owner_prompts_per_window=10_000,
         )
         final = made if config is None else config(made)
         if before_start is not None:
@@ -315,6 +327,7 @@ async def running(
             prompts=None if ask_shell else script,
             sandbox=fake if runner is None else runner,
             clock=clock,
+            monotonic=clock.monotonic,
             limits=limits,
             credentials=credentials,
         )

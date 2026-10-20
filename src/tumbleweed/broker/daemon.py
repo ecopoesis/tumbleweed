@@ -27,6 +27,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -67,7 +68,8 @@ MAX_CONNECTIONS: Final = 8
 def ipc_limits(config: BrokerConfig) -> IpcLimits:
     """The IPC limits of the daemon: handlers may take a whole run, and a quiet peer is dropped."""
     longest = timedelta(seconds=MAX_WALL_SECONDS) + config.run_grace + timedelta(seconds=30)
-    return IpcLimits(handler_timeout=longest, idle_timeout=IDLE_TIMEOUT)
+    asking = config.prompt_timeout + timedelta(seconds=30)  # a request that waits for the user
+    return IpcLimits(handler_timeout=max(longest, asking), idle_timeout=IDLE_TIMEOUT)
 
 
 @final
@@ -156,6 +158,7 @@ async def start_broker(
     prompts: PromptInterface | None = None,
     sandbox: Sandbox | None = None,
     clock: Callable[[], datetime] = utc_now,
+    monotonic: Callable[[], float] = time.monotonic,
     limits: IpcLimits | None = None,
     credentials: PeerCredentialsProvider | None = None,
 ) -> BrokerDaemon:
@@ -193,6 +196,7 @@ async def start_broker(
             prompts=prompts,
             environ=env,
             clock=clock,
+            monotonic=monotonic,
         )
         await service.start()
         handler = BrokerHandler(service, shell_prompts)

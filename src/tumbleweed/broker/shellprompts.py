@@ -11,8 +11,11 @@ task, and waits for the `AnswerPrompt` the shell sends back. What makes the answ
 - **A timeout, a closed connection or any failure is a denial** and never a grant (I10). When the
   broker gives up (its timeout cancels `ask`) it tells the shell to take the prompt down.
 
-The shell does the rest of I5: how it is shown, the rate of answers and who can answer. Nothing
-here knows about GTK or voice.
+The shell does the rest of I5: how it is shown and who can answer. (The rate limit is the
+service's: `BrokerService._rate_limited`.) Nothing here knows about GTK or voice. A same-user
+process that connects to the broker can start tasks of its own and answer their prompts: the broker
+cannot tell it from the shell, which is outside the threat model (ARCHITECTURE section 8), and what
+it makes is audited as a prompt's decision all the same.
 """
 
 import asyncio
@@ -47,6 +50,9 @@ _SHOW_TIMEOUT: Final = timedelta(seconds=10)
 inside this call), so this is only the bound on a shell that does not answer."""
 _CLOSE_TIMEOUT: Final = timedelta(seconds=5)
 _MAX_WAITING: Final = 64
+_MAX_WAITING_PER_OWNER: Final = 8
+"""The shell holds 8 prompts (`viewmodel.prompts.MAX_QUEUED`); one connection cannot take the
+rest of the room from another."""
 
 _SCOPES: Final[dict[GrantScope, Scope]] = {GrantScope.ONCE: "once", GrantScope.TASK: "task"}
 
@@ -108,7 +114,8 @@ class ShellPrompts:
         scopes = _scopes_of(prompt)
         if connection is None or connection.is_closed or not scopes:
             return Denied(reason="no_prompt_ui")
-        if len(self._waiting) >= _MAX_WAITING:
+        mine = sum(1 for waiting in self._waiting.values() if waiting.owner == owner)
+        if len(self._waiting) >= _MAX_WAITING or mine >= _MAX_WAITING_PER_OWNER:
             return Denied(reason="prompt_busy")
         prompt_id = PromptId.new()
         try:
@@ -126,35 +133,36 @@ class ShellPrompts:
             _log.warning("a prompt could not be put on the wire")
             return Denied(reason="prompt_failed")
         waiting = self._waiting[prompt_id] = _Waiting(owner, prompt.scopes)
-        shown = False
+        shell_may_have_it = True  # until `_show` says it does not (a cancellation in it may have)
         try:
-            refused = await self._show(connection, show)
+            refused, shell_may_have_it = await self._show(connection, show)
             if refused is not None:
                 return refused
-            shown = True
             return await waiting.answer
         finally:
-            if self._waiting.pop(prompt_id, None) is not None and shown:
+            if self._waiting.pop(prompt_id, None) is not None and shell_may_have_it:
                 # Nobody answered: the broker's timeout, or this request, ended first. The shell
                 # still shows the prompt, and must not go on asking a user who is no longer asked.
                 self._close_later(connection, prompt_id)
 
     @staticmethod
-    async def _show(connection: Connection, show: ShowPrompt) -> Denied | None:
-        """Send the prompt. A denial if the shell would not take it, None if it has it."""
+    async def _show(connection: Connection, show: ShowPrompt) -> tuple[Denied | None, bool]:
+        """Send the prompt: (a denial if the shell would not take it, None if it has it; and
+        whether the shell may have the prompt all the same: an answer that was lost or late may have
+        followed a prompt that was taken, and then it must be told to take it down)."""
         try:
             await connection.call(show, PromptShown, request_timeout=_SHOW_TIMEOUT)
         except UnexpectedResponseError:
-            return Denied(reason="prompt_busy")  # `Refused(busy)`: its queue is full
+            return Denied(reason="prompt_busy"), False  # `Refused(busy)`: its queue is full
         except RemoteError as error:
             if error.code is ErrorCode.UNSUPPORTED_REQUEST:
-                return Denied(reason="no_prompt_ui")  # a client that serves no prompts
+                return Denied(reason="no_prompt_ui"), False  # a client that serves no prompts
             _log.warning("the shell failed to take a prompt: %s", error.code)
-            return Denied(reason="prompt_failed")
+            return Denied(reason="prompt_failed"), error.code is not ErrorCode.TOO_MANY_REQUESTS
         except IpcError as error:
             _log.warning("a prompt could not be sent: %s", error)
-            return Denied(reason="prompt_failed")
-        return None
+            return Denied(reason="prompt_failed"), True
+        return None, True
 
     def answer(self, owner: Owner, prompt: PromptId, answer: PromptAnswer, /) -> bool:
         """Take an answer: from the connection the prompt was sent to, for a prompt still waiting,
@@ -188,4 +196,8 @@ class ShellPrompts:
     async def close(self) -> None:
         """Wait for the shell to be told of the prompts that ended (shutdown)."""
         if self._closing:
-            await asyncio.wait(set(self._closing), timeout=_CLOSE_TIMEOUT.total_seconds())
+            _done, stuck = await asyncio.wait(
+                set(self._closing), timeout=_CLOSE_TIMEOUT.total_seconds()
+            )
+            for task in stuck:
+                task.cancel()

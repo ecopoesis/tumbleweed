@@ -372,6 +372,7 @@ class TestNoAnswerIsADenial:
                 outcome = await client.request_read(task, RunId.new(), photos(rig), "x")
 
                 assert not outcome.granted
+                assert "could not be asked" in outcome.message  # not "the user did not allow it"
                 assert rig.audit_of(GrantDecision)[0].reason == "prompt_busy"
 
         run(scenario)
@@ -593,5 +594,127 @@ class TestThePicker:
                 assert not outcome.granted
                 assert "only an existing" in outcome.message
                 assert rig.rows("select count(*) from grants") == [(0,)]
+
+        run(scenario)
+
+
+class TestTheAllowanceFollowsTheLineage:
+    def test_a_task_that_replaces_another_has_what_is_left_of_its_allowance(self) -> None:
+        async def scenario() -> None:
+            async with running(
+                ask_shell=True, config=lambda c: replace_config(c, prompts_per_window=2)
+            ) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                first = await task_of(client)
+                for _ in range(2):
+                    pending = await asked(client, first, rig)
+                    await deny(client, await shell.next_prompt())
+                    await pending
+
+                second = (await client.start_task(previous=first)).task
+                fresh = (await client.start_task(previous=second, fresh_context=True)).task
+                outcome = await client.request_read(fresh, RunId.new(), photos(rig), "x")
+
+                assert "too many permission requests" in outcome.message
+                assert len(shell.shown) == 2  # the model got no new allowance by starting tasks
+
+        run(scenario)
+
+    def test_tasks_started_from_nothing_share_the_ceiling_of_their_connection(self) -> None:
+        async def scenario() -> None:
+            async with running(
+                ask_shell=True,
+                config=lambda c: replace_config(
+                    c, prompts_per_window=2, owner_prompts_per_window=3
+                ),
+            ) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                one, two = await task_of(client), await task_of(client)
+                for task in (one, one, two):
+                    pending = await asked(client, task, rig)
+                    await deny(client, await shell.next_prompt())
+                    await pending
+
+                outcome = await client.request_read(two, RunId.new(), photos(rig), "x")
+
+                assert "too many permission requests" in outcome.message  # `two` has had 1 of 2
+                assert len(shell.shown) == 3
+
+        run(scenario)
+
+    def test_another_connection_has_a_ceiling_of_its_own(self) -> None:
+        async def scenario() -> None:
+            async with running(
+                ask_shell=True,
+                config=lambda c: replace_config(
+                    c, prompts_per_window=2, owner_prompts_per_window=2
+                ),
+            ) as rig:
+                shell, other_shell = FakeShell(), FakeShell()
+                client = await rig.client(handler=shell)
+                other = await rig.client(handler=other_shell)
+                task, other_task = await task_of(client), await task_of(other)
+                for _ in range(2):
+                    pending = await asked(client, task, rig)
+                    await deny(client, await shell.next_prompt())
+                    await pending
+
+                pending = await asked(other, other_task, rig)
+                await deny(other, await other_shell.next_prompt())
+                await pending
+
+                assert len(other_shell.shown) == 1
+
+        run(scenario)
+
+    def test_the_window_is_over_exactly_when_it_has_passed_and_a_wall_clock_jump_is_no_time(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            async with running(
+                ask_shell=True, config=lambda c: replace_config(c, prompts_per_window=1)
+            ) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                task = await task_of(client)
+                pending = await asked(client, task, rig)
+                await deny(client, await shell.next_prompt())
+                await pending
+
+                rig.clock.jump_wall_clock(timedelta(hours=1))  # not ten minutes of the broker's
+                jumped = await client.request_read(task, RunId.new(), photos(rig), "x")
+                rig.clock.advance(timedelta(minutes=10) - timedelta(seconds=1))
+                early = await client.request_read(task, RunId.new(), photos(rig), "x")
+                rig.clock.advance(timedelta(seconds=1))
+                again = await asked(client, task, rig)
+                await deny(client, await shell.next_prompt())
+                await again
+
+                assert "too many" in jumped.message
+                assert "too many" in early.message
+                assert len(shell.shown) == 2
+
+        run(scenario)
+
+
+class TestTheShellsRoom:
+    def test_one_connection_cannot_fill_the_shells_queue(self) -> None:
+        async def scenario() -> None:
+            async with running(ask_shell=True) as rig:
+                shell = FakeShell()
+                client = await rig.client(handler=shell)
+                task = await task_of(client)
+                waiting = [await asked(client, task, rig) for _ in range(8)]
+                for _ in range(8):
+                    await shell.next_prompt()
+
+                ninth = await client.request_read(task, RunId.new(), photos(rig), "x")
+
+                assert "too many questions" in ninth.message
+                assert len(shell.shown) == 8
+                for pending in waiting:
+                    pending.cancel()
 
         run(scenario)

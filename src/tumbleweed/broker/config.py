@@ -46,6 +46,11 @@ from tumbleweed.sandbox.policy import (
 )
 
 DEFAULT_RETENTION: Final = timedelta(days=7)
+MAX_PROMPT_TIMEOUT: Final = timedelta(seconds=120)
+"""The longest a prompt may wait. The shell's client waits this and a margin for an answer
+(`client.PROMPT_WAIT`) and the daemon's handlers get it and a margin (`daemon.ipc_limits`): a longer
+wait would end in a transport timeout the caller sees while the broker still asks, and an Allow
+after that would make a grant the caller never hears about (#60)."""
 _MAX_EXTRA: Final = 64
 
 
@@ -64,9 +69,12 @@ class BrokerConfig:
     - `max_live_tasks`, `max_concurrent_runs`: bounds (I9); more are refused with `busy`.
     - `fs_timeout`: how long a decision-time or run-time file system call may take, one that
       reads or walks paths. `delete_timeout`: the same for deleting a workspace.
-    - `prompt_timeout`: how long a prompt may wait for the user; a timeout is a denial.
+    - `prompt_timeout`: how long a prompt may wait for the user, at most `MAX_PROMPT_TIMEOUT`; a
+      timeout is a denial.
     - `prompts_per_window`, `prompt_window`: how many prompts a task may cause in that long (I5:
-      5 in 10 minutes); the rest are denied without asking, and the model is told why.
+      5 in 10 minutes); the rest are denied without asking, and the model is told why. A task that
+      replaces another has what is left of the allowance of the one it replaces.
+      `owner_prompts_per_window` is the ceiling of one connection over all its tasks (15).
     - `run_grace`: how long past its wall-clock limit a run may take to set up and be reaped.
     - `sandbox_path`: the `PATH` inside a sandbox (the runtime decides where its programs are).
     - `limits`: the sandbox limits of a run, except what a request may lower.
@@ -88,6 +96,7 @@ class BrokerConfig:
     delete_timeout: timedelta = timedelta(seconds=60)
     prompt_timeout: timedelta = timedelta(seconds=120)
     prompts_per_window: int = 5
+    owner_prompts_per_window: int = 15
     prompt_window: timedelta = timedelta(minutes=10)
     run_grace: timedelta = timedelta(seconds=20)
     sandbox_path: str = "/usr/bin:/bin"
@@ -101,11 +110,13 @@ class BrokerConfig:
         _require_duration("sweep_interval", self.sweep_interval, maximum=timedelta(days=1))
         _require_duration("fs_timeout", self.fs_timeout, maximum=timedelta(minutes=5))
         _require_duration("delete_timeout", self.delete_timeout, maximum=timedelta(hours=1))
-        _require_duration("prompt_timeout", self.prompt_timeout, maximum=timedelta(hours=1))
+        _require_duration("prompt_timeout", self.prompt_timeout, maximum=MAX_PROMPT_TIMEOUT)
         _require_duration("prompt_window", self.prompt_window, maximum=timedelta(days=1))
         _require_duration("run_grace", self.run_grace, maximum=timedelta(minutes=5))
-        if type(self.prompts_per_window) is not int or not 1 <= self.prompts_per_window <= 10_000:
-            raise InvalidValueError("prompts_per_window must be an int from 1 to 10000")
+        for name in ("prompts_per_window", "owner_prompts_per_window"):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= 10_000:
+                raise InvalidValueError(f"{name} must be an int from 1 to 10000")
         for name, high in (("max_live_tasks", 1024), ("max_concurrent_runs", 64)):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= high:

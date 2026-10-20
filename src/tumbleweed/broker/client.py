@@ -24,6 +24,7 @@ from datetime import timedelta
 from types import TracebackType
 from typing import Final, Literal, Self, final
 
+from tumbleweed.broker.config import MAX_PROMPT_TIMEOUT
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId
 from tumbleweed.core.types import ToolVersion, WorkspaceRelPath
@@ -81,9 +82,9 @@ _log = logging.getLogger(__name__)
 HEARTBEAT: Final = timedelta(seconds=30)
 """How often a quiet connection is pinged. The broker's idle timeout is three times this."""
 _PING_TIMEOUT: Final = timedelta(seconds=10)
-_PROMPT_WAIT: Final = timedelta(seconds=150)
-"""How long `request_grant` waits: the broker's prompt timeout (120 s) and some margin, so that a
-user who takes their time is not denied by the transport (#60)."""
+PROMPT_WAIT: Final = MAX_PROMPT_TIMEOUT + timedelta(seconds=30)
+"""How long `request_grant` waits: the longest prompt timeout the broker allows and some margin,
+so that a user who takes their time is not denied by the transport (#60)."""
 _RUN_SETUP: Final = timedelta(seconds=60)
 
 
@@ -205,7 +206,7 @@ class BrokerClient:
         request = RequestGrant(
             kind="request_grant", task=task, run=run, access=access, reason=reason
         )
-        return await self._ask(request, GrantOutcome, wait=_PROMPT_WAIT)
+        return await self._ask(request, GrantOutcome, wait=PROMPT_WAIT)
 
     async def request_read(self, task: TaskId, run: RunId, path: str, reason: str) -> GrantOutcome:
         return await self.request_grant(task, run, ReadAccess(kind="fs.read", path=path), reason)

@@ -10,9 +10,12 @@ import pytest
 from tests.broker.rig import scratch_home
 from tests.broker.support import World, make_world, resolve
 from tumbleweed.broker import DenyRelation, DenyRules
-from tumbleweed.broker.config import BrokerConfig
+from tumbleweed.broker.client import PROMPT_WAIT
+from tumbleweed.broker.config import MAX_PROMPT_TIMEOUT, BrokerConfig
+from tumbleweed.broker.daemon import ipc_limits
 from tumbleweed.broker.deny import DenyMatch
 from tumbleweed.core.errors import InvalidValueError
+from tumbleweed.ipc.limits import IpcLimits
 
 
 @pytest.fixture
@@ -177,6 +180,17 @@ class TestTheSettings:
         assert config.prompt_window == timedelta(minutes=10)
         assert config.prompt_timeout == timedelta(minutes=2)
 
+    def test_the_transports_waits_outlast_the_longest_prompt(self, home_world: World) -> None:
+        """A prompt that waits longer than the caller or the handler would end in a transport
+        timeout the caller sees while the broker still asks, and an Allow after it would make a
+        grant nobody hears about (#60)."""
+        config = config_for(home_world, prompt_timeout=MAX_PROMPT_TIMEOUT)
+        margin = timedelta(seconds=30)
+
+        assert config.prompt_timeout + margin <= PROMPT_WAIT
+        assert ipc_limits(config).handler_timeout >= config.prompt_timeout + margin
+        assert IpcLimits().request_timeout < PROMPT_WAIT  # (the default is for everything else)
+
     def test_the_directories_are_the_ones_of_the_architecture(self, home_world: World) -> None:
         config = config_for(home_world)
 
@@ -201,6 +215,8 @@ class TestTheSettings:
             {"prompt_window": timedelta(0)},
             {"prompt_window": timedelta(days=2)},
             {"prompt_timeout": timedelta(hours=2)},
+            {"prompt_timeout": MAX_PROMPT_TIMEOUT + timedelta(seconds=1)},
+            {"owner_prompts_per_window": 0},
             {"sandbox_path": ""},
             {"sandbox_path": "a\0b"},
         ],
