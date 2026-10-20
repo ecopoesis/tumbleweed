@@ -8,8 +8,10 @@ GTK: the view is a fake.
 """
 
 import asyncio
+import gc
 import queue
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Final
@@ -418,6 +420,28 @@ class TestAPromptDoesNotOutliveItsConnection:
                     await server.close()
 
         run(scenario)
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+    def test_a_loop_torn_down_with_its_connection_takes_the_prompts_down_too(
+        self, sock_path: SocketPath
+    ) -> None:
+        """`asyncio.run` ending cancels what is left, the connection's watcher included: the
+        prompts of that connection must not stay up for want of its close being seen."""
+        with shell_end() as shell:
+
+            async def scenario() -> None:
+                _server, _broker, to_shell, _client = await pair(sock_path, shell)
+                await to_shell.call(show_message(), PromptShown)
+                assert shell.act(lambda: shell.prompts.controller.current) is not None
+                # ... and the loop ends here, with the connection still open.
+
+            run(scenario)
+            gc.collect()  # the sockets the torn-down loop left open are reported here, not later
+
+            deadline = time.monotonic() + WAIT
+            while shell.act(lambda: shell.prompts.controller.current) is not None:
+                assert time.monotonic() < deadline, "the prompt of a dead connection stayed up"
+                time.sleep(0.02)
 
     def test_a_closed_window_takes_no_more_prompts(self, sock_path: SocketPath) -> None:
         async def scenario() -> None:

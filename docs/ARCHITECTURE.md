@@ -408,7 +408,8 @@ the broker imports the agent or an LLM (I2).
   no path), the scopes it may offer (`once`, `task`: `tool` needs S24's saved tools) and the
   model's reason as text to be quoted. Its answer is checked against what was offered; a timeout
   (120 s), an exception, a scope not offered, an answer that is not one of the two kinds and a
-  picker answered without a choice (or any other prompt answered with one) are all a denial. The grant is issued by `policy.issue_grant` after the
+  picker answered without a choice (or any other prompt answered with one) are all a denial. The
+  grant is issued by `policy.issue_grant` after the
   deny rules are rebuilt, against the path as it was resolved *before* the prompt, so what the user
   saw is what is recorded. Beyond S16's rules the broker refuses, at decision time and without
   asking, what the sandbox would refuse to mount (section 7). A once grant that has been used up is
@@ -511,29 +512,35 @@ the broker imports the agent or an LLM (I2).
   broker resolved it, the scopes, the model's reason, and `expires_in_ms`) to the connection that
   made the task; the shell acknowledges at once, or refuses `busy` when its queue is full, which is
   a denial. The user's answer comes back as `answer_prompt(prompt, allow(scope, picked) | deny)`.
-  The broker keeps each prompt under the connection it sent it to and takes an answer only from
-  that one, once: another connection's answer, a replay, an unknown or an answered or closed id is
+  The broker keeps each prompt under the connection it sent it to and takes an answer only from that
+  one, once: another connection's answer, a replay, an unknown or an answered or closed id is
   `Refused(unknown_prompt)`, and the other connection's attempt leaves the prompt as it was. When
-  the broker's timeout ends the wait it sends `close_prompt`; when the shell's connection ends,
-  whatever waits for it is denied at once. **At most 5 prompts per task in 10 minutes**
-  (`prompts_per_window`, `prompt_window`; a picker counts): the rest are denied without asking, with
-  fixed text for the model, and audited (`rate_limited`). The allowance is the lineage's: a task
-  started with `previous` has what is left of its predecessor's (`fresh_context` or not), so that
-  a model that starts tasks gets no more; and one connection has a ceiling over all its tasks (15 in
-  the window, `owner_prompts_per_window`) so that tasks started from nothing do not multiply it. The
+  the broker's timeout ends the wait it sends `close_prompt`, and so it does when a `show_prompt`
+  failed after the shell may have taken it; when the shell's connection ends, whatever waits for it
+  is denied at once. **At most 5 prompts per task in 10 minutes** (`prompts_per_window`,
+  `prompt_window`; a picker counts): the rest are denied without asking, with fixed text for the
+  model, and audited (`rate_limited`). The allowance is the lineage's: a task started with
+  `previous` has what is left of its predecessor's (`fresh_context` or not), whether the predecessor
+  is live or ended within the window (the allowances of ended tasks are kept for `prompt_window`, at
+  most 1024), so that a model that starts tasks gets no more. One connection also has a ceiling over
+  all its tasks (15 in the window, `owner_prompts_per_window`; the denial says it was the
+  connection's: `rate_limited_connection`), so that tasks started from nothing do not multiply it;
+  it and the kept allowances go when the connection closes, so a reconnect starts over (#147). The
   window runs on a monotonic clock, so a wall clock that is set neither holds nor frees a task. One
   connection holds at most 8 prompts at once (the shell's queue), whatever the rest ask; a prompt
-  that is denied for being busy, failed or timed out says so to the model, and only a user's Deny
-  is "the user did not allow it". The wait is `prompt_timeout`, at most 120 s
-  (`config.MAX_PROMPT_TIMEOUT`); `BrokerClient.request_grant` waits that and 30 s
-  (`PROMPT_WAIT`) and the daemon's handlers get it and 30 s, so that a transport timeout can never
-  come before the broker has stopped asking (an Allow after one would make a grant the caller never
-  hears about, #60). When a `show_prompt` fails after the shell may have taken it, the broker sends
-  `close_prompt` all the same. The prompt's `tool` is null until S24 binds a run to a tool. A
-  request may ask for the **picker** (`fs.pick`, file or folder): the shell opens a
-  `Gtk.FileDialog` when the user presses "Choose", and the path the user picks (received text, so
-  not a decision already made) is resolved and issued like any other: deny rules, taint rule and grant cap apply, the grant records `origin = picker`,
-  and the audit entry has the picked path. Nothing here knows about GTK or voice.
+  that is denied for being busy, failed or timed out says so to the model, and only a user's Deny is
+  "the user did not allow it". The wait is `prompt_timeout`, at most 120 s
+  (`config.MAX_PROMPT_TIMEOUT`). A request spends it and up to three file system calls
+  (`FS_CALLS_PER_PROMPT`, each bounded by `fs_timeout`): `BrokerConfig` refuses settings where those
+  and 5 s are more than `PROMPT_WAIT` (150 s), which is what `BrokerClient.request_grant` waits, and
+  the daemon's handlers get at least that and a margin. So a transport timeout can never come before
+  the broker has stopped asking (an Allow after one would make a grant the caller never hears about,
+  #60). The prompt's `tool` is null until S24 binds a run to a tool. A request may ask for the
+  **picker** (`fs.pick`, file or folder): the shell opens a `Gtk.FileDialog` when the user presses
+  "Choose", and the path the user picks (received text, so not a decision already made) is resolved
+  and issued like any other: deny rules, taint rule and grant cap apply, the grant records `origin =
+  picker`, and the audit entry has the picked path (a net-tainted task is refused before the user is
+  asked). Nothing here knows about GTK or voice.
 - **Development.** `BrokerConnector` connects and, if nobody is there, starts `python -I -m
   tumbleweed.broker.daemon` detached, from `/`, with a minimal environment of its own (never the
   shell's: the API key is not passed on, I6; `-I` and the working directory keep a module planted
@@ -1232,33 +1239,40 @@ Each invariant names where it is enforced. Reviews check every change against th
   is told why). Prompt IDs are unguessable and single-use. The broker accepts an answer only
   from the connection it sent the prompt to.
   **The prompt (S18, D25).** `tumbleweed.shell.viewmodel.prompts.PromptController` (no GTK) holds
-  the rules and `tumbleweed.shell.prompt_chrome.PromptBanner` draws them in the chrome region.
-  *What is shown*: our heading, "From task ..." (and the tool, once a run can name one: S24), one sentence per kind
-  of access ("The assistant asks to read this file or folder and all in it:", full network access,
-  choose a file or a folder) and the path on a line of its own, spelled out where it has a control,
-  format, line-separator or paragraph-separator character; then "The assistant says (its own words,
-  not checked):" and the reason set apart as a quotation (a rule and italics, and no quotation
-  marks, so no character of it can close one), as one plain line of at most 300 characters
-  (control, format and separator characters become a space; a cut ends in an ellipsis). Every string goes in with `set_text`, markup and
-  mnemonics off. The styling is a set of classes (`tw-trusted-*`) that a spec cannot name: the spec
-  model has no field for a class, a name or a region, and a test renders a hostile spec and looks.
-  *When it takes answers*: not for 750 ms, by the controller's clock, read when the answer arrives
-  (a late timer cannot arm it early); the buttons are dimmed until then. The 750 ms counts from the
-  prompt's first frame, and starts again when the window is activated and on every press or key
-  that reaches the window before the prompt is armed, so that a stream of clicks aimed at where a
-  button will appear is never taken until it has stopped for the whole delay. Deny has the focus. *One at a time*: the rest wait in order, at most 8 in all (a ninth is refused
-  and denied by the broker); each has the broker's deadline (`expires_in_ms`) from the moment it
-  arrived, and past it the shell answers `deny(prompt_timeout)` and takes it down, shown or
-  waiting. A prompt does not outlive its connection: when the connection ends, its prompts are
-  taken down (the next one, of a live connection, comes up), and after the window is closed none
-  is taken. *While pending* (`tumbleweed.shell.prompt_guard`, #53): everything but the chrome
-  (the canvas, the side panel with the chat, whose labels are selectable and so open a menu, the
-  terminal pane and the status strip) is insensitive and F12 does nothing, every popover under
-  the window is popped down, every toplevel but the shell's is closed and any that appears is
-  closed at once (the picker's own dialog is let through while it is open, and is closed with
-  its prompt), and the focus comes back to where it was when the last prompt is gone. The buttons are plain widgets and
-  nothing in the prompt is a `GAction` (#54: `tests/shell/test_session_bus.py` lists everything the
-  shell exports with a prompt pending and the picker open, and activates all of it).
+  the rules and `tumbleweed.shell.prompt_chrome.PromptBanner` draws them in the chrome region. *What
+  is shown*: our heading, "From task ..." (and the tool, once a run can name one: S24), one sentence
+  per kind of access ("The assistant asks to read this file or folder and all in it:", full network
+  access, choose a file or a folder) and the path on a line of its own, spelled out where it has a
+  control, format, line-separator or paragraph-separator character; then "The assistant says (its
+  own words, not checked):" and the reason set apart as a quotation (a rule and italics, and no
+  quotation marks, so no character of it can close one), as one plain line of at most 300 characters
+  (control, format and separator characters become a space; a cut ends in an ellipsis). Every string
+  goes in with `set_text`, markup and mnemonics off. The styling is a set of classes
+  (`tw-trusted-*`) that a spec cannot name: the spec model has no field for a class, a name or a
+  region, and a test renders a hostile spec and looks. *When it takes answers*: not for 750 ms, by
+  the controller's clock, read when the answer arrives (a late timer cannot arm it early); the
+  buttons are dimmed until then. The 750 ms counts from the prompt's first frame, and starts again
+  when the window is activated (not while the picker's own dialog is open: the window only lost the
+  focus to it) and on every press or key that reaches the window before the prompt is armed, so that
+  a stream of clicks aimed at where a button will appear is never taken until it has stopped for the
+  whole delay. A click comes on the release of a press, so a press that began before the prompt was
+  armed ends in no click however long it was held, and does not open the picker either; a key held
+  from before is the same. Deny has the focus. *One at a time*: the rest wait in order, at most 8 in
+  all (a ninth is refused and denied by the broker); each has the broker's deadline
+  (`expires_in_ms`) from the moment it arrived, and past it the shell answers `deny(prompt_timeout)`
+  and takes it down, shown or waiting. A prompt does not outlive its connection: when the connection
+  ends (or the loop it ran on is torn down) its prompts are taken down (the next one, of a live
+  connection, comes up), and after the window is closed none is taken. *While pending*
+  (`tumbleweed.shell.prompt_guard`, #53): everything but the chrome (the canvas, the side panel with
+  the chat, whose labels are selectable and so open a menu, the terminal pane and the strip's
+  Terminal button) is insensitive and F12 does nothing; the strip's voice buttons stay usable,
+  because turning the microphone off with the pointer must always work and nothing there can answer
+  a prompt. Every popover under the window is popped down, every toplevel but the shell's is closed
+  and any that appears is closed at once (the picker's own dialog is let through while it is open,
+  and is closed with its prompt), and the focus comes back to where it was when the last prompt is
+  gone. The buttons are plain widgets and nothing in the prompt is a `GAction` (#54:
+  `tests/shell/test_session_bus.py` lists everything the shell exports with a prompt pending and the
+  picker open, and activates all of it).
 - **I6 — Secrets stay out.** The API key never enters model context, logs, the invocation
   log, sandboxes (environment is cleared), workspaces or tool packages.
   The agent takes the key out of the process environment when it starts (so no child process

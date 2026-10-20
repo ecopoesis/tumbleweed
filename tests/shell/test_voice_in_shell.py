@@ -625,6 +625,23 @@ class TestVoiceCannotAnswerAPrompt:
         assert window.prompt_banner.get_visible()
         assert window.get_focus() is window.prompt_banner.deny_button
 
+    def test_the_microphone_can_still_be_turned_off_with_the_pointer_under_a_prompt(
+        self, build_voiced: VoicedBuilder
+    ) -> None:
+        from tests.shell.prompt_support import read_card
+
+        v = build_voiced(["allow"], responder=ManualResponder())
+        controls_ = controls(v)
+        controller = v.shell.window.broker_prompts.controller
+        assert controller.offer(read_card(), 600.0)
+        assert pump_until(controller.armed)
+
+        assert v.shell.window.status_strip.is_sensitive()
+        for button in (controls_.mic_button, controls_.mute_button, controls_.hands_free_button):
+            if button is not None:
+                assert button.is_sensitive()  # turning the voice off cannot answer a prompt
+        assert not v.shell.window.status_strip.terminal_button.is_sensitive()  # F12's twin is inert
+
     def test_the_voice_keys_are_not_the_prompts_keys(self, build_voiced: VoicedBuilder) -> None:
         from tests.shell.prompt_support import read_card
         from tumbleweed.shell._gi import Gdk

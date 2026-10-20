@@ -172,6 +172,9 @@ class _Entry:
         self.cancel_deadline: Callable[[], None] = _nothing
         self.cancel_arming: Callable[[], None] = _nothing
         self.shown_at: float | None = None
+        # The press (or key) that is in progress began while the prompt was not armed: the click it
+        # ends in is not taken, however long it was held. (A click comes on the release.)
+        self.pressed_disarmed = False
 
 
 def _nothing() -> None:
@@ -235,10 +238,16 @@ class PromptController:
     def disturbed(self) -> None:
         """A press or a key reached the window. If the prompt is not armed yet the delay starts
         again, so that clicks aimed at where its buttons appear (a stream of them, a model's tool
-        can make one) are never taken until the user has stopped for the whole delay."""
+        can make one) are never taken until the user has stopped for the whole delay, and the click
+        that such a press ends in, however long it was held, is not taken either."""
         entry = self._current
-        if entry is not None and not self.armed():
-            self._restart_arming(entry)
+        if entry is None:
+            return
+        if self.armed():
+            entry.pressed_disarmed = False  # a press on a prompt that takes answers: the user's
+            return
+        entry.pressed_disarmed = True
+        self._restart_arming(entry)
 
     def reactivated(self) -> None:
         """The window became the active one: a click that brought it to the front may be about to
@@ -266,13 +275,24 @@ class PromptController:
 
     def can_act(self, prompt: PromptId) -> bool:
         """Whether a click on `prompt` is to be taken now: it is the one shown, and armed."""
-        return self._current is not None and self._current.card.prompt == prompt and self.armed()
+        entry = self._current
+        if entry is None or entry.card.prompt != prompt:
+            return False
+        if entry.pressed_disarmed:  # a press held from before it took answers ends in this click
+            entry.pressed_disarmed = False
+            return False
+        return self.armed()
 
     def choose(self, prompt: PromptId, decision: PromptDecision) -> bool:
         """The user's decision on the prompt that is shown. Ignored (False) unless that is
         `prompt`, it is armed and the decision is one the prompt offers."""
         entry = self._current
-        if entry is None or entry.card.prompt != prompt or not self.armed():
+        if entry is None or entry.card.prompt != prompt:
+            return False
+        if entry.pressed_disarmed:  # a press that began before the prompt took answers ends here
+            entry.pressed_disarmed = False
+            return False
+        if not self.armed():
             return False
         match decision:
             case AllowDecision():

@@ -183,6 +183,42 @@ class TestNotWhileSomethingElseIsHappening:
         rig.timers.advance(0.01)
         assert rig.controller.choose(card.prompt, ALLOW_TASK)
 
+    def test_a_press_that_began_before_the_prompt_took_answers_is_no_click_however_long_it_is_held(
+        self, rig: Rig
+    ) -> None:
+        """Press and hold ("hold to confirm", a model's tool): the click comes on the release."""
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.disturbed()  # the press lands on a button that has just appeared
+
+        rig.timers.advance(0.8)  # held until the prompt is armed
+        assert rig.controller.armed()
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # ... and released: no click
+
+        rig.controller.disturbed()  # the user's own press, on a prompt that takes answers
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_a_key_held_from_before_the_prompt_took_answers_is_no_activation(
+        self, rig: Rig
+    ) -> None:
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.disturbed()  # Enter or Space, pressed while the prompt arrived
+        rig.timers.advance(0.8)
+
+        assert not rig.controller.choose(card.prompt, DENY)
+        assert rig.answers.given == []
+
+    def test_a_held_press_does_not_open_the_picker_either(self, rig: Rig) -> None:
+        card = rig.offer(pick_card())
+        rig.timers.advance(0.1)
+        rig.controller.disturbed()
+        rig.timers.advance(0.8)
+
+        assert not rig.controller.can_act(card.prompt)
+        rig.controller.disturbed()
+        assert rig.controller.can_act(card.prompt)
+
     def test_a_press_on_a_prompt_that_takes_answers_does_not_disarm_it(self, rig: Rig) -> None:
         card = rig.offer()
         rig.arm()
@@ -252,6 +288,16 @@ class TestNotWhileSomethingElseIsHappening:
         clock.now += again[0]
         again[1]()
         assert view.armed == [True]
+
+
+def test_the_categories_a_path_spells_out_include_those_a_workspace_path_refuses() -> None:
+    """One set of characters is unsafe to show: if `core.types` learns another, so must this."""
+    from tumbleweed.core.types import (
+        _FORBIDDEN_CATEGORIES,
+    )
+    from tumbleweed.shell.viewmodel.prompts import _SPELLED_OUT
+
+    assert _FORBIDDEN_CATEGORIES <= _SPELLED_OUT
 
 
 class TestOnlyOneAnswerCounts:

@@ -147,10 +147,14 @@ class BrokerPrompts:
             self._watchers[connection] = (task, loop)
 
     async def _lost_when_closed(self, connection: Connection) -> None:
-        await connection.wait_closed()
-        with self._lock:
-            self._watchers.pop(connection, None)
-        self._dispatcher.post(lambda: self._lost(connection))
+        try:
+            await connection.wait_closed()
+        finally:
+            # Also when this task is cancelled (the connection's loop being torn down): then the
+            # connection is going too, and its prompts must not stay behind.
+            with self._lock:
+                self._watchers.pop(connection, None)
+            self._dispatcher.post(lambda: self._lost(connection))
 
     def _lost(self, connection: Connection) -> None:
         """Main thread: the connection ended, so what it asked of the user is not asked any more

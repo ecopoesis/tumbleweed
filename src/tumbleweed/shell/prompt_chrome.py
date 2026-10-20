@@ -233,7 +233,9 @@ class PromptBanner(Gtk.Box):
         return False
 
     def _on_active_changed(self, window: Gtk.Window, _pspec: object) -> None:
-        if window.is_active() and self._controller is not None:
+        # Not while our own dialog is open: the window lost the focus to it, and getting it back
+        # must not drop the choice that is about to be made.
+        if window.is_active() and self._controller is not None and not self._picking:
             self._controller.reactivated()
 
     # --- drawing ---------------------------------------------------------------------------
@@ -351,4 +353,8 @@ class PromptBanner(Gtk.Box):
         except (ValidationError, UnicodeEncodeError, ValueError):
             self.note.set_text("That name cannot be used. Choose another, or Deny.")
             return
-        controller.choose(card.prompt, decision)
+        if not controller.choose(card.prompt, decision):
+            _log.warning(
+                "a choice in the picker was not taken (the prompt is not armed or is gone)"
+            )
+            self.note.set_text("That was not taken. Choose again, or Deny.")

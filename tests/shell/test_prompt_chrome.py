@@ -383,6 +383,47 @@ class TestClicksThatAreNotTheUsers:
         once.emit("clicked")
         assert len(answers.given) == 1
 
+    def test_a_press_held_from_before_the_prompt_took_answers_ends_in_no_click(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        once = buttons(shell.window.prompt_banner)["Allow once"]
+
+        shell.timers.advance(0.1)
+        self.press(shell.window)  # lands on the button where it has just appeared ...
+        shell.timers.advance(0.8)  # ... and is held until the prompt takes answers
+        once.emit("clicked")  # the release
+        assert answers.given == []
+
+        self.press(shell.window)  # the user's own, deliberate press
+        once.emit("clicked")
+        assert len(answers.given) == 1
+
+    def test_activating_the_window_starts_the_delay_again_and_dims_the_buttons(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        from tumbleweed.shell.prompt_chrome import DISARMED_CLASS
+
+        shell = build_prompt_shell()
+        controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        shell.wait_armed()
+        once = buttons(shell.window.prompt_banner)["Allow once"]
+        assert controller.armed()
+
+        with patch.object(shell.window, "is_active", return_value=True):
+            shell.window.notify("is-active")  # the window comes to the front
+        pump(0.05)
+
+        assert not controller.armed()
+        assert DISARMED_CLASS in once.get_css_classes()
+        once.emit("clicked")
+        assert answers.given == []
+
     def test_keys_start_the_delay_again_and_are_not_consumed(
         self, build_prompt_shell: Builder
     ) -> None:
@@ -432,7 +473,7 @@ class TestTheTerminalDuringAPrompt:
         assert consumed  # the key is not left for VTE to get
         toggle.assert_not_called()  # and nothing was opened
         assert not window.terminal_pane.is_sensitive()
-        assert not window.status_strip.is_sensitive()
+        assert not window.status_strip.terminal_button.is_sensitive()
         assert window.get_focus() is window.prompt_banner.deny_button
 
     def test_after_the_prompt_the_terminal_opens_again(self, build_prompt_shell: Builder) -> None:
@@ -635,6 +676,48 @@ class TestThePicker:
         assert shell.picker.cancelled == 1  # the dialog is closed with its prompt
         shell.picker.finish("/home/u/Documents")  # a late choice, from a dialog that was too slow
         assert answers.given == []
+
+    def test_coming_back_from_the_picker_does_not_drop_the_choice(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """The window loses the focus to the dialog and gets it back when it closes, maybe before
+        the dialog's own answer arrives: that activation is not a stranger's click."""
+        shell = build_prompt_shell()
+        controller, answers = shell.own_controller()
+        present(shell)
+        card = pending(shell, pick_card("folder"))
+        shell.wait_armed()
+        buttons(shell.window.prompt_banner)["Choose, allow once\u2026"].emit("clicked")
+
+        with patch.object(shell.window, "is_active", return_value=True):
+            shell.window.notify("is-active")  # back from the dialog ...
+        shell.picker.finish("/home/u/Documents")  # ... and then its answer
+
+        assert controller.armed() or answers.given
+        assert answers.given == [
+            (card.prompt, AllowDecision(kind="allow", scope="once", picked="/home/u/Documents"))
+        ]
+
+    def test_a_choice_that_is_not_taken_says_so_and_the_prompt_stays_usable(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        shell = build_prompt_shell()
+        controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell, pick_card("file"))
+        shell.wait_armed()
+        buttons(shell.window.prompt_banner)["Choose, allow once\u2026"].emit("clicked")
+        controller.reactivated()  # something disarmed it meanwhile
+
+        shell.picker.finish("/home/u/Documents")
+
+        assert answers.given == []
+        assert "was not taken" in shell.window.prompt_banner.note.get_text()
+        assert shell.window.prompt_banner.get_visible()
+        shell.wait_armed()
+        buttons(shell.window.prompt_banner)["Choose, allow once\u2026"].emit("clicked")
+        shell.picker.finish("/home/u/Documents")  # and the choice can be made again
+        assert len(answers.given) == 1
 
     def test_a_dismissed_picker_leaves_the_prompt_open(self, build_prompt_shell: Builder) -> None:
         shell = build_prompt_shell()

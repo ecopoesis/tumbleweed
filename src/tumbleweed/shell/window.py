@@ -140,7 +140,7 @@ class ShellWindow(Adw.ApplicationWindow):
         wiring = PromptWiring() if prompt_wiring is None else prompt_wiring
         self.prompt_guard = PromptGuard(
             self,
-            (self.canvas, self._side, self.terminal_pane, self.status_strip),
+            (self.canvas, self._side, self.terminal_pane, self.status_strip.terminal_button),
             self._focus_input_unless_closing,
         )
         self.prompt_banner = PromptBanner(self, self.prompt_guard, wiring.picker)

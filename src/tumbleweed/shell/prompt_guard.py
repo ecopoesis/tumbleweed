@@ -6,9 +6,10 @@ creates none from a spec (`tumbleweed.ui.gtk.guard`); this is the second line, f
 could be on screen when a prompt arrives, and for what could appear while it is there:
 
 - everything in the window but the chrome (the canvas, the side panel with the chat, whose labels
-  are selectable and so open a menu, the terminal pane and the status strip) is made insensitive,
-  so that it takes no pointer or keyboard input and opens nothing; F12 does not move the focus to
-  the terminal either (`ShellWindow`);
+  are selectable and so open a menu, the terminal pane and the strip's Terminal button) is made
+  insensitive, so that it takes no pointer or keyboard input and opens nothing; F12 does not move
+  the focus to the terminal either (`ShellWindow`). The strip's voice buttons stay: turning the
+  microphone off with the pointer must always work, and nothing there can answer a prompt (I10);
 - every popover under the window is popped down, and every toplevel that is not the shell's window
   is closed, when the prompt appears, and any new one while it is pending is closed at once
   (the picker's own dialog is let through, while it is open);
