@@ -29,7 +29,11 @@ from tumbleweed.agent.config import (
 )
 from tumbleweed.agent.echo import EchoResponder
 from tumbleweed.agent.errors import AgentError, describe_unexpected
-from tumbleweed.agent.prompts import SYSTEM_PROMPT_VERSION, load_system_prompt
+from tumbleweed.agent.prompts import (
+    SYSTEM_PROMPT_VERSION,
+    load_system_prompt,
+    system_prompt_label,
+)
 from tumbleweed.agent.recorder import InvocationRecorder, JsonlInvocationLog
 from tumbleweed.agent.responder import Responder
 from tumbleweed.agent.runtime import AgentResponder, MainThreadDispatcher, UnavailableResponder
@@ -83,7 +87,7 @@ def _build_anthropic(
         )
         recorder = InvocationRecorder(
             JsonlInvocationLog(shell_data_dir(environ) / "invocations.jsonl"),
-            prompt_version=SYSTEM_PROMPT_VERSION,
+            prompt_version=system_prompt_label(),
         )
         model = config.model_for(ModelRole.CHAT)
         registry = ToolRegistry()

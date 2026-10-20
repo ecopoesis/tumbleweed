@@ -96,8 +96,16 @@ class CanvasTools:
         tool = self.tool(instance)
         if tool is None:
             raise UnknownInstanceError(f"no tool {instance} is on the canvas")
+        store = tool.runtime.store
+        before = store.snapshot()
         tool.runtime.patch_state(patch)  # SpecError: refused whole, nothing applied
-        return tuple(StateKey(key) for key in patch)
+        after = store.snapshot()
+        # What changed, computed entries included, in the spec's order.
+        return tuple(
+            key
+            for key, value in after.items()
+            if type(before[key]) is not type(value) or before[key] != value
+        )
 
     def close(self) -> None:
         """Close every instance and give the canvas back its placeholder."""
@@ -106,8 +114,10 @@ class CanvasTools:
 
     def _close(self, shown: _Shown) -> None:
         self._shown.remove(shown)
-        self._gate.forget(shown.instance)
-        self._column.remove(shown.card)
-        shown.tool.close()
+        try:
+            shown.tool.close()  # first: its signals are disconnected before anything else goes
+        finally:
+            self._gate.forget(shown.instance)
+            self._column.remove(shown.card)
         if not self._shown and self._canvas.content is self._column:
             self._canvas.set_content(None)

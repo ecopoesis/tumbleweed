@@ -5,23 +5,34 @@ registry, the GLib dispatcher, and the real renderer, from `show_ui` to a user's
 import json
 import re
 from collections.abc import Callable, Iterator
+from functools import partial
 from typing import TYPE_CHECKING
 
 import pytest
 from pydantic import JsonValue
 
 from tests.agent.support import MemoryLog
-from tests.shell.gtk_support import Shell, click_send, descendants, pump_until, rows, type_text
+from tests.agent.test_canvas_events import FakeClock
+from tests.shell.gtk_support import (
+    Shell,
+    click_send,
+    descendants,
+    pump,
+    pump_until,
+    rows,
+    type_text,
+)
 from tests.ui.gtk.support import of_type
 from tests.ui.spec.support import golden_text
 from tumbleweed.agent.canvas import CanvasLink, register_canvas_tools
-from tumbleweed.agent.canvas_events import MAX_VALUE_BYTES
+from tumbleweed.agent.canvas_events import MAX_VALUE_BYTES, MIN_TURN_INTERVAL, EventGate
 from tumbleweed.agent.fake import FakeProvider, FakeToolCall, FakeTurn
 from tumbleweed.agent.limits import MAX_USER_TEXT_BYTES, AgentLimits
 from tumbleweed.agent.llm import TextBlock, ToolResultBlock
 from tumbleweed.agent.recorder import InvocationRecorder
 from tumbleweed.agent.runtime import AgentResponder
 from tumbleweed.agent.tools import ToolRegistry
+from tumbleweed.core.ids import ToolInstanceId
 from tumbleweed.core.types import ModelName
 from tumbleweed.ui.spec.names import StateKey
 
@@ -62,6 +73,15 @@ def asking_spec(*, title: str = "Ask", on_change: bool = False, max_length: int 
 
 def show(spec: Json, **extra: JsonValue) -> FakeToolCall:
     return FakeToolCall(name="show_ui", input={"spec": spec, **extra})
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """The window's gate runs on a manual clock and timer: no test waits for real time."""
+    fake = FakeClock()
+    monkeypatch.setattr("tumbleweed.shell.window.EventGate", partial(EventGate, clock=fake))
+    monkeypatch.setattr("tumbleweed.shell.window.GlibScheduler", lambda: fake)
+    return fake
 
 
 @pytest.fixture
@@ -360,11 +380,10 @@ class TestAgentHandlers:
         assert len(json.dumps(shown)) <= MAX_VALUE_BYTES
 
     def test_the_rate_limit_holds_and_the_waiting_events_are_folded_into_one_turn(
-        self, canvas_shell: Builder, monkeypatch: pytest.MonkeyPatch
+        self, canvas_shell: Builder, clock: FakeClock
     ) -> None:
         from tumbleweed.shell._gi import Gtk
 
-        monkeypatch.setattr("tumbleweed.agent.canvas_events.MIN_TURN_INTERVAL", 0.4)
         shell, provider = canvas_shell(
             [
                 FakeTurn(tool_calls=(show(asking_spec(on_change=True)),)),
@@ -379,13 +398,15 @@ class TestAgentHandlers:
         for text in ("a", "ab", "abc", "abcd", "abcde"):  # a user typing: five events at once
             entry.set_text(text)
 
-        # One turn started at once; the other four wait, as one event: the newest.
+        # One turn started at once; the other events wait, as one: the newest.
         assert pump_until(lambda: len(provider.requests) == 3)
         assert shell.window.event_gate.waiting == 1
         assert pump_until(lambda: not shell.window.controller.busy)
-        assert len(provider.requests) == 3  # inside the interval nothing more has started
+        pump(0.2)
+        assert len(provider.requests) == 3  # the clock has not moved: nothing more has started
 
-        assert pump_until(lambda: len(provider.requests) == 4)  # after it, the waiting one starts
+        clock.advance(MIN_TURN_INTERVAL)  # after the interval, the waiting one starts
+        assert pump_until(lambda: len(provider.requests) == 4)
         first, second = framed(user_text(provider, 2)), framed(user_text(provider, 3))
         # (GTK's `set_text` is a delete and an insert: each edit is two events, the first of them
         # the one that started a turn.)
@@ -396,6 +417,91 @@ class TestAgentHandlers:
         assert replaced >= 4  # all the others, folded into this one
         assert pump_until(lambda: not shell.window.controller.busy)
         assert shell.window.event_gate.waiting == 0
+
+    def waiting_tool(
+        self, canvas_shell: Builder, extra: list[FakeTurn], *, hang: bool = True
+    ) -> tuple[Shell, FakeProvider, "RenderedTool"]:
+        """A shell with a tool whose event turn is in flight and a second event waiting."""
+        from tumbleweed.shell._gi import Gtk
+
+        shell, provider = canvas_shell(
+            [
+                FakeTurn(tool_calls=(show(asking_spec(on_change=True)),)),
+                FakeTurn(chunks=("Made it.",)),
+                FakeTurn(chunks=("answer",), hang=hang),
+                *extra,
+            ]
+        )
+        say(shell, "make a tool")
+        tool = only_tool(shell)
+        (entry,) = of_type(tool, Gtk.Entry)
+        entry.set_text("x")  # the first event starts a turn at once
+        entry.set_text("y")  # the next waits
+        assert shell.window.event_gate.waiting == 1
+        assert pump_until(lambda: len(provider.requests) == 3)
+        return shell, provider, tool
+
+    def test_an_event_waiting_for_an_instance_that_is_replaced_gets_no_turn(
+        self, canvas_shell: Builder, clock: FakeClock
+    ) -> None:
+        from tumbleweed.ui.spec import validate_ui_spec
+
+        shell, provider, _ = self.waiting_tool(
+            canvas_shell, [FakeTurn(chunks=("never",))], hang=False
+        )
+
+        shell.window.canvas_tools.show(validate_ui_spec(TIP), "replace")  # the tool is closed
+        assert pump_until(lambda: not shell.window.controller.busy)  # the reply ends by itself
+        clock.advance(MIN_TURN_INTERVAL * 2)
+        pump(0.2)
+
+        assert shell.window.event_gate.waiting == 0
+        assert len(provider.requests) == 3
+
+    def test_escape_on_a_canvas_reply_does_not_start_the_next_waiting_turn(
+        self, canvas_shell: Builder, clock: FakeClock
+    ) -> None:
+        shell, provider, _ = self.waiting_tool(canvas_shell, [FakeTurn(chunks=("second",))])
+
+        shell.window.controller.cancel()  # what Escape does
+        clock.advance(MIN_TURN_INTERVAL * 2)
+        pump(0.2)
+
+        assert shell.window.event_gate.waiting == 0
+        assert len(provider.requests) == 3  # the user stopped the agent: nothing restarts it
+
+    def test_closing_the_window_closes_the_gate_and_the_tools(
+        self, canvas_shell: Builder, clock: FakeClock
+    ) -> None:
+        shell, provider, _ = self.waiting_tool(canvas_shell, [FakeTurn(chunks=("second",))])
+
+        shell.window.shutdown()
+        clock.advance(MIN_TURN_INTERVAL * 2)
+        pump(0.2)
+
+        assert shell.window.event_gate.waiting == 0
+        assert shell.window.canvas_tools.instances == ()
+        assert len(provider.requests) == 3
+        # And the gate takes nothing more.
+        shell.window.event_gate.submit(ToolInstanceId.new(), lambda: pytest.fail("built"))
+        assert shell.window.event_gate.waiting == 0
+
+    def test_a_failing_canvas_teardown_does_not_skip_the_rest_of_the_shutdown(
+        self, canvas_shell: Builder, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        shell, _ = canvas_shell([FakeTurn(chunks=("x",))])
+        closed: list[str] = []
+
+        def boom() -> None:
+            raise RuntimeError("teardown bug")
+
+        monkeypatch.setattr(shell.window.canvas_tools, "close", boom)
+        monkeypatch.setattr(shell.window.session, "close", lambda: closed.append("session"))
+
+        with pytest.raises(RuntimeError, match="teardown bug"):
+            shell.window.shutdown()
+
+        assert closed == ["session"]
 
     def test_patch_state_updates_the_widgets_and_fires_no_handler(
         self, canvas_shell: Builder
@@ -488,3 +594,19 @@ def test_sandbox_handlers_are_disabled_with_a_reason_and_cannot_fire_in_the_shel
     assert tool.runtime.store.value(StateKey("status")) == status
     assert not shell.window.controller.busy
     assert len(provider.requests) == 2
+
+
+def test_the_host_reports_the_keys_that_changed_computed_ones_included(
+    canvas_shell: Builder,
+) -> None:
+    from tumbleweed.ui.spec import validate_ui_spec
+
+    shell, _ = canvas_shell([FakeTurn(chunks=("x",))])
+    tools = shell.window.canvas_tools
+    shown = tools.show(validate_ui_spec(TIP), "replace")
+
+    changed = tools.patch(shown.instance, {"bill": 100.0, "people": 2})
+
+    assert [str(key) for key in changed][:2] == ["bill", "tip_amount"]
+    assert "people" not in changed  # written, but it already had that value
+    assert tools.patch(shown.instance, {"bill": 100.0}) == ()

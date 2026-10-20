@@ -10,6 +10,7 @@ from the spec's schema and docs (`tumbleweed.agent.spec_prompt`), not typed. The
 version of its own, the spec's, and is bounded separately.
 """
 
+import hashlib
 import re
 from importlib import resources
 from typing import Final
@@ -46,3 +47,14 @@ def load_system_prompt(version: str = SYSTEM_PROMPT_VERSION) -> str:
     if reference is None:
         return text
     return f"{text}\n\n{_read(f'{reference}.md', MAX_SPEC_REFERENCE_BYTES, 'spec reference')}"
+
+
+def system_prompt_label(version: str = SYSTEM_PROMPT_VERSION) -> str:
+    """What the invocation log records for the prompt: the version, and for a prompt that carries
+    the generated spec reference, a short hash of the whole text (`v2.1a2b3c4d`), so a change to
+    the docs or the models that regenerates the reference is a different label, not an unnoticed
+    edit under the same one."""
+    if version not in _SPEC_REFERENCE_OF:
+        return version
+    digest = hashlib.sha256(load_system_prompt(version).encode("utf-8")).hexdigest()
+    return f"{version}.{digest[:8]}"

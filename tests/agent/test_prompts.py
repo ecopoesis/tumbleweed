@@ -13,6 +13,7 @@ from tumbleweed.agent.prompts import (
     MAX_SPEC_REFERENCE_BYTES,
     SYSTEM_PROMPT_VERSION,
     load_system_prompt,
+    system_prompt_label,
 )
 from tumbleweed.agent.spec_prompt import SECTIONS, build_section, main, section_text
 from tumbleweed.core.errors import InvalidValueError
@@ -144,3 +145,31 @@ class TestSpecReference:
         text = (ROOT / "src/tumbleweed/agent/prompts/ui_spec_v1.md").read_bytes()
 
         assert 0 < len(text) <= MAX_SPEC_REFERENCE_BYTES
+
+
+class TestLabel:
+    def test_the_first_version_is_labelled_by_its_name_and_the_current_one_by_a_hash_too(
+        self,
+    ) -> None:
+        from tumbleweed.agent.recorder import _PROMPT_VERSION_PATTERN
+
+        assert system_prompt_label("v1") == "v1"
+        label = system_prompt_label()
+        assert re.fullmatch(r"v2\.[0-9a-f]{8}", label)
+        assert re.fullmatch(_PROMPT_VERSION_PATTERN, label)  # the log accepts it
+
+    def test_a_change_of_the_reference_is_a_different_label(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import tumbleweed.agent.prompts as prompts
+
+        before = system_prompt_label()
+        original = prompts._read  # noqa: SLF001
+
+        def changed(name: str, limit: int, what: str) -> str:
+            text = original(name, limit, what)
+            return text + " changed" if name.startswith("ui_spec") else text
+
+        monkeypatch.setattr(prompts, "_read", changed)
+
+        assert system_prompt_label() != before

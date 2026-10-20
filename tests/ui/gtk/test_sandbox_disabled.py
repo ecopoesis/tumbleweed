@@ -207,3 +207,16 @@ def test_widget_at_gives_the_box_that_holds_the_control_and_its_reason() -> None
 
     assert isinstance(held, Gtk.Box)
     assert [type(w) for w in descendants(held) if isinstance(w, Gtk.Button)] == [Gtk.Button]
+
+
+def test_the_box_keeps_the_controls_expansion_so_the_layout_is_the_specs() -> None:
+    from tumbleweed.shell._gi import Gtk
+
+    tool = render(CONTROLS["entry change"])  # an entry expands horizontally
+    held = tool.widget_at("root.children[0]")
+    assert isinstance(held, Gtk.Box)
+
+    (entry,) = of_type(tool, Gtk.Entry)
+
+    assert held.get_hexpand() == entry.get_hexpand() is True
+    assert held.get_halign() == entry.get_halign()

@@ -231,22 +231,24 @@ class ShellWindow(Adw.ApplicationWindow):
         self._closing = True
         if self._canvas_link is not None:
             self._canvas_link.detach()
-        self.event_gate.close()
-        self.canvas_tools.close()
         try:
-            if self._speech_feed is not None:
-                self.transcript.unsubscribe(self._speech_feed)
-            if self.voice_controls is not None:
-                self.transcript.unsubscribe(self.voice_controls.reply_watch)
-                self.voice_controls.shutdown()
+            self.event_gate.close()
+            self.canvas_tools.close()
         finally:
             try:
-                self.chat_panel.shutdown()
+                if self._speech_feed is not None:
+                    self.transcript.unsubscribe(self._speech_feed)
+                if self.voice_controls is not None:
+                    self.transcript.unsubscribe(self.voice_controls.reply_watch)
+                    self.voice_controls.shutdown()
             finally:
                 try:
-                    self.terminal_pane.shutdown()
+                    self.chat_panel.shutdown()
                 finally:
-                    self.session.close()
+                    try:
+                        self.terminal_pane.shutdown()
+                    finally:
+                        self.session.close()
 
     def _on_close_request(self, _window: Gtk.Window) -> bool:
         self.shutdown()

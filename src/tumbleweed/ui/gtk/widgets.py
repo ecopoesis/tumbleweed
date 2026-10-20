@@ -567,15 +567,19 @@ def _handlers_of(component: Component) -> tuple[HandlerName | None, ...]:
             assert_never(unreachable)
 
 
-def _disabled_with_reason(widget: Gtk.Widget, ctx: BuildContext) -> Gtk.Widget:
-    """`widget` insensitive, with the reason in plain text under it, in the tool itself.
+def _disabled_with_reason(widget: Gtk.Widget) -> Gtk.Widget:
+    """`widget` insensitive, in a box with the reason in plain text under it, in the tool itself.
 
-    Never a tooltip (D14: a tooltip is a surface of its own, #53). The control keeps working as
-    far as the user's edit of its value goes nowhere: `BuildContext` does not fire a sandbox
-    handler whatever reaches it, so this is the explanation, not the guard.
+    Never a tooltip (D14: a tooltip is a surface of its own, #53). This is the explanation, not the
+    guard: `BuildContext` withholds a sandbox handler's events whatever reaches the widget. The box
+    takes over the control's expansion and alignment, so the layout stays as the spec made it.
     """
     widget.set_sensitive(False)
     column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    column.set_hexpand(widget.get_hexpand())
+    column.set_vexpand(widget.get_vexpand())
+    column.set_halign(widget.get_halign())
+    column.set_valign(widget.get_valign())
     column.append(widget)
     column.append(line_label(SANDBOX_UNAVAILABLE, css_classes=["dim-label", "caption"]))
     return column
@@ -591,7 +595,7 @@ def build_widget(component: Component, path: str, ctx: BuildContext) -> Gtk.Widg
     if not ctx.runtime.sandbox_connected and any(
         ctx.names_sandbox_handler(name) for name in _handlers_of(component)
     ):
-        return _disabled_with_reason(widget, ctx)
+        return _disabled_with_reason(widget)
     return widget
 
 
