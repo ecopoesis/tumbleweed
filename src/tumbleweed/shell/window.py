@@ -155,7 +155,7 @@ class ShellWindow(Adw.ApplicationWindow):
         # Ctrl+L is the shell's clear-screen: while the terminal has the focus the action is
         # disabled, which lets the key through to the terminal.
         self.connect("notify::focus-widget", self._on_focus_changed)
-        self._add_action("toggle-side-panel", self._toggle_side_panel)
+        self._side_action = self._add_action("toggle-side-panel", self._toggle_side_panel)
         self.connect("close-request", self._on_close_request)
         self.set_focus(self.chat_panel.input_view)
 
@@ -190,7 +190,20 @@ class ShellWindow(Adw.ApplicationWindow):
 
     def _on_focus_changed(self, _window: Gtk.Window, _pspec: object) -> None:
         focus = self.get_focus()
-        self._focus_action.set_enabled(focus is None or not focus.is_ancestor(self.terminal_pane))
+        # Ctrl+L, F9 and Ctrl+Q are chords a program in the terminal uses (clear screen, a function
+        # key, quit): while the terminal has the focus the actions are disabled, which lets GTK
+        # pass the keys on to it (#90). Ctrl+Q then quits the program in the terminal, as in any
+        # terminal; the shell is quit from the chat, from the window's close button or by a signal.
+        enabled = focus is None or not focus.is_ancestor(self.terminal_pane)
+        self._focus_action.set_enabled(enabled)
+        self._side_action.set_enabled(enabled)
+        self._set_quit_enabled(enabled)
+
+    def _set_quit_enabled(self, enabled: bool) -> None:
+        application = self.get_application()
+        action = None if application is None else application.lookup_action("quit")
+        if isinstance(action, Gio.SimpleAction):
+            action.set_enabled(enabled)
 
     def _focus_input_unless_closing(self) -> None:
         if not self._closing:
@@ -229,6 +242,7 @@ class ShellWindow(Adw.ApplicationWindow):
         calls this: the `close-request` handler does, and so does the application when it quits.
         """
         self._closing = True
+        self._set_quit_enabled(True)  # the application outlives the window's focus
         if self._canvas_link is not None:
             self._canvas_link.detach()
         try:

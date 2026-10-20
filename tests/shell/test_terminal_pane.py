@@ -682,6 +682,28 @@ class TestTheEmbeddedTerminal:
         assert pump_until(lambda: action.get_enabled())
         assert not pane.get_visible()
 
+    def test_ctrl_q_and_f9_go_to_the_terminal_while_it_has_the_focus(
+        self, vte_shell: VteShellBuilder
+    ) -> None:
+        """#90: the quit and side-panel actions are disabled while the terminal has the focus, so
+        GTK does not take the chords from the program running in it."""
+        shell = vte_shell()
+        show(shell)
+        side = shell.window.lookup_action("toggle-side-panel")
+        quit_action = shell.app.lookup_action("quit")
+        assert side is not None
+        assert quit_action is not None
+        assert side.get_enabled()
+        assert quit_action.get_enabled()
+
+        press_f12(shell)
+        assert pump_until(lambda: not side.get_enabled())
+        assert not quit_action.get_enabled()
+
+        press_f12(shell)  # hide: the focus returns to the chat
+        assert pump_until(lambda: side.get_enabled())
+        assert quit_action.get_enabled()
+
     def test_a_shell_that_exits_closes_the_pane_and_is_reaped(
         self, vte_shell: VteShellBuilder, tmp_path: Path
     ) -> None:
