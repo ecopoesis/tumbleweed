@@ -1250,15 +1250,24 @@ Each invariant names where it is enforced. Reviews check every change against th
   (control, format and separator characters become a space; a cut ends in an ellipsis). Every string
   goes in with `set_text`, markup and mnemonics off. The styling is a set of classes
   (`tw-trusted-*`) that a spec cannot name: the spec model has no field for a class, a name or a
-  region, and a test renders a hostile spec and looks. *When it takes answers*: not for 750 ms, by
-  the controller's clock, read when the answer arrives (a late timer cannot arm it early); the
-  buttons are dimmed until then. The 750 ms counts from the prompt's first frame, and starts again
-  when the window is activated (not while the picker's own dialog is open: the window only lost the
-  focus to it) and on every press or key that reaches the window before the prompt is armed, so that
-  a stream of clicks aimed at where a button will appear is never taken until it has stopped for the
-  whole delay. A click comes on the release of a press, so a press that began before the prompt was
-  armed ends in no click however long it was held, and does not open the picker either; a key held
-  from before is the same. Deny has the focus. *One at a time*: the rest wait in order, at most 8 in
+  region, and a test renders a hostile spec and looks. *When it takes answers*: the arming
+  invariant. **(A) An Allow or a Choose (anything that can lead to a grant) is accepted only if the
+  user input that produced it (the pointer press whose release clicked it, or the key press that
+  activated it) began while the prompt was armed and after the last arming restart, and no input
+  that began while disarmed is still held. (B) A Deny is never refused because of an input that is
+  held or how one began (it cannot become a grant), and is ignored only in the first 750 ms. (C)
+  Nothing refuses a deliberate Allow for good: an input that begins after arming with nothing
+  tainted held is accepted, of either kind and after any other input; a refusal is shown in a
+  note.** The 750 ms are of quiet, by the controller's clock, read when the answer arrives (a late
+  timer cannot arm it early); the buttons are dimmed until then. The delay starts again at the first
+  frame, when the window is activated (not while the picker's own dialog is open: the window only
+  lost the focus to it) and at any input that begins while disarmed. Every pointer button, touch and
+  key that is down is tracked exactly, from the press and release events themselves (not a gesture's
+  "stopped", which fires during any hold of 400 ms), by identity (keys by hardware code, never read
+  as characters), and is tainted if it began disarmed or before a restart; a second button, a key
+  (Enter on the focused Deny too) or auto-repeat cannot end the hold of another input; a window that
+  loses the focus forgets what was held. `tests/shell/test_prompt_arming_model.py` checks (A) to (C)
+  over random sequences. Deny has the focus. *One at a time*: the rest wait in order, at most 8 in
   all (a ninth is refused and denied by the broker); each has the broker's deadline
   (`expires_in_ms`) from the moment it arrived, and past it the shell answers `deny(prompt_timeout)`
   and takes it down, shown or waiting. A prompt does not outlive its connection: when the connection

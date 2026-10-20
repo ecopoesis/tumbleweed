@@ -397,6 +397,17 @@ class TestTheArmingInvariant:
 
         assert click(rig, card, ALLOW_TASK)
 
+    def test_a_cancelled_press_leaves_no_click_to_refuse(self, rig: Rig) -> None:
+        """It made no click, so an activation that comes without a new input of its own (a held
+        Enter's) is not refused for it."""
+        card = rig.offer()
+        rig.timers.advance(0.1)
+        rig.controller.input_began(TOUCH)
+        rig.controller.input_ended(TOUCH, cancelled=True)
+        rig.arm()
+
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+
     def test_a_broken_grab_cancels_every_pointer_press(self, rig: Rig) -> None:
         card = rig.offer()
         rig.timers.advance(0.1)

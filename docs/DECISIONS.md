@@ -1121,17 +1121,37 @@ must be shorter than what a caller waits: `BrokerClient.request_grant` waits `PR
 `BrokerConfig` refuses settings whose prompt, three file system calls and 5 s are longer, and the
 daemon's handlers get at least that and 30 s. So a transport timeout can never come before the
 broker has stopped asking, which would let an Allow make a grant nobody hears about. A timeout is a
-denial on both sides. (6) *The shell is a controller and widgets.* `PromptController` has no GTK and
-holds I5's rules: one prompt at a time, in order, at most 8; answers ignored for 750 ms by its own
-clock, read when the answer arrives, counted from the first frame and started again by the window
-being activated (not while the picker's own dialog is open) and by any press or key that reaches the
-window before the prompt is armed (a stream of clicks aimed at where a button will appear is never
-taken); a press that began before the prompt was armed ends in no click however long it is held (the
-click comes on the release), and a held key likewise; a deadline that denies, shown or waiting; the
-card built from the structure; the path spelled out where it has a control, format or separator
-character (the categories of `core.types` and more, with a test that keeps them so); the reason set
-apart as a quotation with no quotation marks, so none of its characters can close one. The banner in
-the chrome region draws it and reports clicks. While a prompt is pending a guard makes everything
+denial on both sides. (6) *The shell is a controller and widgets, and the arming rule is one
+invariant.* `PromptController` has no GTK and holds I5's rules: one prompt at a time, in order, at
+most 8; a deadline that denies, shown or waiting; the card built from the structure; the path
+spelled out where it has a control, format or separator character (the categories of `core.types`
+and more, with a test that keeps them so); the reason set apart as a quotation with no quotation
+marks, so none of its characters can close one. The 750 ms are governed by this invariant, which
+three rounds of flag patches (a held press, a key during it, Enter on the focused Deny, a refused
+click clearing the wrong flag, a gesture's "stopped") showed had to be stated and not approximated:
+**(A) An Allow/Choose (anything that can lead to a grant) is accepted only if the user input that
+produced it, the pointer press whose release clicked it or the key press that activated it, began
+while the prompt was armed and after the last arming restart, and no input that began while disarmed
+is still held. (B) A Deny is never refused because of an input that is held or how one began, since
+a Deny cannot become a grant; it still needs a real click or key (I10) and is ignored only in the
+first 750 ms, which the plan asks (early clicks and Enter presses are ignored). (C) Nothing refuses
+a deliberate Allow for good: an input that begins after arming with nothing tainted held is
+accepted, of either kind and after any other input (typing, a window activation); a refusal of an
+Allow is shown in a note.** It is implemented by recording every pointer button, touch and key that
+goes down with whether the prompt was armed and in which epoch (every restart of the delay starts
+one: the prompt shown, first drawn, the window activated, any input that begins while disarmed); an
+input is tainted if it began disarmed or in an earlier epoch; held inputs are counted exactly by
+identity, so a second button, a key, Enter on the focused Deny or an auto-repeat cannot end the hold
+of another input; a release remembers whether the input that ended was tainted, for the click that
+follows. Losing the focus cancels what was held (GTK cancels it), and a release that otherwise never
+comes fails closed: Allows are refused until it is released again, the window is deactivated or the
+prompt ends, and the broker's deadline denies. The window reports exact press and release events (a
+gesture's "stopped" is not a release: it fires from the double-click timer during any hold of 400
+ms), key hardware codes as opaque numbers (no key is read as a character: a tripwire test holds
+that) and the focus coming and going. A model-based property test
+(`tests/shell/test_prompt_arming_model.py`) drives random interleavings against a reference model
+written from (A) to (C); the round-3 controller fails it, in both directions. The banner in the
+chrome region draws the card and reports clicks. While a prompt is pending a guard makes everything
 but the chrome insensitive (the canvas, the chat, whose labels are selectable and so open a menu,
 the terminal pane and the status strip's Terminal button; F12 does nothing); the strip's voice
 buttons stay usable, because turning the microphone off with the pointer must always work and cannot

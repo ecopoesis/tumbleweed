@@ -286,8 +286,8 @@ class ArmingMachine(RuleBasedStateMachine):
 
 TestArmingModel = ArmingMachine.TestCase
 TestArmingModel.settings = settings(
-    max_examples=400,
-    stateful_step_count=45,
+    max_examples=1500,
+    stateful_step_count=60,
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow],
 )
