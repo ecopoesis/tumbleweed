@@ -46,6 +46,20 @@ from tumbleweed.sandbox.policy import (
 )
 
 DEFAULT_RETENTION: Final = timedelta(days=7)
+MAX_PROMPT_TIMEOUT: Final = timedelta(seconds=120)
+"""The longest a prompt may wait."""
+PROMPT_MARGIN: Final = timedelta(seconds=30)
+PROMPT_WAIT: Final = MAX_PROMPT_TIMEOUT + PROMPT_MARGIN
+"""How long a caller of `request_grant` waits (`client`), and the most one request may spend: the
+prompt's wait and the file system calls around it (`FS_CALLS_PER_PROMPT`, each bounded by
+`fs_timeout`). `BrokerConfig` refuses settings whose sum is longer, and the daemon's handlers get
+at least that: otherwise a transport timeout would reach the caller while the broker still asks, and
+an Allow after it would make a grant the caller never hears about (#60)."""
+PROMPT_SLACK: Final = timedelta(seconds=5)
+"""What must be left of `PROMPT_WAIT` after the prompt and the file system calls."""
+FS_CALLS_PER_PROMPT: Final = 3
+"""A grant request resolves the path and builds the deny rules before the prompt and builds the
+rules again after it (a picker resolves after it and builds rules once more)."""
 _MAX_EXTRA: Final = 64
 
 
@@ -64,7 +78,15 @@ class BrokerConfig:
     - `max_live_tasks`, `max_concurrent_runs`: bounds (I9); more are refused with `busy`.
     - `fs_timeout`: how long a decision-time or run-time file system call may take, one that
       reads or walks paths. `delete_timeout`: the same for deleting a workspace.
-    - `prompt_timeout`: how long a prompt may wait for the user; a timeout is a denial.
+    - `prompt_timeout`: how long a prompt may wait for the user, at most `MAX_PROMPT_TIMEOUT`; a
+      timeout is a denial. It and `fs_timeout` are limited together: a grant request spends the
+      prompt and three file system calls (`FS_CALLS_PER_PROMPT`), and those and `PROMPT_SLACK` must
+      fit in `PROMPT_WAIT` (150 s), which is what a caller waits. With the default `prompt_timeout`
+      that leaves `fs_timeout` at most about 8.3 s; a shorter prompt leaves more.
+    - `prompts_per_window`, `prompt_window`: how many prompts a task may cause in that long (I5:
+      5 in 10 minutes); the rest are denied without asking, and the model is told why. A task that
+      replaces another has what is left of the allowance of the one it replaces.
+      `owner_prompts_per_window` is the ceiling of one connection over all its tasks (15).
     - `run_grace`: how long past its wall-clock limit a run may take to set up and be reaped.
     - `sandbox_path`: the `PATH` inside a sandbox (the runtime decides where its programs are).
     - `limits`: the sandbox limits of a run, except what a request may lower.
@@ -84,7 +106,10 @@ class BrokerConfig:
     max_runs_per_task: int = 1000
     fs_timeout: timedelta = timedelta(seconds=5)
     delete_timeout: timedelta = timedelta(seconds=60)
-    prompt_timeout: timedelta = timedelta(seconds=60)
+    prompt_timeout: timedelta = timedelta(seconds=120)
+    prompts_per_window: int = 5
+    owner_prompts_per_window: int = 15
+    prompt_window: timedelta = timedelta(minutes=10)
     run_grace: timedelta = timedelta(seconds=20)
     sandbox_path: str = "/usr/bin:/bin"
 
@@ -97,8 +122,18 @@ class BrokerConfig:
         _require_duration("sweep_interval", self.sweep_interval, maximum=timedelta(days=1))
         _require_duration("fs_timeout", self.fs_timeout, maximum=timedelta(minutes=5))
         _require_duration("delete_timeout", self.delete_timeout, maximum=timedelta(hours=1))
-        _require_duration("prompt_timeout", self.prompt_timeout, maximum=timedelta(hours=1))
+        _require_duration("prompt_timeout", self.prompt_timeout, maximum=MAX_PROMPT_TIMEOUT)
+        _require_duration("prompt_window", self.prompt_window, maximum=timedelta(days=1))
         _require_duration("run_grace", self.run_grace, maximum=timedelta(minutes=5))
+        if self.prompt_timeout + FS_CALLS_PER_PROMPT * self.fs_timeout + PROMPT_SLACK > PROMPT_WAIT:
+            raise InvalidValueError(
+                "prompt_timeout and the file system calls around a prompt "
+                f"({FS_CALLS_PER_PROMPT} x fs_timeout) and {PROMPT_SLACK} must fit in {PROMPT_WAIT}"
+            )
+        for name in ("prompts_per_window", "owner_prompts_per_window"):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= 10_000:
+                raise InvalidValueError(f"{name} must be an int from 1 to 10000")
         for name, high in (("max_live_tasks", 1024), ("max_concurrent_runs", 64)):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= high:

@@ -935,6 +935,13 @@ one means, is `tumbleweed.ui/2`.
   (`tumbleweed.ui.gtk`) creates no popup, dialog, tooltip or drag icon from a spec (a `dropdown` is
   a list in place, ARCHITECTURE I5) and renders all 18 kinds (S11, section 8); the host gives it an
   `ImageResolver` (`tumbleweed.ui.images`: S19 passes the broker's) for the images.
+- **Trusted prompts (S18).** A spec cannot imitate a permission prompt or reach it: no field of any
+  component sets a style class, a widget name or a place in the window, so the prompt's styling
+  (`tw-trusted-*`) and its region (the chrome, outside the canvas) are not available to a spec, and
+  text that says "Permission request" is only text on the canvas. While a prompt is pending the
+  canvas is insensitive (nothing in a tool takes a click or a key, and no handler fires from user
+  input), and any popover or window that is open is closed; a tool's own state and computed values
+  go on working. A prompt shows nothing from a spec (ARCHITECTURE I5).
 - **Agent (S12).** `parse_ui_spec` for text and `validate_ui_spec` for a tool call's arguments;
   return `SpecError.problems` to the model; `UiSpec.validate_patch(patch, current=...)` for
   `patch_state`; the system prompt section is generated from the models' JSON Schema and this

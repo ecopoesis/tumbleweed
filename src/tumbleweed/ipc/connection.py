@@ -5,6 +5,12 @@ is done; both ends are the same class. Either peer calls the other with `call` a
 other's requests with its `RequestHandler`, concurrently and in any order: requests are told
 apart by their `IpcRequestId`, which only has meaning on the connection it was sent on.
 
+A connection made with a `Role` (the broker's end or the shell's) serves only the requests of that
+role and sends only the ones its peer serves (`messages.serves`, `messages.sends`, #61): a request
+of the other direction is answered `unsupported_request` without reaching the handler, and
+`call` raises `TypeError` for one that no peer of the other role would serve. Without a role (the
+transport's own tests) any registered request goes either way.
+
 The connection answers the transport's own diagnostics, `ping` and `echo`, itself: a
 `RequestHandler` never sees them, so a handler matches on the requests of its own step only.
 (`answer_diagnostics=False` hands them to the handler. It is a seam for tests, which have no
@@ -79,7 +85,18 @@ from tumbleweed.ipc.errors import (
 )
 from tumbleweed.ipc.framing import close_writer, encode_frame, read_frame, write_bytes
 from tumbleweed.ipc.limits import IpcLimits
-from tumbleweed.ipc.messages import Echo, Echoed, Ping, Pong, RequestBody, Response, ResponseBody
+from tumbleweed.ipc.messages import (
+    Echo,
+    Echoed,
+    Ping,
+    Pong,
+    RequestBody,
+    Response,
+    ResponseBody,
+    Role,
+    sends,
+    serves,
+)
 from tumbleweed.ipc.wire import (
     MAX_ERROR_MESSAGE_CHARS,
     ErrorFrame,
@@ -144,7 +161,9 @@ class Connection:
         limits: IpcLimits,
         handler: RequestHandler | None,
         answer_diagnostics: bool = True,
+        role: Role | None = None,
     ) -> None:
+        self._role = role
         self._reader = reader
         self._writer = writer
         self._transport = writer.transport
@@ -228,6 +247,8 @@ class Connection:
         if type(limit) is not timedelta or limit <= timedelta(0):
             raise InvalidValueError(f"request_timeout must be a positive timedelta, got {limit!r}")
         self._raise_if_closed()
+        if self._role is not None and not isinstance(request, (*sends(self._role), Ping, Echo)):
+            raise TypeError(f"a {self._role.value} end does not send a {type(request).__name__}")
         if len(self._pending) >= self._limits.max_inflight_calls:
             raise TooManyRequestsError(
                 f"{len(self._pending)} requests are already in flight "
@@ -431,6 +452,11 @@ class Connection:
         if handler is None:
             self._reply_now(
                 _error(frame.id, ErrorCode.UNSUPPORTED_REQUEST, "this peer serves no requests")
+            )
+            return
+        if self._role is not None and not isinstance(frame.body, serves(self._role)):
+            self._reply_now(
+                _error(frame.id, ErrorCode.UNSUPPORTED_REQUEST, "this peer does not serve that")
             )
             return
         if len(self._inflight) >= self._limits.max_inflight_handlers:

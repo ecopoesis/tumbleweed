@@ -48,12 +48,14 @@ import dataclasses
 import itertools
 import logging
 import os
+import time
+from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from functools import partial
-from typing import Final, Literal, NewType, Protocol, assert_never, final
+from typing import Final, Literal, Protocol, assert_never, final
 
 from tumbleweed.broker.audit import (
     MAX_AUDITED_IDS,
@@ -102,6 +104,7 @@ from tumbleweed.broker.fsworker import FsWorker
 from tumbleweed.broker.grants import (
     Grant,
     GrantOrigin,
+    GrantScope,
     OnceGrant,
     RunContext,
     RunTrigger,
@@ -109,6 +112,7 @@ from tumbleweed.broker.grants import (
     ToolGrant,
 )
 from tumbleweed.broker.identity import FsIdentity
+from tumbleweed.broker.owner import Owner
 from tumbleweed.broker.paths import ResolvedPath, StoredPath
 from tumbleweed.broker.policy import (
     AccessRequest,
@@ -150,6 +154,7 @@ from tumbleweed.ipc.broker_messages import (
     ListDir,
     ListWorkspace,
     NetworkAccess,
+    PickAccess,
     ReadAccess,
     ReadFile,
     ReadWorkspaceFile,
@@ -169,6 +174,14 @@ from tumbleweed.ipc.broker_messages import (
 from tumbleweed.ipc.broker_messages import TaskEnded as TaskEndedReply
 from tumbleweed.ipc.errors import ErrorCode, RequestRefused
 from tumbleweed.ipc.messages import Echo, Ping, RequestBody, ResponseBody
+from tumbleweed.ipc.prompt_messages import (
+    AllowDecision,
+    AnswerPrompt,
+    ClosePrompt,
+    DenyDecision,
+    PromptAnswered,
+    ShowPrompt,
+)
 from tumbleweed.ipc.tool_messages import (
     ExportTool,
     ImportTool,
@@ -213,10 +226,19 @@ from tumbleweed.tools import (
 
 _log = logging.getLogger(__name__)
 
-Owner = NewType("Owner", int)
-"""One IPC connection, as far as the service is concerned: the daemon makes one per connection."""
-
 MAX_GRANTS_PER_TASK: Final = 64
+_MAX_ENDED_PER_OWNER: Final = 256
+_DENIAL_MESSAGES: Final = {
+    "rate_limited": "too many permission requests for this task; wait a while before asking again",
+    "rate_limited_connection": "too many permission requests in all; wait a while before asking",
+    "prompt_timeout": "the user did not answer in time",
+    "no_prompt_ui": "there is nobody to ask here",
+    "prompt_busy": "the user could not be asked just now: too many questions are waiting",
+    "prompt_failed": "the user could not be asked: the prompt did not work",
+    "scope_not_offered": "the answer was not one the prompt offered, so nothing was granted",
+    "user_denied": "the user did not allow it",
+}
+_DENIED: Final = "the request was denied"
 _PROBE_WAIT: Final = timedelta(seconds=15)
 _SWEEP_BATCH: Final = 100
 _UNAVAILABLE_AUDIT: Final = "the audit log is unavailable, so nothing is done"
@@ -232,6 +254,12 @@ class Sandbox(Protocol):
     async def aclose(self) -> None: ...
 
 
+def _denial_message(reason: str) -> str:
+    """What the model is told when a request is denied: fixed text for the reasons that are ours
+    (never the user's words, never a path)."""
+    return _DENIAL_MESSAGES.get(reason, _DENIED)
+
+
 class _Refuse(Exception):  # noqa: N818  (it is an answer, not a failure)
     """Internal: stop the request and answer `Refused(reason, message)`. Never leaves the module."""
 
@@ -242,6 +270,25 @@ class _Refuse(Exception):  # noqa: N818  (it is an answer, not a failure)
         self.code = code or reason  # what the audit log says: more exact than the reason
 
 
+@final
+class _Budget:
+    """How many prompts may be asked in a window, on a monotonic clock (a wall clock that jumps
+    would free or hold a task by the size of the jump). A prompt is counted when it is asked."""
+
+    def __init__(self, limit: int, window: timedelta) -> None:
+        self._limit = limit
+        self._window = window.total_seconds()
+        self._asked: deque[float] = deque()
+
+    def exhausted(self, now: float) -> bool:
+        while self._asked and now - self._asked[0] >= self._window:
+            self._asked.popleft()
+        return len(self._asked) >= self._limit
+
+    def count(self, now: float) -> None:
+        self._asked.append(now)
+
+
 @dataclass(slots=True)
 class _Live:
     """A live task: its policy state, who owns it and what it holds."""
@@ -249,6 +296,9 @@ class _Live:
     owner: Owner
     state: TaskState
     workspace: FsIdentity
+    # What the task's lineage may still ask: shared with the task that replaces it (a model that
+    # starts a new task does not get a new allowance).
+    prompts: _Budget
     grants: list[Grant] = field(default_factory=list)
     runs: set[RunId] = field(default_factory=set)
     pending_runs: set[RunId] = field(default_factory=set)  # reserved, not yet authorised
@@ -411,8 +461,16 @@ class BrokerService:
         prompts: PromptInterface,
         environ: Mapping[str, str],
         clock: Callable[[], datetime] = utc_now,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
+        self._monotonic = monotonic
+        self._owner_prompts: dict[Owner, _Budget] = {}  # one connection's ceiling over its tasks
+        # The allowances of tasks that ended, for `prompt_window` and at most `_MAX_ENDED_PER_OWNER`
+        # per connection (so that one connection's churn evicts nothing of another's), so that
+        # ending a task and then starting one with `previous` does not start over:
+        # owner -> task -> (allowance, when it ended).
+        self._ended_prompts: dict[Owner, dict[TaskId, tuple[_Budget, float]]] = {}
         self._store = store
         self._tools = tools
         self._audit = audit_log
@@ -483,6 +541,7 @@ class BrokerService:
             state=TaskState(task=record.task, taint=record.taint),
             workspace=record.workspace,
             grants=self._store.grants_of(record.task),
+            prompts=self._new_budget(self._config.prompts_per_window),
         )
         with self._atomic() as entries:
             self._end_stored(live, TaskEndReason.STARTUP, now, entries)
@@ -656,7 +715,9 @@ class BrokerService:
                 return self._export_tool(request)
             case ImportTool():
                 return self._import_tool(request)
-            case Ping() | Echo():
+            case AnswerPrompt():
+                return self._answer_prompt(owner, request)
+            case ShowPrompt() | ClosePrompt() | Ping() | Echo():
                 raise RequestRefused(ErrorCode.UNSUPPORTED_REQUEST, "not a broker request")
             case _:
                 assert_never(request)
@@ -673,6 +734,9 @@ class BrokerService:
                 _log.exception("a task of a closed connection could not be ended on record")
             finally:
                 self._apply_ended(live)
+        # The connection's allowances go with it (a reconnect starts a new one: #147).
+        self._owner_prompts.pop(owner, None)
+        self._ended_prompts.pop(owner, None)
 
     # --- the tool store ------------------------------------------------------------------------
 
@@ -841,6 +905,7 @@ class BrokerService:
     def _apply_ended(self, live: _Live) -> None:
         """Make an ended task unusable in memory and stop its runs."""
         self._live.pop(live.state.task, None)
+        self._remember_allowance(live)
         live.state = live.state.end()
         live.grants.clear()
         for future in list(live.running):
@@ -943,7 +1008,13 @@ class BrokerService:
             )
         if replaced is not None:
             self._apply_ended(replaced)
-        self._live[task] = _Live(owner=owner, state=state, workspace=identity)
+        budget = (
+            replaced.prompts
+            if replaced is not None
+            else self._ended_allowance(owner, request.previous)
+            or self._new_budget(self._config.prompts_per_window)
+        )
+        self._live[task] = _Live(owner=owner, state=state, workspace=identity, prompts=budget)
         return TaskStarted(kind="task_started", task=task, taint=_taint_names(state.taint))
 
     async def _discard_workspace(self, task: TaskId) -> None:
@@ -986,9 +1057,83 @@ class BrokerService:
         rules: DenyRules = await self._fs.call(partial(DenyRules.build, self._deny))
         return rules
 
+    def _answer_prompt(self, owner: Owner, request: AnswerPrompt) -> ResponseBody:
+        """Hand the user's answer to the prompt interface, which takes it only from the connection
+        the prompt was sent to, and only once (I5): any other is `unknown_prompt`."""
+        decision = request.decision
+        answer: PromptAnswer
+        match decision:
+            case AllowDecision():
+                answer = Allowed(scope=GrantScope(decision.scope), picked=decision.picked)
+            case DenyDecision():
+                answer = Denied(reason=decision.reason)
+            case _:
+                assert_never(decision)
+        if not self._prompts.answer(owner, request.prompt, answer):
+            raise _Refuse("unknown_prompt", "no such prompt")
+        return PromptAnswered(kind="prompt_answered")
+
+    def _remember_allowance(self, live: _Live) -> None:
+        """Keep an ended task's allowance for `prompt_window`, `_MAX_ENDED_PER_OWNER` per connection
+        (the oldest goes first: a lineage whose allowance was evicted starts a fresh per-task
+        allowance, still under its connection's ceiling)."""
+        now = self._monotonic()
+        window = self._config.prompt_window.total_seconds()
+        kept = {
+            task: entry
+            for task, entry in self._ended_prompts.get(live.owner, {}).items()
+            if now - entry[1] < window
+        }
+        while len(kept) >= _MAX_ENDED_PER_OWNER:
+            del kept[next(iter(kept))]
+        kept[live.state.task] = (live.prompts, now)
+        self._ended_prompts[live.owner] = kept
+
+    def _ended_allowance(self, owner: Owner, previous: TaskId | None) -> _Budget | None:
+        """The allowance of `previous`, an ended task of `owner`'s that ended within the window."""
+        kept = None if previous is None else self._ended_prompts.get(owner, {}).get(previous)
+        if kept is None:
+            return None
+        if self._monotonic() - kept[1] >= self._config.prompt_window.total_seconds():
+            return None
+        return kept[0]
+
+    def _new_budget(self, limit: int) -> _Budget:
+        return _Budget(limit, self._config.prompt_window)
+
+    def _rate_limited(self, live: _Live) -> str | None:
+        """Why the task may not be asked now, or None (I5: 5 in 10 minutes, by default): the rest
+        are denied without asking, and the model is told which limit it hit. A task that asks for
+        permission over and over is the user's attention under attack, or a loop. The allowance is
+        the lineage's (a task that replaces another, or one that replaces an ended one within the
+        window, has what is left of it) and the connection has a ceiling over all its tasks, so that
+        tasks started from nothing do not multiply it. Does not count this one."""
+        now = self._monotonic()
+        if live.prompts.exhausted(now):
+            return "rate_limited"
+        if self._owner_budget(live.owner).exhausted(now):
+            return "rate_limited_connection"
+        return None
+
+    def _count_prompt(self, live: _Live) -> None:
+        now = self._monotonic()
+        live.prompts.count(now)
+        self._owner_budget(live.owner).count(now)
+
+    def _owner_budget(self, owner: Owner) -> _Budget:
+        budget = self._owner_prompts.get(owner)
+        if budget is None:
+            budget = self._owner_prompts[owner] = self._new_budget(
+                self._config.owner_prompts_per_window
+            )
+        return budget
+
     async def _request_grant(self, owner: Owner, request: RequestGrant) -> ResponseBody:
         self._owned(owner, request.task)
-        capability, resolved = await self._access_target(request)
+        access = request.access
+        if isinstance(access, PickAccess):
+            return await self._request_pick(owner, request, access)
+        capability, resolved = await self._access_target(access)
         rules = await self._rules()
         context = RunContext(run=request.run, trigger=RunTrigger.MODEL, tool=None)
         asked = AccessRequest(task=request.task, run=context, capability=capability, path=resolved)
@@ -1032,16 +1177,73 @@ class BrokerService:
         if self._held(live) >= MAX_GRANTS_PER_TASK:  # before asking: nobody is asked in vain
             self._audit_denied(request, capability, path_text, "grant_cap")
             raise _Refuse("busy", "the task holds as many grants as it may")
-        answer = await self._ask(prompt)
+        if (limit := self._rate_limited(live)) is not None:
+            return self._denied(request, capability, path_text, limit, _denial_message(limit))
+        self._count_prompt(live)
+        answer = await self._ask(prompt, owner)
         if isinstance(answer, Denied):
             return self._denied(
-                request, capability, path_text, answer.reason, "the user did not allow it"
+                request, capability, path_text, answer.reason, _denial_message(answer.reason)
             )
         try:
-            return await self._issue_after_prompt(owner, request, asked, answer, path_text)
+            return await self._issue_after_prompt(
+                owner, request, asked, answer, path_text, GrantOrigin.PROMPT
+            )
         except (_Refuse, PathError, FsTimeoutError, InvalidValueError) as error:
             # Whoever asked is told why, and the log says that the user's yes was not acted on.
             self._audit_denied(request, capability, path_text, _why(error))
+            raise
+
+    async def _request_pick(
+        self, owner: Owner, request: RequestGrant, access: PickAccess
+    ) -> ResponseBody:
+        """The trusted picker: the user chooses a file or folder and the choice is the grant (S18).
+
+        Nothing about the path can be decided before the user chooses, so before the prompt there
+        are only the checks that do not need it (a net-tainted task can be given no file, the grant
+        cap, the rate limit); the choice is then resolved and goes through the same issuance as any
+        other grant (the deny rules, the write gate, the taint rule, the cap).
+        """
+        capability = CapabilityKind.FS_READ
+        live = self._owned(owner, request.task)
+        if TaintKind.NET in live.state.taint:  # whatever is picked is `fs`: do not ask in vain
+            conflict = TaintConflict(held=TaintKind.NET, wanted=TaintKind.FS)
+            return self._denied(request, capability, None, conflict.kind, describe(conflict))
+        if self._held(live) >= MAX_GRANTS_PER_TASK:
+            self._audit_denied(request, capability, None, "grant_cap")
+            raise _Refuse("busy", "the task holds as many grants as it may")
+        if (limit := self._rate_limited(live)) is not None:
+            return self._denied(request, capability, None, limit, _denial_message(limit))
+        self._count_prompt(live)
+        prompt = GrantPrompt(
+            task=request.task,
+            run=request.run,
+            pick=access.choose,
+            scopes=frozenset({GrantScope.ONCE, GrantScope.TASK}),
+            reason=request.reason,
+        )
+        answer = await self._ask(prompt, owner)
+        if isinstance(answer, Denied):
+            return self._denied(
+                request, capability, None, answer.reason, _denial_message(answer.reason)
+            )
+        if answer.picked is None:  # a picker prompt is answered with a choice, or denied
+            return self._denied(
+                request, capability, None, "prompt_failed", _denial_message("prompt_failed")
+            )
+        picked_text: str | None = None  # what the audit says the user picked, once it is resolved
+        try:
+            resolved = await self._resolve(answer.picked)
+            picked_text = resolved.text
+            context = RunContext(run=request.run, trigger=RunTrigger.MODEL, tool=None)
+            asked = AccessRequest(
+                task=request.task, run=context, capability=capability, path=resolved
+            )
+            return await self._issue_after_prompt(
+                owner, request, asked, answer, resolved.text, GrantOrigin.PICKER
+            )
+        except (_Refuse, PathError, FsTimeoutError, InvalidValueError) as error:
+            self._audit_denied(request, capability, picked_text, _why(error))
             raise
 
     async def _issue_after_prompt(
@@ -1051,6 +1253,7 @@ class BrokerService:
         asked: AccessRequest,
         answer: Allowed,
         path_text: str | None,
+        origin: GrantOrigin,
     ) -> ResponseBody:
         capability = asked.capability
         rules = await self._rules()  # rebuilt at issuance (S16): the list may have grown
@@ -1061,7 +1264,7 @@ class BrokerService:
             live.state,
             asked,
             scope=answer.scope,
-            origin=GrantOrigin.PROMPT,
+            origin=origin,
             grant_id=GrantId.new(),
             rules=rules,
             now=self._now(),
@@ -1101,9 +1304,9 @@ class BrokerService:
                 assert_never(issuance)
 
     async def _access_target(
-        self, request: RequestGrant
+        self, access: ReadAccess | WriteAccess | NetworkAccess
     ) -> tuple[CapabilityKind, ResolvedPath | None]:
-        match request.access:
+        match access:
             case ReadAccess(path=text):
                 return CapabilityKind.FS_READ, await self._resolve(text)
             case WriteAccess(path=text):
@@ -1113,14 +1316,14 @@ class BrokerService:
             case _ as unreachable:
                 assert_never(unreachable)
 
-    async def _ask(self, prompt: GrantPrompt) -> PromptAnswer:
+    async def _ask(self, prompt: GrantPrompt, owner: Owner) -> PromptAnswer:
         """The user's answer, or a denial: a timeout, a failure or an answer that is not allowed
         by what was offered all deny."""
         limit = asyncio.timeout(self._config.prompt_timeout.total_seconds())
         answer: object
         try:
             async with limit:
-                answer = await self._prompts.ask(prompt)
+                answer = await self._prompts.ask(prompt, owner)
         except TimeoutError:
             if limit.expired():
                 return Denied(reason="prompt_timeout")
@@ -1132,6 +1335,10 @@ class BrokerService:
         if isinstance(answer, Allowed):
             if answer.scope not in prompt.scopes:
                 return Denied(reason="scope_not_offered")
+            if (answer.picked is None) != (prompt.pick is None):
+                # A choice answers the picker and nothing else: the user did not choose a path for
+                # a prompt that named one, and a picker is not answered without a choice.
+                return Denied(reason="prompt_failed")
             return answer
         if isinstance(answer, Denied):
             return answer

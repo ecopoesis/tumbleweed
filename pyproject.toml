@@ -225,10 +225,11 @@ forbidden_modules = [
 
 # The policy core, the store and the audit log know nothing of the transport (S16, S17). Only the
 # daemon layer does: `service` (which answers IPC requests), `daemon` (the server), `client`
-# (the shell's side) and `toolscli` (`tumbleweed-tools`, a client of the broker). Indirect imports
+# (the shell's side), `shellprompts` (the prompt interface, which asks the shell over its
+# connection) and `toolscli` (`tumbleweed-tools`, a client of the broker). Indirect imports
 # count, so nothing else may reach `ipc` through them either.
 [[tool.importlinter.contracts]]
-name = "the broker imports ipc only in its daemon layer: service, daemon, client and toolscli (S17, S23)"
+name = "the broker imports ipc only in its daemon layer: service, daemon, client, shellprompts and toolscli (S17, S18, S23)"
 type = "forbidden"
 source_modules = ["tumbleweed.broker"]
 forbidden_modules = ["tumbleweed.ipc"]
@@ -237,6 +238,7 @@ ignore_imports = [
     "tumbleweed.broker.daemon -> tumbleweed.ipc.**",
     "tumbleweed.broker.client -> tumbleweed.ipc.**",
     "tumbleweed.broker.toolscli -> tumbleweed.ipc.**",
+    "tumbleweed.broker.shellprompts -> tumbleweed.ipc.**",
 ]
 
 # `service` is exempt from the contract above, so something below it importing `service` would
@@ -257,11 +259,13 @@ source_modules = [
     "tumbleweed.broker.grants",
     "tumbleweed.broker.identity",
     "tumbleweed.broker.model",
+    "tumbleweed.broker.owner",
     "tumbleweed.broker.paths",
     "tumbleweed.broker.policy",
     "tumbleweed.broker.privatefs",
     "tumbleweed.broker.prompts",
     "tumbleweed.broker.service",
+    "tumbleweed.broker.shellprompts",
     "tumbleweed.broker.store",
     "tumbleweed.broker.task",
     "tumbleweed.broker.toolblobs",

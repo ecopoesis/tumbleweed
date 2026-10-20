@@ -289,3 +289,67 @@ def test_every_reviewed_action_is_low_harm(path: str) -> None:
 
     for action in EXPECTED_ACTIONS[path]:
         assert not any(word in action.lower() for word in forbidden), action
+
+
+def shell_with_a_prompt(tmp_path: Path, bus: Bus) -> subprocess.Popen[bytes]:
+    environment = {name: os.environ[name] for name in PASSED_ON if name in os.environ}
+    environment["DBUS_SESSION_BUS_ADDRESS"] = bus.address
+    environment["XDG_DATA_HOME"] = str(tmp_path / "data")
+    return subprocess.Popen(
+        [sys.executable, "-m", "tests.shell.prompt_shell_main"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=environment,
+    )
+
+
+def test_a_pending_prompt_and_an_open_picker_export_no_action_and_no_action_answers_them(
+    tmp_path: Path,
+) -> None:
+    """#54: no prompt, answer, picker result or grant is a GAction. With a prompt pending, then with
+    the picker's dialog open, the shell exports exactly the reviewed set, and activating every
+    action in it (but `quit`) leaves the prompt pending and unanswered."""
+    from tumbleweed.shell._gi import GLib
+
+    bus = Bus(tmp_path)
+    shell = shell_with_a_prompt(tmp_path, bus)
+    try:
+        read_until(shell, "stderr", b"prompt pending")
+        owner = bus.owner_of_process(shell.pid)
+
+        interfaces, actions = bus.exported(owner)
+        assert interfaces == EXPECTED_INTERFACES
+        assert actions == EXPECTED_ACTIONS
+
+        for path, names in actions.items():
+            for name in sorted(names - {"quit"}):
+                bus.call(
+                    owner,
+                    path,
+                    "org.gtk.Actions",
+                    "Activate",
+                    GLib.Variant("(sava{sv})", (name, [], {})),
+                    "()",
+                )
+
+        read_until(shell, "stderr", b"picker open")
+        interfaces, actions = bus.exported(owner)
+        assert interfaces == EXPECTED_INTERFACES  # the dialog adds nothing to the bus either
+        assert actions == EXPECTED_ACTIONS
+
+        assert shell.stdin is not None
+        shell.stdin.write(b"report\n")
+        shell.stdin.flush()
+        report = read_until(shell, "stderr", b"report pending=")
+        tail = report.split(b"report pending=")[1].split(b"\n")[0].decode()
+        assert tail.startswith("True answers=['deny']")  # only the user's own denial of the first
+        assert tail.endswith("windows=2")  # the shell's and the picker's dialog: it was open
+    finally:
+        if shell.poll() is None:
+            shell.kill()
+            shell.wait(timeout=10)
+        for stream in (shell.stdin, shell.stderr):
+            if stream is not None:
+                stream.close()
+        bus.close()

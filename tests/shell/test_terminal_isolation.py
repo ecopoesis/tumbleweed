@@ -697,7 +697,7 @@ def test_the_window_module_uses_a_shortcut_controller_not_a_key_controller() -> 
 # the event), so the handler names include `speech`. Since S08 it also takes Esc while a hands-free
 # turn is being recorded (it reads that machine's phase, never the event): `hands_free`, `hearing`.
 PUSH_TO_TALK_MODULE = "shell/voice_controls.py"
-OTHER_KEY_CONTROLLER_MODULES = ["shell/chat_panel.py"]
+OTHER_KEY_CONTROLLER_MODULES = ["shell/chat_panel.py", "shell/prompt_chrome.py"]
 PUSH_TO_TALK_HANDLER_NAMES = frozenset(
     {
         "Gdk", "Gtk", "keyval", "state", "in_terminal", "held", "voice", "_RELEASE_KEYS",
@@ -722,6 +722,38 @@ def test_push_to_talk_is_the_only_window_key_controller_outside_the_terminal_mod
     )
 
     assert users == sorted([*OTHER_KEY_CONTROLLER_MODULES, PUSH_TO_TALK_MODULE])
+
+
+def test_the_prompts_key_controller_reads_only_the_hardware_code_of_a_key() -> None:
+    """The prompt (S18) tracks which keys are held (to know when none is) and so reads the hardware
+    code, as an opaque number: the lambdas connected to `key-pressed` and `key-released` take
+    `(controller, keyval, keycode, state)` and use `keycode` only. No key is read as a character,
+    and the pointer controller handles no key event at all."""
+    tree = ast.parse((SOURCE / "shell/prompt_chrome.py").read_text())
+    handlers = {
+        str(_constant(call.args[0])): call.args[1]
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "connect"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "keys"
+    }
+
+    assert sorted(handlers) == ["key-pressed", "key-released"]
+    for handler in handlers.values():
+        assert isinstance(handler, ast.Lambda)
+        assert [a.arg for a in handler.args.args] == ["_c", "_keyval", "keycode", "_state"]
+        used = {n.id for n in ast.walk(handler.body) if isinstance(n, ast.Name)}
+        assert used & {"_keyval", "_state", "_c"} == set()  # only the code is read
+
+    pointer = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name in {"_on_pointer_event", "pointer_event"}
+    )
+    names = {n.attr for n in ast.walk(pointer) if isinstance(n, ast.Attribute)}
+    assert not {name for name in names if name.startswith(("KEY_", "get_key"))}
 
 
 def test_the_push_to_talk_controller_reads_nothing_but_the_key_and_the_modifiers() -> None:

@@ -14,6 +14,7 @@ from tumbleweed.ipc.errors import IpcError
 from tumbleweed.ipc.framing import close_writer
 from tumbleweed.ipc.handshake import server_handshake
 from tumbleweed.ipc.limits import IpcLimits
+from tumbleweed.ipc.messages import Role
 from tumbleweed.ipc.peercred import (
     PeerCredentialsProvider,
     SystemPeerCredentials,
@@ -70,6 +71,7 @@ class IpcServer:
         credentials: PeerCredentialsProvider | None = None,
         answer_diagnostics: bool = True,
         refresh_interval: timedelta = DEFAULT_REFRESH_INTERVAL,
+        role: Role | None = None,
     ) -> None:
         if type(max_connections) is not int or not 1 <= max_connections <= _MAX_CONNECTIONS_LIMIT:
             raise InvalidValueError(
@@ -83,6 +85,7 @@ class IpcServer:
         self._max_connections = max_connections
         self._credentials = SystemPeerCredentials() if credentials is None else credentials
         self._diagnostics = answer_diagnostics
+        self._role = role
         self._refresh_interval = refresh_interval
         self._owner = current_uid()
         self._claim: SocketClaim | None = None
@@ -242,6 +245,7 @@ class IpcServer:
                     limits=self._limits,
                     handler=self._handler,
                     answer_diagnostics=self._diagnostics,
+                    role=self._role,
                 )
             )
             admitted = True
