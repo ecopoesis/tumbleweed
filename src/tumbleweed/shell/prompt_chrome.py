@@ -38,7 +38,7 @@ from tumbleweed.shell._gi import Gdk, Gio, GLib, Gtk
 from tumbleweed.shell._widgets import plain_label
 from tumbleweed.shell.prompt_guard import PromptGuard
 from tumbleweed.shell.viewmodel.display import display_text
-from tumbleweed.shell.viewmodel.prompts import PromptCard, PromptController
+from tumbleweed.shell.viewmodel.prompts import InputId, PromptCard, PromptController
 
 _log = logging.getLogger(__name__)
 
@@ -64,6 +64,11 @@ _CSS: Final = f"""
 .{DISARMED_CLASS} {{ opacity: 0.45; }}
 """
 
+_IGNORED: Final = (
+    "That was ignored: the prompt had only just appeared, or the click began before it was "
+    "ready. Try again."
+)
+_TOUCH: Final = InputId("pointer", 1000)  # (touch has no button: one id for it)
 _PICK_TITLE: Final = {"file": "Choose a file to share", "folder": "Choose a folder to share"}
 _SCOPE_LABEL: Final[dict[Scope, str]] = {"once": "Allow once", "task": "Allow for this task"}
 _PICK_LABEL: Final[dict[Scope, str]] = {
@@ -154,20 +159,20 @@ class PromptBanner(Gtk.Box):
         self._picking = False
         self._cancel_picker: Callable[[], None] | None = None
         self.note = plain_label("", wrap=True, css_classes=["caption"])
-        # Whatever reaches the window while the prompt is not yet armed starts its delay again
-        # (a stream of clicks aimed at where a button will appear is never taken), and so does the
-        # window coming to the front. They only watch: the events go on to whoever they were for.
-        presses = Gtk.GestureClick()
-        presses.set_button(0)
-        presses.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        presses.connect("pressed", lambda *_args: self._pointer_pressed())
-        presses.connect("released", lambda *_args: self._pointer_released())
-        presses.connect("stopped", lambda *_args: self._pointer_released())  # cancelled
-        window.add_controller(presses)
+        # What goes down and up in the window is reported to the controller, which holds the
+        # arming invariant (`viewmodel.prompts`): every pointer button and touch (exactly, from
+        # the press and release events themselves: a gesture's "stopped" is not a release, it fires
+        # from the double-click timer during any hold), every key by its hardware code (never as a
+        # character), and the window gaining and losing the focus. They only watch: the events go
+        # on to whoever they were for.
+        pointer = Gtk.EventControllerLegacy()
+        pointer.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        pointer.connect("event", self._on_pointer_event)
+        window.add_controller(pointer)
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        keys.connect("key-pressed", lambda *_args: self._key_pressed())  # False: not consumed
-        keys.connect("key-released", lambda *_args: self._key_released())
+        keys.connect("key-pressed", lambda _c, _keyval, keycode, _state: self._key_down(keycode))
+        keys.connect("key-released", lambda _c, _keyval, keycode, _state: self._key_up(keycode))
         window.add_controller(keys)
         window.connect("notify::is-active", self._on_active_changed)
 
@@ -230,28 +235,49 @@ class PromptBanner(Gtk.Box):
             self._controller.mark_drawn(card.prompt)
         return False  # once
 
-    def _pointer_pressed(self) -> None:
-        if self._controller is not None:
-            self._controller.pointer_pressed()
+    def _on_pointer_event(self, _controller: Gtk.EventControllerLegacy, event: Gdk.Event) -> bool:
+        button = event.get_button() if isinstance(event, Gdk.ButtonEvent) else 0
+        self.pointer_event(event.get_event_type(), button)
+        return False  # never consumed
 
-    def _pointer_released(self) -> None:
-        if self._controller is not None:
-            self._controller.pointer_released()
+    def pointer_event(self, kind: Gdk.EventType, button: int) -> None:
+        """What the window's pointer events come to: a button or touch going down or up (exactly),
+        a touch cancelled, a grab broken."""
+        controller = self._controller
+        if controller is None:
+            return
+        if kind == Gdk.EventType.BUTTON_PRESS:
+            controller.input_began(InputId("pointer", button))
+        elif kind == Gdk.EventType.BUTTON_RELEASE:
+            controller.input_ended(InputId("pointer", button))
+        elif kind == Gdk.EventType.TOUCH_BEGIN:
+            controller.input_began(_TOUCH)
+        elif kind == Gdk.EventType.TOUCH_END:
+            controller.input_ended(_TOUCH)
+        elif kind == Gdk.EventType.TOUCH_CANCEL:
+            controller.input_ended(_TOUCH, cancelled=True)
+        elif kind == Gdk.EventType.GRAB_BROKEN:
+            controller.pointers_cancelled()
 
-    def _key_pressed(self) -> bool:
+    def _key_down(self, keycode: int) -> bool:
         if self._controller is not None:
-            self._controller.key_pressed()
+            self._controller.input_began(InputId("key", keycode))
         return False
 
-    def _key_released(self) -> None:
+    def _key_up(self, keycode: int) -> None:
         if self._controller is not None:
-            self._controller.key_released()
+            self._controller.input_ended(InputId("key", keycode))
 
     def _on_active_changed(self, window: Gtk.Window, _pspec: object) -> None:
-        # Not while our own dialog is open: the window lost the focus to it, and getting it back
-        # must not drop the choice that is about to be made.
-        if window.is_active() and self._controller is not None and not self._picking:
-            self._controller.reactivated()
+        controller = self._controller
+        if controller is None:
+            return
+        if not window.is_active():
+            controller.deactivated()  # the focus is gone: what was held is cancelled
+        elif not self._picking:
+            # Not while our own dialog is open: the window lost the focus to it, and getting it
+            # back must not drop the choice that is about to be made.
+            controller.reactivated()
 
     # --- drawing ---------------------------------------------------------------------------
 
@@ -330,18 +356,25 @@ class PromptBanner(Gtk.Box):
     # --- the user ---------------------------------------------------------------------------
 
     def _deny_clicked(self, prompt: PromptId) -> None:
-        if self._controller is not None:
-            self._controller.choose(prompt, DenyDecision(kind="deny", reason="user_denied"))
+        if self._controller is not None and not self._controller.choose(
+            prompt, DenyDecision(kind="deny", reason="user_denied")
+        ):
+            self.note.set_text(_IGNORED)
 
     def _allow_clicked(self, card: PromptCard, scope: Scope) -> None:
         controller = self._controller
         if controller is None:
             return
         if not card.picks:
-            controller.choose(card.prompt, AllowDecision(kind="allow", scope=scope, picked=None))
+            allow = AllowDecision(kind="allow", scope=scope, picked=None)
+            if not controller.choose(card.prompt, allow):
+                self.note.set_text(_IGNORED)  # a refusal is never silent
             return
-        if self._picking or not controller.can_act(card.prompt):
-            return  # not yet armed, or the picker is open already
+        if self._picking:
+            return  # the dialog is open already
+        if not controller.can_act(card.prompt):
+            self.note.set_text(_IGNORED)
+            return
         choose: Literal["file", "folder"] = "file" if card.kind == "pick_file" else "folder"
         self._picking = True
         self._guard.picking = True  # the dialog is a toplevel of ours, not a stranger

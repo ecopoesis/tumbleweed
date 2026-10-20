@@ -9,13 +9,29 @@ What it holds to, in the order of the invariant (I5):
 - **One at a time.** At most one prompt is shown; the others wait behind it in order, at most
   `MAX_QUEUED` in all (a ninth is refused: the broker denies it). A prompt takes the place of the
   last one only when that one is answered, withdrawn or expired.
-- **Not at once.** A prompt ignores every answer for its first `ARM_SECONDS`: a click or an Enter
-  that was meant for whatever was under the pointer or the focus a moment ago cannot answer it.
-  The clock is the controller's own and is read when the answer arrives, so a late timer cannot
-  arm a prompt early. The delay starts again when the prompt is first drawn (`mark_drawn`), when
-  the window is activated (`reactivated`) and on every press or key that reaches the window while
-  the prompt is not yet armed (`disturbed`): a stream of clicks aimed at where a button will
-  appear is never taken until there has been a quiet gap of the whole delay.
+- **Not at once, and not from an input that was already under way.** The arming invariant:
+
+  (A) An Allow or a Choose (anything that can lead to a grant) is accepted only if the user input
+  that produced it (the pointer press whose release clicked it, or the key press that activated
+  it) began while the prompt was armed and after the last arming restart, and no input that began
+  while the prompt was disarmed (or before a restart) is still held.
+  (B) A Deny is never refused because of an input that is held, or of how an input began: a Deny
+  cannot become a grant. It is ignored only in the first `ARM_SECONDS` (the plan: early clicks and
+  Enter presses are ignored), and it still needs a real click or key (I10).
+  (C) Nothing makes the prompt refuse a deliberate Allow for good: an input that begins after the
+  prompt is armed, with nothing tainted held, is accepted, of either kind and after any other input
+  (typing, a window activation). A refusal of an Allow is shown to the user, by the view.
+
+  How: every pointer button, touch and key that goes down is recorded with whether the prompt was
+  armed and in which *epoch* (every restart of the delay starts a new one: the prompt shown, first
+  drawn, the window activated, any input that begins while disarmed). An input is *tainted* if it
+  began disarmed or in an earlier epoch. A release remembers whether the input that ended was
+  tainted, for the click that follows. Held inputs are counted exactly (identity, not flags): a
+  second button, a key or Enter on the focused Deny cannot end the hold of another input, and
+  auto-repeat is not a new press. Losing the focus cancels what is held (GTK cancels it); a release
+  that never comes otherwise fails closed (the prompt refuses Allows until the input is released
+  again, the window is deactivated, or the prompt ends, and the broker's deadline denies).
+  The delay itself restarts at the same events, so the 750 ms are of quiet.
 - **No answer is a denial.** Every prompt has the deadline the broker gave it (`expires_in`), and
   past it the shell answers `deny(prompt_timeout)` and takes the prompt down: shown or waiting.
 - **What is shown is built from the structure.** `card_of` turns the wire message into a card of a
@@ -172,23 +188,29 @@ class _Entry:
         self.cancel_deadline: Callable[[], None] = _nothing
         self.cancel_arming: Callable[[], None] = _nothing
         self.shown_at: float | None = None
-        # A press (or a key) that began while the prompt was not armed ends in no click, however
-        # long it is held (a click comes on the release). A pointer and a key have a life of their
-        # own each: a key pressed during a held press, or a second button, does not end it. A flag
-        # is cleared only by a refused click, or by a new press that begins on a prompt that takes
-        # answers with nothing of that kind held.
-        self.pointer_disarmed = False
-        self.key_disarmed = False
-        self.pointers_down = 0
-        self.key_down = False
 
-    @property
-    def held_from_disarmed(self) -> bool:
-        return self.pointer_disarmed or self.key_disarmed
 
-    def forget_held(self) -> None:
-        self.pointer_disarmed = False
-        self.key_disarmed = False
+type InputKind = Literal["pointer", "key"]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class InputId:
+    """One input that can be held: a pointer button or touch (`code` told apart by the view), or a
+    key (its hardware code, as an opaque number: no key is ever read as a character)."""
+
+    kind: InputKind
+    code: int
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class _Held:
+    armed: bool  # the prompt took answers when the input began
+    epoch: int  # the epoch it began in
+
+
+_MAX_HELD: Final = 64
 
 
 def _nothing() -> None:
@@ -212,6 +234,9 @@ class PromptController:
         self._clock = clock
         self._current: _Entry | None = None
         self._queue: deque[_Entry] = deque()
+        self._epoch = 0  # advances at every restart of the delay
+        self._held: dict[InputId, _Held] = {}
+        self._ended_tainted = False  # the input that came up last began tainted: its click is out
 
     @property
     def current(self) -> PromptCard | None:
@@ -249,57 +274,53 @@ class PromptController:
             self._next()
         return True
 
-    def pointer_pressed(self) -> None:
-        """A pointer button went down in the window. If the prompt is not armed yet the delay starts
-        again, so that clicks aimed at where its buttons appear (a stream of them, a model's tool
-        can make one) are never taken until the user has stopped for the whole delay, and the click
-        that such a press ends in, however long it is held, is not taken either. A press that
-        begins on a prompt that takes answers, with no button already down, is the user's own."""
+    def input_began(self, which: InputId) -> None:
+        """A pointer button, a touch or a key went down in the window.
+
+        If the prompt is not armed the delay starts again (a stream of clicks aimed at where a
+        button will appear is never taken, and neither is one that is held), and the input is
+        recorded as having begun disarmed. A key that is already down is auto-repeat, not a new
+        press. A pointer that is down and is pressed again lost its release: if what was recorded
+        was tainted it stays so (fail closed), otherwise this is a new press.
+        """
         entry = self._current
-        if entry is None:
+        armed = self.armed()
+        before = self._held.get(which)
+        if before is not None and (which.kind == "key" or self._tainted(before)):
+            if entry is not None and not armed:
+                self._restart_arming(entry)
             return
-        fresh = entry.pointers_down == 0
-        entry.pointers_down += 1
-        if not self.armed():
-            entry.pointer_disarmed = True
+        if entry is not None and not armed:
             self._restart_arming(entry)
-        elif fresh:
-            entry.pointer_disarmed = False
+        if len(self._held) >= _MAX_HELD:
+            del self._held[next(iter(self._held))]
+        self._held[which] = _Held(armed=armed, epoch=self._epoch)
+        self._ended_tainted = False  # a new input: the one that ended before has had its click
 
-    def pointer_released(self) -> None:
-        """A button came up (or the press was cancelled). The click, if there is one, follows."""
-        if self._current is not None:
-            self._current.pointers_down = max(0, self._current.pointers_down - 1)
+    def input_ended(self, which: InputId, *, cancelled: bool = False) -> None:
+        """The input came up. The click it makes, if any, follows: it is taken only if this input
+        was not tainted. A cancelled one (a grab broken, a touch cancelled) makes no click."""
+        held = self._held.pop(which, None)
+        self._ended_tainted = not cancelled and (held is None or self._tainted(held))
 
-    def key_pressed(self) -> None:
-        """The same for a key (a held Enter or Space activates the button with the focus). A key
-        never ends a press that is held from before the prompt was armed."""
-        entry = self._current
-        if entry is None:
-            return
-        fresh = not entry.key_down
-        entry.key_down = True
-        if not self.armed():
-            entry.key_disarmed = True
-            self._restart_arming(entry)
-        elif fresh:
-            entry.key_disarmed = False
+    def pointers_cancelled(self) -> None:
+        """Every pointer press is over without a click (a grab was broken)."""
+        for which in [which for which in self._held if which.kind == "pointer"]:
+            del self._held[which]
+        self._ended_tainted = False
 
-    def key_released(self) -> None:
-        if self._current is not None:
-            self._current.key_down = False
+    def deactivated(self) -> None:
+        """The window lost the focus: what was held is cancelled (GTK cancels it), so nothing that
+        was down stays recorded, and a release that never came cannot refuse Allows for good."""
+        self._held.clear()
+        self._ended_tainted = False
 
     def reactivated(self) -> None:
         """The window became the active one: a click that brought it to the front may be about to
-        land on a button of the prompt, which has not been seen since (and the press that did it
-        may have been delivered before this, so it counts as begun disarmed). The delay starts
-        again."""
-        entry = self._current
-        if entry is not None:
-            entry.pointer_disarmed = True
-            entry.pointers_down = 0  # (releases can be lost with the focus)
-            entry.key_down = False
-            self._restart_arming(entry)
+        land on a button of the prompt, which has not been seen since. The delay starts again, and
+        a press that is already down (delivered before this) is of the epoch before: tainted."""
+        if self._current is not None:
+            self._restart_arming(self._current)
 
     def mark_drawn(self, prompt: PromptId) -> None:
         """The prompt's first frame is on screen (or about to be): the delay counts from here, not
@@ -320,25 +341,25 @@ class PromptController:
             self._queue.remove(entry)
 
     def can_act(self, prompt: PromptId) -> bool:
-        """Whether a click on `prompt` is to be taken now: it is the one shown, and armed."""
+        """Whether a click on a button that can lead to a grant (the picker's) is to be taken now:
+        `prompt` is the one shown and the arming invariant (A) holds."""
         entry = self._current
         if entry is None or entry.card.prompt != prompt:
             return False
-        if entry.held_from_disarmed:  # a press held from before it took answers ends in this click
-            entry.forget_held()
-            return False
-        return self.armed()
+        return self._grant_input_clean()
 
     def choose(self, prompt: PromptId, decision: PromptDecision) -> bool:
         """The user's decision on the prompt that is shown. Ignored (False) unless that is
-        `prompt`, it is armed and the decision is one the prompt offers."""
+        `prompt`, the decision is one it offers and the arming invariant holds: an Allow needs (A),
+        a Deny only that the prompt is armed (B)."""
         entry = self._current
         if entry is None or entry.card.prompt != prompt:
             return False
-        if entry.held_from_disarmed:  # a press that began before the prompt took answers ends here
-            entry.forget_held()
-            return False
-        if not self.armed():
+        if isinstance(decision, AllowDecision):
+            if not self._grant_input_clean():
+                return False
+        elif not self.armed():
+            self._ended_tainted = False
             return False
         match decision:
             case AllowDecision():
@@ -362,6 +383,7 @@ class PromptController:
             entry.cancel_arming()
         self._current = None
         self._queue.clear()
+        self._held.clear()
         self._view.clear()
 
     # --- inside ----------------------------------------------------------------------------
@@ -401,10 +423,27 @@ class PromptController:
             return
         entry = self._queue.popleft()
         self._current = entry
+        self._ended_tainted = False
         self._start_arming(entry)
         self._view.present(entry.card)
 
+    def _tainted(self, held: _Held) -> bool:
+        """An input is tainted if it began while the prompt was not armed, or before the last
+        restart of the delay (so it has been held, or is about to be released, across one)."""
+        return not held.armed or held.epoch != self._epoch
+
+    def _grant_input_clean(self) -> bool:
+        """(A): armed, no tainted input held, and the input whose click this is was not tainted.
+        The click is used up either way."""
+        ended_tainted, self._ended_tainted = self._ended_tainted, False
+        return (
+            self.armed()
+            and not ended_tainted
+            and not any(self._tainted(held) for held in self._held.values())
+        )
+
     def _start_arming(self, entry: _Entry) -> None:
+        self._epoch += 1
         entry.cancel_arming()
         entry.shown_at = self._clock()
         entry.cancel_arming = self._scheduler.call_later(ARM_SECONDS, lambda: self._arm(entry))
