@@ -1,7 +1,7 @@
 """The shell window: canvas, side panel, status strip and the reserved trusted-chrome region.
 
     +--------------------------------------------+
-    | chrome region (trusted; prompts, S18)      |
+    | chrome region (trusted: the prompt, S18)   |
     +----------------------------+---------------+
     | canvas                     | side panel    |
     | (generated tools, S10)     | (chat)        |
@@ -15,18 +15,23 @@ No desktop metaphor: one window, and no overlapping layers. The chrome region si
 canvas in a plain vertical box, so the canvas cannot overlap it (I5, see `chrome`).
 """
 
+import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import final
 
 from tumbleweed.agent.canvas import CanvasLink
-from tumbleweed.agent.canvas_events import EventGate
+from tumbleweed.agent.canvas_events import EventGate, Scheduler
 from tumbleweed.agent.responder import Responder
 from tumbleweed.shell._gi import Adw, Gio, Gtk
+from tumbleweed.shell.broker_prompts import BrokerPrompts
 from tumbleweed.shell.canvas import CanvasView
 from tumbleweed.shell.canvas_tools import CanvasTools
 from tumbleweed.shell.chat_panel import ChatPanel
 from tumbleweed.shell.chrome import ChromeRegion
-from tumbleweed.shell.dispatch import GlibScheduler
+from tumbleweed.shell.dispatch import GlibDispatcher, GlibScheduler
+from tumbleweed.shell.prompt_chrome import FilePicker, PromptBanner
+from tumbleweed.shell.prompt_guard import PromptGuard
 from tumbleweed.shell.speech_feed import SpeechFeed
 from tumbleweed.shell.status_strip import StatusStrip
 from tumbleweed.shell.terminal_pane import TerminalPane, default_settings
@@ -44,6 +49,17 @@ TERMINAL_ACCELERATOR = "F12"
 
 
 @final
+@dataclass(frozen=True)
+class PromptWiring:
+    """What the trusted prompt (S18) is made from, for a test to replace: the clock its 750 ms and
+    its deadlines are read from, the timers, and the picker (a dialog no test can operate)."""
+
+    clock: Callable[[], float] = time.monotonic
+    scheduler: Scheduler = field(default_factory=GlibScheduler)
+    picker: FilePicker | None = None
+
+
+@final
 class ShellWindow(Adw.ApplicationWindow):
     """The one window of the shell."""
 
@@ -55,6 +71,7 @@ class ShellWindow(Adw.ApplicationWindow):
         voice: VoiceSetup | None = None,
         terminal: TerminalSettings | None = None,
         canvas_link: CanvasLink | None = None,
+        prompt_wiring: PromptWiring | None = None,
     ) -> None:
         super().__init__(application=application)
         self._closing = False
@@ -115,6 +132,21 @@ class ShellWindow(Adw.ApplicationWindow):
         body.set_vexpand(True)
         body.append(self.canvas)
         body.append(self._side)
+
+        # The trusted prompt (S18): drawn in the chrome region, answered by the user only, and while
+        # it is pending the canvas and the side panel (model content) take no input and no surface
+        # of theirs stays open. The broker's requests reach it through `broker_prompts`, which the
+        # broker connection's handler is (the shell connects in S19).
+        wiring = PromptWiring() if prompt_wiring is None else prompt_wiring
+        self.prompt_guard = PromptGuard(
+            self, (self.canvas, self._side), self._focus_input_unless_closing
+        )
+        self.prompt_banner = PromptBanner(self, self.prompt_guard, wiring.picker)
+        self.chrome.append(self.prompt_banner)
+        self.broker_prompts = BrokerPrompts(
+            self.prompt_banner, GlibDispatcher(), wiring.scheduler, wiring.clock
+        )
+        self.prompt_banner.bind(self.broker_prompts.controller)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         root.append(self.chrome)
@@ -243,6 +275,7 @@ class ShellWindow(Adw.ApplicationWindow):
         """
         self._closing = True
         self._set_quit_enabled(True)  # the application outlives the window's focus
+        self.broker_prompts.close()
         if self._canvas_link is not None:
             self._canvas_link.detach()
         try:

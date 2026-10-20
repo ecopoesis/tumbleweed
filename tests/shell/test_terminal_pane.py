@@ -309,9 +309,10 @@ class TestTheFocusAfterTheShellEnds:
         standin = Gtk.Box()
         standin.set_focusable(True)
         pane.append(standin)
-        window.set_focus(standin)
+        # (F9 is not the shell's while the terminal has the focus, #90: hide the panel first)
         window.activate_action("win.toggle-side-panel", None)
         assert not side_shown(shell)
+        window.set_focus(standin)
 
         press_f12(shell)  # closes the pane
 

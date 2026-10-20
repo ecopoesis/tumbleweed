@@ -4,6 +4,11 @@ from collections.abc import Callable, Iterator
 
 import pytest
 
+from tests.ipc.conftest import (  # noqa: F401  (fixtures for the prompt tests)
+    base,
+    sock_path,
+    socket_dir,
+)
 from tests.shell.gtk_support import Shell, pump
 from tumbleweed.agent.echo import EchoResponder
 from tumbleweed.agent.responder import Responder

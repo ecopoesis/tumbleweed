@@ -29,14 +29,16 @@ def answer_body(decision: dict[str, object]) -> dict[str, object]:
 
 
 def test_a_well_formed_prompt_and_answers_are_accepted() -> None:
-    assert ShowPrompt.model_validate_json(json.dumps(show_body()))
-    for decision in (
+    assert isinstance(ShowPrompt.model_validate_json(json.dumps(show_body())), ShowPrompt)
+    decisions: list[dict[str, object]] = [
         {"kind": "allow", "scope": "once", "picked": None},
         {"kind": "allow", "scope": "task", "picked": "/home/u/Photos"},
         {"kind": "deny", "reason": "user_denied"},
         {"kind": "deny", "reason": "prompt_timeout"},
-    ):
-        assert AnswerPrompt.model_validate_json(json.dumps(answer_body(decision)))
+    ]
+    for decision in decisions:
+        parsed = AnswerPrompt.model_validate_json(json.dumps(answer_body(decision)))
+        assert isinstance(parsed, AnswerPrompt)
 
 
 @pytest.mark.parametrize(
