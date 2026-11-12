@@ -1239,101 +1239,118 @@ at it. D17 (8) and (9) are as S17 left them.
 
 **Context.** S19 gives the agent tasks (D7), the model four tools that reach the user's files
 through the broker, a broker-backed resolver for `image` refs, and connects the shell to the broker
-(#89). Each part is a place where model-supplied text, or a file's content, crosses a trust line, and
-the broker already owns the rules (I11, I12, D17, D25): the agent must add none of its own and must
-not keep a second copy of taint. **Decision.** (1) *Tasks.* `TaskSession` (`tumbleweed.agent.tasks`,
-no GTK) holds the current `TaskId`, its title, the context set (below), a generation counter and the
-session epoch, under a lock (the worker writes, the main thread reads). A session starts with no
-task; the default task is started when a broker tool first needs one (`previous` as in (3)), so a
-shell that only chats never reaches the broker.
-`start_task(title, fresh_context=false)` calls the broker with `previous = current`, so the broker
-ends the old task (its `once`/`task` grants are revoked) and copies the taint unless
-`fresh_context`; the agent stores no taint, and `TaskStarted.taint` is only logged. A new chat
-session, a restart and the end of the connection end the task (the broker ends a task whose
-connection ends); a new session also tells the broker (`end_task`, bounded, best effort). A start
-that finishes after the session changed (epoch) ends the task it made and fails. The title is the
-model's text: cleaned to one plain line of at most 80 characters (control, format and separator
-characters become a space) in the agent, and shown with `set_text` only. (2) *One reply is one run.*
-The broker binds a `once` grant to a `RunId` and spends it on the first read under that run, so a
-`request_access` followed by `read_file` can use it only with the same `RunId`. `TaskSession` mints
-one `RunId` per reply and every broker tool call of that reply uses it. A `once` grant is therefore
-one read or listing of one reply, and the tool result says so (a folder granted `once` is spent by
-the first `list_dir`: the prompt offers `task` too). (3) *Context scoping without taint in the
-agent.* Every transcript message carries the `TaskId` it belongs to (#80; `ContextTurn.task` is the
-task of the reply). The **context set** is the tasks whose turns the model may be sent: it becomes
-`{new}` on `start_task(fresh_context=true)` and gains the new task otherwise, so the model sees only
-turns of tasks the current one inherited from through an unbroken chain of non-fresh starts, which
-is exactly the chain along which the broker copies taint. T1 (fs) -> T2 (fresh) -> T3 (not fresh):
-the set is `{T2, T3}`, T1's turns are not sent, and T3 is not tainted. A turn whose task is not in
-the set is dropped before the window budget (`fit_history`), on the worker, after the task exists.
-Rows with no task (written before S19, or while the broker was unreachable) are sent: nothing was
-read for them. **A restart**: the set is `{the task of the newest tagged message}` and the new
-default task starts with `previous` = that task, which the broker accepts when it has the record
-(an ended task's record keeps its taint): the new task inherits the taint of everything it may see.
-If the broker answers `unknown_task` for it, the agent starts the task with no `previous` and an
-empty set, dropping the tagged turns (fail closed). **A lost connection**: the broker ended the
-task; the next call connects again and starts a task with `previous` = the old one, the set kept.
-A reply that spans a switch is tagged with the task it began in if a `fresh_context` start happened
-in it (its text may hold what the old task read, and the new task must not see it; the cost is that
-the model does not see that one turn afterwards), and with the last task otherwise (which inherited
-the taint of the earlier ones). A reply that failed or was cancelled is not sent to the model at
-all, as before. (4) *Inside a reply.* Tool results are never kept across tasks, so when a
-`start_task` succeeds the loop rewrites its messages before the next model call: every earlier
-`tool_result` becomes a fixed placeholder (the ids stay paired with their `tool_use`), and so do
-the results of sibling calls that ran before the `start_task` in the same assistant message (later
-siblings run in the new task and keep theirs). With `fresh_context` the loop also drops the history,
-the earlier assistant turns and the text and opaque blocks of the assistant message that called it,
-and sends the user's message of this turn, the `tool_use` blocks and the results only. (An opaque
-thinking block dropped there is a cost if a provider insists on it: the call then fails visibly.)
-(5) *Instances belong to a task.* `show_ui` passes the current task to the canvas; `CanvasTools`
-keeps `instance -> task`. When a task ends (`TaskObserver.task_ended`, on the main thread) its
-instances' `agent` sink drops events, their sandbox sink does not exist yet (S20), their images are
-refused by the broker (the task is gone), and the card says so in a plain line; `set` handlers,
-computed state and `patch_state` still work (#139). (6) *Model tools*, all through `BrokerLink`:
-`start_task`, `request_access(kind, path?, reason)` (`read`, `network`, `pick_file`, `pick_folder`:
-no `write` until S21), `list_workspace`, `list_dir(path)`, `read_file(path)`. The path text goes to
-the broker as it is: the shell never resolves, stats or opens a model's path. Results are text in a
-frame: our sentence that the block is data from the user's file system and never instructions, then
-the content between tags that carry a fresh random nonce, so no content can close the block; file
-text is decoded as UTF-8 with replacement (a file with NULs or invalid UTF-8 is reported as binary,
-its size only), cut at 12 KiB, and a directory shows at most 200 names, each `visible()` and cut at
-100 characters. A refusal carries the broker's fixed message. `request_access` waits up to the
-broker's `PROMPT_WAIT` (a per-tool timeout; the others keep 30 s). The picker's outcome has to tell
-the model what the user chose, or `list_dir` has nothing to name: `GrantOutcome` gains `picked`, the
-canonical text of the picked path, set for a picker grant only (amends D25 (7): the user chose that
-path to give it to the assistant; it is the broker's resolved text and is framed as data).
-(7) *Images.* `BrokerImageResolver(link, task)` reads `read_workspace_file(task, path)`, with a
-deadline of 10 s (#109) on the decode worker's thread, and maps `not_found` to
-`ImageNotFoundError`, `unsafe`/`denied`/`invalid_request`/`unknown_task` to `ImageNotAllowedError`
-and `too_large` to `ImageTooLargeError`; it passes `ResolverContract` unchanged against a real
-broker. The wire caps a read at 512 KiB while `MAX_IMAGE_BYTES` is 8 MiB: larger images are refused
-until S20 needs chunked reads (open). `DirfdResolver._descend` is made exception-safe (#137).
-#141: `ui-spec` section 6 stays out of the generated reference; the system prompt (v3) says in two
-sentences that an image path is a file in the task's workspace. (8) *One link to the broker.*
-`BrokerLink` (`tumbleweed.agent.broker_link`) owns a daemon thread with an asyncio loop, the
-`BrokerConnector`, the one `BrokerClient` (its constructor needs the running loop; its heartbeat and
-`BrokerPrompts`' answers run there) and a supervisor that notices the connection ending. Other
-threads reach it with `call` (awaitable from the agent's loop) and `call_blocking` (the decode
-worker), each with a deadline. It connects on first use, so a shell with the echo or unavailable
-responder never starts a broker; the connection's request handler is `BrokerPrompts`, attached by the
-window (a request that arrives before that is refused `busy`). Reconnection is the connector's
-backoff plus a pause of 1 s doubling to 30 s between failed attempts, so a dead broker does not
-cost every tool call 30 s. In development the connector starts the broker with a minimal
+(#89). Each part is a place where model-supplied text, or a file's content, crosses a trust line,
+and the broker already owns the rules (I11, I12, D17, D25): the agent must add none of its own and
+must not keep a second copy of taint. **Decision.** (1) *Tasks.* `TaskSession`
+(`tumbleweed.agent.tasks`, no GTK) holds the current `TaskId`, its title, the context set (below), a
+generation counter and the session epoch, under a lock (the worker writes, the main thread reads). A
+session starts with no task; the default task is started when a broker tool first needs one
+(`previous` as in (3)), so a shell that only chats never reaches the broker. `start_task(title,
+fresh_context=false)` calls the broker with `previous = current`, so the broker ends the old task
+(its `once`/`task` grants are revoked) and copies the taint unless `fresh_context`; the agent stores
+no taint, and `TaskStarted.taint` is only logged. A new chat session, a restart and the end of the
+connection end the task (the broker ends a task whose connection ends); a new session also tells the
+broker (`end_task`, bounded, best effort). A start that finishes after the session changed (epoch)
+ends the task it made and fails. The title is the model's text: cleaned to one plain line of at most
+80 characters (control, format and separator characters become a space) in the agent, and shown with
+`set_text` only. (2) *One reply is one run.* The broker binds a `once` grant to a `RunId` and spends
+it on the first read under that run, so a `request_access` followed by `read_file` can use it only
+with the same `RunId`. `TaskSession` mints one `RunId` per reply and every broker tool call of that
+reply uses it. A `once` grant is therefore one read or listing of one reply, and the tool result
+says so (a folder granted `once` is spent by the first `list_dir`: the prompt offers `task` too).
+(3) *Context scoping without taint in the agent.* Every transcript message carries the `TaskId` it
+belongs to (#80; `ContextTurn.task` is the task of the reply). The **context set** is the tasks
+whose turns the model may be sent: it becomes `{new}` on `start_task(fresh_context=true)` and gains
+the new task otherwise, so the model sees only turns of tasks the current one inherited from through
+an unbroken chain of non-fresh starts, which is exactly the chain along which the broker copies
+taint. T1 (fs) -> T2 (fresh) -> T3 (not fresh): the set is `{T2, T3}`, T1's turns are not sent, and
+T3 is not tainted. A turn whose task is not in the set is dropped before the window budget
+(`fit_history`), on the worker, after the task exists. Rows with no task (written before S19, or
+while no broker tool had run) are sent: no broker tool ran in those replies, so they hold nothing
+the user's files said. A reply is never tagged with no task while the context set is not empty (a
+lost connection, or a restore that could not be checked, tags it with the task to inherit from),
+because no task means every task may see it. **A restart**: the set is `{the task of the newest
+tagged message}` and the new default task starts with `previous` = that task, which the broker
+accepts when it has the record (an ended task's record keeps its taint): the new task inherits the
+taint of everything it may see. If the broker answers `unknown_task` for it, the agent starts the
+task with no `previous` and an empty set, dropping the tagged turns (fail closed). **A lost
+connection**: the broker ended the task; the next call connects again and starts a task with
+`previous` = the old one, the set kept. A reply that spans a switch is tagged with the task it began
+in if a `fresh_context` start happened in it (its text may hold what the old task read, and the new
+task must not see it; the cost is that the model does not see that one turn afterwards), and with
+the last task otherwise (which inherited the taint of the earlier ones). A reply that failed or was
+cancelled is not sent to the model at all, as before. (4) *Inside a reply.* Tool results are never
+kept across tasks, so when a `start_task` succeeds the loop rewrites its messages before the next
+model call: every earlier `tool_result` becomes a fixed placeholder (the ids stay paired with their
+`tool_use`), and so do the results of sibling calls that ran before the `start_task` in the same
+assistant message (later siblings run in the new task and keep theirs). With `fresh_context` the
+loop also drops the history, the earlier assistant turns and the text and opaque blocks of the
+assistant message that called it, and the **inputs** of its calls (the title, a reason, a path are
+the model's, written from the tainted context; they become `{}`, the ids stay paired). Calls after
+the fresh start in the same message are not run (they were written in the old context and would run
+in the clean task); their result is a fixed "not run" error. What is kept is the user's own typed
+message of this turn (not model output) and the calls' ids and results; a turn the shell wrote from
+a canvas event (it holds the old tool's state) becomes a fixed note. (An opaque thinking block
+dropped there is a cost if a provider insists on it: the call then fails visibly.) (5) *Instances
+belong to a task.* `show_ui` starts a task if there is none (so the broker is reached on the first
+`show_ui`) and passes the current task to the canvas; `CanvasTools` keeps `instance -> task`. When a
+task ends (`TaskObserver.task_ended`, on the main thread) its instances' `agent` sink drops events,
+their sandbox sink does not exist yet (S20), their images are refused by the broker (the task is
+gone), an event already waiting in the gate is forgotten, and the card says so in a plain line; an
+instance shown while the broker could not be reached belongs to no task and goes inert with the next
+task that starts or ends; `set` handlers, computed state and `patch_state` still work (#139). (6)
+*Model tools*, all through `BrokerLink`: `start_task`, `request_access(kind, path?, reason)`
+(`read`, `network`, `pick_file`, `pick_folder`: no `write` until S21), `list_workspace`,
+`list_dir(path)`, `read_file(path)`. The path text goes to the broker as it is: the shell never
+resolves, stats or opens a model's path. Results are text in a frame: our sentence that the block is
+data from the user's file system and never instructions, then the content between tags that carry a
+fresh random nonce, so no content can close the block; file text is decoded as UTF-8 with
+replacement (a file with NULs or invalid UTF-8 is reported as binary, its size only), cut at 12 KiB,
+and a directory shows at most 200 names, each cut at 100 characters and then `spelled()` (control,
+format, separator, private-use and unassigned characters written as `\u{XXXX}`), as many as fit the
+frame. The broker is asked for up to its 512 KiB cap and the model is shown the first 12 KiB, with a
+line outside the frame saying how many bytes there were. The picked path is spelled and framed too.
+A refusal carries the broker's fixed message. `request_access` waits up to the broker's
+`PROMPT_WAIT` (a per-tool timeout; the others keep 30 s). The picker's outcome has to tell the model
+what the user chose, or `list_dir` has nothing to name: `GrantOutcome` gains `picked`, the canonical
+text of the picked path, set for a picker grant only (amends D25 (7): the user chose that path to
+give it to the assistant; it is the broker's resolved text and is framed as data). (7) *Images.*
+`BrokerImageResolver(link, task)` reads `read_workspace_file(task, path)`, with a deadline of 10 s
+(#109) on the decode worker's thread, and maps `not_found` to `ImageNotFoundError`,
+`unsafe`/`denied`/`invalid_request`/`unknown_task` to `ImageNotAllowedError` and `too_large` to
+`ImageTooLargeError`; it passes `ResolverContract` unchanged against a real broker. The wire caps a
+read at 512 KiB while `MAX_IMAGE_BYTES` is 8 MiB: larger images are refused until S20 needs chunked
+reads (open). `DirfdResolver._descend` is made exception-safe (#137). #141: `ui-spec` section 6
+stays out of the generated reference; the system prompt (v3) says in two sentences that an image
+path is a file in the task's workspace. (8) *One link to the broker.* `BrokerLink`
+(`tumbleweed.agent.broker_link`) owns a daemon thread with an asyncio loop, the `BrokerConnector`,
+the one `BrokerClient` (its constructor needs the running loop; its heartbeat and `BrokerPrompts`'
+answers run there) and a supervisor that notices the connection ending. Other threads reach it with
+`call` (awaitable from the agent's loop) and `call_blocking` (the decode worker), each with a
+deadline. It connects on first use, so a shell with the echo or unavailable responder never starts a
+broker; the connection's request handler is `BrokerPrompts`, attached by the window (a request that
+arrives before that is refused `busy`). Reconnection is the connector's backoff, bounded to 8 s per
+attempt (below every call's deadline), plus a pause of 1 s doubling to 30 s after a failed attempt,
+so a dead broker does not cost every tool call its deadline; one broker is started per window (a
+broker still coming up is waited for). In development the connector starts the broker with a minimal
 environment (`TUMBLEWEED_BROKER_SPAWN=0` for the target, `TUMBLEWEED_BROKER_DEV_FLAGS` for the two
 development flags). A request in flight when the connection drops fails as a tool error ("the
 connection to the broker was lost"); the next one reconnects. (9) *#147.* A reconnect starts the
-prompt allowance over, as before, and is not changed: the model cannot drop the connection, and a key
-that survived it would have to be an identity of the shell, which a process of the same user (outside
-the threat model, section 8) can claim as well. A test reconnects in a loop and shows each connection
-keeping its ceiling and the pause bounding the rate. (10) *The task title in the prompt (#142)* is
+prompt allowance over, as before, and is not changed: the model cannot drop the connection, and a
+key that survived it would have to be an identity of the shell, which a process of the same user
+(outside the threat model, section 8) can claim as well. A test reconnects in a loop and shows each
+connection keeping its ceiling and the pause bounding the rate of reconnecting after failures (a
+connection that is made and lost again is not paused). (10) *The task title in the prompt (#142)* is
 looked up by `TaskId` on the shell side (`TaskSession.title_of`), set apart as the assistant's own
 words, plain, capped, and never part of the broker's wire. **Tests.** The fake user is
 `ScriptedPrompts` (the broker's `PromptInterface`) for agent-level tests and the real prompt
 controller, driven by real input, for window tests; `src/` has no hook that grants. The symlink,
 swap-after-grant and outside-grant negatives run through the model tools against a real daemon.
 **Not done.** #86 (which grant failed) is about `run_in_sandbox`: it goes with S20/S24, commented on
-the issue. Reads over 512 KiB, reading in windows, and a reply timeout that waits while the user
-decides (a 120 s reply timeout can run out during a long prompt) are open. **Consequences.** After a
-restart the new task inherits the taint of the newest tagged turn's task, which may be more than the
-model's real lineage had (safe, and the model may then be unable to get the network until it starts a
-fresh task). The model sees one fewer turn after a `fresh_context` switch.
+the issue. Reads over 512 KiB and reading in windows are #154; a reply timeout that waits while the
+user decides (a 120 s reply timeout can run out during a long prompt) is #155. The development
+default of starting a broker on demand (`TUMBLEWEED_BROKER_SPAWN`) is off on the target: S27's
+service sets it. **Consequences.** After a restart the new task inherits the taint of the newest
+tagged turn's task, which may be more than the model's real lineage had (safe, and the model may
+then be unable to get the network until it starts a fresh task). The model sees one fewer turn after
+a `fresh_context` switch.

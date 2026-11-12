@@ -57,13 +57,24 @@ class TaskUnsureError(TaskError):
     """The broker did not answer a start in time: it may or may not have made the task."""
 
 
+def _capped_marks(text: str) -> str:
+    """`text` with no more than two combining marks in a row (a pile of them is a tall smear)."""
+    kept: list[str] = []
+    run = 0
+    for char in text:
+        run = run + 1 if unicodedata.category(char) in ("Mn", "Me") else 0
+        if run <= 2:
+            kept.append(char)
+    return "".join(kept)
+
+
 def clean_title(text: str) -> str:
     """The model's title as one plain line of at most `MAX_TITLE_CHARS` characters: control,
     format, separator, private-use and unassigned characters become a space."""
     pieces = [
         " " if unicodedata.category(char)[0] in "CZ" and char != " " else char for char in text
     ]
-    line = " ".join("".join(pieces).split())
+    line = " ".join(_capped_marks("".join(pieces)).split())
     return line if len(line) <= MAX_TITLE_CHARS else line[: MAX_TITLE_CHARS - 1].rstrip() + "…"
 
 

@@ -55,6 +55,9 @@ class TestTitles:
         assert "‮" not in title
         assert len(title) <= MAX_TITLE_CHARS
 
+    def test_a_pile_of_combining_marks_is_cut_to_two(self) -> None:
+        assert clean_title("e" + "\u0301" * 50 + "x") == "e\u0301\u0301x"
+
     def test_a_title_of_nothing_visible_is_empty(self) -> None:
         assert clean_title("‮\n\t ") == ""
 
