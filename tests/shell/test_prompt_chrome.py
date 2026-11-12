@@ -767,6 +767,25 @@ class TestInputsThatAreNotTheUsers:
             AllowDecision(kind="allow", scope="once", picked=None)
         ]
 
+    def test_enter_on_a_focused_allow_then_another_key_still_grants(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """GTK does not cancel an activation when another key goes down (round 7, opus)."""
+        from tumbleweed.shell._gi import Gdk
+
+        shell, answers, buttons_ = self.armed_prompt(build_prompt_shell)
+        once = buttons_["Allow once"]
+        shell.window.set_focus(once)
+        self.key_down(shell.window, 36, Gdk.KEY_Return)
+        once.emit("activate")
+        pump(0.05)
+        self.key_down(shell.window, 38, Gdk.KEY_a)  # a letter, during GTK's 250 ms
+        pump(0.4)
+
+        assert [d for _, d in answers.given] == [
+            AllowDecision(kind="allow", scope="once", picked=None)
+        ]
+
     def test_a_mouse_click_on_allow_grants(self, build_prompt_shell: Builder) -> None:
         shell, answers, buttons_ = self.armed_prompt(build_prompt_shell)
         user_click(shell, buttons_["Allow once"])

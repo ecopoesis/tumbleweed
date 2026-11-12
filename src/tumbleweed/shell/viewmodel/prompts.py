@@ -32,23 +32,22 @@ What it holds to, in the order of the invariant (I5):
       restarting the delay: that costs liveness, not safety).
   (C) Nothing makes the prompt refuse a deliberate Allow for good: an input that begins after the
       prompt is armed, with nothing tainted held, is accepted, of either kind and after any other
-      input (typing, a window activation, a key that activates nothing during an activation). A
-      refusal of an Allow is shown to the user, by the view. The cases that fail closed instead are
-      the documented ones: an input whose release was lost (a pointer is replaced by its next press
-      of the same button of the same device, or dropped when the next prompt comes up, so a lost
-      release costs one prompt at most; a key is forgotten when the window loses the focus), an
-      input that comes up with no record (it went down before the prompt or a focus loss, was
-      dropped, or was one too many to record: at most 64 are held), a click completed by a tainted
-      input's release, a pointer press or a key that activates another button during an activation
-      (it ends it), and two mice that the system merges into one device (their same-numbered buttons
-      are one input to the window, so a press of the second replaces the record of the first). What
-      remains, outside the threat model (a same-user process, ARCHITECTURE section 8): a synthetic
-      click on the very button the user is activating, in the same event as their clean release on
-      it or within half a second of their clean Enter or Space on it, is taken as theirs. The
-      picker's dialog is GTK's or the portal's own window and can be driven over the accessibility
-      bus like any window of the session; what protects it is that it opens only after a granted
-      Choose, that its answer is taken only then and only once, and that the broker still applies
-      the deny rules, the taint rule and the cap to what it picks.
+      input (typing, a window activation, any press during a keyboard activation). A refusal of an
+      Allow is shown to the user, by the view. The cases that fail closed instead are the documented
+      ones: an input whose release was lost (a pointer is replaced by its next press of the same
+      button of the same device, or dropped when the next prompt comes up, so a lost release costs
+      one prompt at most; a key is forgotten when the window loses the focus), an input that comes
+      up with no record (it went down before the prompt or a focus loss, was dropped, or was one too
+      many to record: at most 64 are held), a click completed by a tainted input's release, and two
+      mice that the system merges into one device (their same-numbered buttons are one input to the
+      window, so a press of the second replaces the record of the first). What remains, outside the
+      threat model (a same-user process, ARCHITECTURE section 8): a synthetic click on the very
+      button the user is activating, in the same event as their clean release on it or within half a
+      second of their clean Enter or Space on it, is taken as theirs. The picker's dialog is GTK's
+      or the portal's own window and can be driven over the accessibility bus like any window of the
+      session; what protects it is that it opens only after a granted Choose, that its answer is
+      taken only then and only once, and that the broker still applies the deny rules, the taint
+      rule and the cap to what it picks.
 
   How: every pointer button (told apart by its device: a mouse and a pen both have a button 1),
   touch (one identity per sequence) and key that goes down is recorded with whether the prompt was
@@ -68,8 +67,8 @@ What it holds to, in the order of the invariant (I5):
   next input or `event_done`, which the view runs at high priority so that nothing at the default
   one sees it), or a clean press of Enter or Space, bare, while that button has the focus, in the
   last `ACTIVATION_SECONDS` (GTK completes a keyboard activation with a 250 ms timer or the next key
-  release, and does not cancel it when another key goes down: only a pointer press, or a key that
-  activates another button, ends it here). One with neither, as an accessibility `DoAction` is, or
+  release, and does not cancel it when anything else goes down: only the press of a key that
+  activates replaces it here). One with neither, as an accessibility `DoAction` is, or
   on another button than its producer's, is refused and starts the delay again. The delay itself
   restarts at the same events, so the 750 ms are of quiet.
 - **No answer is a denial.** Every prompt has the deadline the broker gave it (`expires_in`), and
@@ -362,13 +361,13 @@ class PromptController:
         press (it activates again if it is one that activates). A pointer that is already down
         cannot go down again from the same device: its release was lost, and this press replaces
         the record (the next deliberate press heals a lost release). At most `_MAX_HELD` are
-        recorded; one more is not, and so is tainted when it comes up. A pointer press, or a key
-        that activates another button, ends an activation under way; a key that activates nothing
-        does not (GTK does not cancel one either).
+        recorded; one more is not, and so is tainted when it comes up. An activation under way
+        is not ended by any other press (GTK does not cancel one either): only by the press of a
+        key that activates, which replaces it.
         """
         self._released = None  # a new input: whatever was released has had its click
-        if which.kind == "pointer" or activates is not None:
-            self._activation = None  # (a press makes no click by itself)
+        if activates is not None:
+            self._activation = None  # (replaced below; a press makes no click by itself)
         entry = self._current
         armed = self.armed()
         before = self._held.get(which)
@@ -458,6 +457,8 @@ class PromptController:
         entry = self._current
         if entry is None or entry.card.prompt != prompt:
             return False
+        if not entry.card.picks or scope not in entry.card.scopes:
+            return False
         if not self._grant_input_clean(scope):
             return False
         entry.picking = scope
@@ -475,6 +476,8 @@ class PromptController:
             return False
         if isinstance(decision, AllowDecision):
             if decision.picked is None:
+                if entry.card.picks or decision.scope not in entry.card.scopes:
+                    return False  # (before the producer is used up: a malformed call costs none)
                 if not self._grant_input_clean(decision.scope):
                     return False
             elif entry.picking != decision.scope:

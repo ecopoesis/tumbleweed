@@ -33,7 +33,7 @@ matters here:
   - a GtkButton clicks when the pointer press that began on it is released (the release is
     delivered to that button); a keyboard activation (Enter, Space, bare, with the button focused)
     starts at the key press and is completed by a 250 ms timer or by the release of any key,
-    whichever is first, and then a new activation can start (auto-repeat); another key going down
+    whichever is first, and then a new activation can start (auto-repeat); anything else going down
     does not cancel it;
   - a window that is deactivated does not cancel a pointer press (its release still arrives), but
     its keys' releases go to the window that has the focus: the window forgets the keys;
@@ -232,7 +232,6 @@ class ArmingMachine(RuleBasedStateMachine):
         self.stale: dict[Phys, Down] = {}  # physically up, the window was not told (lost)
         self.inflight: Down | None = None  # a keyboard activation under way: its activating press
         self.inflight_at = 0.0  # when it began
-        self.disturbed = False  # a press that ends it has come since
         self.activating_at: float | None = None  # the last activating key press on the button
         self.fingers = 0  # touch sequences so far
         self.pick_open = False
@@ -266,24 +265,10 @@ class ArmingMachine(RuleBasedStateMachine):
             self.forgotten[which] = self.down.pop(which).on_button
         self.stale.clear()
 
-    def press_ends_activation(self) -> None:
-        """A pointer press, or a key that activates the button, ends an activation under way (the
-        controller keeps it across a key that activates nothing, as GTK does)."""
-        if self.inflight is not None:
-            self.disturbed = True
-
     def start_activation(self, record: Down) -> None:
         self.activating_at = self.subject.clock.now
         if self.inflight is None:
-            self.inflight, self.inflight_at, self.disturbed = record, self.activating_at, False
-
-    def timely(self) -> bool:
-        """The activation under way is not over: half a second at most, and nothing ended it."""
-        return (
-            self.inflight is not None
-            and self.subject.clock.now - self.inflight_at <= ACTIVATION_SECONDS
-            and not self.disturbed
-        )
+            self.inflight, self.inflight_at = record, self.activating_at
 
     def check_click(
         self,
@@ -354,7 +339,6 @@ class ArmingMachine(RuleBasedStateMachine):
     def pointer_down(self, which: Phys, on_button: bool) -> None:
         if which in self.down or which in self.forgotten:
             return  # (a device's button is down once: a second press means its release was lost)
-        self.press_ends_activation()
         self.stale.pop(which, None)  # a press of a button whose release was lost replaces it
         self.record_press(which, on_button)
         self.done()
@@ -362,7 +346,6 @@ class ArmingMachine(RuleBasedStateMachine):
     @rule(on_button=st.booleans())
     def touch_down(self, on_button: bool) -> None:
         """A finger: its sequence is new, never an id used before."""
-        self.press_ends_activation()
         which = Phys("pointer", FIRST_FINGER + self.fingers)
         self.fingers += 1
         self.record_press(which, on_button)
@@ -373,8 +356,6 @@ class ArmingMachine(RuleBasedStateMachine):
         if which in self.forgotten:
             return  # (it is physically down in another window)
         activates = which in ACTIVATING and on_button
-        if activates:
-            self.press_ends_activation()
         if which in self.down:  # auto-repeat: not a new press, but it restarts a disarmed prompt
             if self.shown and not self.armed():
                 self.restart()
@@ -408,14 +389,13 @@ class ArmingMachine(RuleBasedStateMachine):
             # Any key's release completes the activation under way (GTK): the click is the
             # activator's, and fail closed if the key that comes up began tainted.
             activator, self.inflight = self.inflight, None
-            self.check_click(activator, record, record is None, producer_ok=self.over_ok(activator))
+            self.check_click(activator, record, record is None, producer_ok=self.over_ok())
         self.done()
 
-    def over_ok(self, activator: Down) -> bool:
-        """The activation that is completed was not over, nor ended by a press."""
-        return (
-            self.subject.clock.now - self.inflight_at <= ACTIVATION_SECONDS and not self.disturbed
-        )
+    def over_ok(self) -> bool:
+        """The activation that is completed is not over: the controller's half second, after which
+        the producer is no longer taken for the user's (GTK's own timer is 250 ms)."""
+        return self.subject.clock.now - self.inflight_at <= ACTIVATION_SECONDS
 
     @precondition(lambda self: bool(self.down) or bool(self.forgotten))
     @rule(data=st.data())
@@ -429,7 +409,7 @@ class ArmingMachine(RuleBasedStateMachine):
         """The 250 ms of a keyboard activation pass with its key still down."""
         assert self.inflight is not None
         activator, self.inflight = self.inflight, None
-        self.check_click(activator, None, False, producer_ok=self.over_ok(activator))
+        self.check_click(activator, None, False, producer_ok=self.over_ok())
         self.done()
 
     @precondition(lambda self: any(i.kind == "pointer" for i in self.down))
@@ -655,7 +635,8 @@ class TestScripted:
         machine.wait(1.0)
         machine.activation_timer()
 
-    def test_a_press_ends_an_activation(self) -> None:
+    def test_a_press_does_not_end_an_activation(self) -> None:
+        """GTK does not cancel it, so the user's Allow is taken: (C)."""
         machine = self.machine()
         machine.key_down(ENTER, on_button=True)
         machine.pointer_down(MIDDLE, on_button=False)

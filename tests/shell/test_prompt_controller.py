@@ -786,13 +786,31 @@ class TestAGrantNeedsAProducingInput:
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
-    def test_a_pointer_press_after_the_activating_key_ends_the_activation(self, rig: Rig) -> None:
+    def test_a_pointer_press_during_an_activation_does_not_end_it(self, rig: Rig) -> None:
+        """GTK does not cancel it: the user's Allow is taken (a clean press held blocks nothing)."""
         card = rig.offer()
         rig.arm()
         rig.controller.input_began(ENTER, activates="task")
-        rig.controller.input_began(LEFT)
+        rig.controller.input_began(RIGHT)
 
-        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_the_press_of_a_key_that_activates_replaces_the_activation(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(ENTER, activates="once")
+        rig.controller.input_began(SPACE, activates="task")
+
+        assert not rig.controller.choose(card.prompt, ALLOW_ONCE)  # the first is replaced
+
+    def test_a_malformed_call_does_not_use_the_producer_up(self, rig: Rig) -> None:
+        card = rig.offer(read_card(scopes=("once",)))
+        rig.arm()
+        rig.controller.input_began(ENTER, activates="once")
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # a scope it does not offer
+        assert not rig.controller.can_act(card.prompt, "once")  # not a picker's button
+        assert rig.controller.choose(card.prompt, ALLOW_ONCE)
 
     def test_a_key_that_activates_nothing_does_not_end_the_activation(self, rig: Rig) -> None:
         """GTK does not cancel an activation under way when another key goes down (Shift, say)."""
