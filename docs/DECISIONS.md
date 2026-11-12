@@ -1244,7 +1244,8 @@ the broker already owns the rules (I11, I12, D17, D25): the agent must add none 
 not keep a second copy of taint. **Decision.** (1) *Tasks.* `TaskSession` (`tumbleweed.agent.tasks`,
 no GTK) holds the current `TaskId`, its title, the context set (below), a generation counter and the
 session epoch, under a lock (the worker writes, the main thread reads). A session starts with no
-task; the default task is started when the first reply needs one (`previous` as in (3)).
+task; the default task is started when a broker tool first needs one (`previous` as in (3)), so a
+shell that only chats never reaches the broker.
 `start_task(title, fresh_context=false)` calls the broker with `previous = current`, so the broker
 ends the old task (its `once`/`task` grants are revoked) and copies the taint unless
 `fresh_context`; the agent stores no taint, and `TaskStarted.taint` is only logged. A new chat
