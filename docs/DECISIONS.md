@@ -1151,51 +1151,52 @@ deadline still denying: that costs liveness, not safety; and with no attack at a
 within 0.75 s of the user's own refused Allow is ignored, and the note is shown). (C) Nothing makes
 the prompt refuse a deliberate Allow for good: an input that begins after the prompt is armed, with
 nothing tainted held, is accepted, of either kind and after any other input (typing, a window
-activation, any press during a keyboard activation: only the release of the activating key ends it).
-A refusal of an Allow is shown to the user, by the view. The cases that fail closed instead are the
-documented ones: an input whose release was lost (a pointer is replaced by its next press of the
-same button of the same device, or dropped when the next prompt comes up, so a lost release costs
-one prompt at most; a key is forgotten when the window loses the focus), an input that comes up with
-no record (it went down before the prompt or a focus loss, was dropped, or was one too many to
-record: at most 64 are held), a click completed by a tainted input's release, and two mice that the
-system merges into one device (their same-numbered buttons are one input to the window, so a press
-of the second replaces the record of the first). Exactly, for Enter on Allow followed by a press on
-Deny during GTK's activation: if Enter is still held when GTK's 250 ms timer fires, GTK clicks Allow
-and it is taken (the user's own Enter; GTK does the same without the shell); if Enter comes up after
-the press moved the focus to Deny, the activation ends at that release, GTK's timer click on Allow
-is refused and the delay restarts, so a Deny that clicks after that is ignored too: no answer, the
-note is shown, and a retry works (fail closed). What remains, outside the threat model (a same-user
-process, ARCHITECTURE section 8): a synthetic click on the very button the user is activating, in
-the same event as their clean release on it or within half a second of their clean Enter or Space on
-it, is taken as theirs. The picker's dialog is GTK's or the portal's own window and can be driven
-over the accessibility bus like any window of the session; what protects it is that it opens only
-after a granted Choose, that its answer is taken only then, only once, and not after the dialog was
-dismissed or the delay restarted, and that the broker still applies the deny rules, the taint rule
-and the cap to what it picks. Assistive-technology users grant with Enter or Space on the focused
-button; a DoAction is refused. A bus client cannot move the keyboard focus onto Allow: GTK's AT-SPI
-Component.GrabFocus answers NotSupported (gtk/a11y/gtkatspicomponent.c, GTK 4.14.5; the same in
-4.16, 4.18 and main), and the Action interface's DoAction only calls gtk_widget_activate, which
-takes no focus. A GTK that implemented GrabFocus would let the user's Enter meant for Deny activate
-Allow, from a same-user process, outside the threat model: re-check it on a GTK upgrade.** It is
-implemented by recording every pointer button, touch (one identity per sequence, pruned when the
-next prompt comes up; a button's with its device: a mouse and a pen both have a button 1) and key
-that goes down with whether the prompt was armed and in which epoch (every restart of the delay
-starts one: the prompt shown, first drawn, the window activated, any input that begins while
-disarmed); an input is tainted if it began disarmed or in an earlier epoch, and so is one that comes
-up with no record (it went down before the prompt, or before a focus loss). Held inputs are tracked
-exactly by identity, so a second button, a key, Enter on the focused Deny or an auto-repeat cannot
-end the hold of another input; a click needs a producing input of its own button: the release that
-came on that button, remembered for the click in its own event (a high-priority idle ends the event,
-before anything at the default priority runs), or a clean press of Enter or Space with no modifier
-while that button has the focus, in the last half second (GTK's activation timer is 250 ms); a
-release elsewhere, a key pressed with the focus on Deny, the chat or a voice button, or the
-push-to-talk key produces no grant, and a refused attempt starts the delay again; pointer records
-survive a focus loss (GTK does not cancel a press when the window is deactivated: the grab goes on
-and its release arrives) and keys are forgotten (their release goes to the other window); at most 64
-are recorded, and one more is not evicted for but comes up unrecorded, so tainted; the pointers held
-are dropped when the next prompt comes up, so that a release that never arrives (a drag took it)
-costs one prompt at most; the picker's answer is the user's choice in the trusted dialog and needs
-no input of the window. The window reports exact press and release
+activation, a press during a keyboard activation, which only the press of another activating key
+replaces, and its own key's release, the half second, a focus loss or a restart end). A refusal of
+an Allow is shown to the user, by the view. The cases that fail closed instead are the documented
+ones: an input whose release was lost (a pointer is replaced by its next press of the same button of
+the same device, or dropped when the next prompt comes up, so a lost release costs one prompt at
+most; a key is forgotten when the window loses the focus), an input that comes up with no record (it
+went down before the prompt or a focus loss, was dropped, or was one too many to record: at most 64
+are held), a click completed by a tainted input's release, and two mice that the system merges into
+one device (their same-numbered buttons are one input to the window, so a press of the second
+replaces the record of the first). Exactly, for Enter on Allow followed by a press on Deny during
+GTK's activation: if Enter is still held when GTK's 250 ms timer fires, GTK clicks Allow and it is
+taken (the user's own Enter; GTK does the same without the shell); if Enter comes up before that
+timer, after the press moved the focus to Deny, the activation ends at that release, GTK's timer
+click on Allow is refused and the delay restarts, so a Deny that clicks after that is ignored too:
+no answer, the note is shown, and a retry works (fail closed). What remains, outside the threat
+model (a same-user process, ARCHITECTURE section 8): a synthetic click on the very button the user
+is activating, in the same event as their clean release on it or within half a second of their clean
+Enter or Space on it, is taken as theirs. The picker's dialog is GTK's or the portal's own window
+and can be driven over the accessibility bus like any window of the session; what protects it is
+that it opens only after a granted Choose, that its answer is taken only then, only once, and not
+after the dialog was dismissed or the delay restarted, and that the broker still applies the deny
+rules, the taint rule and the cap to what it picks. Assistive-technology users grant with Enter or
+Space on the focused button; a DoAction is refused. A bus client cannot move the keyboard focus onto
+Allow: GTK's AT-SPI Component.GrabFocus answers NotSupported (gtk/a11y/gtkatspicomponent.c, GTK
+4.14.5; the same in 4.16, 4.18 and main), and the Action interface's DoAction only calls
+gtk_widget_activate, which takes no focus. A GTK that implemented GrabFocus would let the user's
+Enter meant for Deny activate Allow, from a same-user process, outside the threat model: re-check it
+on a GTK upgrade.** It is implemented by recording every pointer button, touch (one identity per
+sequence, pruned when the next prompt comes up; a button's with its device: a mouse and a pen both
+have a button 1) and key that goes down with whether the prompt was armed and in which epoch (every
+restart of the delay starts one: the prompt shown, first drawn, the window activated, any input that
+begins while disarmed); an input is tainted if it began disarmed or in an earlier epoch, and so is
+one that comes up with no record (it went down before the prompt, or before a focus loss). Held
+inputs are tracked exactly by identity, so a second button, a key, Enter on the focused Deny or an
+auto-repeat cannot end the hold of another input; a click needs a producing input of its own button:
+the release that came on that button, remembered for the click in its own event (a high-priority
+idle ends the event, before anything at the default priority runs), or a clean press of Enter or
+Space with no modifier while that button has the focus, in the last half second (GTK's activation
+timer is 250 ms); a release elsewhere, a key pressed with the focus on Deny, the chat or a voice
+button, or the push-to-talk key produces no grant, and a refused attempt starts the delay again;
+pointer records survive a focus loss (GTK does not cancel a press when the window is deactivated:
+the grab goes on and its release arrives) and keys are forgotten (their release goes to the other
+window); at most 64 are recorded, and one more is not evicted for but comes up unrecorded, so
+tainted; the pointers held are dropped when the next prompt comes up, so that a release that never
+arrives (a drag took it) costs one prompt at most; the picker's answer is the user's choice in the
+trusted dialog and needs no input of the window. The window reports exact press and release
 events (a gesture's "stopped" is not
 a release: it fires from the double-click timer during any hold of 400 ms), key hardware codes as
 opaque numbers (no key is read as a character: a tripwire test holds that), and the focus coming and

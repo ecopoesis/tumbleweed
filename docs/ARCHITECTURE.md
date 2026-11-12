@@ -1273,18 +1273,19 @@ Each invariant names where it is enforced. Reviews check every change against th
   with no attack at all, a Deny pressed within 0.75 s of the user's own refused Allow is ignored,
   and the note is shown). (C) Nothing makes the prompt refuse a deliberate Allow for good: an input
   that begins after the prompt is armed, with nothing tainted held, is accepted, of either kind and
-  after any other input (typing, a window activation, any press during a keyboard activation: only
-  the release of the activating key ends it). A refusal of an Allow is shown to the user, by the
-  view. The cases that fail closed instead are the documented ones: an input whose release was lost
-  (a pointer is replaced by its next press of the same button of the same device, or dropped when
-  the next prompt comes up, so a lost release costs one prompt at most; a key is forgotten when the
-  window loses the focus), an input that comes up with no record (it went down before the prompt or
-  a focus loss, was dropped, or was one too many to record: at most 64 are held), a click completed
-  by a tainted input's release, and two mice that the system merges into one device (their
-  same-numbered buttons are one input to the window, so a press of the second replaces the record of
-  the first). Exactly, for Enter on Allow followed by a press on Deny during GTK's activation: if
-  Enter is still held when GTK's 250 ms timer fires, GTK clicks Allow and it is taken (the user's
-  own Enter; GTK does the same without the shell); if Enter comes up after the press moved the focus
+  after any other input (typing, a window activation, a press during a keyboard activation, which
+  only the press of another activating key replaces, and its own key's release, the half second, a
+  focus loss or a restart end). A refusal of an Allow is shown to the user, by the view. The cases
+  that fail closed instead are the documented ones: an input whose release was lost (a pointer is
+  replaced by its next press of the same button of the same device, or dropped when the next prompt
+  comes up, so a lost release costs one prompt at most; a key is forgotten when the window loses the
+  focus), an input that comes up with no record (it went down before the prompt or a focus loss, was
+  dropped, or was one too many to record: at most 64 are held), a click completed by a tainted
+  input's release, and two mice that the system merges into one device (their same-numbered buttons
+  are one input to the window, so a press of the second replaces the record of the first). Exactly,
+  for Enter on Allow followed by a press on Deny during GTK's activation: if Enter is still held
+  when GTK's 250 ms timer fires, GTK clicks Allow and it is taken (the user's own Enter; GTK does
+  the same without the shell); if Enter comes up before that timer, after the press moved the focus
   to Deny, the activation ends at that release, GTK's timer click on Allow is refused and the delay
   restarts, so a Deny that clicks after that is ignored too: no answer, the note is shown, and a
   retry works (fail closed). What remains, outside the threat model (a same-user process,
