@@ -7,6 +7,7 @@ responder; the model is the scripted fake provider and the user is the broker's 
 # ruff: noqa: PT018, S608  (compound assertions read better here; the SQL takes our own task ids)
 
 import asyncio
+import json
 import re
 import time
 from collections.abc import Iterator
@@ -24,7 +25,7 @@ from tumbleweed.agent.access import register_access_tools
 from tumbleweed.agent.broker_link import BrokerLink
 from tumbleweed.agent.fake import FakeToolCall, FakeTurn
 from tumbleweed.agent.limits import MAX_TOOL_RESULT_BYTES
-from tumbleweed.agent.llm import LlmMessage, TextBlock, ToolResultBlock
+from tumbleweed.agent.llm import LlmMessage, TextBlock, ToolResultBlock, ToolUseBlock
 from tumbleweed.agent.loop import EARLIER_TASK_RESULT
 from tumbleweed.agent.tasks import TaskError, TaskSession, TaskUnsureError
 from tumbleweed.agent.tools import ToolRegistry
@@ -104,6 +105,8 @@ def all_text(messages: tuple[LlmMessage, ...]) -> str:
                 parts.append(block.text)
             elif isinstance(block, ToolResultBlock):
                 parts.append(block.content)
+            elif isinstance(block, ToolUseBlock):
+                parts.append(json.dumps(block.input))  # what the model wrote in its calls
     return "\n".join(parts)
 
 
@@ -676,7 +679,7 @@ class TestRoundOne:
     def test_a_long_listing_is_cut_with_a_note_and_never_in_the_middle_of_an_escape(self) -> None:
         with world() as w:
             for number in range(200):
-                (w.home / "Photos" / f"{number:03d}\ue000{'n' * 90}").write_text("x")
+                (w.home / "Photos" / f"{number:03d}{'n' * 93}\ue000tail").write_text("x")
             w.allow("task")
             w.run_tool("request_access", kind="read", path=str(w.home / "Photos"), reason="r")
 

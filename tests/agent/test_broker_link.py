@@ -136,7 +136,7 @@ def test_a_connect_that_outlasts_the_call_deadline_still_starts_the_pause() -> N
         def factory(handler: RequestHandler) -> BrokerConnector:
             return BrokerConnector(nobody, handler=handler)  # give_up: 30 s
 
-        link = BrokerLink(factory, retry_floor=5.0, connect_seconds=0.3)
+        link = BrokerLink(factory, retry_floor=5.0, connect_seconds=0.6)
         try:
             began = time.monotonic()
             with pytest.raises(BrokerUnavailableError):
@@ -146,7 +146,7 @@ def test_a_connect_that_outlasts_the_call_deadline_still_starts_the_pause() -> N
             began = time.monotonic()
             with pytest.raises(BrokerUnavailableError):
                 link.call_blocking(start, deadline=2.0)
-            assert time.monotonic() - began < 0.5  # refused by the pause
+            assert time.monotonic() - began < 0.3  # refused by the pause, not tried again
         finally:
             link.close()
 
