@@ -1130,35 +1130,59 @@ marks, so none of its characters can close one. The 750 ms are governed by this 
 three rounds of flag patches (a held press, a key during it, Enter on the focused Deny, a refused
 click clearing the wrong flag, a gesture's "stopped") showed had to be stated and not approximated:
 **(A) An Allow or a Choose (anything that can lead to a grant) is accepted only if the input that
-produced it (the pointer press whose release clicked it, or the key press that activated it) is
-recorded, began while the prompt was armed and after the last arming restart, and no input that
-began while the prompt was disarmed, or before a restart, is still held, as far as the window has
-seen (pointers are tracked until their release arrives or the next prompt comes up, keys until it
-arrives or the window loses the focus). A click that a release completes is refused if the input
-that is released is tainted, whichever input produced it (fail closed). A click with no producing
-input (a synthetic one, such as an accessibility DoAction) is refused. (B) A Deny is never refused
-because of an input that is held, or of how an input began: a Deny cannot become a grant. It is
-ignored whenever the prompt is disarmed (the 750 ms after it appears or after any restart; the plan:
-early clicks and Enter presses are ignored), and it still needs a real click or key (I10). (C)
+produced it is recorded, produced a click on that very button, began while the prompt was armed and
+after the last arming restart, and no input that began while the prompt was disarmed, or before a
+restart, is still held, as far as the window has seen (pointers are tracked until their release
+arrives or the next prompt comes up, keys until it arrives or the window loses the focus). The
+producer is the pointer press whose release came on that button, or the press of Enter or Space,
+bare, that started a keyboard activation of that button while it had the focus, in the last half
+second; the release of any key completes an activation under way. A click that a release completes
+is refused if the input that is released is tainted, whichever input produced it (fail closed). A
+click with no producing input (a synthetic one, such as an accessibility DoAction), or whose
+producer belongs to another button, is refused, and the delay starts again. The answer of the
+picker's dialog is taken only after a Choose that was granted at that scope. (B) A Deny is never
+refused because of an input that is held, or of how an input began: a Deny cannot become a grant. It
+is ignored whenever the prompt is disarmed (the 750 ms after it appears or after any restart; the
+plan: early clicks and Enter presses are ignored), and otherwise taken from any click, a synthetic
+one included, because it cannot grant (a hostile client of the accessibility bus can deny a user's
+prompts, and delay their grants by restarting the delay: that costs liveness, not safety). (C)
 Nothing makes the prompt refuse a deliberate Allow for good: an input that begins after the prompt
 is armed, with nothing tainted held, is accepted, of either kind and after any other input (typing,
-a window activation). A refusal of an Allow is shown to the user, by the view. The cases that fail
-closed instead are the documented ones: an input whose release was lost (a pointer is replaced by
-its next press of the same button of the same device, or dropped when the next prompt comes up, so a
-lost release costs one prompt at most; a key is forgotten when the window loses the focus), an input
-that comes up with no record (it went down before the prompt or a focus loss, was dropped, or was
-one too many to record: at most 64 are held), and a click completed by a tainted input's release.**
-It is
-implemented by recording every pointer button, touch (one identity per sequence, a button's with its device: a mouse and a pen both have a button 1) and key that goes
-down with whether the prompt was armed and in which epoch (every restart of the delay starts one:
-the prompt shown, first drawn, the window activated, any input that begins while disarmed); an input
-is tainted if it began disarmed or in an earlier epoch, and so is one that comes up with no record
-(it went down before the prompt, or before a focus loss). Held inputs are tracked exactly by
-identity, so a second button, a key, Enter on the focused Deny or an auto-repeat cannot end the hold
-of another input; a click needs a producing input, the release remembered for the click in its own event (forgotten with the next input or the end of the event) or a clean press of an activating key (Enter, Space) in the last second, and one with neither, as an accessibility DoAction is, is refused (the limit that remains: one that arrives in the same event as the user's own clean release, or within a second of their Enter press, looks like theirs); pointer records survive a focus loss (GTK does not cancel a press
-when the window is deactivated: the grab goes on and its release arrives) and keys are forgotten
-(their release goes to the other window); at most 64 are recorded, and one more is not evicted for but comes up unrecorded, so tainted; the pointers held are dropped when the next prompt comes up, so that a release that never arrives (a drag took it) costs one prompt at most; the picker's answer is the user's choice in the trusted dialog and needs no
-input of the window. The window reports exact press and release events (a gesture's "stopped" is not
+a window activation, a key that activates nothing during an activation). A refusal of an Allow is
+shown to the user, by the view. The cases that fail closed instead are the documented ones: an input
+whose release was lost (a pointer is replaced by its next press of the same button of the same
+device, or dropped when the next prompt comes up, so a lost release costs one prompt at most; a key
+is forgotten when the window loses the focus), an input that comes up with no record (it went down
+before the prompt or a focus loss, was dropped, or was one too many to record: at most 64 are held),
+a click completed by a tainted input's release, a pointer press or a key that activates another
+button during an activation (it ends it), and two mice that the system merges into one device (their
+same-numbered buttons are one input to the window, so a press of the second replaces the record of
+the first). What remains, outside the threat model (a same-user process, ARCHITECTURE section 8): a
+synthetic click on the very button the user is activating, in the same event as their clean release
+on it or within half a second of their clean Enter or Space on it, is taken as theirs. The picker's
+dialog is GTK's or the portal's own window and can be driven over the accessibility bus like any
+window of the session; what protects it is that it opens only after a granted Choose, that its
+answer is taken only then and only once, and that the broker still applies the deny rules, the taint
+rule and the cap to what it picks.** It is implemented by recording every pointer button, touch (one
+identity per sequence, pruned when the next prompt comes up; a button's with its device: a mouse and
+a pen both have a button 1) and key that goes down with whether the prompt was armed and in which
+epoch (every restart of the delay starts one: the prompt shown, first drawn, the window activated,
+any input that begins while disarmed); an input is tainted if it began disarmed or in an earlier
+epoch, and so is one that comes up with no record (it went down before the prompt, or before a focus
+loss). Held inputs are tracked exactly by identity, so a second button, a key, Enter on the focused
+Deny or an auto-repeat cannot end the hold of another input; a click needs a producing input of its
+own button: the release that came on that button, remembered for the click in its own event (a
+high-priority idle ends the event, before anything at the default priority runs), or a clean press
+of Enter or Space with no modifier while that button has the focus, in the last half second (GTK's
+activation timer is 250 ms); a release elsewhere, a key pressed with the focus on Deny, the chat or
+a voice button, or the push-to-talk key produces no grant, and a refused attempt starts the delay
+again; pointer records survive a focus loss (GTK does not cancel a press when the window is
+deactivated: the grab goes on and its release arrives) and keys are forgotten (their release goes to
+the other window); at most 64 are recorded, and one more is not evicted for but comes up unrecorded,
+so tainted; the pointers held are dropped when the next prompt comes up, so that a release that
+never arrives (a drag took it) costs one prompt at most; the picker's answer is the user's choice in
+the trusted dialog and needs no input of the window. The window reports exact press and release
+events (a gesture's "stopped" is not
 a release: it fires from the double-click timer during any hold of 400 ms), key hardware codes as
 opaque numbers (no key is read as a character: a tripwire test holds that), and the focus coming and
 going; its controllers are added last so that they run first and see every key, F12 included. A
