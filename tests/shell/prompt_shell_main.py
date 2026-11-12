@@ -12,6 +12,7 @@ import sys
 import time
 from collections.abc import Iterator
 
+from tests.shell.gtk_support import user_click
 from tests.shell.prompt_support import pick_card, read_card
 from tumbleweed.agent.echo import EchoResponder
 from tumbleweed.shell._gi import GLib, Gtk
@@ -60,7 +61,7 @@ def main() -> int:
     def open_picker(window: ShellWindow) -> bool:
         for widget in _walk(window.prompt_banner):
             if isinstance(widget, Gtk.Button) and (widget.get_label() or "").startswith("Choose"):
-                widget.emit("clicked")
+                user_click(window.prompt_banner, widget)  # (an input behind the click)
                 break
         say("picker open")
         return GLib.SOURCE_REMOVE

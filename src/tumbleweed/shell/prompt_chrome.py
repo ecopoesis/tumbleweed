@@ -38,7 +38,13 @@ from tumbleweed.shell._gi import Gdk, Gio, GLib, Gtk
 from tumbleweed.shell._widgets import plain_label
 from tumbleweed.shell.prompt_guard import PromptGuard
 from tumbleweed.shell.viewmodel.display import display_text
-from tumbleweed.shell.viewmodel.prompts import InputId, PromptCard, PromptController
+from tumbleweed.shell.viewmodel.prompts import (
+    NO_DEVICE,
+    DeviceNo,
+    InputId,
+    PromptCard,
+    PromptController,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -67,6 +73,9 @@ _CSS: Final = f"""
 _IGNORED: Final = (
     "That was ignored: the prompt had only just appeared, or the click began before it was "
     "ready. Try again."
+)
+_ACTIVATING: Final = frozenset(
+    {Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter, Gdk.KEY_space, Gdk.KEY_KP_Space}
 )
 _FIRST_TOUCH: Final = 1000  # (a touch has no button: its ids start above any)
 _PICK_TITLE: Final = {"file": "Choose a file to share", "folder": "Choose a folder to share"}
@@ -159,6 +168,7 @@ class PromptBanner(Gtk.Box):
         self._picking = False
         self._cancel_picker: Callable[[], None] | None = None
         self._touches: list[tuple[Gdk.EventSequence, int]] = []
+        self._devices: list[Gdk.Device] = []  # kept: a device's number is its place here
         self._next_touch = _FIRST_TOUCH
         self.note = plain_label("", wrap=True, css_classes=["caption"])
         window.connect("notify::is-active", self._on_active_changed)
@@ -181,7 +191,9 @@ class PromptBanner(Gtk.Box):
         self._window.add_controller(pointer)
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        keys.connect("key-pressed", lambda _c, _keyval, keycode, _state: self._key_down(keycode))
+        keys.connect(
+            "key-pressed", lambda _c, keyval, keycode, _state: self._key_down(keyval, keycode)
+        )
         keys.connect("key-released", lambda _c, _keyval, keycode, _state: self._key_up(keycode))
         self._window.add_controller(keys)
 
@@ -253,14 +265,26 @@ class PromptBanner(Gtk.Box):
             return False
         kind = event.get_event_type()
         if kind in (Gdk.EventType.BUTTON_PRESS, Gdk.EventType.BUTTON_RELEASE):
-            self.pointer_event(kind, event.get_button())
+            self.pointer_event(kind, event.get_button(), self._device_no(event))
         elif kind in (
             Gdk.EventType.TOUCH_BEGIN,
             Gdk.EventType.TOUCH_END,
             Gdk.EventType.TOUCH_CANCEL,
         ):
-            self.pointer_event(kind, self._touch_id(event.get_event_sequence(), kind))
+            self.pointer_event(
+                kind, self._touch_id(event.get_event_sequence(), kind), self._device_no(event)
+            )
         return False  # never consumed
+
+    def _device_no(self, event: Gdk.Event) -> DeviceNo:
+        """The number of the device the event came from: a mouse and a pen both have a button 1,
+        and one must not stand in for the other."""
+        device = event.get_device()
+        if device is None:
+            return NO_DEVICE
+        if device not in self._devices:
+            self._devices.append(device)
+        return DeviceNo(self._devices.index(device) + 1)
 
     def _touch_id(self, sequence: Gdk.EventSequence, kind: Gdk.EventType) -> int:
         for known, ident in self._touches:
@@ -274,13 +298,13 @@ class PromptBanner(Gtk.Box):
             self._touches.append((sequence, ident))
         return ident  # (an end or cancel of a touch not seen begin: an id that is not held)
 
-    def pointer_event(self, kind: Gdk.EventType, code: int) -> None:
+    def pointer_event(self, kind: Gdk.EventType, code: int, device: DeviceNo = NO_DEVICE) -> None:
         """What the window's pointer events come to: a button (`code` its number) or a touch (its
-        id) going down or up, exactly, or a touch cancelled."""
+        id, never reused) of a device going down or up, exactly, or a touch cancelled."""
         controller = self._controller
         if controller is None:
             return
-        which = InputId("pointer", code)
+        which = InputId("pointer", code, device)
         if kind in (Gdk.EventType.BUTTON_PRESS, Gdk.EventType.TOUCH_BEGIN):
             controller.input_began(which)
         elif kind in (Gdk.EventType.BUTTON_RELEASE, Gdk.EventType.TOUCH_END):
@@ -289,9 +313,11 @@ class PromptBanner(Gtk.Box):
         elif kind == Gdk.EventType.TOUCH_CANCEL:
             controller.input_ended(which, cancelled=True)
 
-    def _key_down(self, keycode: int) -> bool:
+    def _key_down(self, keyval: int, keycode: int) -> bool:
         if self._controller is not None:
-            self._controller.input_began(InputId("key", keycode))
+            # Which keys start an activation of the focused button is GTK's; the controller only
+            # needs to know that this press may be what a click that follows came from.
+            self._controller.input_began(InputId("key", keycode), activates=keyval in _ACTIVATING)
         return False
 
     def _key_up(self, keycode: int) -> None:
@@ -311,7 +337,7 @@ class PromptBanner(Gtk.Box):
         if controller is None:
             return
         if not window.is_active():
-            controller.deactivated()  # the focus is gone: what was held is cancelled
+            controller.deactivated()  # keys are forgotten, pointer presses are not
         elif not self._picking:
             # Not while our own dialog is open: the window lost the focus to it, and getting it
             # back must not drop the choice that is about to be made.
@@ -440,7 +466,6 @@ class PromptBanner(Gtk.Box):
             self.note.set_text("That name cannot be used. Choose another, or Deny.")
             return
         if not controller.choose(card.prompt, decision):
-            _log.warning(
-                "a choice in the picker was not taken (the prompt is not armed or is gone)"
-            )
+            # (The prompt is not the one shown any more, or the choice is not one it offers.)
+            _log.warning("a choice in the picker was not taken")
             self.note.set_text("That was not taken. Choose again, or Deny.")

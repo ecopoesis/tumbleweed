@@ -17,7 +17,7 @@ import pytest
 
 from tests.broker.rig import replace_config
 from tests.shell.conftest import PromptShell
-from tests.shell.gtk_support import descendants, pump, pump_until
+from tests.shell.gtk_support import descendants, pump, pump_until, user_click
 from tests.shell.live_broker import LiveBroker
 from tumbleweed.broker.audit import GrantDecision
 from tumbleweed.broker.config import BrokerConfig
@@ -100,7 +100,7 @@ class TestAGrant:
             assert not pending.done()  # the broker waits for the user, not for a timeout
 
             shell.wait_armed()
-            clickable(shell, "Allow for this task").emit("clicked")
+            user_click(shell.window.prompt_banner, clickable(shell, "Allow for this task"))
             outcome = broker.wait(pending)
 
             assert outcome.granted
@@ -247,7 +247,7 @@ class TestThePicker:
             assert pump_until(lambda: shown(shell))
             shell.wait_armed()
 
-            clickable(shell, "Choose, allow for this task…").emit("clicked")
+            user_click(shell.window.prompt_banner, clickable(shell, "Choose, allow for this task…"))
             assert shell.picker.asked == ["folder"]
             assert not pending.done()
             shell.picker.finish(str(chosen))
@@ -273,7 +273,7 @@ class TestThePicker:
             assert pump_until(lambda: shown(shell))
             shell.wait_armed()
 
-            clickable(shell, "Choose, allow once…").emit("clicked")
+            user_click(shell.window.prompt_banner, clickable(shell, "Choose, allow once…"))
             shell.picker.finish(str(broker.rig.home / ".ssh"))
             outcome = broker.wait(pending)
 

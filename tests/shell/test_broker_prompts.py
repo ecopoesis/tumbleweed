@@ -34,13 +34,14 @@ from tumbleweed.ipc.prompt_messages import (
     DenyDecision,
     PromptAnswered,
     PromptClosed,
+    PromptDecision,
     PromptShown,
     ShowPrompt,
 )
 from tumbleweed.ipc.server import IpcServer
 from tumbleweed.ipc.sockdir import SocketPath
 from tumbleweed.shell.broker_prompts import BrokerPrompts
-from tumbleweed.shell.viewmodel.prompts import ARM_SECONDS, MAX_QUEUED
+from tumbleweed.shell.viewmodel.prompts import ARM_SECONDS, MAX_QUEUED, InputId
 
 WAIT: Final = 10.0
 
@@ -113,6 +114,18 @@ class Shell:
     def act[T](self, function: Callable[[], T]) -> T:
         return self.main.call(function)
 
+    def click(self, prompt: PromptId, decision: PromptDecision) -> bool:
+        """The user's click on a button: the press, the release, and the button's click."""
+        controller = self.prompts.controller
+        left = InputId("pointer", 1)
+
+        def clicked() -> bool:
+            controller.input_began(left)
+            controller.input_ended(left)
+            return controller.choose(prompt, decision)
+
+        return self.act(clicked)
+
     def user_waits(self, seconds: float = ARM_SECONDS) -> None:
         self.act(lambda: self.timers.advance(seconds))
 
@@ -170,9 +183,7 @@ class TestAShownPrompt:
                     shell.user_waits()
                     allow = AllowDecision(kind="allow", scope="task", picked=None)
 
-                    taken = shell.act(
-                        lambda: shell.prompts.controller.choose(message.prompt, allow)
-                    )
+                    taken = shell.click(message.prompt, allow)
                     answered, came_on = await broker.next()
 
                     assert taken
@@ -227,9 +238,7 @@ class TestAShownPrompt:
                     assert broker.answers.empty()
                     # And the user cannot answer a prompt that is gone.
                     allow = AllowDecision(kind="allow", scope="task", picked=None)
-                    assert not shell.act(
-                        lambda: shell.prompts.controller.choose(message.prompt, allow)
-                    )
+                    assert not shell.click(message.prompt, allow)
                 finally:
                     await client.close()
                     await server.close()
@@ -414,7 +423,7 @@ class TestAPromptDoesNotOutliveItsConnection:
 
                     shell.user_waits()
                     allow = AllowDecision(kind="allow", scope="once", picked=None)
-                    assert shell.act(lambda: shell.prompts.controller.choose(new.prompt, allow))
+                    assert shell.click(new.prompt, allow)
                     await second.close()
                 finally:
                     await server.close()

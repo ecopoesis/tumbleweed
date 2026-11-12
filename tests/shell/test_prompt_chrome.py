@@ -19,6 +19,7 @@ from tests.shell.gtk_support import (
     pump,
     pump_until,
 )
+from tests.shell.gtk_support import user_click as gtk_user_click
 from tests.shell.prompt_support import network_card, pick_card, read_card
 from tests.ui.gtk.hostile import hostile_spec
 from tests.ui.gtk.test_no_surfaces import show as show_spec
@@ -36,6 +37,10 @@ if TYPE_CHECKING:
 pytestmark = pytest.mark.gtk
 
 type Builder = Callable[[], PromptShell]
+
+
+def user_click(shell: PromptShell, button: "Gtk.Button") -> None:
+    gtk_user_click(shell.window.prompt_banner, button)
 
 
 def buttons(widget: "Gtk.Widget") -> dict[str, "Gtk.Button"]:
@@ -202,7 +207,7 @@ class TestFocusAndInput:
         assert banner.get_visible()
 
         shell.timers.advance(0.1)
-        once.emit("clicked")
+        user_click(shell, once)
 
         assert [d for _, d in answers.given] == [
             AllowDecision(kind="allow", scope="once", picked=None)
@@ -252,7 +257,7 @@ class TestFocusAndInput:
         assert not any("second" in line for line in texts(banner))
         shell.wait_armed()
 
-        buttons(banner)["Allow once"].emit("clicked")
+        user_click(shell, buttons(banner)["Allow once"])
         # The click that answered the first lands again, on the second, at once.
         deny = banner.deny_button
         assert deny is not None
@@ -299,7 +304,7 @@ class TestTheRestOfTheWindowWhilePending:
         assert not window.chat_panel.is_sensitive()  # (its own box is locked)
         assert window.chrome.is_sensitive()
         shell.wait_armed()
-        buttons(window.prompt_banner)["Allow once"].emit("clicked")
+        user_click(shell, buttons(window.prompt_banner)["Allow once"])
         assert card is not None
         assert window.canvas.get_sensitive()
         assert window.chat_panel.is_sensitive()
@@ -336,14 +341,19 @@ class FakeEvent:
     """Stands in for a `Gdk.Event`: the controller only asks it what it is, its button and its
     touch sequence."""
 
-    def __init__(self, kind: object, button: int = 1, sequence: object = None) -> None:
-        self._kind, self._button, self._sequence = kind, button, sequence
+    def __init__(
+        self, kind: object, button: int = 1, sequence: object = None, device: object = None
+    ) -> None:
+        self._kind, self._button, self._sequence, self._device = kind, button, sequence, device
 
     def get_event_type(self) -> object:
         return self._kind
 
     def get_button(self) -> int:
         return self._button
+
+    def get_device(self) -> object:
+        return self._device
 
     def get_event_sequence(self) -> object:
         return self._sequence
@@ -390,7 +400,14 @@ class TestInputsThatAreNotTheUsers:
         from tumbleweed.shell._gi import Gdk
 
         return any(
-            bool(k.emit("key-pressed", Gdk.KEY_a, keycode, Gdk.ModifierType(0)))
+            bool(
+                k.emit(
+                    "key-pressed",
+                    Gdk.KEY_Return if keycode == 36 else Gdk.KEY_a,
+                    keycode,
+                    Gdk.ModifierType(0),
+                )
+            )
             for k in cls.keys(window)
         )
 
@@ -596,11 +613,71 @@ class TestInputsThatAreNotTheUsers:
         once.emit("clicked")
         assert len(answers.given) == 1
 
+    def test_a_click_with_no_input_behind_it_is_refused_and_says_so(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """Round 6: what an accessibility `DoAction` on the button does. Armed, nothing held."""
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        banner = shell.window.prompt_banner
+        shell.wait_armed()
+
+        buttons(banner)["Allow once"].emit("clicked")
+        buttons(banner)["Allow once"].emit("activate")
+
+        assert answers.given == []
+        assert banner.get_visible()
+        assert "ignored" in banner.note.get_text()
+
+    def test_a_synthetic_choose_opens_no_dialog(self, build_prompt_shell: Builder) -> None:
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell, pick_card("file"))
+        shell.wait_armed()
+
+        buttons(shell.window.prompt_banner)["Choose, allow once…"].emit("clicked")
+
+        assert shell.picker.asked == []
+        assert answers.given == []
+
+    def test_a_mouse_and_a_pen_are_two_devices_with_a_button_1_each(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """Round 6 (security): the mouse is held from the first 750 ms, the pen taps after: the
+        tap is not the user's deliberate click while the mouse press is still down."""
+        from tumbleweed.shell._gi import Gdk
+
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell)
+        banner = shell.window.prompt_banner
+        once = buttons(banner)["Allow once"]
+        mouse, pen = object(), object()
+
+        def event(kind: "Gdk.EventType", device: object) -> None:
+            banner._on_pointer_event(None, FakeEvent(kind, button=1, device=device))  # type: ignore[arg-type]  # noqa: SLF001  (a fake event)
+
+        shell.timers.advance(0.1)
+        event(Gdk.EventType.BUTTON_PRESS, mouse)  # tainted, and held
+        shell.timers.advance(ARM_SECONDS)
+        event(Gdk.EventType.BUTTON_PRESS, pen)
+        event(Gdk.EventType.BUTTON_RELEASE, pen)
+        once.emit("clicked")
+        assert answers.given == []
+
+        event(Gdk.EventType.BUTTON_RELEASE, mouse)
+        once.emit("clicked")
+        assert answers.given == []
+
     def test_a_release_is_forgotten_when_the_main_loop_is_idle_again(
         self, build_prompt_shell: Builder
     ) -> None:
-        """A tainted release that started no click must not refuse a later activation (a timer's)
-        that no input of its own produced."""
+        """A tainted release that started no click is forgotten with the event: it neither refuses a
+        later click nor stands in as the producer of one."""
         shell = build_prompt_shell()
         controller, answers = shell.own_controller()
         present(shell)
@@ -611,9 +688,10 @@ class TestInputsThatAreNotTheUsers:
 
         assert pump_until(lambda: True)  # the idle callback runs
         pump(0.05)
-        assert controller.choose(
-            card.prompt, AllowDecision(kind="allow", scope="once", picked=None)
-        )
+        allow = AllowDecision(kind="allow", scope="once", picked=None)
+        assert not controller.choose(card.prompt, allow)  # nothing produced this click
+        self.press(shell)
+        assert controller.choose(card.prompt, allow)  # and the tainted release did not linger
         assert len(answers.given) == 1
 
     def test_a_key_that_ended_in_no_activation_does_not_cost_the_next_one(
@@ -945,7 +1023,7 @@ class TestThePicker:
         assert any("choose a folder it may read" in line for line in texts(banner))
         shell.wait_armed()
 
-        buttons(banner)["Choose, allow for this task…"].emit("clicked")
+        user_click(shell, buttons(banner)["Choose, allow for this task…"])
         assert shell.picker.asked == ["folder"]
         assert answers.given == []  # nothing is decided until the user has chosen
         shell.picker.finish("/home/u/Documents")
@@ -975,7 +1053,7 @@ class TestThePicker:
         present(shell)
         card = pending(shell, pick_card("file"))
         shell.wait_armed()
-        buttons(shell.window.prompt_banner)["Choose, allow once\u2026"].emit("clicked")
+        user_click(shell, buttons(shell.window.prompt_banner)["Choose, allow once\u2026"])
         assert shell.picker.cancelled == 0
 
         controller.withdraw(card.prompt)
@@ -994,7 +1072,7 @@ class TestThePicker:
         present(shell)
         card = pending(shell, pick_card("folder"))
         shell.wait_armed()
-        buttons(shell.window.prompt_banner)["Choose, allow once\u2026"].emit("clicked")
+        user_click(shell, buttons(shell.window.prompt_banner)["Choose, allow once\u2026"])
 
         with patch.object(shell.window, "is_active", return_value=True):
             shell.window.notify("is-active")  # back from the dialog ...
@@ -1015,7 +1093,7 @@ class TestThePicker:
         present(shell)
         card = pending(shell, pick_card("file"))
         shell.wait_armed()
-        buttons(shell.window.prompt_banner)["Choose, allow once\u2026"].emit("clicked")
+        user_click(shell, buttons(shell.window.prompt_banner)["Choose, allow once\u2026"])
         TestInputsThatAreNotTheUsers.up(shell, 3)  # a release from the dialog, with no press seen
         controller.reactivated()  # and something restarted the delay meanwhile
 
@@ -1031,7 +1109,7 @@ class TestThePicker:
         banner = shell.window.prompt_banner
         shell.wait_armed()
         button = buttons(banner)["Choose, allow once…"]
-        button.emit("clicked")
+        user_click(shell, button)
         button.emit("clicked")  # the dialog is open: a second one is not
         assert shell.picker.asked == ["file"]
 
@@ -1040,7 +1118,7 @@ class TestThePicker:
         assert answers.given == []
         assert banner.get_visible()
         assert "Nothing was chosen" in banner.note.get_text()
-        button.emit("clicked")  # and it can be opened again
+        user_click(shell, button)  # and it can be opened again
         assert shell.picker.asked == ["file", "file"]
 
     def test_a_name_that_cannot_be_sent_is_not_a_choice(self, build_prompt_shell: Builder) -> None:
@@ -1049,7 +1127,7 @@ class TestThePicker:
         present(shell)
         pending(shell, pick_card("file"))
         shell.wait_armed()
-        buttons(shell.window.prompt_banner)["Choose, allow once…"].emit("clicked")
+        user_click(shell, buttons(shell.window.prompt_banner)["Choose, allow once…"])
 
         shell.picker.finish("/home/u/\udcff-not-utf8")
 
@@ -1064,7 +1142,7 @@ class TestThePicker:
         present(shell)
         card = pending(shell, pick_card("file"))
         shell.wait_armed()
-        buttons(shell.window.prompt_banner)["Choose, allow once…"].emit("clicked")
+        user_click(shell, buttons(shell.window.prompt_banner)["Choose, allow once…"])
 
         controller.withdraw(card.prompt)  # the broker gave up
         shell.picker.finish("/home/u/Documents")
@@ -1083,7 +1161,7 @@ class TestThePicker:
         present(shell)
         pending(shell, pick_card("file"))
         shell.wait_armed()
-        buttons(shell.window.prompt_banner)["Choose, allow once…"].emit("clicked")
+        user_click(shell, buttons(shell.window.prompt_banner)["Choose, allow once…"])
         assert shell.window.prompt_guard.picking
         dialog = Gtk.Window(title="the picker's dialog")
 

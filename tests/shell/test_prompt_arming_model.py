@@ -4,18 +4,20 @@ The invariant (also in `viewmodel.prompts`, D25 (6) and ARCHITECTURE I5):
 
   (A) An Allow or a Choose (anything that can lead to a grant) is accepted only if the input that
       produced it (the pointer press whose release clicked it, or the key press that activated it)
-      began while the prompt was armed and after the last arming restart, and no input that began
-      while the prompt was disarmed, or before a restart, is still held, as far as the window has
-      seen (pointers are tracked until their release arrives, keys until it arrives or the window
-      loses the focus). A click that a release completes is refused if the input that is released
-      is tainted, whichever input produced it (fail closed).
+      is recorded, began while the prompt was armed and after the last arming restart, and no
+      input that began while the prompt was disarmed, or before a restart, is still held, as far
+      as the window has seen (pointers are tracked until their release arrives, or until the next
+      prompt comes up; keys until it arrives or the window loses the focus). A click that a
+      release completes is refused if the input that is released is tainted, whichever input
+      produced it (fail closed). A click with no producing input (a synthetic one) is refused.
   (B) A Deny is never refused because of an input that is held, or of how an input began. It is
       ignored whenever the prompt is disarmed.
   (C) Nothing makes the prompt refuse a deliberate Allow for good: an input that begins after the
       prompt is armed, with nothing tainted held, is accepted, of either kind and after any other
-      input. The cases that fail closed instead are the documented ones: an input whose release was
-      lost (a pointer is replaced by its next press of the same button) and a click completed by
-      a tainted input's release.
+      input. The cases that fail closed instead are the documented ones: an input whose release
+      was lost (a pointer is replaced by its next press of the same button of the same device, or
+      dropped when the next prompt comes up), an input that is released with no record, and a
+      click completed by a tainted input's release.
 
 The reference model is written from that statement and from what GTK does (read in gtkbutton.c and
 gtkwindow.c), and shares no code with the controller. It keeps what is physically down, apart from
@@ -29,13 +31,17 @@ the controller's own idea of when it is armed with them. What GTK does that matt
     release of any key, whichever is first, and then a new activation can start (auto-repeat);
   - a window that is deactivated does not cancel a pointer press (its release still arrives), but
     its keys' releases go to the window that has the focus: the window forgets the keys;
-  - a drag can take a release (the button is up and the window was not told).
+  - a drag can take a release (the button is up and the window was not told);
+  - a mouse and a pen both have a button 1, as two devices; a touch sequence is new each time, and
+    the end of one that began elsewhere arrives with no press seen.
 
-The random steps are pointer presses and releases (buttons 1, 2, 3 and two touches), touch cancels,
-lost and stray releases, key presses and releases (Enter, Space, a letter, Shift, with auto-repeat),
+The random steps are pointer presses and releases (buttons 1, 2, 3, a pen's, and touches, each a new
+sequence), touch cancels, lost and stray releases (of a key too: it completes an activation under
+way), key presses and releases (Enter, Space, a letter, Shift, with auto-repeat),
 the timer of a keyboard activation, the window being activated and deactivated, the clock, the
-first frame, a prompt swap, a prompt that goes away and one that comes (a plain one or a picker's),
-Deny clicks, a picker's click and its answer, and deliberate Allow clicks and key activations.
+first frame, a click with no input behind it, a prompt swap, a prompt that goes away and one that
+comes (a plain one or a picker's), Deny clicks, a picker's click and its answer, and deliberate
+Allow clicks and key activations.
 
 Runs are deterministic (`derandomize`, no example database): what passes here passes in CI.
 
@@ -53,19 +59,31 @@ from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, 
 
 from tests.shell.prompt_support import Answers, Clock, FakeView, Timers, pick_card, read_card
 from tumbleweed.ipc.prompt_messages import AllowDecision, DenyDecision
-from tumbleweed.shell.viewmodel.prompts import ARM_SECONDS, InputId, PromptController
+from tumbleweed.shell.viewmodel.prompts import (
+    ACTIVATION_SECONDS,
+    ARM_SECONDS,
+    DeviceNo,
+    InputId,
+    PromptController,
+)
 
 ALLOW = AllowDecision(kind="allow", scope="task", picked=None)
 PICKED = AllowDecision(kind="allow", scope="task", picked="/home/u/Documents")
 DENY = DenyDecision(kind="deny", reason="user_denied")
 
 LEFT, MIDDLE, RIGHT = (InputId("pointer", n) for n in (1, 2, 3))
-FINGER_A, FINGER_B = InputId("pointer", 1000), InputId("pointer", 1001)
+PEN = InputId("pointer", 1, DeviceNo(2))  # the same button number as LEFT, on another device
+FIRST_FINGER = 1000  # a touch sequence is a new id each time
+POINTERS = (LEFT, MIDDLE, RIGHT, PEN)
 ENTER, SPACE, LETTER, SHIFT = (InputId("key", n) for n in (36, 65, 38, 50))
-POINTERS = (LEFT, MIDDLE, RIGHT, FINGER_A, FINGER_B)
 KEYS = (ENTER, SPACE, LETTER, SHIFT)
-CLICKS = (LEFT, FINGER_A, FINGER_B)  # what makes a GtkButton click, if it began on it
 ACTIVATING = (ENTER, SPACE)  # what starts a keyboard activation of the focused button
+
+
+def clicks(which: InputId) -> bool:
+    """Whether its release makes a GtkButton click, if it began on it: the primary button of a
+    device, or a touch."""
+    return which.kind == "pointer" and (which.code == 1 or which.code >= FIRST_FINGER)
 
 
 class Subject(Protocol):
@@ -73,7 +91,7 @@ class Subject(Protocol):
 
     clock: Clock
 
-    def began(self, which: InputId) -> None: ...
+    def began(self, which: InputId, activates: bool) -> None: ...
     def ended(self, which: InputId, cancelled: bool = False) -> None: ...
     def event_done(self) -> None: ...
     def deactivated(self) -> None: ...
@@ -99,8 +117,8 @@ class RealSubject:
         self.card = read_card()
         self.show(False)
 
-    def began(self, which: InputId) -> None:
-        self.controller.input_began(which)
+    def began(self, which: InputId, activates: bool) -> None:
+        self.controller.input_began(which, activates=activates)
 
     def ended(self, which: InputId, cancelled: bool = False) -> None:
         self.controller.input_ended(which, cancelled=cancelled)
@@ -179,6 +197,10 @@ class ArmingMachine(RuleBasedStateMachine):
         self.forgotten: set[InputId] = set()  # keys physically down that the window forgot
         self.stale: dict[InputId, Down] = {}  # physically up, the window was not told (lost)
         self.inflight: Down | None = None  # a keyboard activation under way: its activating press
+        self.inflight_at = 0.0  # when it began
+        self.disturbed = False  # another press has come since
+        self.activating_at: float | None = None  # the last time an activating key went down
+        self.fingers = 0  # touch sequences so far
         self.pick_open = False
         self.restart()
 
@@ -203,24 +225,50 @@ class ArmingMachine(RuleBasedStateMachine):
     def done(self) -> None:
         self.subject.event_done()
 
-    def check_click(self, producer: Down | None, releaser: Down | None, unrecorded: bool) -> None:
+    def drop_pointers(self) -> None:
+        """A prompt comes up: the window drops the pointers it holds, whose release (if it comes) is
+        then one with no record."""
+        for which in [i for i in self.down if i.kind == "pointer"]:
+            del self.down[which]
+            self.forgotten.add(which)
+        self.stale.clear()
+
+    def disturb(self) -> None:
+        """A press (that does not start an activation) ends the producer of an activation under
+        way, as far as the controller goes."""
+        if self.inflight is not None:
+            self.disturbed = True
+
+    def start_activation(self, record: Down) -> None:
+        self.activating_at = self.subject.clock.now
+        if self.inflight is None:
+            self.inflight, self.inflight_at, self.disturbed = record, self.activating_at, False
+
+    def check_click(
+        self,
+        producer: Down,
+        releaser: Down | None,
+        unrecorded: bool,
+        live_ok: bool = True,
+    ) -> None:
         """A button clicked. Safe: accepted only if armed, its producer clean, nothing tainted
         held, and the release that completed it (if any) clean. Live: all of those, and nothing
-        stale that the window still believes held, and it is taken."""
+        stale that the window still believes held, and it is taken (`live_ok`: for a click that
+        a timer makes, that the activation is not a second old and no press came after it)."""
         if not self.shown:
             return
         safe = (
             self.armed()
-            and (producer is None or not self.tainted(producer))
+            and not self.tainted(producer)
             and not self.tainted_held()
             and not (releaser is not None and self.tainted(releaser))
             and not unrecorded
         )
-        live = safe and not self.tainted_stale()
+        live = safe and live_ok and not self.tainted_stale()
         got = self.subject.allow()
         assert not (got and not safe), (
             f"UNSAFE: an Allow was accepted that (A) refuses (armed={self.armed()}, producer "
-            f"tainted={None if producer is None else self.tainted(producer)}, held tainted="
+            f"tainted={self.tainted(producer)}, held tainted="
             f"{self.tainted_held()}, releaser tainted="
             f"{None if releaser is None else self.tainted(releaser)}, unrecorded={unrecorded})"
         )
@@ -240,6 +288,7 @@ class ArmingMachine(RuleBasedStateMachine):
         self.shown = True
         self.inflight = None
         self.pick_open = False
+        self.drop_pointers()
 
     # -- inputs -----------------------------------------------------------------------------------
 
@@ -248,13 +297,23 @@ class ArmingMachine(RuleBasedStateMachine):
         if self.shown and not armed:
             self.restart()
         self.down[which] = Down(armed, self.epoch, on_button)
-        self.subject.began(which)
+        self.subject.began(which, which in ACTIVATING)
 
     @rule(which=st.sampled_from(POINTERS), on_button=st.booleans())
     def pointer_down(self, which: InputId, on_button: bool) -> None:
-        if which in self.down:
-            return  # the hardware never presses a held button twice
+        if which in self.down or which in self.forgotten:
+            return  # (a device's button is down once: a second press means its release was lost)
+        self.disturb()
         self.stale.pop(which, None)  # a press of a button whose release was lost replaces it
+        self.record_press(which, on_button)
+        self.done()
+
+    @rule(on_button=st.booleans())
+    def touch_down(self, on_button: bool) -> None:
+        """A finger: its sequence is new, never an id used before."""
+        self.disturb()
+        which = InputId("pointer", FIRST_FINGER + self.fingers)
+        self.fingers += 1
         self.record_press(which, on_button)
         self.done()
 
@@ -265,20 +324,26 @@ class ArmingMachine(RuleBasedStateMachine):
         if which in self.down:  # auto-repeat: not a new press, but it restarts a disarmed prompt
             if self.shown and not self.armed():
                 self.restart()
-            self.subject.began(which)
-            if which in ACTIVATING and self.down[which].on_button and self.inflight is None:
-                self.inflight = self.down[which]  # the keyboard repeats an activation
+            self.disturb()
+            self.subject.began(which, which in ACTIVATING)
+            if which in ACTIVATING:
+                self.activating_at = self.subject.clock.now
+                if self.down[which].on_button:
+                    self.start_activation(self.down[which])  # the keyboard repeats an activation
             self.done()
             return
+        self.disturb()
         self.record_press(which, on_button)
-        if which in ACTIVATING and on_button and self.inflight is None:
-            self.inflight = self.down[which]
+        if which in ACTIVATING:
+            self.activating_at = self.subject.clock.now
+            if on_button:
+                self.start_activation(self.down[which])
         self.done()
 
     @precondition(lambda self: bool(self.down) or bool(self.forgotten))
     @rule(data=st.data())
     def release(self, data: st.DataObject) -> None:
-        choices = sorted([*self.down, *self.forgotten], key=lambda i: (i.kind, i.code))
+        choices = sorted([*self.down, *self.forgotten], key=lambda i: (i.kind, i.code, i.device))
         which = data.draw(st.sampled_from(choices))
         if which in self.down:
             record: Down | None = self.down.pop(which)
@@ -288,7 +353,7 @@ class ArmingMachine(RuleBasedStateMachine):
         self.subject.ended(which)
         unrecorded = record is None
         if which.kind == "pointer":
-            if record is not None and record.on_button and which in CLICKS:
+            if record is not None and record.on_button and clicks(which):
                 self.check_click(record, None, unrecorded)  # the button clicks on the release
         elif self.inflight is not None:
             # Any key's release completes the activation under way (GTK): the click is the
@@ -303,7 +368,8 @@ class ArmingMachine(RuleBasedStateMachine):
         """The 250 ms of a keyboard activation pass with its key still down."""
         assert self.inflight is not None
         activator, self.inflight = self.inflight, None
-        self.check_click(activator, None, False)
+        recent = self.subject.clock.now - self.inflight_at <= ACTIVATION_SECONDS
+        self.check_click(activator, None, False, live_ok=recent and not self.disturbed)
         self.done()
 
     @precondition(lambda self: any(i.kind == "pointer" for i in self.down))
@@ -312,26 +378,51 @@ class ArmingMachine(RuleBasedStateMachine):
         """A drag takes the release: the button is up and the window is not told."""
         which = data.draw(
             st.sampled_from(
-                sorted((i for i in self.down if i.kind == "pointer"), key=lambda i: i.code)
+                sorted(
+                    (i for i in self.down if i.kind == "pointer"), key=lambda i: (i.code, i.device)
+                )
             )
         )
         self.stale[which] = self.down.pop(which)
 
-    @precondition(lambda self: any(i in (FINGER_A, FINGER_B) for i in self.down))
+    @precondition(lambda self: any(i.code >= FIRST_FINGER for i in self.down))
     @rule(data=st.data())
     def touch_cancelled(self, data: st.DataObject) -> None:
-        which = data.draw(st.sampled_from([i for i in (FINGER_A, FINGER_B) if i in self.down]))
+        touches = sorted(i.code for i in self.down if i.code >= FIRST_FINGER)
+        which = InputId("pointer", data.draw(st.sampled_from(touches)))
         del self.down[which]
         self.subject.ended(which, cancelled=True)  # no click
         self.done()
 
-    @rule(which=st.sampled_from(POINTERS))
-    def release_stray(self, which: InputId) -> None:
-        """A release comes with no press that was seen (it went down in another window)."""
-        if which in self.down or which in self.stale:
+    @rule(which=st.sampled_from([*POINTERS, *KEYS, None]))
+    def release_stray(self, which: InputId | None) -> None:
+        """A release comes with no press that was seen (it went down in another window; a touch
+        that began elsewhere is a sequence not seen before: None). A key's completes an
+        activation under way, like any key's, and the click is refused (fail closed)."""
+        if which is None:
+            which = InputId("pointer", FIRST_FINGER + self.fingers)
+            self.fingers += 1
+        if which in self.down or which in self.stale or which in self.forgotten:
             return
         self.subject.ended(which)
-        self.done()  # (no button began on it: nothing clicks)
+        if which.kind == "key" and self.inflight is not None:
+            activator, self.inflight = self.inflight, None
+            self.check_click(activator, None, True)
+        self.done()  # (no button began on a pointer: nothing clicks)
+
+    @rule()
+    def synthetic_click(self) -> None:
+        """A click with no input behind it (an accessibility `DoAction`) is never taken, armed or
+        not, whatever came before: unless an activating key went down in the last second, which
+        looks the same as the user's own Enter (a documented limit)."""
+        recent = (
+            self.activating_at is not None
+            and self.subject.clock.now - self.activating_at <= ACTIVATION_SECONDS
+        )
+        if not self.shown or self.inflight is not None or recent:
+            return
+        assert not self.subject.allow(), "UNSAFE: an Allow with no input behind it was accepted"
+        self.done()
 
     # -- the window and the prompt --------------------------------------------------------------
 
@@ -387,6 +478,7 @@ class ArmingMachine(RuleBasedStateMachine):
         self.restart()
         self.inflight = None
         self.pick_open = False
+        self.drop_pointers()
         self.done()
 
     @precondition(lambda self: self.shown)
@@ -405,21 +497,28 @@ class ArmingMachine(RuleBasedStateMachine):
         self.subject.show(picks)
         self.shown = True
         self.restart()
+        self.drop_pointers()
         self.done()
 
     @precondition(lambda self: self.shown)
-    @rule(use_key=st.booleans())
-    def deliberate_input(self, use_key: bool) -> None:
-        """(C): the user waits for the prompt, then clicks (or presses Enter) on the button. If
-        nothing tainted is held and nothing is stale it must be taken, whatever came before."""
-        if self.tainted_held() or self.tainted_stale() or self.subject.armed() != self.armed():
+    @rule(device=st.sampled_from(["enter", "mouse", "pen", "touch"]))
+    def deliberate_input(self, device: str) -> None:
+        """(C): the user waits for the prompt, then clicks (a mouse, a pen, a finger) or presses
+        Enter on the button. If nothing tainted is held and nothing is stale it must be taken,
+        whatever came before; if something tainted is held (a mouse button from the first 750 ms,
+        say, that a pen's tap must not stand in for) it must not."""
+        if self.subject.armed() != self.armed():
             return
         self.subject.advance(ARM_SECONDS)
-        which = ENTER if use_key else LEFT
+        if device == "touch":
+            which = InputId("pointer", FIRST_FINGER + self.fingers)
+            self.fingers += 1
+        else:
+            which = {"enter": ENTER, "mouse": LEFT, "pen": PEN}[device]
         if which in self.down or which in self.forgotten or self.inflight is not None:
             return
         self.record_press(which, True)
-        if use_key:
+        if device == "enter":
             self.inflight = None
             self.check_click(self.down[which], None, False)  # the activation, by its timer
             self.subject.ended(which)

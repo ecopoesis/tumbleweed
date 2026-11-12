@@ -19,12 +19,24 @@ if TYPE_CHECKING:
     from tumbleweed.shell._gi import Gio, Gtk
     from tumbleweed.shell.app import ShellApplication
     from tumbleweed.shell.chat_panel import MessageRow
+    from tumbleweed.shell.prompt_chrome import PromptBanner
     from tumbleweed.shell.window import ShellWindow
 
 DEADLINE_SECONDS = 5.0
 _ITERATIONS_PER_TURN = 1000  # a source that always fires must not hold the loop here forever
 
 type Rgb = tuple[float, float, float]
+
+
+def user_click(banner: "PromptBanner", button: "Gtk.Button") -> None:
+    """A click as the user makes it: the press and release of the primary button, as the window
+    reports them, and then the button's own click. A click with no input behind it (an
+    accessibility `DoAction`) is never taken as a grant (S18, round 6)."""
+    from tumbleweed.shell._gi import Gdk
+
+    banner.pointer_event(Gdk.EventType.BUTTON_PRESS, 1)
+    banner.pointer_event(Gdk.EventType.BUTTON_RELEASE, 1)
+    button.emit("clicked")
 
 
 def pump_until(condition: Callable[[], bool], *, timeout: float = DEADLINE_SECONDS) -> bool:
