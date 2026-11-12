@@ -23,21 +23,26 @@ This module imports no GTK; `tumbleweed.shell.canvas_tools` implements `CanvasHo
 """
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Final, Literal, Protocol, final
+from typing import TYPE_CHECKING, Final, Literal, Protocol, final
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from tumbleweed.agent.runtime import MainThreadDispatcher
+from tumbleweed.agent.tasks import TaskError
 from tumbleweed.agent.tools import ToolError, ToolName, ToolRegistry
 from tumbleweed.core.errors import TumbleweedError
-from tumbleweed.core.ids import ToolInstanceId
+from tumbleweed.core.ids import TaskId, ToolInstanceId
 from tumbleweed.ui.spec import SpecError, UiSpec, validate_ui_spec
 from tumbleweed.ui.spec.names import StateKey
 from tumbleweed.ui.spec.state import BoolState, FloatState, IntState, StringState
+
+if TYPE_CHECKING:
+    from tumbleweed.agent.tasks import TaskSession
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +71,9 @@ class ShownTool:
 class CanvasHost(Protocol):
     """The canvas, as the agent needs it. Called on the main thread only."""
 
-    def show(self, spec: UiSpec, placement: Placement) -> ShownTool: ...
+    def show(self, spec: UiSpec, placement: Placement, task: TaskId | None) -> ShownTool:
+        """Show `spec` as an instance that belongs to `task` (None: to no task, S12's case)."""
+        ...
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
         """Apply `patch` to the instance; the keys whose value changed, computed entries
@@ -91,8 +98,10 @@ class CanvasLink:
         """Disconnect it (the window is closing): later calls are tool errors. Main thread."""
         self._host = None
 
-    async def show(self, spec: UiSpec, placement: Placement) -> ShownTool:
-        return await self._on_main(lambda host: host.show(spec, placement))
+    async def show(
+        self, spec: UiSpec, placement: Placement, task: TaskId | None = None
+    ) -> ShownTool:
+        return await self._on_main(lambda host: host.show(spec, placement, task))
 
     async def patch(
         self, instance: ToolInstanceId, patch: Mapping[str, object]
@@ -179,15 +188,24 @@ def _describe_entries(spec: UiSpec) -> str:
     return ", ".join(shown) + (f", and {more} more" if more > 0 else "")
 
 
-def register_canvas_tools(registry: ToolRegistry, link: CanvasLink) -> None:
-    """Add `show_ui` and `patch_state` to `registry`, talking to the canvas through `link`."""
+def register_canvas_tools(
+    registry: ToolRegistry, link: CanvasLink, tasks: "TaskSession | None" = None
+) -> None:
+    """Add `show_ui` and `patch_state` to `registry`, talking to the canvas through `link`.
+
+    With `tasks`, a shown tool belongs to the current task (started if there is none; if the broker
+    cannot be reached it belongs to none), and becomes inert when that task ends (D26 (5))."""
 
     async def show_ui(arguments: ShowUiInput) -> str:
         try:
             spec = validate_ui_spec(arguments.spec)
         except SpecError as error:
             raise _failure_of(error, _FIX_AND_RETRY) from None
-        shown = await link.show(spec, arguments.placement)
+        task: TaskId | None = None
+        if tasks is not None:
+            with contextlib.suppress(TaskError):
+                task = await tasks.ensure()
+        shown = await link.show(spec, arguments.placement, task)
         count = "" if shown.on_canvas == 1 else f" ({shown.on_canvas} tools)"
         where = f"on the canvas{count}"
         return (
