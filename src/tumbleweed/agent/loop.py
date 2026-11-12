@@ -29,7 +29,8 @@ Limits (I9), each ending the reply with a `LimitError` whose message says which:
 import asyncio
 import contextlib
 from collections.abc import Callable
-from typing import assert_never, final
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, assert_never, final
 
 from tumbleweed.agent.errors import (
     LimitError,
@@ -53,7 +54,32 @@ from tumbleweed.agent.recorder import RecordedProvider
 from tumbleweed.agent.tools import ToolRegistry
 from tumbleweed.core.types import ModelName, TokenCount
 
+if TYPE_CHECKING:
+    from tumbleweed.agent.tasks import TaskSession
+
 _PARAGRAPH_BREAK = "\n\n"
+EARLIER_TASK_RESULT = "[This tool result belongs to an earlier task and is not available.]"
+"""What a tool result of an earlier task becomes once a task has started (D26 (4))."""
+
+
+@dataclass(frozen=True)
+class _Switch:
+    """A task started during a round of tool calls: the index of the last start, and whether any
+    start in the round was a fresh one."""
+
+    last_index: int
+    fresh: bool
+
+
+def _scrubbed(message: LlmMessage, before: int | None = None) -> LlmMessage:
+    """`message` with its tool results (those before index `before`, if given) replaced."""
+    blocks = tuple(
+        ToolResultBlock(tool_use_id=block.tool_use_id, content=EARLIER_TASK_RESULT)
+        if isinstance(block, ToolResultBlock) and (before is None or index < before)
+        else block
+        for index, block in enumerate(message.content)
+    )
+    return LlmMessage(role=message.role, content=blocks)
 
 
 @final
@@ -66,7 +92,9 @@ class AgentLoop:
         model: ModelName,
         system_prompt: str,
         limits: AgentLimits,
+        tasks: "TaskSession | None" = None,
     ) -> None:
+        self._tasks = tasks
         raw: object = provider  # the annotation is for the checker; callers can pass anything
         if not isinstance(raw, RecordedProvider):
             raise TypeError("the loop calls the model only through a RecordedProvider")
@@ -144,8 +172,14 @@ class AgentLoop:
                     calls = [block for block in done.content if isinstance(block, ToolUseBlock)]
                     if not calls:
                         raise ProviderError("The model asked for a tool but named none.")
-                    messages.append(LlmMessage(role="assistant", content=done.content))
-                    messages.append(await self._run_tools(calls))
+                    assistant = LlmMessage(role="assistant", content=done.content)
+                    results, switch = await self._run_tools(calls)
+                    if switch is None:
+                        messages.extend((assistant, results))
+                    else:
+                        messages[:] = self._rescoped(
+                            messages, len(history), assistant, results, switch
+                        )
                 case StopReason.PAUSE_TURN:
                     messages.append(LlmMessage(role="assistant", content=done.content))
                 case StopReason.MAX_TOKENS:
@@ -175,8 +209,27 @@ class AgentLoop:
             "(thinking included) and was cut off. `max_turn_output_tokens` in the config raises it."
         )
 
-    async def _run_tools(self, calls: list[ToolUseBlock]) -> LlmMessage:
+    @staticmethod
+    def _rescoped(
+        messages: list[LlmMessage],
+        turn_start: int,
+        assistant: LlmMessage,
+        results: LlmMessage,
+        switch: _Switch,
+    ) -> list[LlmMessage]:
+        """The messages for the next call after a task started (D26 (4)): no tool result of an
+        earlier task survives, and after a fresh start neither does anything the earlier context
+        held (the history, the reply's earlier text, the assistant's text and thinking in the
+        message that made the call), only the user's message of this turn and the calls."""
+        results = _scrubbed(results, switch.last_index)
+        if switch.fresh:
+            calls = tuple(block for block in assistant.content if isinstance(block, ToolUseBlock))
+            return [messages[turn_start], LlmMessage(role="assistant", content=calls), results]
+        return [*(_scrubbed(message) for message in messages), assistant, results]
+
+    async def _run_tools(self, calls: list[ToolUseBlock]) -> tuple[LlmMessage, _Switch | None]:
         results: list[ToolResultBlock] = []
+        switch: _Switch | None = None
         for index, call in enumerate(calls):
             if index >= MAX_TOOL_CALLS_PER_ITERATION:
                 results.append(
@@ -188,10 +241,14 @@ class AgentLoop:
                     )
                 )
                 continue
+            generation = None if self._tasks is None else self._tasks.generation
             outcome = await self._registry.call(call.name, call.input)
+            if self._tasks is not None and self._tasks.generation != generation:
+                fresh = self._tasks.last_switch_fresh or (switch is not None and switch.fresh)
+                switch = _Switch(index, fresh)
             results.append(
                 ToolResultBlock(
                     tool_use_id=call.id, content=outcome.text, is_error=outcome.is_error
                 )
             )
-        return LlmMessage(role="user", content=tuple(results))
+        return LlmMessage(role="user", content=tuple(results)), switch

@@ -413,7 +413,7 @@
     },
     "GrantOutcome": {
       "additionalProperties": false,
-      "description": "The answer to `RequestGrant`: granted (`grant`, `scope`), already covered, or denied.\n\n`message` is fixed text that names the rule, never the path.",
+      "description": "The answer to `RequestGrant`: granted (`grant`, `scope`), already covered, or denied.\n\n`message` is fixed text that names the rule, never the path. `picked` is the canonical path of\nwhat the user chose in the picker, for a picker grant only (D26 (6), amending D25 (7)): the\nuser chose it to give it to the assistant, and without it a granted folder has no name to\nlist. It is the broker's resolved text, and the receiver frames it as data.",
       "properties": {
         "grant": {
           "anyOf": [
@@ -440,6 +440,20 @@
           "maxLength": 300,
           "title": "Message",
           "type": "string"
+        },
+        "picked": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Picked"
         },
         "scope": {
           "anyOf": [

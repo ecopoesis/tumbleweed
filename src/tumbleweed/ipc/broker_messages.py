@@ -159,7 +159,10 @@ class RequestGrant(Request):
 class GrantOutcome(Response):
     """The answer to `RequestGrant`: granted (`grant`, `scope`), already covered, or denied.
 
-    `message` is fixed text that names the rule, never the path.
+    `message` is fixed text that names the rule, never the path. `picked` is the canonical path of
+    what the user chose in the picker, for a picker grant only (D26 (6), amending D25 (7)): the
+    user chose it to give it to the assistant, and without it a granted folder has no name to
+    list. It is the broker's resolved text, and the receiver frames it as data.
     """
 
     kind: Literal["grant_outcome"]
@@ -167,6 +170,7 @@ class GrantOutcome(Response):
     grant: GrantId | None
     scope: Scope | None
     message: Annotated[str, Field(max_length=MAX_MESSAGE_CHARS)]
+    picked: Annotated[str, Field(min_length=1, max_length=MAX_PATH_CHARS)] | None = None
 
 
 @final

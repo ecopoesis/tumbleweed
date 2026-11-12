@@ -1299,6 +1299,7 @@ class BrokerService:
                     grant=grant.id,
                     scope=scope,
                     message="granted by the user",
+                    picked=path_text if origin is GrantOrigin.PICKER else None,
                 )
             case _:
                 assert_never(issuance)
