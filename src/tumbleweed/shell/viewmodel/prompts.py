@@ -18,12 +18,13 @@ What it holds to, in the order of the invariant (I5):
       tracked until their release arrives or the next prompt comes up, keys until it arrives or the
       window loses the focus). The producer is the pointer press whose release came on that button,
       or the press of Enter or Space, bare, that started a keyboard activation of that button while
-      it had the focus, in the last half second; the release of any key completes an activation
-      under way. A click that a release completes is refused if the input that is released is
-      tainted, whichever input produced it (fail closed). A click with no producing input (a
-      synthetic one, such as an accessibility DoAction), or whose producer belongs to another
-      button, is refused, and the delay starts again. The answer of the picker's dialog is taken
-      only after a Choose that was granted at that scope.
+      it had the focus, in the last half second; a key's release in that half second is taken for
+      the completion of an activation under way, and the release of the activating key itself ends
+      it. A click that a release completes is refused if the input that is released is tainted,
+      whichever input produced it (fail closed). A click with no producing input (a synthetic one,
+      such as an accessibility DoAction), or whose producer belongs to another button, is refused,
+      and the delay starts again. The answer of the picker's dialog is taken only after a Choose
+      that was granted at that scope.
   (B) A Deny is never refused because of an input that is held, or of how an input began: a Deny
       cannot become a grant. It is ignored whenever the prompt is disarmed (the 750 ms after it
       appears or after any restart; the plan: early clicks and Enter presses are ignored), and
@@ -34,28 +35,35 @@ What it holds to, in the order of the invariant (I5):
       0.75 s of the user's own refused Allow is ignored, and the note is shown).
   (C) Nothing makes the prompt refuse a deliberate Allow for good: an input that begins after the
       prompt is armed, with nothing tainted held, is accepted, of either kind and after any other
-      input (typing, a window activation, any press during a keyboard activation). A refusal of an
-      Allow is shown to the user, by the view. The cases that fail closed instead are the documented
-      ones: an input whose release was lost (a pointer is replaced by its next press of the same
-      button of the same device, or dropped when the next prompt comes up, so a lost release costs
-      one prompt at most; a key is forgotten when the window loses the focus), an input that comes
-      up with no record (it went down before the prompt or a focus loss, was dropped, or was one too
-      many to record: at most 64 are held), a click completed by a tainted input's release, and two
-      mice that the system merges into one device (their same-numbered buttons are one input to the
-      window, so a press of the second replaces the record of the first). What remains, outside the
-      threat model (a same-user process, ARCHITECTURE section 8): a synthetic click on the very
-      button the user is activating, in the same event as their clean release on it or within half a
-      second of their clean Enter or Space on it, is taken as theirs. The picker's dialog is GTK's
-      or the portal's own window and can be driven over the accessibility bus like any window of the
-      session; what protects it is that it opens only after a granted Choose, that its answer is
-      taken only then, only once, and not after the dialog was dismissed or the delay restarted, and
-      that the broker still applies the deny rules, the taint rule and the cap to what it picks.
-      Assistive-technology users grant with Enter or Space on the focused button; a DoAction is
-      refused. This assumes that a bus client cannot move the keyboard focus onto Allow: GTK 4.14.5
-      names the AT-SPI Component method GrabFocus in libgtk, but whether and how it moves the focus
-      was not run (the test container has no accessibility bus); if it can, the user's Enter meant
-      for Deny would activate Allow and be taken as theirs, which is again a same-user process,
-      outside the threat model.
+      input (typing, a window activation, any press during a keyboard activation: only the release
+      of the activating key ends it). A refusal of an Allow is shown to the user, by the view. The
+      cases that fail closed instead are the documented ones: an input whose release was lost (a
+      pointer is replaced by its next press of the same button of the same device, or dropped when
+      the next prompt comes up, so a lost release costs one prompt at most; a key is forgotten when
+      the window loses the focus), an input that comes up with no record (it went down before the
+      prompt or a focus loss, was dropped, or was one too many to record: at most 64 are held), a
+      click completed by a tainted input's release, and two mice that the system merges into one
+      device (their same-numbered buttons are one input to the window, so a press of the second
+      replaces the record of the first). Exactly, for Enter on Allow followed by a press on Deny
+      during GTK's activation: if Enter is still held when GTK's 250 ms timer fires, GTK clicks
+      Allow and it is taken (the user's own Enter; GTK does the same without the shell); if Enter
+      comes up after the press moved the focus to Deny, the activation ends at that release, GTK's
+      timer click on Allow is refused and the delay restarts, so a Deny that clicks after that is
+      ignored too: no answer, the note is shown, and a retry works (fail closed). What remains,
+      outside the threat model (a same-user process, ARCHITECTURE section 8): a synthetic click on
+      the very button the user is activating, in the same event as their clean release on it or
+      within half a second of their clean Enter or Space on it, is taken as theirs. The picker's
+      dialog is GTK's or the portal's own window and can be driven over the accessibility bus like
+      any window of the session; what protects it is that it opens only after a granted Choose, that
+      its answer is taken only then, only once, and not after the dialog was dismissed or the delay
+      restarted, and that the broker still applies the deny rules, the taint rule and the cap to
+      what it picks. Assistive-technology users grant with Enter or Space on the focused button; a
+      DoAction is refused. A bus client cannot move the keyboard focus onto Allow: GTK's AT-SPI
+      Component.GrabFocus answers NotSupported (gtk/a11y/gtkatspicomponent.c, GTK 4.14.5; the same
+      in 4.16, 4.18 and main), and the Action interface's DoAction only calls gtk_widget_activate,
+      which takes no focus. A GTK that implemented GrabFocus would let the user's Enter meant for
+      Deny activate Allow, from a same-user process, outside the threat model: re-check it on a GTK
+      upgrade.
 
   How: every pointer button (told apart by its device: a mouse and a pen both have a button 1),
   touch (one identity per sequence) and key that goes down is recorded with whether the prompt was
