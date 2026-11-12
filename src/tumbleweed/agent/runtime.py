@@ -34,7 +34,7 @@ import threading
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Final, Protocol, final
 
-from tumbleweed.agent.canvas_events import frame_turn
+from tumbleweed.agent.canvas_events import CanvasTurn, frame_turn
 from tumbleweed.agent.context import fit_history, history_budget
 from tumbleweed.agent.errors import AgentBusyError, AgentError, LimitError, describe_unexpected
 from tumbleweed.agent.limits import MAX_USER_TEXT_BYTES, AgentLimits
@@ -216,7 +216,9 @@ class AgentResponder:
                 limits=self._limits,
                 tasks=self._tasks,
             )
-            run.future = self._worker.submit(self._drive(run, loop, request.history, text))
+            run.future = self._worker.submit(
+                self._drive(run, loop, request.history, text, request.canvas_turn)
+            )
         except BaseException:
             self._active = None
             raise
@@ -245,7 +247,12 @@ class AgentResponder:
     # On the worker thread.
 
     async def _drive(
-        self, run: _Run, loop: AgentLoop, turns: tuple[ContextTurn, ...], text: str
+        self,
+        run: _Run,
+        loop: AgentLoop,
+        turns: tuple[ContextTurn, ...],
+        text: str,
+        canvas: CanvasTurn | None,
     ) -> None:
         tasks = self._tasks
         try:
@@ -263,7 +270,12 @@ class AgentResponder:
                 text,
                 budget=history_budget(self._limits.max_turn_output_tokens),
             )
-            await loop.run(history, text, lambda piece: self._post(run, ReplyDelta(text=piece)))
+            await loop.run(
+                history,
+                text,
+                lambda piece: self._post(run, ReplyDelta(text=piece)),
+                typed=canvas is None,
+            )
         except AgentError as exc:
             self._post(run, ReplyFailed(reason=str(exc), task=_tag(tasks)))
         except Exception as exc:  # noqa: BLE001  (the worker is a boundary)

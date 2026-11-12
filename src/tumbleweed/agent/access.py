@@ -27,6 +27,7 @@ from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.ids import RunId, TaskId
 from tumbleweed.core.types import WorkspaceRelPath
 from tumbleweed.ipc.broker_messages import (
+    MAX_FILE_BYTES,
     MAX_PATH_CHARS,
     MAX_REASON_CHARS,
     DirListing,
@@ -37,7 +38,7 @@ from tumbleweed.ipc.broker_messages import (
 )
 
 BROKER_SECONDS: Final = 20.0  # a file system call, or a listing
-READ_LIMIT: Final = MAX_FRAMED_BYTES  # a file larger than this is refused by the broker
+READ_LIMIT: Final = MAX_FILE_BYTES  # what the wire carries; the model is shown MAX_FRAMED_BYTES
 MAX_LISTED: Final = 200
 _PROMPT_SECONDS: Final = PROMPT_WAIT.total_seconds() + 10.0
 
@@ -104,11 +105,18 @@ class WorkspaceInput(BaseModel):
 
 
 def _listing(listing: DirListing, source: str) -> str:
-    lines = [
-        f"{entry.entry}\t{'' if entry.size is None else entry.size}\t"
-        f"{spelled(entry.name)[:MAX_NAME_CHARS]}"
-        for entry in listing.entries[:MAX_LISTED]
-    ]
+    lines: list[str] = []
+    used = 0
+    for entry in listing.entries[:MAX_LISTED]:
+        # Cut before spelling out, so that an escape is never cut in half; stop at the frame's room.
+        line = (
+            f"{entry.entry}\t{'' if entry.size is None else entry.size}\t"
+            f"{spelled(entry.name[:MAX_NAME_CHARS])}"
+        )
+        used += len(line.encode("utf-8")) + 1
+        if used > MAX_FRAMED_BYTES - 64:
+            break
+        lines.append(line)
     notes = []
     hidden = len(listing.entries) - len(lines)
     if hidden > 0:
@@ -193,7 +201,9 @@ def register_access_tools(registry: ToolRegistry, tasks: TaskSession, link: Brok
             )
             text = f"Granted {scope}."
             if outcome.picked is not None:
-                text += " The user chose:\n" + framed("the path the user picked", outcome.picked)
+                text += " The user chose:\n" + framed(
+                    "the path the user picked", spelled(outcome.picked)
+                )
             return text
 
         return await ask(grant, _PROMPT_SECONDS)

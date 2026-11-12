@@ -17,6 +17,7 @@ thread, through the dispatcher. A start that finishes after the chat session cha
 ends the task it made and fails, so a cancelled reply cannot leave a task behind.
 """
 
+import asyncio
 import logging
 import threading
 import unicodedata
@@ -50,6 +51,10 @@ class TaskObserver(Protocol):
 
 class TaskError(TumbleweedError):
     """A task could not be started; the message is fixed text for the model."""
+
+
+class TaskUnsureError(TaskError):
+    """The broker did not answer a start in time: it may or may not have made the task."""
 
 
 def clean_title(text: str) -> str:
@@ -168,7 +173,15 @@ class TaskSession:
         else the last one (D26 (3))."""
         with self._lock:
             self._reply_open = False
-            return self._reply_first if self._reply_fresh else self._current
+            if self._reply_fresh:
+                return self._reply_first
+            # Never None while the context set is not empty: None is visible to every task. After
+            # a lost connection or a restore that could not be checked, the task to inherit from
+            # (the head) is the one the reply belongs to.
+            for task in (self._current, self._head, self._reply_first):
+                if task is not None:
+                    return task
+            return None
 
     # --- starting tasks (the worker) -------------------------------------------------------
 
@@ -190,17 +203,23 @@ class TaskSession:
             previous = self._current if self._current is not None else self._head
         refused_previous = False
         try:
-            started = await self._start_on_broker(previous, fresh)
-        except BrokerRefused as refusal:
-            if previous is None or refusal.reason != "unknown_task":
-                raise TaskError(f"The task could not be started: {refusal.message}.") from None
-            # The broker does not know the task to inherit from: nothing of it can be trusted to
-            # carry over, so start clean and drop the turns of the lineage (fail closed).
-            refused_previous = True
             try:
-                started = await self._start_on_broker(None, False)
-            except BrokerRefused as again:
-                raise TaskError(f"The task could not be started: {again.message}.") from None
+                started = await self._start_on_broker(previous, fresh)
+            except BrokerRefused as refusal:
+                if previous is None or refusal.reason != "unknown_task":
+                    raise TaskError(f"The task could not be started: {refusal.message}.") from None
+                # The broker does not know the task to inherit from: nothing of it can be trusted to
+                # carry over, so start clean and drop the turns of the lineage (fail closed).
+                refused_previous = True
+                try:
+                    started = await self._start_on_broker(None, False)
+                except BrokerRefused as again:
+                    raise TaskError(f"The task could not be started: {again.message}.") from None
+        except (asyncio.CancelledError, TaskUnsureError):
+            # The broker may have ended the task we had and made another: we cannot tell. Do not
+            # go on as if the old task were current; the next start inherits from it as the head.
+            self._abandon(epoch, previous)
+            raise
         task = started
         old: TaskId | None = None
         with self._lock:
@@ -222,7 +241,7 @@ class TaskSession:
                         self._reply_first = task
                     if self._reply_had or reset:
                         self._generation += 1
-                    self._reply_fresh = self._reply_fresh or reset
+                    self._reply_fresh = self._reply_fresh or fresh
                     self._reply_had = True
                 elif reset:
                     self._generation += 1
@@ -241,7 +260,14 @@ class TaskSession:
         try:
             return await self._link.call(work, deadline=TASK_CALL_SECONDS)
         except BrokerUnavailableError as error:
-            raise TaskError(str(error)) from None
+            raise TaskUnsureError(str(error)) from None
+
+    def _abandon(self, epoch: int, previous: TaskId | None) -> None:
+        with self._lock:
+            if epoch != self._epoch or previous is None or self._current != previous:
+                return
+            self._head, self._current = previous, None
+        self._notify_ended(previous)
 
     # --- the end of a connection (the link's thread) ---------------------------------------
 

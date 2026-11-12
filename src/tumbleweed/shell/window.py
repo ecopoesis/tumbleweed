@@ -78,6 +78,7 @@ class _TaskWatch:
             return
         self._shown = task
         self._strip.show_task(title)
+        self._canvas_tools.task_started(task)
 
     def task_ended(self, task: TaskId) -> None:
         if self.closed:

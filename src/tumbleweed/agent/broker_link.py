@@ -52,6 +52,9 @@ logger = logging.getLogger(__name__)
 
 RETRY_FLOOR: Final = 1.0
 RETRY_CEILING: Final = 30.0
+CONNECT_SECONDS: Final = 8.0
+"""The most one attempt to connect may take: below the deadline of every call, so that a call
+waiting for a broker that is not there fails by this and starts the pause, not by its own."""
 _START_TIMEOUT: Final = 5.0
 _STOP_TIMEOUT: Final = 3.0
 _MARGIN: Final = 2.0  # seconds a blocking caller waits beyond the deadline of the work itself
@@ -94,7 +97,9 @@ class BrokerLink:
         *,
         retry_floor: float = RETRY_FLOOR,
         retry_ceiling: float = RETRY_CEILING,
+        connect_seconds: float = CONNECT_SECONDS,
     ) -> None:
+        self._connect_seconds = connect_seconds
         self._make_connector = connector
         self._retry_floor = retry_floor
         self._retry_ceiling = retry_ceiling
@@ -218,10 +223,14 @@ class BrokerLink:
                     self._fail(loop)
                     raise BrokerUnavailableError("The broker's socket cannot be used.") from None
             try:
-                client = await self._connector.connect()
-            except (IpcError, OSError):
+                async with asyncio.timeout(self._connect_seconds):
+                    client = await self._connector.connect()
+            except (IpcError, OSError, TimeoutError):
                 self._fail(loop)
                 raise BrokerUnavailableError("The broker is not reachable right now.") from None
+            except asyncio.CancelledError:
+                self._fail(loop)  # the caller's own deadline ended the attempt: still a failure
+                raise
             self._failures = 0
             self._client = client
             watcher = loop.create_task(self._watch(client), name="broker-link-watch")
@@ -292,6 +301,7 @@ def connector_from_environment(environ: Mapping[str, str]) -> ConnectorFactory:
         if name in _DEV_FLAGS
     )
     snapshot = dict(environ)
+    started: list[asyncio.subprocess.Process] = []
 
     def make(handler: RequestHandler) -> BrokerConnector:
         from tumbleweed.broker.daemon import SOCKET_NAME  # lazily: the daemon's module is large
@@ -299,7 +309,13 @@ def connector_from_environment(environ: Mapping[str, str]) -> ConnectorFactory:
         path = SocketDirectory.from_environment(snapshot, create=True).socket_path(SOCKET_NAME)
 
         async def spawn() -> object:
-            return await spawn_broker_process(snapshot, extra_args=flags)
+            # One broker per attempt window: a broker that was started and is still coming up is
+            # waited for, not started again by the next call.
+            if started and started[-1].returncode is None:
+                return started[-1]
+            process = await spawn_broker_process(snapshot, extra_args=flags)
+            started.append(process)
+            return process
 
         return BrokerConnector(path, spawn=spawn if spawn_enabled else None, handler=handler)
 

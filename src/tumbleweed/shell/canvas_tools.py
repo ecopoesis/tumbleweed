@@ -146,12 +146,22 @@ class CanvasTools:
 
     def task_ended(self, task: TaskId) -> None:
         """The task has ended: its instances become inert (D26 (5), ARCHITECTURE section 2). Their
-        `agent` events are dropped, they can no longer read the task's workspace (the broker
-        refuses an ended task), `set` handlers, computed state and `patch_state` still work, and
-        the card says so."""
+        `agent` events are dropped (and one already waiting is forgotten), they can no longer read
+        the task's workspace (the broker refuses an ended task), `set` handlers, computed state
+        and `patch_state` still work, and the card says so. An instance that belongs to no task
+        (it was shown while the broker could not be reached) goes inert with the first task that
+        ends or starts after it."""
+        self._make_inert(lambda shown: shown.task in (task, None))
+
+    def task_started(self, task: TaskId) -> None:
+        """A task has started: an instance that belongs to no task goes inert (see `task_ended`)."""
+        self._make_inert(lambda shown: shown.task is None)
+
+    def _make_inert(self, which: Callable[[_Shown], bool]) -> None:
         for shown in self._shown:
-            if shown.task == task and not shown.sink.inert:
+            if which(shown) and not shown.sink.inert:
                 shown.sink.inert = True
+                self._gate.forget(shown.instance)  # an event already waiting must not start a turn
                 shown.card.append(line_label(INERT_NOTICE, css_classes=["caption", "dim-label"]))
 
     def close(self) -> None:

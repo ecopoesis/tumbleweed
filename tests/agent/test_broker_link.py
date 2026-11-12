@@ -3,6 +3,7 @@
 
 import asyncio
 import time
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -121,3 +122,83 @@ def _show_prompt() -> RequestBody:
     from tests.shell.prompt_support import show_message
 
     return show_message()
+
+
+def test_a_connect_that_outlasts_the_call_deadline_still_starts_the_pause() -> None:
+    # The connector's own patience (30 s) is longer than any call deadline; the link bounds one
+    # attempt by less, so the failure counts and the next call is refused at once (round-1 M4).
+    from tests.broker.rig import short_directory
+    from tests.ipc.paths import unchecked_socket_path
+
+    with short_directory() as base:
+        nobody = unchecked_socket_path(Path(str(base)) / "nobody.sock")
+
+        def factory(handler: RequestHandler) -> BrokerConnector:
+            return BrokerConnector(nobody, handler=handler)  # give_up: 30 s
+
+        link = BrokerLink(factory, retry_floor=5.0, connect_seconds=0.3)
+        try:
+            began = time.monotonic()
+            with pytest.raises(BrokerUnavailableError):
+                link.call_blocking(start, deadline=2.0)
+            assert time.monotonic() - began < 1.5  # ended by the attempt's bound, not the call's
+
+            began = time.monotonic()
+            with pytest.raises(BrokerUnavailableError):
+                link.call_blocking(start, deadline=2.0)
+            assert time.monotonic() - began < 0.5  # refused by the pause
+        finally:
+            link.close()
+
+
+def test_a_call_ended_by_its_own_deadline_while_connecting_also_starts_the_pause() -> None:
+    from tests.broker.rig import short_directory
+    from tests.ipc.paths import unchecked_socket_path
+
+    with short_directory() as base:
+        nobody = unchecked_socket_path(Path(str(base)) / "nobody.sock")
+        link = BrokerLink(
+            lambda handler: BrokerConnector(nobody, handler=handler),
+            retry_floor=5.0,
+            connect_seconds=60.0,  # longer than the call: the call's deadline ends the attempt
+        )
+        try:
+            with pytest.raises(BrokerUnavailableError):
+                link.call_blocking(start, deadline=0.3)
+            began = time.monotonic()
+            with pytest.raises(BrokerUnavailableError):
+                link.call_blocking(start, deadline=2.0)
+            assert time.monotonic() - began < 0.5
+        finally:
+            link.close()
+
+
+def test_a_broker_that_is_still_coming_up_is_not_started_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+
+    from tests.broker.rig import short_directory
+    from tumbleweed.agent import broker_link
+
+    class Pending:
+        returncode = None
+
+    started: list[int] = []
+
+    async def fake_spawn(*args: object, **kwargs: object) -> Pending:
+        started.append(1)
+        return Pending()
+
+    monkeypatch.setattr(broker_link, "spawn_broker_process", fake_spawn)
+    with short_directory() as base:
+        make = broker_link.connector_from_environment({"XDG_RUNTIME_DIR": str(base)})
+        link = BrokerLink(make, retry_floor=0.01, connect_seconds=0.5)
+        try:
+            for _ in range(3):
+                with pytest.raises(BrokerUnavailableError):
+                    link.call_blocking(start, deadline=3.0)
+                time.sleep(0.05)
+        finally:
+            link.close()
+
+    assert started == [1]

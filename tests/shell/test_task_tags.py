@@ -1,14 +1,25 @@
 """A task rides on every message and turn (D26, #80): from the reply that ended, through the
 transcript and the chat history, to the turns the model is sent."""
 
+from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
+
+from tests.history.support import closing_every_store
 from tests.shell.fakes import ManualResponder
 from tests.shell.test_session import Rig as SessionRig
 from tumbleweed.agent.responder import ReplyDelta, ReplyFailed, ReplyFinished
 from tumbleweed.core.ids import MessageId, TaskId
 from tumbleweed.shell.viewmodel.chat import ChatController, context_turns
 from tumbleweed.shell.viewmodel.transcript import MessageState, Role, Transcript, TranscriptMessage
+
+
+@pytest.fixture(autouse=True)
+def _close_every_store(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    # A store a test leaves open is finalised later, and that is an error on Python 3.13.
+    with closing_every_store(monkeypatch):
+        yield
 
 
 def test_a_finished_reply_is_tagged_with_the_task_the_responder_names() -> None:

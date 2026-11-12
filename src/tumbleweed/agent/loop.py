@@ -60,6 +60,14 @@ if TYPE_CHECKING:
 _PARAGRAPH_BREAK = "\n\n"
 EARLIER_TASK_RESULT = "[This tool result belongs to an earlier task and is not available.]"
 """What a tool result of an earlier task becomes once a task has started (D26 (4))."""
+NOT_RUN = "[Not run: this call was written before the fresh start of a new task.]"
+EVENT_NOTE = (
+    "[The user's last action was in a tool of an earlier task; that event is not available.]"
+)
+
+
+def _event_note() -> LlmMessage:
+    return LlmMessage(role="user", content=(TextBlock(text=EVENT_NOTE),))
 
 
 @dataclass(frozen=True)
@@ -109,12 +117,17 @@ class AgentLoop:
         history: tuple[LlmMessage, ...],
         user_text: str,
         on_text: Callable[[str], None],
+        *,
+        typed: bool = True,
     ) -> str:
-        """Answer `user_text` after `history`; the reply's text. Raises `AgentError`s."""
+        """Answer `user_text` after `history`; the reply's text. Raises `AgentError`s.
+
+        `typed` says the user wrote `user_text`; a message the shell wrote from a canvas event is
+        not kept across a fresh start (D26 (4))."""
         deadline = asyncio.timeout(self._limits.reply_timeout_seconds)
         try:
             async with deadline:
-                return await self._run(history, user_text, on_text, deadline)
+                return await self._run(history, user_text, on_text, deadline, typed)
         except TimeoutError:
             if not deadline.expired():
                 raise
@@ -129,8 +142,10 @@ class AgentLoop:
         user_text: str,
         on_text: Callable[[str], None],
         deadline: asyncio.Timeout,
+        typed: bool,
     ) -> str:
-        messages = [*history, LlmMessage(role="user", content=(TextBlock(text=user_text),))]
+        turn = LlmMessage(role="user", content=(TextBlock(text=user_text),))
+        messages = [*history, turn]
         parts: list[str] = []
         emitted = 0
         budget = int(self._limits.max_turn_output_tokens)
@@ -178,7 +193,7 @@ class AgentLoop:
                         messages.extend((assistant, results))
                     else:
                         messages[:] = self._rescoped(
-                            messages, len(history), assistant, results, switch
+                            messages, turn if typed else _event_note(), assistant, results, switch
                         )
                 case StopReason.PAUSE_TURN:
                     messages.append(LlmMessage(role="assistant", content=done.content))
@@ -212,19 +227,25 @@ class AgentLoop:
     @staticmethod
     def _rescoped(
         messages: list[LlmMessage],
-        turn_start: int,
+        turn: LlmMessage,
         assistant: LlmMessage,
         results: LlmMessage,
         switch: _Switch,
     ) -> list[LlmMessage]:
         """The messages for the next call after a task started (D26 (4)): no tool result of an
-        earlier task survives, and after a fresh start neither does anything the earlier context
-        held (the history, the reply's earlier text, the assistant's text and thinking in the
-        message that made the call), only the user's message of this turn and the calls."""
+        earlier task survives. After a fresh start nothing else the earlier context held does
+        either: not the history, not the reply's earlier messages, not the text and thinking of the
+        message that made the call, and not the inputs of its calls (they are the model's, written
+        from that context: the title, a reason, a path); only the user's message of this turn
+        (`turn`) and the calls' ids and results stay."""
         results = _scrubbed(results, switch.last_index)
         if switch.fresh:
-            calls = tuple(block for block in assistant.content if isinstance(block, ToolUseBlock))
-            return [messages[turn_start], LlmMessage(role="assistant", content=calls), results]
+            calls = tuple(
+                ToolUseBlock(id=block.id, name=block.name, input={})
+                for block in assistant.content
+                if isinstance(block, ToolUseBlock)
+            )
+            return [turn, LlmMessage(role="assistant", content=calls), results]
         return [*(_scrubbed(message) for message in messages), assistant, results]
 
     async def _run_tools(self, calls: list[ToolUseBlock]) -> tuple[LlmMessage, _Switch | None]:
@@ -240,6 +261,10 @@ class AgentLoop:
                         is_error=True,
                     )
                 )
+                continue
+            if switch is not None and switch.fresh:
+                # Written in the earlier context, it would run in the new, clean task.
+                results.append(ToolResultBlock(tool_use_id=call.id, content=NOT_RUN, is_error=True))
                 continue
             generation = None if self._tasks is None else self._tasks.generation
             outcome = await self._registry.call(call.name, call.input)
