@@ -148,6 +148,8 @@ class PromptCard:
     scopes: tuple[Scope, ...]
     reason: str
     reason_cut: bool
+    task_title: str | None = None
+    """The title the assistant gave the task (plain, capped), or None: set apart as its words."""
 
     @property
     def picks(self) -> bool:
@@ -186,8 +188,15 @@ def visible(text: str) -> str:
     )
 
 
-def card_of(show: ShowPrompt) -> PromptCard:
-    """The card for a prompt from the broker. The capability is read from its structure."""
+MAX_TITLE_SHOWN: Final = 80
+"""The most characters of a task's title that are shown (I5: capped)."""
+
+
+def card_of(show: ShowPrompt, task_title: str | None = None) -> PromptCard:
+    """The card for a prompt from the broker. The capability is read from its structure.
+
+    `task_title` is the assistant's name for the task, looked up by the shell (#142); it is made a
+    plain line and capped here as the reason is, whoever gave it."""
     access = show.access
     kind: CardKind
     path: str | None = None
@@ -203,6 +212,7 @@ def card_of(show: ShowPrompt) -> PromptCard:
         case _:
             assert_never(access)
     reason, cut = plain_reason(show.reason)
+    title = None if not task_title else plain_reason(task_title, MAX_TITLE_SHOWN)[0] or None
     return PromptCard(
         prompt=show.prompt,
         task=show.task,
@@ -212,6 +222,7 @@ def card_of(show: ShowPrompt) -> PromptCard:
         scopes=show.scopes,
         reason=reason,
         reason_cut=cut,
+        task_title=title,
     )
 
 

@@ -20,9 +20,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import final
 
+from tumbleweed.agent.broker_images import BrokerImageResolver
+from tumbleweed.agent.broker_link import BrokerLink
 from tumbleweed.agent.canvas import CanvasLink
 from tumbleweed.agent.canvas_events import EventGate, Scheduler
 from tumbleweed.agent.responder import Responder
+from tumbleweed.agent.tasks import TaskSession
+from tumbleweed.core.ids import TaskId
 from tumbleweed.shell._gi import Adw, Gio, Gtk
 from tumbleweed.shell.broker_prompts import BrokerPrompts
 from tumbleweed.shell.canvas import CanvasView
@@ -60,6 +64,31 @@ class PromptWiring:
 
 
 @final
+class _TaskWatch:
+    """Tells the chrome which task is current and the canvas which have ended (main thread)."""
+
+    def __init__(self, strip: StatusStrip, canvas_tools: CanvasTools) -> None:
+        self._strip = strip
+        self._canvas_tools = canvas_tools
+        self._shown: TaskId | None = None
+        self.closed = False
+
+    def task_started(self, task: TaskId, title: str | None) -> None:
+        if self.closed:
+            return
+        self._shown = task
+        self._strip.show_task(title)
+
+    def task_ended(self, task: TaskId) -> None:
+        if self.closed:
+            return
+        if task == self._shown:
+            self._shown = None
+            self._strip.show_task(None)
+        self._canvas_tools.task_ended(task)
+
+
+@final
 class ShellWindow(Adw.ApplicationWindow):
     """The one window of the shell."""
 
@@ -72,6 +101,8 @@ class ShellWindow(Adw.ApplicationWindow):
         terminal: TerminalSettings | None = None,
         canvas_link: CanvasLink | None = None,
         prompt_wiring: PromptWiring | None = None,
+        broker_link: BrokerLink | None = None,
+        tasks: TaskSession | None = None,
     ) -> None:
         super().__init__(application=application)
         self._closing = False
@@ -80,9 +111,11 @@ class ShellWindow(Adw.ApplicationWindow):
         self.set_default_size(*DEFAULT_SIZE)
 
         self.transcript = Transcript()
-        self.controller = ChatController(self.transcript, responder)
+        self.controller = ChatController(
+            self.transcript, responder, (lambda: None) if tasks is None else (lambda: tasks.current)
+        )
         # Restores the last session into the transcript before the panel is built from it.
-        self.session = ChatSession(self.transcript, self.controller, open_history)
+        self.session = ChatSession(self.transcript, self.controller, open_history, tasks)
         self.session.start()
         self.chrome = ChromeRegion()
         self.canvas = CanvasView()
@@ -91,7 +124,13 @@ class ShellWindow(Adw.ApplicationWindow):
         # decides when it becomes a turn.
         self.event_gate = EventGate(self.controller, GlibScheduler())
         self.controller.add_idle_listener(self.event_gate.turn_ended)
-        self.canvas_tools = CanvasTools(self.canvas, self.event_gate)
+        self.canvas_tools = CanvasTools(
+            self.canvas,
+            self.event_gate,
+            images_for=None
+            if broker_link is None
+            else (lambda task: BrokerImageResolver(broker_link, task)),
+        )
         if canvas_link is not None:
             canvas_link.attach(self.canvas_tools)
         self.chat_panel = ChatPanel(self.controller, self.transcript, self.session)
@@ -146,9 +185,20 @@ class ShellWindow(Adw.ApplicationWindow):
         self.prompt_banner = PromptBanner(self, self.prompt_guard, wiring.picker)
         self.chrome.append(self.prompt_banner)
         self.broker_prompts = BrokerPrompts(
-            self.prompt_banner, GlibDispatcher(), wiring.scheduler, wiring.clock
+            self.prompt_banner,
+            GlibDispatcher(),
+            wiring.scheduler,
+            wiring.clock,
+            (lambda _task: None) if tasks is None else tasks.title_of,
         )
         self.prompt_banner.bind(self.broker_prompts.controller)
+        # The shell's one connection to the broker answers the broker's prompts with this window's
+        # (S19); the broker is started when something first needs it.
+        self._task_watch = _TaskWatch(self.status_strip, self.canvas_tools)
+        if broker_link is not None:
+            broker_link.attach_handler(self.broker_prompts)
+        if tasks is not None:
+            tasks.subscribe(self._task_watch)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         root.append(self.chrome)
@@ -282,6 +332,7 @@ class ShellWindow(Adw.ApplicationWindow):
         calls this: the `close-request` handler does, and so does the application when it quits.
         """
         self._closing = True
+        self._task_watch.closed = True
         self._set_quit_enabled(True)  # the application outlives the window's focus
         self.broker_prompts.close()
         if self._canvas_link is not None:

@@ -5,8 +5,9 @@ import enum
 from typing import assert_never, final
 
 from tumbleweed.core.errors import InvalidValueError
-from tumbleweed.shell._gi import Gtk
+from tumbleweed.shell._gi import Gtk, Pango
 from tumbleweed.shell._widgets import plain_label
+from tumbleweed.shell.viewmodel.display import display_text
 
 
 class VoiceState(enum.StrEnum):
@@ -41,6 +42,8 @@ def _describe(state: VoiceState) -> str:
             assert_never(unreachable)
 
 
+TASK_PREFIX = "Task (named by the assistant): "
+MAX_TASK_TITLE = 80
 MICROPHONE_ON_TEXT = "Microphone on"
 
 
@@ -94,6 +97,17 @@ class VoiceIndicator(Gtk.Box):
 class StatusStrip(Gtk.Box):
     """The strip itself: the voice indicator, and room for later status items."""
 
+    def show_task(self, title: str | None) -> None:
+        """Show the title the assistant gave the current task, or nothing (S19, I5): its words,
+        labelled as such, as plain text and bounded."""
+        shown = None if not title else display_text(f"{TASK_PREFIX}{title[:MAX_TASK_TITLE]}")
+        self._task.set_visible(shown is not None)
+        self._task.set_text(shown or "")
+
+    @property
+    def task_text(self) -> str:
+        return self._task.get_text()
+
     def __init__(self) -> None:
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         self.set_name("tumbleweed-status")
@@ -103,6 +117,10 @@ class StatusStrip(Gtk.Box):
         self.set_margin_bottom(4)
         self.voice = VoiceIndicator()
         self.append(self.voice)
+        self._task = plain_label("", css_classes=["caption", "dim-label"])
+        self._task.set_ellipsize(Pango.EllipsizeMode.END)
+        self._task.set_visible(False)
+        self.append(self._task)
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         self.append(spacer)
