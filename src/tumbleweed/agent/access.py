@@ -48,7 +48,7 @@ type _Work[R] = Callable[[BrokerClient, TaskId, RunId], Awaitable[R]]
 
 
 def _refused(refusal: BrokerRefused) -> ToolError:
-    return ToolError(f"The broker refused: {refusal.message} ({refusal.reason}).")
+    return ToolError(f"The broker said no ({refusal.reason}): {refusal.message}.")
 
 
 @final

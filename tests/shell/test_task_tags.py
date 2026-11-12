@@ -65,3 +65,46 @@ def test_a_turn_without_a_task_has_none() -> None:
         id=MessageId.new(), role=Role.USER, text="q", state=MessageState.COMPLETE
     )
     assert message.task is None
+
+
+class _Lineage:
+    def __init__(self) -> None:
+        self.restored: list[TaskId | None] = []
+        self.ended = 0
+
+    def restore(self, head: TaskId | None) -> None:
+        self.restored.append(head)
+
+    def end_session(self) -> None:
+        self.ended += 1
+
+
+def test_a_restored_chat_tells_the_tasks_the_newest_tagged_task_and_a_new_session_ends_it(
+    tmp_path: Path,
+) -> None:
+    from tests.history.support import history_directory
+    from tumbleweed.history.store import HistoryStore
+    from tumbleweed.shell.viewmodel.session import ChatSession
+
+    older, newest = TaskId.new(), TaskId.new()
+    first = SessionRig(tmp_path)
+    for task in (older, newest):
+        first.controller.send("q")
+        first.responder.sink.emit(ReplyDelta(text="a"))
+        first.responder.sink.emit(ReplyFinished(task=task))
+    first.controller.send("untagged tail")
+    first.responder.sink.emit(ReplyDelta(text="b"))
+    first.responder.sink.emit(ReplyFinished())
+    first.session.close()
+
+    transcript, responder = Transcript(), ManualResponder()
+    controller = ChatController(transcript, responder)
+    lineage = _Lineage()
+    directory = history_directory(tmp_path)
+    session = ChatSession(transcript, controller, lambda: HistoryStore.open(directory), lineage)
+    session.start()
+
+    assert lineage.restored == [newest]
+    session.new_session()
+    assert lineage.ended == 1
+    session.close()
