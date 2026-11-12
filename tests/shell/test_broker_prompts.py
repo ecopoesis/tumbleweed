@@ -122,6 +122,8 @@ class Shell:
         def clicked() -> bool:
             controller.input_began(left)
             controller.input_ended(left)
+            if isinstance(decision, AllowDecision):
+                controller.released_on(decision.scope)
             return controller.choose(prompt, decision)
 
         return self.act(clicked)

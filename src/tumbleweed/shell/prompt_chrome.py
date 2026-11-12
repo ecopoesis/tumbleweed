@@ -167,7 +167,10 @@ class PromptBanner(Gtk.Box):
         self._deny: Gtk.Button | None = None
         self._picking = False
         self._cancel_picker: Callable[[], None] | None = None
+        # Touch sequences by id. Equality of two `EventSequence`s is GTK's pointer identity; if it
+        # ever failed, a touch end would look like one with no record: tainted, never a grant.
         self._touches: list[tuple[Gdk.EventSequence, int]] = []
+        self._grants: list[tuple[Gtk.Button, Scope]] = []  # the buttons that can lead to a grant
         self._devices: list[Gdk.Device] = []  # kept: a device's number is its place here
         self._next_touch = _FIRST_TOUCH
         self.note = plain_label("", wrap=True, css_classes=["caption"])
@@ -192,7 +195,7 @@ class PromptBanner(Gtk.Box):
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         keys.connect(
-            "key-pressed", lambda _c, keyval, keycode, _state: self._key_down(keyval, keycode)
+            "key-pressed", lambda _c, keyval, keycode, state: self._key_down(keyval, keycode, state)
         )
         keys.connect("key-released", lambda _c, _keyval, keycode, _state: self._key_up(keycode))
         self._window.add_controller(keys)
@@ -210,6 +213,11 @@ class PromptBanner(Gtk.Box):
         return [button for button in self._buttons if button is not self._deny]
 
     @property
+    def grants(self) -> list[tuple[Gtk.Button, Scope]]:
+        """The buttons that can lead to a grant, with the scope each is at."""
+        return list(self._grants)
+
+    @property
     def picking(self) -> bool:
         return self._picking
 
@@ -217,6 +225,7 @@ class PromptBanner(Gtk.Box):
 
     def present(self, card: PromptCard) -> None:
         self._end_picker()
+        self._touches.clear()  # (a touch end that never came must not outlive its prompt)
         self._card = card
         self._rebuild(card)
         self.set_visible(True)
@@ -239,6 +248,7 @@ class PromptBanner(Gtk.Box):
         self._card = None
         self._deny = None
         self._buttons = []
+        self._grants = []
         self._empty()
         self.set_visible(False)
         self._guard.release()
@@ -313,12 +323,23 @@ class PromptBanner(Gtk.Box):
         elif kind == Gdk.EventType.TOUCH_CANCEL:
             controller.input_ended(which, cancelled=True)
 
-    def _key_down(self, keyval: int, keycode: int) -> bool:
+    def _key_down(self, keyval: int, keycode: int, state: "Gdk.ModifierType") -> bool:
         if self._controller is not None:
-            # Which keys start an activation of the focused button is GTK's; the controller only
-            # needs to know that this press may be what a click that follows came from.
-            self._controller.input_began(InputId("key", keycode), activates=keyval in _ACTIVATING)
+            self._controller.input_began(
+                InputId("key", keycode), activates=self._activated_by(keyval, state)
+            )
         return False
+
+    def _activated_by(self, keyval: int, state: "Gdk.ModifierType") -> Scope | None:
+        """The grant button that this key press starts a keyboard activation of, if any: Enter or
+        Space, with no modifier (GTK binds them bare: Ctrl+Space is the push-to-talk key, which
+        the window takes), pressed while one of the prompt's grant buttons has the focus. A key
+        pressed with the focus anywhere else (Deny, the chat, a voice button) activates no grant
+        button, and so is the producer of no grant."""
+        if keyval not in _ACTIVATING or state & Gtk.accelerator_get_default_mod_mask():
+            return None
+        focus = self._window.get_focus()
+        return next((scope for button, scope in self._grants if button is focus), None)
 
     def _key_up(self, keycode: int) -> None:
         if self._controller is not None:
@@ -326,11 +347,12 @@ class PromptBanner(Gtk.Box):
             self._event_over()
 
     def _event_over(self) -> None:
-        """A release is over with its click once the event has been dispatched: when the main loop
-        is idle again."""
+        """A release is over with its click once the event has been dispatched. The callback runs
+        at high priority, so that nothing at the default one (the bus, GTK's timers) runs first
+        and finds the release still there."""
         controller = self._controller
         if controller is not None:
-            GLib.idle_add(controller.event_done)
+            GLib.idle_add(controller.event_done, priority=GLib.PRIORITY_HIGH)
 
     def _on_active_changed(self, window: Gtk.Window, _pspec: object) -> None:
         controller = self._controller
@@ -355,6 +377,7 @@ class PromptBanner(Gtk.Box):
     def _rebuild(self, card: PromptCard) -> None:
         self._empty()
         self._buttons = []
+        self._grants = []
         self.append(plain_label("Permission request", css_classes=[TITLE_CLASS]))
         source = f"From task {card.task}" + ("" if card.tool is None else f", tool {card.tool}")
         self.append(plain_label(source, wrap=True, css_classes=["caption", "dim-label"]))
@@ -413,9 +436,33 @@ class PromptBanner(Gtk.Box):
             label = _PICK_LABEL[scope] if card.picks else _SCOPE_LABEL[scope]
             button = Gtk.Button(label=label)
             button.connect("clicked", lambda _button, scope=scope: self._allow_clicked(card, scope))
+            self._watch_release(button, scope)
             row.append(button)
             self._buttons.append(button)
+            self._grants.append((button, scope))
         return row
+
+    def _watch_release(self, button: Gtk.Button, scope: Scope) -> None:
+        """Tell the controller when a pointer is released on this button: the release is delivered
+        to the button the press began on, which is the only one a click can come from, so a click
+        on any other button is not made by it. Only watches; the event goes on."""
+        legacy = Gtk.EventControllerLegacy()
+        legacy.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        legacy.connect("event", lambda _c, event: self._on_grant_button_event(scope, event))
+        button.add_controller(legacy)
+
+    def _on_grant_button_event(self, scope: Scope, event: Gdk.Event | None) -> bool:
+        if event is not None and event.get_event_type() in (
+            Gdk.EventType.BUTTON_RELEASE,
+            Gdk.EventType.TOUCH_END,
+        ):
+            self.released_on(scope)
+        return False  # never consumed
+
+    def released_on(self, scope: Scope) -> None:
+        """A pointer was released on the grant button at `scope`."""
+        if self._controller is not None:
+            self._controller.released_on(scope)
 
     # --- the user ---------------------------------------------------------------------------
 
@@ -436,7 +483,7 @@ class PromptBanner(Gtk.Box):
             return
         if self._picking:
             return  # the dialog is open already
-        if not controller.can_act(card.prompt):
+        if not controller.can_act(card.prompt, scope):
             self.note.set_text(_IGNORED)
             return
         choose: Literal["file", "folder"] = "file" if card.kind == "pick_file" else "folder"

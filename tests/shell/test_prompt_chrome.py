@@ -20,14 +20,14 @@ from tests.shell.gtk_support import (
     pump_until,
 )
 from tests.shell.gtk_support import user_click as gtk_user_click
-from tests.shell.prompt_support import network_card, pick_card, read_card
+from tests.shell.prompt_support import Answers, network_card, pick_card, read_card
 from tests.ui.gtk.hostile import hostile_spec
 from tests.ui.gtk.test_no_surfaces import show as show_spec
 from tests.ui.gtk.test_no_surfaces import surfaces_below, use_every_widget
 from tests.ui.spec.support import Json, build
 from tumbleweed.ipc.broker_messages import Scope
 from tumbleweed.ipc.prompt_messages import AllowDecision, DenyDecision
-from tumbleweed.shell.prompt_chrome import REASON_CLASS, RESERVED_CLASSES
+from tumbleweed.shell.prompt_chrome import REASON_CLASS, RESERVED_CLASSES, PromptBanner
 from tumbleweed.shell.viewmodel.prompts import ARM_SECONDS, PromptCard
 from tumbleweed.ui.spec import SpecError, parse_ui_spec
 
@@ -206,7 +206,7 @@ class TestFocusAndInput:
         assert answers.given == []
         assert banner.get_visible()
 
-        shell.timers.advance(0.1)
+        shell.wait_armed()  # (the refused clicks started the delay again)
         user_click(shell, once)
 
         assert [d for _, d in answers.given] == [
@@ -359,6 +359,14 @@ class FakeEvent:
         return self._sequence
 
 
+def feed(banner: PromptBanner, event: FakeEvent) -> None:
+    """Hand a fake event to the banner's pointer handler. A `Gdk.Event` cannot be made headless;
+    the handler asks it its type, button, touch sequence and device, which the fake answers."""
+    handler = banner._on_pointer_event  # noqa: SLF001  (the handler under test)
+    # None stands for the controller, which the handler ignores, and the fake for the event.
+    handler(None, event)  # type: ignore[arg-type]  # see above: the handler asks nothing else
+
+
 class TestInputsThatAreNotTheUsers:
     """The window reports what goes down and up to the prompt's controller, which holds the arming
     invariant (`viewmodel.prompts`, `test_prompt_arming_model`): a stream of clicks aimed at where
@@ -374,7 +382,9 @@ class TestInputsThatAreNotTheUsers:
     def up(shell: PromptShell, button: int = 1) -> None:
         from tumbleweed.shell._gi import Gdk
 
-        shell.window.prompt_banner.pointer_event(Gdk.EventType.BUTTON_RELEASE, button)
+        banner = shell.window.prompt_banner
+        banner.pointer_event(Gdk.EventType.BUTTON_RELEASE, button)
+        banner.released_on("once")  # (on "Allow once": what that button's own controller reports)
 
     @classmethod
     def press(cls, shell: PromptShell, button: int = 1) -> None:
@@ -396,18 +406,18 @@ class TestInputsThatAreNotTheUsers:
         return found
 
     @classmethod
-    def key_down(cls, window: "Gtk.Window", keycode: int = 38) -> bool:
+    def key_down(
+        cls,
+        window: "Gtk.Window",
+        keycode: int = 38,
+        keyval: int | None = None,
+        state: int = 0,
+    ) -> bool:
         from tumbleweed.shell._gi import Gdk
 
+        keyval = (Gdk.KEY_Return if keycode == 36 else Gdk.KEY_a) if keyval is None else keyval
         return any(
-            bool(
-                k.emit(
-                    "key-pressed",
-                    Gdk.KEY_Return if keycode == 36 else Gdk.KEY_a,
-                    keycode,
-                    Gdk.ModifierType(0),
-                )
-            )
+            bool(k.emit("key-pressed", keyval, keycode, Gdk.ModifierType(state)))
             for k in cls.keys(window)
         )
 
@@ -482,6 +492,7 @@ class TestInputsThatAreNotTheUsers:
         once.emit("clicked")  # the release
         assert answers.given == []
 
+        shell.wait_armed()  # (the refused click started the delay again)
         self.press(shell)  # the user's own, deliberate press
         once.emit("clicked")
         assert len(answers.given) == 1
@@ -578,14 +589,16 @@ class TestInputsThatAreNotTheUsers:
         first, second = object(), object()
 
         def touch(kind: "Gdk.EventType", sequence: object) -> None:
-            banner._on_pointer_event(None, FakeEvent(kind, sequence=sequence))  # type: ignore[arg-type]  # noqa: SLF001  (a fake event)
+            feed(banner, FakeEvent(kind, sequence=sequence))
+            if kind == Gdk.EventType.TOUCH_END:
+                banner.released_on("task")  # (what the button's own controller reports)
 
         touch(Gdk.EventType.TOUCH_BEGIN, first)
         touch(Gdk.EventType.TOUCH_BEGIN, second)
         touch(Gdk.EventType.TOUCH_END, first)
-        assert controller.can_act(card.prompt)  # the first finger's tap
+        assert controller.can_act(card.prompt, "task")  # the first finger's tap
         touch(Gdk.EventType.TOUCH_END, second)
-        assert controller.can_act(card.prompt)  # and the second's: its record was its own
+        assert controller.can_act(card.prompt, "task")  # and the second's: its record was its own
 
     def test_the_window_events_are_translated_to_inputs(self, build_prompt_shell: Builder) -> None:
         """A Gdk event to a button or touch going down or up (a fake event stands in for it)."""
@@ -599,7 +612,9 @@ class TestInputsThatAreNotTheUsers:
         once = buttons(banner)["Allow once"]
 
         def event(kind: "Gdk.EventType", button: int = 1) -> None:
-            banner._on_pointer_event(None, FakeEvent(kind, button=button))  # type: ignore[arg-type]  # noqa: SLF001
+            feed(banner, FakeEvent(kind, button=button))
+            if kind == Gdk.EventType.BUTTON_RELEASE:
+                banner.released_on("once")  # (what the button's own controller reports)
 
         shell.timers.advance(0.1)
         event(Gdk.EventType.BUTTON_PRESS)  # disarmed
@@ -607,7 +622,7 @@ class TestInputsThatAreNotTheUsers:
         once.emit("clicked")
         assert answers.given == []  # tainted: the press began before the prompt took answers
 
-        shell.timers.advance(ARM_SECONDS)
+        shell.wait_armed()
         event(Gdk.EventType.BUTTON_PRESS, 3)  # the right button, armed
         event(Gdk.EventType.BUTTON_RELEASE, 3)
         once.emit("clicked")
@@ -625,11 +640,138 @@ class TestInputsThatAreNotTheUsers:
         shell.wait_armed()
 
         buttons(banner)["Allow once"].emit("clicked")
+        shell.wait_armed()
         buttons(banner)["Allow once"].emit("activate")
+        pump(0.4)  # past GTK's 250 ms activation timer, which is what makes the click
 
         assert answers.given == []
         assert banner.get_visible()
         assert "ignored" in banner.note.get_text()
+
+    # -- a producer is the producer of one button (round 7) ---------------------------------
+
+    @staticmethod
+    def armed_prompt(
+        build_prompt_shell: Builder, card: PromptCard | None = None
+    ) -> "tuple[PromptShell, Answers, dict[str, Gtk.Button]]":
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell, card)
+        shell.wait_armed()
+        return shell, answers, buttons(shell.window.prompt_banner)
+
+    def test_the_users_enter_on_deny_makes_no_grant_of_a_synthetic_activation_of_allow(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """Round 7 (security, opus, sonnet): `DoAction` on Allow is in flight when the user presses
+        Enter on the focused Deny. The Deny may be lost to the refusal (it restarts the delay),
+        but never turns into a grant."""
+        from tumbleweed.shell._gi import Gdk
+
+        shell, answers, buttons_ = self.armed_prompt(build_prompt_shell)
+        deny = shell.window.prompt_banner.deny_button
+        assert deny is not None
+        shell.window.set_focus(deny)
+
+        buttons_["Allow once"].emit("activate")  # the synthetic one: GTK's timer is running
+        pump(0.1)
+        self.key_down(shell.window, 36, Gdk.KEY_Return)  # the user's Enter, on Deny
+        deny.emit("activate")
+        pump(0.4)
+        self.key_up(shell.window, 36)
+
+        assert not any(isinstance(d, AllowDecision) for _, d in answers.given)
+        shell.wait_armed()
+        deny.emit("clicked")
+        assert [d for _, d in answers.given] == [DenyDecision(kind="deny", reason="user_denied")]
+
+    def test_the_push_to_talk_key_held_makes_no_grant(self, build_prompt_shell: Builder) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        shell, answers, buttons_ = self.armed_prompt(build_prompt_shell)
+        for _ in range(5):  # Ctrl+Space, auto-repeating
+            self.key_down(shell.window, 65, Gdk.KEY_space, Gdk.ModifierType.CONTROL_MASK)
+            pump(0.05)
+
+        buttons_["Allow once"].emit("activate")
+        pump(0.4)
+
+        assert answers.given == []
+
+    def test_a_space_on_something_else_makes_no_grant(self, build_prompt_shell: Builder) -> None:
+        """A voice button, the chat: the focus is not on a grant button."""
+        from tumbleweed.shell._gi import Gdk
+
+        shell, answers, buttons_ = self.armed_prompt(build_prompt_shell)
+        shell.window.set_focus(None)
+        self.key_down(shell.window, 65, Gdk.KEY_space)
+
+        buttons_["Allow once"].emit("activate")
+        pump(0.4)
+
+        assert answers.given == []
+
+    def test_a_release_on_the_prompts_text_makes_no_grant(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        shell, answers, buttons_ = self.armed_prompt(build_prompt_shell)
+        banner = shell.window.prompt_banner
+        banner.pointer_event(Gdk.EventType.BUTTON_PRESS, 1)
+        banner.pointer_event(Gdk.EventType.BUTTON_RELEASE, 1)  # not on a grant button
+
+        buttons_["Allow once"].emit("clicked")
+
+        assert answers.given == []
+
+    def test_a_click_on_one_button_is_not_a_grant_on_the_other(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        shell, answers, buttons_ = self.armed_prompt(build_prompt_shell)
+        banner = shell.window.prompt_banner
+        from tumbleweed.shell._gi import Gdk
+
+        banner.pointer_event(Gdk.EventType.BUTTON_PRESS, 1)
+        banner.pointer_event(Gdk.EventType.BUTTON_RELEASE, 1)
+        banner.released_on("once")
+        buttons_["Allow for this task"].emit("clicked")
+
+        assert answers.given == []
+
+    def test_a_synthetic_choose_during_the_users_enter_on_deny_opens_no_dialog(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        shell, answers, buttons_ = self.armed_prompt(build_prompt_shell, pick_card("file"))
+        self.key_down(shell.window, 36, Gdk.KEY_Return)  # the focus is on Deny
+
+        buttons_["Choose, allow once…"].emit("clicked")
+
+        assert shell.picker.asked == []
+        assert answers.given == []
+
+    def test_enter_on_the_focused_allow_grants(self, build_prompt_shell: Builder) -> None:
+        from tumbleweed.shell._gi import Gdk
+
+        shell, answers, buttons_ = self.armed_prompt(build_prompt_shell)
+        once = buttons_["Allow once"]
+        shell.window.set_focus(once)
+        self.key_down(shell.window, 36, Gdk.KEY_Return)
+        once.emit("activate")
+        pump(0.4)
+
+        assert [d for _, d in answers.given] == [
+            AllowDecision(kind="allow", scope="once", picked=None)
+        ]
+
+    def test_a_mouse_click_on_allow_grants(self, build_prompt_shell: Builder) -> None:
+        shell, answers, buttons_ = self.armed_prompt(build_prompt_shell)
+        user_click(shell, buttons_["Allow once"])
+
+        assert len(answers.given) == 1
 
     def test_a_synthetic_choose_opens_no_dialog(self, build_prompt_shell: Builder) -> None:
         shell = build_prompt_shell()
@@ -659,7 +801,7 @@ class TestInputsThatAreNotTheUsers:
         mouse, pen = object(), object()
 
         def event(kind: "Gdk.EventType", device: object) -> None:
-            banner._on_pointer_event(None, FakeEvent(kind, button=1, device=device))  # type: ignore[arg-type]  # noqa: SLF001  (a fake event)
+            feed(banner, FakeEvent(kind, button=1, device=device))
 
         shell.timers.advance(0.1)
         event(Gdk.EventType.BUTTON_PRESS, mouse)  # tainted, and held
@@ -672,6 +814,25 @@ class TestInputsThatAreNotTheUsers:
         event(Gdk.EventType.BUTTON_RELEASE, mouse)
         once.emit("clicked")
         assert answers.given == []
+
+    def test_a_device_keeps_its_number_and_no_device_is_zero(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        """`_device_no` on stand-ins: the container's display has no seat, so no real `Gdk.Device`
+        exists headless (a pen against a mouse on a real Wayland seat is not verified here)."""
+        from tumbleweed.shell._gi import Gdk
+
+        shell = build_prompt_shell()
+        banner = shell.window.prompt_banner
+        mouse, pen = object(), object()
+
+        def number(device: object) -> int:
+            event = FakeEvent(Gdk.EventType.BUTTON_PRESS, device=device)
+            return banner._device_no(event)  # type: ignore[arg-type]  # noqa: SLF001  (a FakeEvent answers `get_device`)
+
+        assert number(mouse) == number(mouse) != 0
+        assert number(pen) != number(mouse)
+        assert number(None) == 0
 
     def test_a_release_is_forgotten_when_the_main_loop_is_idle_again(
         self, build_prompt_shell: Builder
@@ -690,6 +851,7 @@ class TestInputsThatAreNotTheUsers:
         pump(0.05)
         allow = AllowDecision(kind="allow", scope="once", picked=None)
         assert not controller.choose(card.prompt, allow)  # nothing produced this click
+        shell.wait_armed()
         self.press(shell)
         assert controller.choose(card.prompt, allow)  # and the tainted release did not linger
         assert len(answers.given) == 1
@@ -707,6 +869,7 @@ class TestInputsThatAreNotTheUsers:
         self.key_down(shell.window)
         self.key_up(shell.window)  # (without the release the key stays "held")
         shell.timers.advance(ARM_SECONDS)
+        shell.window.set_focus(once)
         self.key_down(shell.window, 36)
         once.emit("clicked")  # Enter on the focused button, deliberately
 

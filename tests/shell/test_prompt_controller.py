@@ -32,6 +32,7 @@ from tumbleweed.shell.viewmodel.prompts import (
 )
 
 ALLOW_TASK = AllowDecision(kind="allow", scope="task", picked=None)
+ALLOW_ONCE = AllowDecision(kind="allow", scope="once", picked=None)
 DENY = DenyDecision(kind="deny", reason="user_denied")
 
 
@@ -177,21 +178,32 @@ LETTER = InputId("key", 38)
 
 
 def click(rig: Rig, card: PromptCard, decision: AllowDecision | DenyDecision = DENY) -> bool:
-    """A whole click as the window sees it: the press, the release, and the button's click."""
+    """A whole click as the window sees it: the press, the release on the button (the view says
+    which), and the button's click."""
     rig.controller.input_began(LEFT)
-    rig.controller.input_ended(LEFT)
+    end(rig, LEFT)
+    if isinstance(decision, AllowDecision):
+        rig.controller.released_on(decision.scope)
     return rig.controller.choose(card.prompt, decision)
+
+
+def end(rig: Rig, which: InputId) -> None:
+    """A pointer comes up, on the grant button (as the view reports it)."""
+    rig.controller.input_ended(which)
+    rig.controller.released_on("task")
 
 
 def click_other(rig: Rig, card: PromptCard) -> bool:
     """A whole click of another button, with whatever else is down staying down."""
     rig.controller.input_began(RIGHT)
-    rig.controller.input_ended(RIGHT)
+    end(rig, RIGHT)
+    rig.controller.released_on("task")
     return rig.controller.choose(card.prompt, ALLOW_TASK)
 
 
 def tap(rig: Rig, key: InputId) -> None:
-    rig.controller.input_began(key)
+    """A key pressed and released, the focus on the Allow button (Enter and Space activate it)."""
+    rig.controller.input_began(key, activates="task" if key in (ENTER, SPACE) else None)
     rig.controller.input_ended(key)
 
 
@@ -230,9 +242,10 @@ class TestTheArmingInvariant:
 
         rig.timers.advance(0.8)  # held until the prompt is armed
         assert rig.controller.armed()
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # ... and released: no click
 
+        rig.arm()  # (a refused click starts the delay again)
         assert click(rig, card, ALLOW_TASK)  # the user's own, on a prompt that takes answers
 
     @pytest.mark.parametrize("other", [LETTER, InputId("key", 50), SPACE, ENTER])
@@ -245,7 +258,7 @@ class TestTheArmingInvariant:
         rig.timers.advance(0.8)
 
         tap(rig, other)
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
         assert rig.answers.given == []
@@ -263,7 +276,7 @@ class TestTheArmingInvariant:
         rig.controller.input_began(ENTER)  # the user presses Enter: the focus is on Deny
         assert rig.controller.choose(card.prompt, DENY)
         rig.controller.input_ended(ENTER)
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
 
         assert [d for _, d in rig.answers.given] == [DENY]
         assert not rig.controller.pending  # nothing is left for the held press to click
@@ -275,8 +288,8 @@ class TestTheArmingInvariant:
         rig.timers.advance(0.8)
 
         rig.controller.input_began(RIGHT)  # another button, with the first still down
-        rig.controller.input_ended(RIGHT)
-        rig.controller.input_ended(LEFT)
+        end(rig, RIGHT)
+        end(rig, LEFT)
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
@@ -291,7 +304,7 @@ class TestTheArmingInvariant:
         rig.timers.advance(0.8)
 
         rig.controller.input_began(LEFT)  # the user's own press, armed
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
 
         assert rig.controller.choose(card.prompt, ALLOW_TASK)
 
@@ -305,6 +318,7 @@ class TestTheArmingInvariant:
         rig.arm()
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # (still down, as far as seen)
 
+        rig.arm()
         assert click(rig, card, ALLOW_TASK)  # the next press heals it
 
     def test_a_pointer_press_during_a_held_key_does_not_end_it_either(self, rig: Rig) -> None:
@@ -314,10 +328,11 @@ class TestTheArmingInvariant:
         rig.timers.advance(0.8)
 
         rig.controller.input_began(LEFT)  # armed, a pointer of its own
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # the key is still held
         rig.controller.input_ended(ENTER)
+        rig.arm()  # (a refused click starts the delay again)
         assert click(rig, card, ALLOW_TASK)  # and once it is up, the next click is free
 
     def test_key_auto_repeat_is_not_a_new_press(self, rig: Rig) -> None:
@@ -336,12 +351,13 @@ class TestTheArmingInvariant:
         rig.timers.advance(0.1)
         rig.controller.input_began(LEFT)
         rig.timers.advance(0.8)
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
 
-        assert not rig.controller.can_act(card.prompt)
+        assert not rig.controller.can_act(card.prompt, "task")
+        rig.arm()  # (a refused click starts the delay again)
         rig.controller.input_began(LEFT)
-        rig.controller.input_ended(LEFT)
-        assert rig.controller.can_act(card.prompt)
+        end(rig, LEFT)
+        assert rig.controller.can_act(card.prompt, "task")
 
     # -- nothing is refused for good ---------------------------------------------------------
 
@@ -423,7 +439,7 @@ class TestTheArmingInvariant:
         rig.arm()
 
         assert not click_other(rig, card)  # a clean press of another button, with it still down
-        rig.controller.input_ended(LEFT)  # its release
+        end(rig, LEFT)  # its release
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
     @pytest.mark.parametrize("which", [LEFT, SPACE])
@@ -456,6 +472,7 @@ class TestTheArmingInvariant:
         rig.arm()
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+        rig.arm()
         assert click(rig, card, ALLOW_TASK)
 
     def test_a_touch_is_one_input_of_its_own_and_two_fingers_are_two(self, rig: Rig) -> None:
@@ -465,7 +482,7 @@ class TestTheArmingInvariant:
 
         rig.controller.input_began(first)
         rig.controller.input_began(second)  # a second finger, armed too
-        rig.controller.input_ended(first)
+        end(rig, first)
         assert rig.controller.choose(card.prompt, ALLOW_TASK)  # the tap of the first finger
 
     def test_a_tainted_finger_is_not_freed_by_another_ending(self, rig: Rig) -> None:
@@ -475,7 +492,7 @@ class TestTheArmingInvariant:
         rig.controller.input_began(first)  # down while disarmed, still down
         rig.arm()
         rig.controller.input_began(second)
-        rig.controller.input_ended(second)
+        end(rig, second)
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # the first is still down
 
@@ -492,6 +509,7 @@ class TestTheArmingInvariant:
         assert not click(rig, card, ALLOW_TASK)  # (evicting the tainted one would accept it)
         for key in keys:
             rig.controller.input_ended(key)
+        rig.arm()
         assert click(rig, card, ALLOW_TASK)
 
     def test_a_stray_release_from_the_picker_dialog_does_not_refuse_the_choice(
@@ -500,10 +518,10 @@ class TestTheArmingInvariant:
         card = rig.offer(pick_card())
         rig.arm()
         rig.controller.input_began(LEFT)
-        rig.controller.input_ended(LEFT)
-        assert rig.controller.can_act(card.prompt)  # the click on Choose opened the dialog
+        end(rig, LEFT)
+        assert rig.controller.can_act(card.prompt, "task")  # the click on Choose opened the dialog
 
-        rig.controller.input_ended(RIGHT)  # a release that arrives from the dialog, unrecorded
+        end(rig, RIGHT)  # a release that arrives from the dialog, unrecorded
         chosen = AllowDecision(kind="allow", scope="task", picked="/home/u/Documents")
 
         assert rig.controller.choose(card.prompt, chosen)
@@ -519,13 +537,11 @@ class TestTheArmingInvariant:
         rig.timers.advance(0.1)
         rig.controller.input_began(SPACE)  # disarmed: tainted
         rig.timers.advance(0.85)
-        rig.controller.input_began(ENTER, activates=True)  # armed, clean
-        assert not rig.controller.choose(card.prompt, ALLOW_TASK)  # Space is still down
-        rig.controller.input_ended(SPACE)  # (its release completes the activation: refused too)
-        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+        rig.controller.input_began(ENTER, activates="task")  # armed, clean
+        rig.controller.input_ended(SPACE)  # (its release completes the activation: refused)
         rig.controller.event_done()
 
-        rig.controller.input_began(ENTER, activates=True)  # the keyboard repeats it
+        rig.controller.input_began(ENTER, activates="task")  # the keyboard repeats it
 
         assert rig.controller.choose(card.prompt, ALLOW_TASK)
 
@@ -539,7 +555,7 @@ class TestTheArmingInvariant:
         shift = InputId("key", 50)
         rig.controller.input_began(shift)
         rig.timers.advance(0.8)
-        rig.controller.input_began(ENTER, activates=True)  # clean
+        rig.controller.input_began(ENTER, activates="task")  # clean
         rig.controller.input_ended(shift)
         rig.controller.event_done()  # (the release has had its click, if it was to have one)
 
@@ -555,7 +571,7 @@ class TestTheArmingInvariant:
         shift = InputId("key", 50)
         rig.controller.input_began(shift)  # tainted
         rig.timers.advance(0.8)
-        rig.controller.input_began(ENTER, activates=True)  # clean, on the focused Allow
+        rig.controller.input_began(ENTER, activates="task")  # clean, on the focused Allow
         rig.controller.input_ended(shift)  # completes the activation, in the same event
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
@@ -567,7 +583,7 @@ class TestTheArmingInvariant:
         rig.controller.input_ended(LETTER)  # tainted, and nothing clicked
         rig.arm()
 
-        rig.controller.input_began(ENTER, activates=True)  # the next input: its own activation
+        rig.controller.input_began(ENTER, activates="task")  # the next input: its own activation
 
         assert rig.controller.choose(card.prompt, ALLOW_TASK)
 
@@ -594,7 +610,7 @@ class TestTheArmingInvariant:
         rig.controller.input_began(LEFT)  # (armed: it looks like the user's own)
         rig.controller.reactivated()  # ... but this was the click that brought the window up
         rig.timers.advance(0.8)
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
@@ -607,8 +623,8 @@ class TestTheArmingInvariant:
         rig.arm()
 
         rig.controller.input_began(RIGHT)
-        rig.controller.input_ended(RIGHT)
-        rig.controller.input_ended(LEFT)
+        end(rig, RIGHT)
+        end(rig, LEFT)
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
@@ -622,7 +638,7 @@ class TestTheArmingInvariant:
         rig.timers.advance(0.8)
         rig.controller.withdraw(first.prompt)  # the next prompt takes its place
         rig.arm()
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
 
         assert not rig.controller.choose(second.prompt, ALLOW_TASK)
 
@@ -665,6 +681,7 @@ class TestTheArmingInvariant:
 
         assert not click(rig, card, ALLOW_TASK)  # the space is still down
         rig.controller.input_ended(SPACE)
+        rig.arm()  # (a refused click starts the delay again)
         assert click(rig, card, ALLOW_TASK)
 
     def test_the_delay_counts_from_the_first_frame_not_from_the_queueing(self, rig: Rig) -> None:
@@ -734,13 +751,13 @@ class TestAGrantNeedsAProducingInput:
         card = rig.offer(pick_card())
         rig.arm()
 
-        assert not rig.controller.can_act(card.prompt)
+        assert not rig.controller.can_act(card.prompt, "task")
 
     def test_an_allow_after_the_event_of_a_clean_release_is_refused(self, rig: Rig) -> None:
         card = rig.offer()
         rig.arm()
         rig.controller.input_began(LEFT)
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
         rig.controller.event_done()  # the release has had its click, if it was to have one
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
@@ -748,7 +765,7 @@ class TestAGrantNeedsAProducingInput:
     def test_a_key_press_that_activates_produces_a_click_for_a_second(self, rig: Rig) -> None:
         card = rig.offer()
         rig.arm()
-        rig.controller.input_began(ENTER, activates=True)
+        rig.controller.input_began(ENTER, activates="task")
         rig.controller.event_done()
         rig.timers.advance(0.25)  # GTK's timer
 
@@ -757,7 +774,7 @@ class TestAGrantNeedsAProducingInput:
     def test_a_key_press_that_activates_produces_nothing_a_second_later(self, rig: Rig) -> None:
         card = rig.offer()
         rig.arm()
-        rig.controller.input_began(ENTER, activates=True)
+        rig.controller.input_began(ENTER, activates="task")
         rig.timers.advance(ACTIVATION_SECONDS + 0.01)
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
@@ -769,18 +786,28 @@ class TestAGrantNeedsAProducingInput:
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
-    def test_a_press_after_the_activating_key_ends_the_activation(self, rig: Rig) -> None:
+    def test_a_pointer_press_after_the_activating_key_ends_the_activation(self, rig: Rig) -> None:
         card = rig.offer()
         rig.arm()
-        rig.controller.input_began(ENTER, activates=True)
-        rig.controller.input_began(LETTER)
+        rig.controller.input_began(ENTER, activates="task")
+        rig.controller.input_began(LEFT)
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_a_key_that_activates_nothing_does_not_end_the_activation(self, rig: Rig) -> None:
+        """GTK does not cancel an activation under way when another key goes down (Shift, say)."""
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(ENTER, activates="task")
+        rig.controller.input_began(LETTER)
+        rig.controller.event_done()
+
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
 
     def test_an_activating_key_that_is_already_up_leaves_nothing_behind(self, rig: Rig) -> None:
         card = rig.offer()
         rig.arm()
-        rig.controller.input_began(ENTER, activates=True)
+        rig.controller.input_began(ENTER, activates="task")
         rig.controller.input_ended(ENTER)
         rig.controller.event_done()
 
@@ -789,12 +816,166 @@ class TestAGrantNeedsAProducingInput:
     def test_an_activating_press_while_disarmed_produces_nothing_when_armed(self, rig: Rig) -> None:
         card = rig.offer()
         rig.timers.advance(0.1)
-        rig.controller.input_began(ENTER, activates=True)
+        rig.controller.input_began(ENTER, activates="task")
         rig.timers.advance(0.8)
         rig.controller.input_ended(LETTER)  # (stray: a release with no press)
         rig.controller.event_done()
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    # -- a producer is the producer of one button (round 7) ---------------------------------------
+
+    def test_the_users_enter_on_deny_makes_no_grant_of_a_synthetic_click_on_allow(
+        self, rig: Rig
+    ) -> None:
+        """Round 7 (three reviewers): a DoAction on Allow is in flight when the user presses Enter
+        on the focused Deny. The Enter activates nothing that can grant."""
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(
+            ENTER
+        )  # the focus is on Deny: the view says it activates no grant
+        rig.timers.advance(0.25)  # GTK's timer: Allow's synthetic activation clicks
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+        assert rig.answers.given == []
+
+    def test_a_press_of_the_push_to_talk_key_or_a_voice_button_makes_no_grant(
+        self, rig: Rig
+    ) -> None:
+        card = rig.offer()
+        rig.arm()
+        for _ in range(10):
+            rig.controller.input_began(SPACE)  # held, auto-repeating: the focus is elsewhere
+            rig.timers.advance(0.1)
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_a_release_anywhere_but_on_the_button_makes_no_grant(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(LEFT)
+        rig.controller.input_ended(LEFT)  # on the prompt's text: the view does not say a button
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_a_release_on_one_button_makes_no_grant_on_the_other(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(LEFT)
+        rig.controller.input_ended(LEFT)
+        rig.controller.released_on("once")
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_an_activation_of_one_button_makes_no_grant_on_the_other(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(ENTER, activates="once")
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+        assert not rig.controller.choose(card.prompt, ALLOW_ONCE)
+
+    def test_the_right_button_is_taken_after_an_activation_and_after_a_release(
+        self, rig: Rig
+    ) -> None:
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(ENTER, activates="once")
+        assert rig.controller.choose(card.prompt, ALLOW_ONCE)
+
+    def test_any_keys_release_completes_the_activation_on_its_button(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(ENTER, activates="once")
+        rig.controller.input_began(LETTER)
+        rig.controller.input_ended(LETTER)  # GTK: any key's release completes it
+
+        assert rig.controller.choose(card.prompt, ALLOW_ONCE)
+
+    def test_a_key_release_with_no_activation_under_way_makes_no_grant(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(LETTER)
+        rig.controller.input_ended(LETTER)
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_a_refused_grant_starts_the_delay_again(self, rig: Rig) -> None:
+        """A stream of synthetic clicks is never armed (at worst it delays the user's own)."""
+        card = rig.offer()
+        rig.arm()
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+        assert not rig.controller.armed()
+        assert rig.view.armed[-1:] == [False]
+        rig.arm()
+        assert click(rig, card, ALLOW_TASK)
+
+    def test_a_refused_choose_starts_the_delay_again(self, rig: Rig) -> None:
+        card = rig.offer(pick_card())
+        rig.arm()
+
+        assert not rig.controller.can_act(card.prompt, "task")
+
+        assert not rig.controller.armed()
+
+    def test_a_scope_that_is_not_the_producers_uses_the_producer_up(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(ENTER, activates="once")
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+        rig.arm()
+        assert not rig.controller.choose(card.prompt, ALLOW_ONCE)
+
+    def test_an_activation_by_an_input_too_many_to_record_is_no_producer(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        for code in range(64):
+            rig.controller.input_began(InputId("key", 100 + code))
+        rig.controller.input_began(ENTER, activates="task")  # the 65th: unrecorded, so tainted
+
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_an_activation_lasts_half_a_second(self, rig: Rig) -> None:
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(ENTER, activates="task")
+        rig.timers.advance(ACTIVATION_SECONDS - 0.01)
+        assert rig.controller.choose(card.prompt, ALLOW_TASK)
+
+        second = rig.offer()
+        rig.arm()
+        rig.controller.input_began(ENTER, activates="task")
+        rig.timers.advance(ACTIVATION_SECONDS + 0.01)
+        assert not rig.controller.choose(second.prompt, ALLOW_TASK)
+
+    def test_the_pickers_answer_needs_a_choose_at_its_scope(self, rig: Rig) -> None:
+        card = rig.offer(pick_card())
+        rig.arm()
+        picked = AllowDecision(kind="allow", scope="task", picked="/home/u/Documents")
+
+        assert not rig.controller.choose(card.prompt, picked)  # no Choose has opened a dialog
+        rig.controller.input_began(LEFT)
+        rig.controller.input_ended(LEFT)
+        rig.controller.released_on("once")
+        assert rig.controller.can_act(card.prompt, "once")
+        assert not rig.controller.choose(card.prompt, picked)  # the dialog is at another scope
+        rig.arm()
+        rig.controller.input_began(LEFT)
+        end(rig, LEFT)
+        assert rig.controller.can_act(card.prompt, "task")
+        assert rig.controller.choose(card.prompt, picked)
+
+    def test_the_pickers_answer_is_refused_at_the_instant_the_prompt_appears(
+        self, rig: Rig
+    ) -> None:
+        card = rig.offer(pick_card())
+
+        picked = AllowDecision(kind="allow", scope="task", picked="/home/u/Documents")
+        assert not rig.controller.choose(card.prompt, picked)
 
     def test_a_pen_tap_does_not_stand_in_for_a_mouse_press_held_from_disarmed(
         self, rig: Rig
@@ -807,10 +988,10 @@ class TestAGrantNeedsAProducingInput:
         rig.arm()
 
         rig.controller.input_began(PEN)
-        rig.controller.input_ended(PEN)
+        end(rig, PEN)
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
     def test_the_same_button_of_two_devices_are_two_inputs(self, rig: Rig) -> None:
@@ -818,7 +999,7 @@ class TestAGrantNeedsAProducingInput:
         rig.arm()
         rig.controller.input_began(LEFT)
         rig.controller.input_began(PEN)
-        rig.controller.input_ended(PEN)
+        end(rig, PEN)
 
         assert rig.controller.choose(card.prompt, ALLOW_TASK)
 
@@ -829,6 +1010,7 @@ class TestAGrantNeedsAProducingInput:
         rig.controller.input_began(TOUCH)  # tainted, and never released
         rig.arm()
         assert not click(rig, first, ALLOW_TASK)
+        rig.arm()
         assert rig.controller.choose(first.prompt, DENY)
 
         rig.arm()
@@ -844,7 +1026,7 @@ class TestAGrantNeedsAProducingInput:
         rig.controller.choose(first.prompt, DENY)
         rig.arm()
 
-        rig.controller.input_ended(LEFT)
+        end(rig, LEFT)
 
         assert not rig.controller.choose(second.prompt, ALLOW_TASK)
 
@@ -857,7 +1039,7 @@ class TestAGrantNeedsAProducingInput:
             rig.controller.input_began(InputId("key", 100 + code))
         extra = InputId("pointer", 7)
         rig.controller.input_began(extra)  # the 65th: not recorded
-        rig.controller.input_ended(extra)
+        end(rig, extra)
 
         assert not rig.controller.choose(card.prompt, ALLOW_TASK)
 
@@ -886,7 +1068,7 @@ class TestOnlyOneAnswerCounts:
         rig.arm()
 
         rig.controller.input_began(LEFT)
-        rig.controller.input_ended(LEFT)  # (a real click, so the id is the only thing wrong)
+        end(rig, LEFT)  # (a real click, so the id is the only thing wrong)
         assert not rig.controller.choose(PromptId.new(), ALLOW_TASK)
         assert rig.answers.given == []
 
@@ -907,6 +1089,11 @@ class TestOnlyOneAnswerCounts:
         rig.arm()
 
         assert not click(rig, picker, ALLOW_TASK)  # a picker wants a choice
+        rig.arm()
+        assert not rig.controller.choose(picker.prompt, chosen)  # no Choose opened the dialog
+        rig.controller.input_began(LEFT)
+        end(rig, LEFT)
+        assert rig.controller.can_act(picker.prompt, "task")
         assert rig.controller.choose(picker.prompt, chosen)
 
     def test_a_sink_that_fails_still_brings_the_prompt_down(self, rig: Rig) -> None:

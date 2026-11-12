@@ -730,9 +730,10 @@ def test_the_prompts_key_controller_reads_only_the_hardware_code_and_whether_a_k
     """The prompt (S18) tracks which keys are held (to know when none is) and so reads the hardware
     code, as an opaque number. The one thing read of the keyval is whether it is one of the keys
     that activate the focused button (Enter, Space), to tell the controller a click may follow:
-    `key-pressed` hands the keyval to `_key_down` and nothing else, `key-released` reads the code
-    only, and the keys that activate are compared by name in `_ACTIVATING`. No key is read as a
-    character, and the pointer controller handles no key event at all."""
+    `key-pressed` hands the keyval and the modifiers to `_key_down` and nothing else, which asks
+    `_activated_by` only whether the key is one of `_ACTIVATING` pressed bare, `key-released`
+    reads the code only, and the keys that activate are compared by name in `_ACTIVATING`. No key
+    is read as a character, and the pointer controller handles no key event at all."""
     tree = ast.parse((SOURCE / "shell/prompt_chrome.py").read_text())
     handlers = {
         str(_constant(call.args[0])): call.args[1]
@@ -745,14 +746,14 @@ def test_the_prompts_key_controller_reads_only_the_hardware_code_and_whether_a_k
     }
 
     assert sorted(handlers) == ["key-pressed", "key-released"]
-    expected = {"key-pressed": ["_c", "keyval", "keycode", "_state"]}
+    expected = {"key-pressed": ["_c", "keyval", "keycode", "state"]}
     for name, handler in handlers.items():
         assert isinstance(handler, ast.Lambda)
         assert [a.arg for a in handler.args.args] == expected.get(
             name, ["_c", "_keyval", "keycode", "_state"]
         )
         used = {n.id for n in ast.walk(handler.body) if isinstance(n, ast.Name)}
-        assert used & {"_keyval", "_state", "_c"} == set()  # only the code (and keyval) is read
+        assert used & {"_keyval", "_state", "_c"} == set()  # only the code, keyval and state
         assert ("keyval" in used) == (name == "key-pressed")
     calls = [
         n
@@ -760,10 +761,13 @@ def test_the_prompts_key_controller_reads_only_the_hardware_code_and_whether_a_k
         if isinstance(n, ast.Call)
     ]
     assert [ast.unparse(c.func) for c in calls] == ["self._key_down"]
-    assert [ast.unparse(a) for a in calls[0].args] == ["keyval", "keycode"]
+    assert [ast.unparse(a) for a in calls[0].args] == ["keyval", "keycode", "state"]
 
-    down = _function(tree, "_key_down")
-    assert {n.id for n in ast.walk(down) if isinstance(n, ast.Name)} >= {"keyval", "_ACTIVATING"}
+    activated_by = _function(tree, "_activated_by")
+    assert {n.id for n in ast.walk(activated_by) if isinstance(n, ast.Name)} >= {
+        "keyval",
+        "_ACTIVATING",
+    }
     activating = next(
         n.value
         for n in ast.walk(tree)

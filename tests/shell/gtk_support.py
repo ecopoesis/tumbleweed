@@ -36,6 +36,9 @@ def user_click(banner: "PromptBanner", button: "Gtk.Button") -> None:
 
     banner.pointer_event(Gdk.EventType.BUTTON_PRESS, 1)
     banner.pointer_event(Gdk.EventType.BUTTON_RELEASE, 1)
+    for grant, scope in banner.grants:
+        if grant is button:
+            banner.released_on(scope)  # (what the button's own controller reports)
     button.emit("clicked")
 
 
