@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 from pydantic import JsonValue
 
 from tests.agent.broker_thread import BrokerThread
@@ -26,8 +27,12 @@ from tumbleweed.agent.loop import EARLIER_TASK_RESULT
 from tumbleweed.agent.tasks import TaskSession
 from tumbleweed.agent.tools import ToolRegistry
 from tumbleweed.broker.client import BrokerClient
+from tumbleweed.broker.deny import DenyRules
 from tumbleweed.broker.grants import GrantScope
+from tumbleweed.broker.paths import StoredPath
+from tumbleweed.broker.policy import Allow
 from tumbleweed.broker.prompts import Allowed
+from tumbleweed.broker.service import BrokerService
 from tumbleweed.core.ids import MessageId, RunId, TaskId
 from tumbleweed.shell.viewmodel.transcript import MessageState, Role, TranscriptMessage
 
@@ -212,6 +217,32 @@ class TestAccess:
             text, error = w.run_tool("read_file", path=str(w.home / PHOTO))
 
             assert error and "secret" not in text
+
+    def test_a_folder_swapped_for_a_symlink_between_the_decision_and_the_open_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The decision was made on the real folder; the swap happens just before the broker opens
+        # what was granted, so only the open-time checks (no symlink, same identity) can refuse.
+        with world() as w:
+            w.allow("task")
+            w.run_tool("request_access", kind="read", path=str(w.home / "Photos"), reason="r")
+            # The same file by another name, so that only the folder's identity differs.
+            (w.home / "Documents" / "a.jpg").hardlink_to(w.home / PHOTO)
+            real = BrokerService._read_granted  # noqa: SLF001
+
+            def swapping(
+                stored: StoredPath, rules: DenyRules, allow: Allow, max_bytes: int
+            ) -> bytes:
+                (w.home / "Photos").rename(w.home / "Photos.old")
+                (w.home / "Photos").symlink_to(w.home / "Documents")
+                return real(stored, rules, allow, max_bytes)
+
+            monkeypatch.setattr(BrokerService, "_read_granted", staticmethod(swapping))
+
+            text, error = w.run_tool("read_file", path=str(w.home / PHOTO))
+
+            assert error
+            assert "jpeg" not in text
 
     def test_a_listing_names_are_untrusted_and_spelled_out(self) -> None:
         with world() as w:
