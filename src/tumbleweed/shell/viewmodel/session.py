@@ -66,6 +66,7 @@ def _transcript_message(stored: StoredMessage) -> TranscriptMessage:
         text=stored.text,
         state=MessageState(stored.state.value),
         error=stored.error,
+        task=stored.task_id,
     )
 
 
@@ -75,7 +76,7 @@ def _new_message(message: TranscriptMessage) -> NewMessage | None:
         return None
     return NewMessage(
         id=message.id,
-        task_id=None,  # no tasks until S19
+        task_id=message.task,
         role=MessageRole(message.role.value),
         state=StoredState(message.state.value),
         text=message.text,

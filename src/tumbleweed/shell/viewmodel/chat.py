@@ -34,7 +34,7 @@ from tumbleweed.agent.responder import (
     Responder,
 )
 from tumbleweed.core.errors import InvalidValueError, TumbleweedError
-from tumbleweed.core.ids import MessageId, SessionId
+from tumbleweed.core.ids import MessageId, SessionId, TaskId
 from tumbleweed.shell.viewmodel.transcript import (
     MessageState,
     Role,
@@ -85,7 +85,10 @@ def context_turns(messages: Sequence[TranscriptMessage]) -> tuple[ContextTurn, .
             pending = None
         else:
             pending = None
-    return tuple(ContextTurn(user=u.text, assistant=a.text) for u, a in pairs[-MAX_CONTEXT_TURNS:])
+    return tuple(
+        ContextTurn(user=u.text, assistant=a.text, task=a.task)
+        for u, a in pairs[-MAX_CONTEXT_TURNS:]
+    )
 
 
 @final
@@ -93,9 +96,14 @@ class _Reply:
     """One reply in flight: it fills one assistant message, and is the sink of its responder."""
 
     def __init__(
-        self, transcript: Transcript, message_id: MessageId, on_closed: Callable[[bool], None]
+        self,
+        transcript: Transcript,
+        message_id: MessageId,
+        on_closed: Callable[[bool], None],
+        current_task: Callable[[], TaskId | None],
     ) -> None:
         self._transcript = transcript
+        self._current_task = current_task
         self._message_id = message_id
         self._thread = threading.get_ident()
         self._handle: ReplyHandle | None = None
@@ -136,7 +144,7 @@ class _Reply:
         self._by_user = by_user
         try:
             if self._transcript.streaming == self._message_id:
-                self._transcript.fail(self._message_id, reason)
+                self._transcript.fail(self._message_id, reason, self._current_task())
         finally:
             try:
                 if self._handle is not None:
@@ -175,15 +183,15 @@ class _Reply:
                 except InvalidValueError as exc:
                     logger.warning("refused a delta of reply %s: %s", self._message_id, exc)
                     self.abort(describe_error(exc))
-            case ReplyFinished():
+            case ReplyFinished(task=task):
                 try:
-                    self._transcript.finish(self._message_id)
+                    self._transcript.finish(self._message_id, task)
                 finally:
                     self.closed = True
                     self._tell_closed()
-            case ReplyFailed(reason=reason):
+            case ReplyFailed(reason=reason, task=task):
                 try:
-                    self._transcript.fail(self._message_id, reason)
+                    self._transcript.fail(self._message_id, reason, task)
                 except InvalidValueError:
                     # A reason that is not text. The message is still streaming: fail it.
                     logger.warning("reply %s: the failure had no usable reason", self._message_id)
@@ -199,9 +207,17 @@ class _Reply:
 class ChatController:
     """Sends user messages to a responder and applies its reply to the transcript."""
 
-    def __init__(self, transcript: Transcript, responder: Responder) -> None:
+    def __init__(
+        self,
+        transcript: Transcript,
+        responder: Responder,
+        current_task: Callable[[], TaskId | None] = lambda: None,
+    ) -> None:
         self._transcript = transcript
         self._responder = responder
+        # The task new messages belong to when the responder does not say (D26): read on the main
+        # thread, where this controller lives.
+        self._current_task = current_task
         self._reply: _Reply | None = None
         self._session_id: SessionId | None = None
         self._idle_listeners: list[Callable[[bool], None]] = []
@@ -248,10 +264,13 @@ class ChatController:
         self._start(display_line(turn), turn)
 
     def _start(self, text: str, canvas_turn: CanvasTurn | None) -> None:
-        user = self._transcript.add_user(text)
+        user = self._transcript.add_user(text, self._current_task())
         history = context_turns(self._transcript.messages[:-1])  # everything before this message
         reply = _Reply(
-            self._transcript, self._transcript.begin_assistant().id, self._on_reply_closed
+            self._transcript,
+            self._transcript.begin_assistant().id,
+            self._on_reply_closed,
+            self._current_task,
         )
         self._reply = reply
         request = ReplyRequest(
