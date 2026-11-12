@@ -94,7 +94,9 @@ def test_a_hostile_task_title_is_a_quoted_plain_line_and_cannot_pose_as_chrome(
     pending(shell, titled)
 
     banner = shell.window.prompt_banner
-    (quoted,) = [w for w in labels_in(banner) if REASON_CLASS in w.get_css_classes()]
+    # The title comes before the reason, in the same style (both are the assistant's words).
+    quoted, reason = [w for w in labels_in(banner) if REASON_CLASS in w.get_css_classes()]
+    assert reason.get_text() == "to look"
     shown = [w.get_text() for w in labels_in(banner)]
     assert "The assistant named this task (its own words, not checked):" in shown
     assert "\n" not in quoted.get_text()

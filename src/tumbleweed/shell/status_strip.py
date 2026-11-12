@@ -8,6 +8,7 @@ from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.shell._gi import Gtk, Pango
 from tumbleweed.shell._widgets import plain_label
 from tumbleweed.shell.viewmodel.display import display_text
+from tumbleweed.shell.viewmodel.prompts import plain_reason
 
 
 class VoiceState(enum.StrEnum):
@@ -100,7 +101,8 @@ class StatusStrip(Gtk.Box):
     def show_task(self, title: str | None) -> None:
         """Show the title the assistant gave the current task, or nothing (S19, I5): its words,
         labelled as such, as plain text and bounded."""
-        shown = None if not title else display_text(f"{TASK_PREFIX}{title[:MAX_TASK_TITLE]}")
+        line = plain_reason(title, MAX_TASK_TITLE)[0] if title else ""
+        shown = display_text(f"{TASK_PREFIX}{line}") if line else None
         self._task.set_visible(shown is not None)
         self._task.set_text(shown or "")
 
