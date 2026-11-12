@@ -28,8 +28,10 @@ What it holds to, in the order of the invariant (I5):
       cannot become a grant. It is ignored whenever the prompt is disarmed (the 750 ms after it
       appears or after any restart; the plan: early clicks and Enter presses are ignored), and
       otherwise taken from any click, a synthetic one included, because it cannot grant (a hostile
-      client of the accessibility bus can deny a user's prompts, and delay their grants by
-      restarting the delay: that costs liveness, not safety).
+      client of the accessibility bus can deny a user's prompts, delay their grants by restarting
+      the delay, and make the user's own Deny be ignored until they retry, the deadline still
+      denying: that costs liveness, not safety; and with no attack at all, a Deny pressed within
+      0.75 s of the user's own refused Allow is ignored, and the note is shown).
   (C) Nothing makes the prompt refuse a deliberate Allow for good: an input that begins after the
       prompt is armed, with nothing tainted held, is accepted, of either kind and after any other
       input (typing, a window activation, any press during a keyboard activation). A refusal of an
@@ -46,8 +48,14 @@ What it holds to, in the order of the invariant (I5):
       second of their clean Enter or Space on it, is taken as theirs. The picker's dialog is GTK's
       or the portal's own window and can be driven over the accessibility bus like any window of the
       session; what protects it is that it opens only after a granted Choose, that its answer is
-      taken only then and only once, and that the broker still applies the deny rules, the taint
-      rule and the cap to what it picks.
+      taken only then, only once, and not after the dialog was dismissed or the delay restarted, and
+      that the broker still applies the deny rules, the taint rule and the cap to what it picks.
+      Assistive-technology users grant with Enter or Space on the focused button; a DoAction is
+      refused. This assumes that a bus client cannot move the keyboard focus onto Allow: GTK 4.14.5
+      names the AT-SPI Component method GrabFocus in libgtk, but whether and how it moves the focus
+      was not run (the test container has no accessibility bus); if it can, the user's Enter meant
+      for Deny would activate Allow and be taken as theirs, which is again a same-user process,
+      outside the threat model.
 
   How: every pointer button (told apart by its device: a mouse and a pen both have a button 1),
   touch (one identity per sequence) and key that goes down is recorded with whether the prompt was
@@ -464,6 +472,13 @@ class PromptController:
         entry.picking = scope
         return True
 
+    def picker_dismissed(self, prompt: PromptId) -> None:
+        """The dialog that a granted Choose opened gave no answer (it was dismissed, or the name
+        cannot be sent): it is over, and no answer is taken until another Choose is granted."""
+        entry = self._current
+        if entry is not None and entry.card.prompt == prompt:
+            entry.picking = None
+
     def choose(self, prompt: PromptId, decision: PromptDecision) -> bool:
         """The user's decision on the prompt that is shown. Ignored (False) unless that is
         `prompt`, the decision is one it offers and the arming invariant holds: an Allow needs (A),
@@ -588,6 +603,7 @@ class PromptController:
 
     def _start_arming(self, entry: _Entry) -> None:
         self._epoch += 1
+        entry.picking = None  # (a dialog that outlives a restart is not the user's choice any more)
         self._activation = None  # (it began in the epoch before)
         entry.cancel_arming()
         entry.shown_at = self._clock()

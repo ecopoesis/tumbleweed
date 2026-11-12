@@ -171,6 +171,7 @@ class TestNotAtOnce:
 
 LEFT = InputId("pointer", 1)
 RIGHT = InputId("pointer", 3)
+MIDDLE = InputId("pointer", 2)
 TOUCH = InputId("pointer", 1000)
 ENTER = InputId("key", 36)
 SPACE = InputId("key", 65)
@@ -812,6 +813,28 @@ class TestAGrantNeedsAProducingInput:
         assert not rig.controller.can_act(card.prompt, "once")  # not a picker's button
         assert rig.controller.choose(card.prompt, ALLOW_ONCE)
 
+    def test_an_activation_that_a_press_did_not_end_makes_no_grant_elsewhere_or_late(
+        self, rig: Rig
+    ) -> None:
+        """Round 8 (T5): the press keeps it (positive, above) but the activation stays that of its
+        own button and of its half second."""
+        card = rig.offer()
+        rig.arm()
+        rig.controller.input_began(ENTER, activates="task")
+        rig.controller.input_began(RIGHT)
+        assert not rig.controller.choose(card.prompt, ALLOW_ONCE)
+
+        rig.arm()
+        rig.controller.input_began(SPACE, activates="task")
+        rig.controller.input_began(MIDDLE)
+        rig.timers.advance(ACTIVATION_SECONDS + 0.01)
+        assert not rig.controller.choose(card.prompt, ALLOW_TASK)
+
+    def test_the_activation_is_over_before_the_delay_can_restart(self) -> None:
+        """`_start_arming` clears the activation, which is unobservable only because an activation
+        (half a second) is over before a restarted delay (750 ms) is: this holds that."""
+        assert ACTIVATION_SECONDS < ARM_SECONDS
+
     def test_a_key_that_activates_nothing_does_not_end_the_activation(self, rig: Rig) -> None:
         """GTK does not cancel an activation under way when another key goes down (Shift, say)."""
         card = rig.offer()
@@ -986,6 +1009,36 @@ class TestAGrantNeedsAProducingInput:
         end(rig, LEFT)
         assert rig.controller.can_act(card.prompt, "task")
         assert rig.controller.choose(card.prompt, picked)
+
+    def test_the_pickers_answer_after_a_dismissed_dialog_is_refused(self, rig: Rig) -> None:
+        """Round 8 (opus): the dialog answered nothing; a late answer needs a new granted Choose."""
+        card = rig.offer(pick_card())
+        rig.arm()
+        picked = AllowDecision(kind="allow", scope="task", picked="/home/u/Documents")
+        rig.controller.input_began(LEFT)
+        end(rig, LEFT)
+        assert rig.controller.can_act(card.prompt, "task")
+
+        rig.controller.picker_dismissed(card.prompt)
+
+        assert not rig.controller.choose(card.prompt, picked)
+        rig.arm()
+        rig.controller.input_began(LEFT)
+        end(rig, LEFT)
+        assert rig.controller.can_act(card.prompt, "task")
+        assert rig.controller.choose(card.prompt, picked)
+
+    def test_the_pickers_answer_after_the_delay_restarts_is_refused(self, rig: Rig) -> None:
+        card = rig.offer(pick_card())
+        rig.arm()
+        picked = AllowDecision(kind="allow", scope="task", picked="/home/u/Documents")
+        rig.controller.input_began(LEFT)
+        end(rig, LEFT)
+        assert rig.controller.can_act(card.prompt, "task")
+
+        rig.controller.reactivated()
+
+        assert not rig.controller.choose(card.prompt, picked)
 
     def test_the_pickers_answer_is_refused_at_the_instant_the_prompt_appears(
         self, rig: Rig

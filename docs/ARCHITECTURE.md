@@ -1267,10 +1267,12 @@ Each invariant names where it is enforced. Reviews check every change against th
   become a grant. It is ignored whenever the prompt is disarmed (the 750 ms after it appears or
   after any restart; the plan: early clicks and Enter presses are ignored), and otherwise taken from
   any click, a synthetic one included, because it cannot grant (a hostile client of the
-  accessibility bus can deny a user's prompts, and delay their grants by restarting the delay: that
-  costs liveness, not safety). (C) Nothing makes the prompt refuse a deliberate Allow for good: an
-  input that begins after the prompt is armed, with nothing tainted held, is accepted, of either
-  kind and after any other input (typing, a window activation, any press during a keyboard
+  accessibility bus can deny a user's prompts, delay their grants by restarting the delay, and make
+  the user's own Deny be ignored until they retry, the deadline still denying: that costs liveness,
+  not safety; and with no attack at all, a Deny pressed within 0.75 s of the user's own refused
+  Allow is ignored, and the note is shown). (C) Nothing makes the prompt refuse a deliberate Allow
+  for good: an input that begins after the prompt is armed, with nothing tainted held, is accepted,
+  of either kind and after any other input (typing, a window activation, any press during a keyboard
   activation). A refusal of an Allow is shown to the user, by the view. The cases that fail closed
   instead are the documented ones: an input whose release was lost (a pointer is replaced by its
   next press of the same button of the same device, or dropped when the next prompt comes up, so a
@@ -1284,30 +1286,36 @@ Each invariant names where it is enforced. Reviews check every change against th
   a second of their clean Enter or Space on it, is taken as theirs. The picker's dialog is GTK's or
   the portal's own window and can be driven over the accessibility bus like any window of the
   session; what protects it is that it opens only after a granted Choose, that its answer is taken
-  only then and only once, and that the broker still applies the deny rules, the taint rule and the
-  cap to what it picks.** The 750 ms are of quiet, by the controller's clock, read when the answer
-  arrives (a late timer cannot arm it early); the buttons are dimmed until then. The delay starts
-  again at the first frame, when the window is activated (not while the picker's own dialog is open:
-  the window only lost the focus to it) and at any input that begins while disarmed. It is
-  implemented by recording every pointer button, touch (one identity per sequence, pruned when the
-  next prompt comes up; a button's with its device: a mouse and a pen both have a button 1) and key
-  that goes down with whether the prompt was armed and in which epoch (every restart of the delay
-  starts one: the prompt shown, first drawn, the window activated, any input that begins while
-  disarmed); an input is tainted if it began disarmed or in an earlier epoch, and so is one that
-  comes up with no record (it went down before the prompt, or before a focus loss). Held inputs are
-  tracked exactly by identity, so a second button, a key, Enter on the focused Deny or an
-  auto-repeat cannot end the hold of another input; a click needs a producing input of its own
-  button: the release that came on that button, remembered for the click in its own event (a
-  high-priority idle ends the event, before anything at the default priority runs), or a clean press
-  of Enter or Space with no modifier while that button has the focus, in the last half second (GTK's
-  activation timer is 250 ms); a release elsewhere, a key pressed with the focus on Deny, the chat
-  or a voice button, or the push-to-talk key produces no grant, and a refused attempt starts the
-  delay again; pointer records survive a focus loss (GTK does not cancel a press when the window is
-  deactivated: the grab goes on and its release arrives) and keys are forgotten (their release goes
-  to the other window); at most 64 are recorded, and one more is not evicted for but comes up
-  unrecorded, so tainted; the pointers held are dropped when the next prompt comes up, so that a
-  release that never arrives (a drag took it) costs one prompt at most; the picker's answer is the
-  user's choice in the trusted dialog and needs no input of the window.
+  only then, only once, and not after the dialog was dismissed or the delay restarted, and that the
+  broker still applies the deny rules, the taint rule and the cap to what it picks.
+  Assistive-technology users grant with Enter or Space on the focused button; a DoAction is refused.
+  This assumes that a bus client cannot move the keyboard focus onto Allow: GTK 4.14.5 names the
+  AT-SPI Component method GrabFocus in libgtk, but whether and how it moves the focus was not run
+  (the test container has no accessibility bus); if it can, the user's Enter meant for Deny would
+  activate Allow and be taken as theirs, which is again a same-user process, outside the threat
+  model.** The 750 ms are of quiet, by the controller's clock, read when the answer arrives (a late
+  timer cannot arm it early); the buttons are dimmed until then. The delay starts again at the first
+  frame, when the window is activated (not while the picker's own dialog is open: the window only
+  lost the focus to it) and at any input that begins while disarmed. It is implemented by recording
+  every pointer button, touch (one identity per sequence, pruned when the next prompt comes up; a
+  button's with its device: a mouse and a pen both have a button 1) and key that goes down with
+  whether the prompt was armed and in which epoch (every restart of the delay starts one: the prompt
+  shown, first drawn, the window activated, any input that begins while disarmed); an input is
+  tainted if it began disarmed or in an earlier epoch, and so is one that comes up with no record
+  (it went down before the prompt, or before a focus loss). Held inputs are tracked exactly by
+  identity, so a second button, a key, Enter on the focused Deny or an auto-repeat cannot end the
+  hold of another input; a click needs a producing input of its own button: the release that came on
+  that button, remembered for the click in its own event (a high-priority idle ends the event,
+  before anything at the default priority runs), or a clean press of Enter or Space with no modifier
+  while that button has the focus, in the last half second (GTK's activation timer is 250 ms); a
+  release elsewhere, a key pressed with the focus on Deny, the chat or a voice button, or the
+  push-to-talk key produces no grant, and a refused attempt starts the delay again; pointer records
+  survive a focus loss (GTK does not cancel a press when the window is deactivated: the grab goes on
+  and its release arrives) and keys are forgotten (their release goes to the other window); at most
+  64 are recorded, and one more is not evicted for but comes up unrecorded, so tainted; the pointers
+  held are dropped when the next prompt comes up, so that a release that never arrives (a drag took
+  it) costs one prompt at most; the picker's answer is the user's choice in the trusted dialog and
+  needs no input of the window.
   `tests/shell/test_prompt_arming_model.py` checks (A) to (C) over random sequences. Deny has the
   focus. *One at a time*: the rest wait in order, at most 8 in all (a ninth is refused and denied by
   the broker); each has the broker's deadline (`expires_in_ms`) from the moment it arrived, and past

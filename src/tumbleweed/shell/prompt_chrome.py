@@ -504,12 +504,14 @@ class PromptBanner(Gtk.Box):
         if controller is None:
             return
         if path is None:
+            controller.picker_dismissed(card.prompt)
             self.note.set_text("Nothing was chosen. Choose again, or Deny.")
             return
         try:
             decision = AllowDecision(kind="allow", scope=scope, picked=path)
             decision.model_dump_json()  # a name that is not valid UTF-8 cannot be sent
         except (ValidationError, UnicodeEncodeError, ValueError):
+            controller.picker_dismissed(card.prompt)
             self.note.set_text("That name cannot be used. Choose another, or Deny.")
             return
         if not controller.choose(card.prompt, decision):

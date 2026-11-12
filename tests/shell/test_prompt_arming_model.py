@@ -121,6 +121,7 @@ class Subject(Protocol):
     def allow(self, other: bool = False) -> bool: ...
     def deny(self) -> bool: ...
     def picked(self) -> bool: ...
+    def dismiss_picker(self) -> None: ...
     def swap(self) -> None: ...
     def dismiss(self) -> None: ...
     def show(self, picks: bool) -> None: ...
@@ -179,6 +180,9 @@ class RealSubject:
 
     def picked(self) -> bool:
         return self.controller.choose(self.card.prompt, PICKED)
+
+    def dismiss_picker(self) -> None:
+        self.controller.picker_dismissed(self.card.prompt)
 
     def swap(self) -> None:
         self.controller.withdraw(self.card.prompt)
@@ -241,6 +245,7 @@ class ArmingMachine(RuleBasedStateMachine):
 
     def restart(self) -> None:
         self.epoch += 1
+        self.pick_open = False  # a dialog that outlives a restart is not the user's choice
         self.restart_at = self.subject.clock.now
 
     def armed(self) -> bool:
@@ -479,6 +484,14 @@ class ArmingMachine(RuleBasedStateMachine):
         self.next_prompt()
         self.done()
 
+    @precondition(lambda self: self.shown and self.pick_open)
+    @rule()
+    def picker_dialog_dismissed(self) -> None:
+        """The dialog answers nothing: a later answer needs a new granted Choose."""
+        self.subject.dismiss_picker()
+        self.pick_open = False
+        self.done()
+
     @precondition(lambda self: self.shown and not self.pick_open)
     @rule()
     def picker_answer_without_a_choose(self) -> None:
@@ -544,7 +557,7 @@ class ArmingMachine(RuleBasedStateMachine):
         self.done()
 
     @precondition(lambda self: self.shown)
-    @rule(device=st.sampled_from(["enter", "mouse", "pen", "touch"]))
+    @rule(device=st.sampled_from(["enter", "mouse", "pen", "touch", "elsewhere"]))
     def deliberate_input(self, device: str) -> None:
         """(C): the user waits for the prompt, then clicks (a mouse, a pen, a finger) or presses
         Enter on the button. If nothing tainted is held and nothing is stale it must be taken,
@@ -557,11 +570,17 @@ class ArmingMachine(RuleBasedStateMachine):
             which = Phys("pointer", FIRST_FINGER + self.fingers)
             self.fingers += 1
         else:
-            which = {"enter": ENTER, "mouse": LEFT, "pen": PEN}[device]
+            which = {"enter": ENTER, "mouse": LEFT, "pen": PEN, "elsewhere": PEN}[device]
         if which in self.down or which in self.forgotten or self.inflight is not None:
             return
-        self.record_press(which, True)
-        if device == "enter":
+        self.record_press(which, device != "elsewhere")
+        if device == "elsewhere":
+            # A deliberate click, but on the prompt's text: a click on the button in its event
+            # (a synthetic one) has no producer there.
+            self.down.pop(which)
+            self.subject.ended(which)
+            self.refused()
+        elif device == "enter":
             self.inflight = None
             self.activating_at = self.subject.clock.now
             self.check_click(self.down[which], None, False)  # the activation, by its timer
@@ -665,6 +684,57 @@ class TestScripted:
         machine.pointer_down(LEFT, on_button=True)
         machine.prompt_swapped()
         machine.release_input(LEFT)
+
+    def test_a_release_elsewhere_makes_no_grant(self) -> None:
+        """A release off the button, and a click in its event: no grant."""
+        machine = self.machine()
+        machine.pointer_down(LEFT, on_button=False)
+        machine.release_input(LEFT)
+
+    def test_a_release_on_the_other_button_makes_no_grant(self) -> None:
+        machine = self.machine()
+        machine.pointer_down(LEFT, on_button=True)
+        machine.subject.ended(LEFT)
+        machine.down.pop(LEFT)
+        machine.subject.released_on_button()
+        machine.refused(other=True)
+
+    def test_an_expired_activation_is_not_completed_by_another_keys_release(self) -> None:
+        """T1: the half second is checked when the release comes, not only at the click."""
+        machine = self.machine()
+        machine.key_down(ENTER, on_button=True)
+        machine.key_down(LETTER, on_button=False)
+        machine.wait(1.0)
+        machine.release_input(LETTER)
+
+    def test_a_pointer_release_is_not_on_the_button_of_an_activation_under_way(self) -> None:
+        """T2: only a key's release takes the activation's target."""
+        machine = self.machine()
+        machine.pointer_down(LEFT, on_button=False)  # clean, held, not on the button
+        machine.key_down(ENTER, on_button=True)
+        machine.release_input(LEFT)
+
+    def test_a_press_during_an_activation_keeps_it_for_its_own_button_only(self) -> None:
+        """T5: positive in `test_a_press_does_not_end_an_activation`; here the negatives."""
+        machine = self.machine()
+        machine.key_down(ENTER, on_button=True)
+        machine.pointer_down(MIDDLE, on_button=False)
+        machine.refused(other=True)
+        machine.wait(0.75)
+        machine.key_down(SPACE, on_button=True)
+        machine.pointer_down(RIGHT, on_button=False)
+        machine.wait(1.0)
+        machine.activation_timer()
+
+    def test_a_dismissed_dialog_takes_no_answer(self) -> None:
+        machine = ArmingMachine()
+        machine.prompt_goes()
+        machine.prompt_comes(picks=True)
+        machine.wait(0.75)
+        machine.deliberate_input("mouse")
+        assert machine.pick_open
+        machine.picker_dialog_dismissed()
+        machine.picker_answer_without_a_choose()
 
     def test_a_deliberate_click_after_all_that_is_taken(self) -> None:
         machine = self.machine()

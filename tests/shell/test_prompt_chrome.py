@@ -1265,19 +1265,19 @@ class TestThePicker:
             (card.prompt, AllowDecision(kind="allow", scope="once", picked="/home/u/Documents"))
         ]
 
-    def test_a_choice_in_the_dialog_is_taken_whatever_the_window_saw_meanwhile(
+    def test_a_choice_in_the_dialog_is_taken_after_a_stray_release_in_the_window(
         self, build_prompt_shell: Builder
     ) -> None:
         """The click on Choose passed the arming check and opened the dialog; the choice is made
-        there, so a stray release or a restart of the delay in the window does not refuse it."""
+        there, so a stray release in the window does not refuse it. (A restart of the delay does,
+        round 8 C1: the dialog is then no longer the one the granted click opened.)"""
         shell = build_prompt_shell()
-        controller, answers = shell.own_controller()
+        _controller, answers = shell.own_controller()
         present(shell)
         card = pending(shell, pick_card("file"))
         shell.wait_armed()
         user_click(shell, buttons(shell.window.prompt_banner)["Choose, allow once\u2026"])
         TestInputsThatAreNotTheUsers.up(shell, 3)  # a release from the dialog, with no press seen
-        controller.reactivated()  # and something restarted the delay meanwhile
 
         shell.picker.finish("/home/u/Documents")
 
@@ -1285,9 +1285,9 @@ class TestThePicker:
 
     def test_a_dismissed_picker_leaves_the_prompt_open(self, build_prompt_shell: Builder) -> None:
         shell = build_prompt_shell()
-        _controller, answers = shell.own_controller()
+        controller, answers = shell.own_controller()
         present(shell)
-        pending(shell, pick_card("file"))
+        card = pending(shell, pick_card("file"))
         banner = shell.window.prompt_banner
         shell.wait_armed()
         button = buttons(banner)["Choose, allow once…"]
@@ -1300,6 +1300,8 @@ class TestThePicker:
         assert answers.given == []
         assert banner.get_visible()
         assert "Nothing was chosen" in banner.note.get_text()
+        late = AllowDecision(kind="allow", scope="once", picked="/home/u/Documents")
+        assert not controller.choose(card.prompt, late)  # the dialog answered nothing
         user_click(shell, button)  # and it can be opened again
         assert shell.picker.asked == ["file", "file"]
 
