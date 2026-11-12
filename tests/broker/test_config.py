@@ -10,9 +10,18 @@ import pytest
 from tests.broker.rig import scratch_home
 from tests.broker.support import World, make_world, resolve
 from tumbleweed.broker import DenyRelation, DenyRules
-from tumbleweed.broker.config import BrokerConfig
+from tumbleweed.broker.config import (
+    FS_CALLS_PER_PROMPT,
+    MAX_PROMPT_TIMEOUT,
+    PROMPT_MARGIN,
+    PROMPT_SLACK,
+    PROMPT_WAIT,
+    BrokerConfig,
+)
+from tumbleweed.broker.daemon import ipc_limits
 from tumbleweed.broker.deny import DenyMatch
 from tumbleweed.core.errors import InvalidValueError
+from tumbleweed.ipc.limits import IpcLimits
 
 
 @pytest.fixture
@@ -168,6 +177,56 @@ class TestTheSettings:
         assert config.require_scope_limits is True
         assert config.retention == timedelta(days=7)
 
+    def test_a_task_may_cause_five_prompts_in_ten_minutes_and_a_prompt_waits_two_minutes(
+        self, home_world: World
+    ) -> None:
+        config = config_for(home_world)
+
+        assert config.prompts_per_window == 5
+        assert config.prompt_window == timedelta(minutes=10)
+        assert config.prompt_timeout == timedelta(minutes=2)
+
+    def test_the_transports_waits_outlast_the_longest_prompt(self, home_world: World) -> None:
+        """A prompt that waits longer than the caller or the handler would end in a transport
+        timeout the caller sees while the broker still asks, and an Allow after it would make a
+        grant nobody hears about (#60)."""
+        config = config_for(home_world, prompt_timeout=MAX_PROMPT_TIMEOUT)
+        spent = config.prompt_timeout + FS_CALLS_PER_PROMPT * config.fs_timeout
+
+        assert spent + PROMPT_SLACK <= PROMPT_WAIT  # the caller outwaits everything one takes
+        assert ipc_limits(config).handler_timeout >= spent + PROMPT_MARGIN
+        assert IpcLimits().request_timeout < PROMPT_WAIT  # (the default is for everything else)
+
+    def test_the_handlers_cover_a_prompt_and_its_file_system_calls_even_with_a_short_grace(
+        self, home_world: World
+    ) -> None:
+        """The run bound alone (the longest run, its grace and 30 s) is shorter than what a
+        prompt can take with a slow file system, once the run grace is small."""
+        config = config_for(home_world, run_grace=timedelta(milliseconds=1))
+        run_bound = timedelta(seconds=120) + config.run_grace + timedelta(seconds=30)
+        asking = config.prompt_timeout + FS_CALLS_PER_PROMPT * config.fs_timeout + PROMPT_MARGIN
+
+        assert asking > run_bound
+        assert ipc_limits(config).handler_timeout == asking
+
+    def test_the_file_system_calls_around_a_prompt_are_inside_the_wait_too(
+        self, home_world: World
+    ) -> None:
+        """A grant request spends `fs_timeout` three times around the prompt: with a long one the
+        caller would give up while the broker still asked (and an Allow would be a lost grant)."""
+        longest = (PROMPT_WAIT - MAX_PROMPT_TIMEOUT - PROMPT_SLACK) / FS_CALLS_PER_PROMPT
+        ok = config_for(home_world, prompt_timeout=MAX_PROMPT_TIMEOUT, fs_timeout=longest)
+        assert ipc_limits(ok).handler_timeout >= PROMPT_WAIT
+
+        with pytest.raises(InvalidValueError):
+            config_for(
+                home_world,
+                prompt_timeout=MAX_PROMPT_TIMEOUT,
+                fs_timeout=longest + timedelta(seconds=1),
+            )
+        with pytest.raises(InvalidValueError):
+            config_for(home_world, fs_timeout=timedelta(minutes=5))
+
     def test_the_directories_are_the_ones_of_the_architecture(self, home_world: World) -> None:
         config = config_for(home_world)
 
@@ -186,6 +245,14 @@ class TestTheSettings:
             {"max_live_tasks": True},
             {"max_concurrent_runs": 1000},
             {"max_runs_per_task": 0},
+            {"prompts_per_window": 0},
+            {"prompts_per_window": True},
+            {"prompts_per_window": 10_001},
+            {"prompt_window": timedelta(0)},
+            {"prompt_window": timedelta(days=2)},
+            {"prompt_timeout": timedelta(hours=2)},
+            {"prompt_timeout": timedelta(seconds=121)},  # (the number, not the constant)
+            {"owner_prompts_per_window": 0},
             {"sandbox_path": ""},
             {"sandbox_path": "a\0b"},
         ],

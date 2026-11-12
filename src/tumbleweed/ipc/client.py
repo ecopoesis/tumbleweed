@@ -8,6 +8,7 @@ from tumbleweed.ipc.errors import IpcConnectError
 from tumbleweed.ipc.framing import close_writer
 from tumbleweed.ipc.handshake import client_handshake
 from tumbleweed.ipc.limits import IpcLimits
+from tumbleweed.ipc.messages import Role
 from tumbleweed.ipc.peercred import (
     PeerCredentialsProvider,
     SystemPeerCredentials,
@@ -24,6 +25,7 @@ async def connect(
     limits: IpcLimits | None = None,
     credentials: PeerCredentialsProvider | None = None,
     answer_diagnostics: bool = True,
+    role: Role | None = None,
 ) -> Connection:
     """Connect to the server at `path` and return the handshaken connection.
 
@@ -31,7 +33,8 @@ async def connect(
     sent, so a socket another user put at `path` never sees anything. `handler` answers the
     server's requests (never `ping` or `echo`: the connection answers those itself unless
     `answer_diagnostics` is `False`, which is for tests); without a handler every other request
-    from the server is refused with `unsupported_request`. The connect and the handshake each get
+    from the server is refused with `unsupported_request`. A `role` limits which requests this end
+    serves and sends (see `Connection`). The connect and the handshake each get
     `limits.handshake_timeout`.
 
     Raises `IpcConnectError` if there is nobody to connect to, `PeerAuthenticationError` if the
@@ -55,5 +58,10 @@ async def connect(
         await close_writer(writer)
         raise
     return Connection(
-        reader, writer, limits=limits, handler=handler, answer_diagnostics=answer_diagnostics
+        reader,
+        writer,
+        limits=limits,
+        handler=handler,
+        answer_diagnostics=answer_diagnostics,
+        role=role,
     )

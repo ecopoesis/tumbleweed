@@ -13,10 +13,12 @@ from tumbleweed.ipc.broker_messages import (
     DirEntry,
     EnvPair,
     NetworkAccess,
+    PickAccess,
     ReadAccess,
     WriteAccess,
 )
 from tumbleweed.ipc.messages import IpcMessage, Request, RequestBody, Response, ResponseBody
+from tumbleweed.ipc.prompt_messages import AllowDecision, DenyDecision
 from tumbleweed.ipc.schema import SCHEMA_FILE_NAME, SCHEMA_TITLE, build_schema, render_schema
 from tumbleweed.ipc.tool_messages import ToolSummary
 from tumbleweed.ipc.wire import PROTOCOL_VERSION, ErrorFrame, Hello, RequestFrame, ResponseFrame
@@ -57,6 +59,9 @@ PARTS: tuple[type[IpcMessage], ...] = (
     ReadAccess,
     WriteAccess,
     NetworkAccess,
+    PickAccess,
+    AllowDecision,
+    DenyDecision,
     DirEntry,
     EnvPair,
     ToolSummary,

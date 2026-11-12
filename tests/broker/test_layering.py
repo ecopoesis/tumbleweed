@@ -31,6 +31,7 @@ DAEMON_LAYER = (
     "service",
     "daemon",
     "client",
+    "shellprompts",
     "toolscli",
 )  # the modules that may import tumbleweed.ipc
 LINT_IMPORTS = "from importlinter.cli import lint_imports_command; lint_imports_command()"

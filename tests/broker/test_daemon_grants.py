@@ -69,6 +69,7 @@ class TestAskingTheUser:
                 await client.request_read(task, RunId.new(), read_path(rig), "x")
 
                 (prompt,) = rig.prompts.asked
+                assert prompt.capability is not None
                 assert prompt.capability.kind.value == "fs.read"
                 assert prompt.capability.path.path == read_path(rig)  # type: ignore[union-attr]  # the prompt asked for a read: FsRead has a path
                 assert prompt.scopes == {GrantScope.ONCE, GrantScope.TASK}  # no tool in S17

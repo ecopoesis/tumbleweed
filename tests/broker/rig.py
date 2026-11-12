@@ -25,9 +25,12 @@ from tumbleweed.broker.audit import AuditEntry, read_entries
 from tumbleweed.broker.client import BrokerClient
 from tumbleweed.broker.config import BrokerConfig
 from tumbleweed.broker.daemon import BrokerDaemon, start_broker
+from tumbleweed.broker.owner import Owner
 from tumbleweed.broker.prompts import Allowed, Denied, GrantPrompt, PromptAnswer
 from tumbleweed.broker.service import Sandbox
+from tumbleweed.core.ids import PromptId
 from tumbleweed.core.types import ByteCount, CanonicalPath
+from tumbleweed.ipc.connection import RequestHandler
 from tumbleweed.ipc.limits import IpcLimits
 from tumbleweed.ipc.peercred import PeerCredentialsProvider
 from tumbleweed.ipc.sockdir import SocketDirectory, SocketPath
@@ -72,11 +75,21 @@ class Clock:
 
     def __init__(self) -> None:
         self.now = START
+        self.mono = 0.0  # the monotonic clock: it only goes forward, whatever the wall clock does
 
     def __call__(self) -> datetime:
         return self.now
 
+    def monotonic(self) -> float:
+        """The same time for the monotonic clock of the broker (the rate limit reads it)."""
+        return self.mono
+
     def advance(self, by: timedelta) -> None:
+        self.now += by
+        self.mono += by.total_seconds()
+
+    def jump_wall_clock(self, by: timedelta) -> None:
+        """The wall clock is set (a user, NTP, a resume): the monotonic one has not moved."""
         self.now += by
 
 
@@ -102,7 +115,7 @@ class ScriptedPrompts:
 
         self.answers.append(Allowed(scope=GrantScope(scope)))
 
-    async def ask(self, prompt: GrantPrompt, /) -> PromptAnswer:
+    async def ask(self, prompt: GrantPrompt, owner: Owner, /) -> PromptAnswer:
         self.asked.append(prompt)
         if self.explode:
             self.explode = False
@@ -114,6 +127,9 @@ class ScriptedPrompts:
             if outcome is not None:
                 await outcome
         return self.answers.pop(0) if self.answers else Denied(reason="user_denied")
+
+    def answer(self, owner: Owner, prompt: PromptId, answer: PromptAnswer, /) -> bool:
+        return False  # nothing here is answered from outside: `ask` returns the answer itself
 
 
 def replace_config(config: BrokerConfig, **changes: object) -> BrokerConfig:
@@ -217,8 +233,10 @@ class Rig:
     def audit_of[E: AuditEntry](self, kind: type[E]) -> list[E]:
         return [entry for entry in self.audit() if isinstance(entry, kind)]
 
-    async def client(self, *, heartbeat: timedelta = timedelta(hours=1)) -> BrokerClient:
-        made = await BrokerClient.connect(self.socket, heartbeat=heartbeat)
+    async def client(
+        self, *, heartbeat: timedelta = timedelta(hours=1), handler: RequestHandler | None = None
+    ) -> BrokerClient:
+        made = await BrokerClient.connect(self.socket, heartbeat=heartbeat, handler=handler)
         self.clients.append(made)
         return made
 
@@ -255,6 +273,7 @@ class Rig:
             prompts=self.prompts,
             sandbox=self.sandbox,
             clock=self.clock,
+            monotonic=self.clock.monotonic,
         )
 
 
@@ -270,6 +289,7 @@ async def running(
     *,
     sandbox: FakeSandbox | None = None,
     prompts: ScriptedPrompts | None = None,
+    ask_shell: bool = False,
     config: Callable[[BrokerConfig], BrokerConfig] | None = None,
     limits: IpcLimits | None = None,
     credentials: PeerCredentialsProvider | None = None,
@@ -278,7 +298,11 @@ async def running(
     socket_at: Path | None = None,
     runner: Sandbox | None = None,
 ) -> AsyncIterator[Rig]:
-    """A started broker over a fake user in a scratch home, closed on exit."""
+    """A started broker over a fake user in a scratch home, closed on exit.
+
+    The prompts are `ScriptedPrompts` unless `ask_shell`: then the broker asks the shell that made
+    the task over its connection, as it does for real (S18), and `rig.prompts` goes unused.
+    """
     with scratch_home() as root, short_directory() as short:
         world = make_world(root)
         directory = SocketDirectory(short, create=True)
@@ -288,6 +312,8 @@ async def running(
             deny=world.context,
             require_scope_limits=require_scope_limits,
             require_landlock=False,
+            prompts_per_window=10_000,  # the rate limit has tests of its own
+            owner_prompts_per_window=10_000,
         )
         final = made if config is None else config(made)
         if before_start is not None:
@@ -298,9 +324,10 @@ async def running(
             final,
             socket,
             environ={},
-            prompts=script,
+            prompts=None if ask_shell else script,
             sandbox=fake if runner is None else runner,
             clock=clock,
+            monotonic=clock.monotonic,
             limits=limits,
             credentials=credentials,
         )

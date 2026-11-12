@@ -26,7 +26,7 @@ from tumbleweed.broker.errors import (
     ToolBlobWriteError,
     UnknownTaskError,
 )
-from tumbleweed.broker.service import Owner
+from tumbleweed.broker.owner import Owner
 from tumbleweed.broker.toolblobs import BLOB_DIRECTORY, ToolBlobs
 from tumbleweed.broker.toolstore import ToolStore
 from tumbleweed.core.canonical import content_hash

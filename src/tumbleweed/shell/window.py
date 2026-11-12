@@ -1,7 +1,7 @@
 """The shell window: canvas, side panel, status strip and the reserved trusted-chrome region.
 
     +--------------------------------------------+
-    | chrome region (trusted; prompts, S18)      |
+    | chrome region (trusted: the prompt, S18)   |
     +----------------------------+---------------+
     | canvas                     | side panel    |
     | (generated tools, S10)     | (chat)        |
@@ -15,18 +15,23 @@ No desktop metaphor: one window, and no overlapping layers. The chrome region si
 canvas in a plain vertical box, so the canvas cannot overlap it (I5, see `chrome`).
 """
 
+import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import final
 
 from tumbleweed.agent.canvas import CanvasLink
-from tumbleweed.agent.canvas_events import EventGate
+from tumbleweed.agent.canvas_events import EventGate, Scheduler
 from tumbleweed.agent.responder import Responder
 from tumbleweed.shell._gi import Adw, Gio, Gtk
+from tumbleweed.shell.broker_prompts import BrokerPrompts
 from tumbleweed.shell.canvas import CanvasView
 from tumbleweed.shell.canvas_tools import CanvasTools
 from tumbleweed.shell.chat_panel import ChatPanel
 from tumbleweed.shell.chrome import ChromeRegion
-from tumbleweed.shell.dispatch import GlibScheduler
+from tumbleweed.shell.dispatch import GlibDispatcher, GlibScheduler
+from tumbleweed.shell.prompt_chrome import FilePicker, PromptBanner
+from tumbleweed.shell.prompt_guard import PromptGuard
 from tumbleweed.shell.speech_feed import SpeechFeed
 from tumbleweed.shell.status_strip import StatusStrip
 from tumbleweed.shell.terminal_pane import TerminalPane, default_settings
@@ -44,6 +49,17 @@ TERMINAL_ACCELERATOR = "F12"
 
 
 @final
+@dataclass(frozen=True)
+class PromptWiring:
+    """What the trusted prompt (S18) is made from, for a test to replace: the clock its 750 ms and
+    its deadlines are read from, the timers, and the picker (a dialog no test can operate)."""
+
+    clock: Callable[[], float] = time.monotonic
+    scheduler: Scheduler = field(default_factory=GlibScheduler)
+    picker: FilePicker | None = None
+
+
+@final
 class ShellWindow(Adw.ApplicationWindow):
     """The one window of the shell."""
 
@@ -55,6 +71,7 @@ class ShellWindow(Adw.ApplicationWindow):
         voice: VoiceSetup | None = None,
         terminal: TerminalSettings | None = None,
         canvas_link: CanvasLink | None = None,
+        prompt_wiring: PromptWiring | None = None,
     ) -> None:
         super().__init__(application=application)
         self._closing = False
@@ -116,6 +133,23 @@ class ShellWindow(Adw.ApplicationWindow):
         body.append(self.canvas)
         body.append(self._side)
 
+        # The trusted prompt (S18): drawn in the chrome region, answered by the user only, and while
+        # it is pending everything but the chrome takes no input and no surface of theirs stays
+        # open. The broker's requests reach it through `broker_prompts`, which is the broker
+        # connection's handler (the shell connects in S19).
+        wiring = PromptWiring() if prompt_wiring is None else prompt_wiring
+        self.prompt_guard = PromptGuard(
+            self,
+            (self.canvas, self._side, self.terminal_pane, self.status_strip.terminal_button),
+            self._focus_input_unless_closing,
+        )
+        self.prompt_banner = PromptBanner(self, self.prompt_guard, wiring.picker)
+        self.chrome.append(self.prompt_banner)
+        self.broker_prompts = BrokerPrompts(
+            self.prompt_banner, GlibDispatcher(), wiring.scheduler, wiring.clock
+        )
+        self.prompt_banner.bind(self.broker_prompts.controller)
+
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         root.append(self.chrome)
         root.append(body)
@@ -155,9 +189,11 @@ class ShellWindow(Adw.ApplicationWindow):
         # Ctrl+L is the shell's clear-screen: while the terminal has the focus the action is
         # disabled, which lets the key through to the terminal.
         self.connect("notify::focus-widget", self._on_focus_changed)
-        self._add_action("toggle-side-panel", self._toggle_side_panel)
+        self._side_action = self._add_action("toggle-side-panel", self._toggle_side_panel)
         self.connect("close-request", self._on_close_request)
         self.set_focus(self.chat_panel.input_view)
+        # Last, so that they run first: they see every key and button, F12's shortcut included.
+        self.prompt_banner.install_controllers()
 
     @property
     def side_panel_visible(self) -> bool:
@@ -174,11 +210,15 @@ class ShellWindow(Adw.ApplicationWindow):
         self.terminal_pane.focus_terminal()
 
     def _on_terminal_key(self, _widget: Gtk.Widget, _args: object) -> bool:
-        self._toggle_terminal()
+        # F12 would move the focus off Deny and put a shell in front of the prompt's window part:
+        # not while a prompt is pending (the key is still consumed, so VTE does not get it).
+        if not self.prompt_guard.engaged:
+            self._toggle_terminal()
         return True
 
     def _on_terminal_clicked(self, _button: Gtk.Button) -> None:
-        self._toggle_terminal()
+        if not self.prompt_guard.engaged:
+            self._toggle_terminal()
 
     def _on_terminal_visibility(self, pane: Gtk.Widget, _pspec: object) -> None:
         if not pane.get_visible() and not self._closing:
@@ -190,7 +230,20 @@ class ShellWindow(Adw.ApplicationWindow):
 
     def _on_focus_changed(self, _window: Gtk.Window, _pspec: object) -> None:
         focus = self.get_focus()
-        self._focus_action.set_enabled(focus is None or not focus.is_ancestor(self.terminal_pane))
+        # Ctrl+L, F9 and Ctrl+Q are chords a program in the terminal uses (clear screen, a function
+        # key, quit): while the terminal has the focus the actions are disabled, which lets GTK
+        # pass the keys on to it (#90). Ctrl+Q then quits the program in the terminal, as in any
+        # terminal; the shell is quit from the chat, from the window's close button or by a signal.
+        enabled = focus is None or not focus.is_ancestor(self.terminal_pane)
+        self._focus_action.set_enabled(enabled)
+        self._side_action.set_enabled(enabled)
+        self._set_quit_enabled(enabled)
+
+    def _set_quit_enabled(self, enabled: bool) -> None:
+        application = self.get_application()
+        action = None if application is None else application.lookup_action("quit")
+        if isinstance(action, Gio.SimpleAction):
+            action.set_enabled(enabled)
 
     def _focus_input_unless_closing(self) -> None:
         if not self._closing:
@@ -229,6 +282,8 @@ class ShellWindow(Adw.ApplicationWindow):
         calls this: the `close-request` handler does, and so does the application when it quits.
         """
         self._closing = True
+        self._set_quit_enabled(True)  # the application outlives the window's focus
+        self.broker_prompts.close()
         if self._canvas_link is not None:
             self._canvas_link.detach()
         try:

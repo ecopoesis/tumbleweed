@@ -60,6 +60,7 @@ RefusalReason = Literal[
     "timeout",  # the file system took too long
     "failed",  # the sandbox could not be set up
     "conflict",  # the tool store already has a tool with that ID, and it is not this one (S23)
+    "unknown_prompt",  # not a prompt this connection was sent, or one already answered or closed
 ]
 
 
@@ -126,12 +127,23 @@ class NetworkAccess(IpcMessage):
     kind: Literal["net.full"]
 
 
-RequestedAccess = Annotated[ReadAccess | WriteAccess | NetworkAccess, Field(discriminator="kind")]
+@final
+class PickAccess(IpcMessage):
+    """`fs.read` of whatever the user picks: no path is named, the user chooses a file or a folder
+    in the trusted picker (S18) and the choice is the grant. A pick is a read: never a write."""
+
+    kind: Literal["fs.pick"]
+    choose: Literal["file", "folder"]
+
+
+RequestedAccess = Annotated[
+    ReadAccess | WriteAccess | NetworkAccess | PickAccess, Field(discriminator="kind")
+]
 
 
 @final
 class RequestGrant(Request):
-    """Ask for `access` for `run` of `task`. The user decides, in a trusted prompt (I2).
+    """Ask for `access` for `run` of `task`. The user decides, in a trusted prompt or picker (I2).
 
     `reason` is model text: the broker bounds it and shows it as quoted, never as a fact.
     """
