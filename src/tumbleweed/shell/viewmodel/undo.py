@@ -80,6 +80,8 @@ def row_of(info: SnapshotInfo) -> UndoRow:
     status: str | None = None
     if info.undone:
         status = "undone"
+    elif info.superseded:
+        status = "a later undo covers it"
     elif not info.undoable:
         status = "ran with no undo"
     return UndoRow(

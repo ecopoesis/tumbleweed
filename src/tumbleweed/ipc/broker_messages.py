@@ -166,9 +166,12 @@ SnapshotCause = Literal[
 class NoUndoAccess(IpcMessage):
     """What the broker asks in the "no undo" prompt (S21, I13): `paths` (canonical, the places a
     run may change) could not be saved, `cause` says why, and the user may let this one run go
-    ahead with no undo. Only the broker sends it, in a `ShowPrompt`; a model cannot request it."""
+    ahead with no undo (`purpose` `run`), or, for an undo, `paths` are what is there now and could
+    not be saved first: the user may let the undo go ahead without being able to undo it
+    (`purpose` `undo`). Only the broker sends it, in a `ShowPrompt`; a model cannot request it."""
 
     kind: Literal["no_undo"]
+    purpose: Literal["run", "undo"] = "run"
     paths: Annotated[
         tuple[Annotated[str, Field(min_length=1, max_length=MAX_PATH_CHARS)], ...],
         Field(min_length=1, max_length=MAX_SNAPSHOT_PATHS),
@@ -371,10 +374,14 @@ class UndoResult(Response):
 
     kind: Literal["undo_result"]
     snapshot: SnapshotId
-    safety: SnapshotId
+    safety: SnapshotId | None
     paths: Annotated[int, Field(ge=1, le=MAX_SNAPSHOT_PATHS)]
     written: Annotated[int, Field(ge=0)]
     removed: Annotated[int, Field(ge=0)]
+    skipped: Annotated[int, Field(ge=0)] = 0
+    """Entries the saved state had that could not be recreated (a socket or a device)."""
+    superseded: Annotated[int, Field(ge=0)] = 0
+    """Later changes of other runs on the same places that are no longer undone one by one."""
 
 
 @final
@@ -400,6 +407,7 @@ class SnapshotInfo(IpcMessage):
     ]
     undoable: bool
     undone: bool
+    superseded: bool = False
 
 
 @final

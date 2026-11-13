@@ -34,7 +34,13 @@ from pathlib import Path
 from typing import Final, final
 
 from tumbleweed.broker.audit import AuditLog
-from tumbleweed.broker.config import FS_CALLS_PER_PROMPT, PROMPT_MARGIN, BrokerConfig
+from tumbleweed.broker.config import (
+    FS_CALLS_PER_PROMPT,
+    PROMPT_MARGIN,
+    RUN_SETUP_WAIT,
+    UNDO_WAIT,
+    BrokerConfig,
+)
 from tumbleweed.broker.deny import DenyContext
 from tumbleweed.broker.errors import BrokerError
 from tumbleweed.broker.fsworker import FsWorker
@@ -68,9 +74,15 @@ MAX_CONNECTIONS: Final = 8
 
 def ipc_limits(config: BrokerConfig) -> IpcLimits:
     """The IPC limits of the daemon: handlers may take a whole run, and a quiet peer is dropped."""
-    longest = timedelta(seconds=MAX_WALL_SECONDS) + config.run_grace + timedelta(seconds=30)
+    # A write run waits for its snapshot and, if none can be saved, for the user (S21, D28).
+    longest = (
+        timedelta(seconds=MAX_WALL_SECONDS)
+        + config.run_grace
+        + RUN_SETUP_WAIT
+        + timedelta(seconds=30)
+    )
     asking = config.prompt_timeout + FS_CALLS_PER_PROMPT * config.fs_timeout + PROMPT_MARGIN
-    return IpcLimits(handler_timeout=max(longest, asking), idle_timeout=IDLE_TIMEOUT)
+    return IpcLimits(handler_timeout=max(longest, asking, UNDO_WAIT), idle_timeout=IDLE_TIMEOUT)
 
 
 @final

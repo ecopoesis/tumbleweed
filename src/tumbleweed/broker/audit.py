@@ -266,6 +266,17 @@ class SnapshotTaken(_AuditModel):
     bytes: Annotated[int, Field(ge=0)]
 
 
+class SnapshotFallback(_AuditModel):
+    """The btrfs backend accepted a path and could not save it, so the copy did (D28): `index` is
+    the path's place in the snapshot, `reason` the fault. Written with `snapshot_taken`."""
+
+    kind: Literal["snapshot_fallback"] = "snapshot_fallback"
+    snapshot: SnapshotId
+    index: Annotated[int, Field(ge=0)]
+    backend: Literal["btrfs"]
+    reason: Text
+
+
 class SnapshotRefused(_AuditModel):
     """No snapshot could be taken for a write run (or for an undo), for `reason` (a fault of
     `SnapshotFault`, or `user_declined`/`no_prompt`...). What happened next is the next entry."""
@@ -331,6 +342,7 @@ type AuditEntry = Annotated[
     | ToolExported
     | ToolImportRefused
     | SnapshotTaken
+    | SnapshotFallback
     | SnapshotRefused
     | NoUndoAccepted
     | UndoDone

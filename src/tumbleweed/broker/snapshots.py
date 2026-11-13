@@ -5,20 +5,24 @@ to it (`compose`), each opened by identity as the run will mount them. Three bac
 (`SnapshotBackend`), tried in this order for each path:
 
 - `BtrfsBackend`: a read-only subvolume snapshot of the subvolume the path is in, made in the
-  dedicated snapshot subvolume (`SnapshotSettings.btrfs_directory`) when the path is a folder on
-  that file system. Instant and unlimited by size. A tree that holds another subvolume is not
-  taken this way (a snapshot leaves a nested subvolume out, and an undo would then delete its
-  files): it falls through to the copy.
+  dedicated snapshot subvolume (`SnapshotSettings.btrfs_directory`) when the path and that
+  directory are both on btrfs (`f_type`: `f_fsid` differs per subvolume, so it cannot say). Instant
+  and unlimited by size. A snapshot is of the whole enclosing subvolume, so it holds more than the
+  folder (D28 names that as an accepted risk). A tree that holds another subvolume is not taken
+  this way (a snapshot leaves a nested subvolume out, and an undo would then delete its files),
+  and a snapshot the tool cannot make (another btrfs, no permission) is not an error: both fall
+  through to the copy, and the manager says so (`TakeResult.fallbacks`).
 - `CopyBackend`: a copy of the tree (a reflink where the file system has one) in the broker's
-  own `snapshots/` directory, capped in bytes, files and depth (`TreeLimits`). A tree over a cap
-  fails closed, before the run.
+  own `snapshots/` directory, capped in allocated bytes, entries and depth for the **whole run**
+  (`TreeBudget`). A tree over a cap fails closed, before the run. Special files are recorded, not
+  refused (`treeops`).
 - `NoopBackend`: takes nothing and says so (`SnapshotFault.UNSUPPORTED`): the broker then needs
   the user's "no undo" for that run. It is what a broker configured with no snapshots uses.
 
-**Where a snapshot is kept.** `<snapshots>/<SnapshotId>/<index>` for a copy, a file or folder
-saved exactly as it was; `<btrfs_directory>/<SnapshotId>-<index>` for a btrfs snapshot. Both are
-on the deny list (`BrokerConfig.deny_context`), so no grant can be made over them, and both are
-read only through descriptors (I11).
+**Where a snapshot is kept.** `<snapshots>/<SnapshotId>/<index>` (and `<index>.meta`) for a copy,
+a file or folder saved exactly as it was; `<btrfs_directory>/<SnapshotId>-<index>` for a btrfs
+snapshot. Both are on the deny list (`BrokerConfig.deny_context`), so no grant can be made over
+them, and both are read only through descriptors (I11).
 
 **What the record says.** `SnapshotRecord` is the broker's own account: which task and run, when,
 and for each path its `StoredPath` (the identity the grant was made for, which an undo must find
@@ -29,12 +33,16 @@ its own that the tree walks check (`treeops`).
 """
 
 import contextlib
+import ctypes
+import functools
 import logging
 import os
 import stat
+import struct
 import subprocess
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -49,22 +57,28 @@ from tumbleweed.broker.model import PolicyModel
 from tumbleweed.broker.paths import StoredPath
 from tumbleweed.broker.privatefs import open_private_directory
 from tumbleweed.broker.treeops import (
+    META_SUFFIX,
     RestoreStats,
+    TreeBudget,
     TreeLimits,
+    TreeMeta,
     contains_subvolume,
     copy_object,
+    load_meta,
     remove_entry,
     restore_object,
 )
+from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.ids import RunId, SnapshotId, TaskId
 
 _log = logging.getLogger(__name__)
 
 MAX_TARGETS: Final = 16
-"""The most writable paths one run's snapshot holds (the run's mounts are capped lower)."""
+"""The most writable paths one run may have: a run with more is refused before it is saved."""
 _DIRECTORY: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _ANY: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY | os.O_NONBLOCK
 _BTRFS_ROOT_INODE: Final = 256  # the inode number of every btrfs subvolume's root directory
+_BTRFS_SUPER_MAGIC: Final = 0x9123683E
 _TOOL_TIMEOUT: Final = timedelta(seconds=30)
 
 
@@ -140,9 +154,11 @@ class SnapshotBackend(Protocol):
         index: int,
         opened: OpenedPath,
         path: StoredPath,
+        budget: TreeBudget,
         deadline: float,
     ) -> SnapshotTarget:
-        """Save `opened`. `SnapshotError` if it cannot; nothing is left behind then."""
+        """Save `opened`, counting against the run's `budget`. `SnapshotError` if it cannot;
+        nothing is left behind then."""
         ...
 
     def open_stored(self, snapshot: SnapshotId, index: int, target: SnapshotTarget) -> int:
@@ -150,8 +166,20 @@ class SnapshotBackend(Protocol):
         (`STORED_COPY_BAD`) if it is not there or is not what was saved."""
         ...
 
+    def load_meta(self, snapshot: SnapshotId, index: int) -> TreeMeta:
+        """What the saved copy holds that it cannot itself (special files, true modes)."""
+        ...
+
     def delete(self, snapshot: SnapshotId, index: int, target: SnapshotTarget) -> None:
         """Delete the saved copy. Deleting what is not there is fine."""
+        ...
+
+    def names(self) -> list[SnapshotId]:
+        """The snapshots that have something saved here (for finding what nobody owns)."""
+        ...
+
+    def delete_all(self, snapshot: SnapshotId) -> bool:
+        """Delete everything saved here for `snapshot`; False if there was nothing."""
         ...
 
 
@@ -177,6 +205,7 @@ class NoopBackend:
         index: int,
         opened: OpenedPath,
         path: StoredPath,
+        budget: TreeBudget,
         deadline: float,
     ) -> SnapshotTarget:
         raise SnapshotError(SnapshotFault.UNSUPPORTED)
@@ -184,11 +213,27 @@ class NoopBackend:
     def open_stored(self, snapshot: SnapshotId, index: int, target: SnapshotTarget) -> int:
         raise SnapshotError(SnapshotFault.STORED_COPY_BAD)
 
+    def load_meta(self, snapshot: SnapshotId, index: int) -> TreeMeta:
+        return TreeMeta()
+
     def delete(self, snapshot: SnapshotId, index: int, target: SnapshotTarget) -> None:
         return None
 
+    def names(self) -> list[SnapshotId]:
+        return []
+
+    def delete_all(self, snapshot: SnapshotId) -> bool:
+        return False
+
 
 # --- copy --------------------------------------------------------------------------------------
+
+
+def _snapshot_id(name: str) -> SnapshotId | None:
+    try:
+        return SnapshotId(name)
+    except InvalidValueError:
+        return None
 
 
 @final
@@ -197,9 +242,8 @@ class CopyBackend:
 
     kind = BackendKind.COPY
 
-    def __init__(self, directory: Path, limits: TreeLimits) -> None:
+    def __init__(self, directory: Path) -> None:
         self._root = open_private_directory(directory)
-        self._limits = limits
 
     def accepts(self, opened: OpenedPath) -> bool:
         return True
@@ -222,6 +266,7 @@ class CopyBackend:
         index: int,
         opened: OpenedPath,
         path: StoredPath,
+        budget: TreeBudget,
         deadline: float,
     ) -> SnapshotTarget:
         try:
@@ -229,7 +274,7 @@ class CopyBackend:
         except OSError:
             raise SnapshotError(SnapshotFault.IO) from None
         try:
-            stats = copy_object(opened.fd, directory, str(index), self._limits, deadline)
+            stats = copy_object(opened.fd, directory, str(index), budget, deadline)
         except SnapshotError:
             self.delete(snapshot, index, SnapshotTarget(path=path, backend=BackendKind.COPY))
             raise
@@ -251,6 +296,16 @@ class CopyBackend:
         finally:
             os.close(directory)
 
+    def load_meta(self, snapshot: SnapshotId, index: int) -> TreeMeta:
+        try:
+            directory = self._snapshot_directory(snapshot, create=False)
+        except OSError:
+            raise SnapshotError(SnapshotFault.STORED_COPY_BAD) from None
+        try:
+            return load_meta(directory, str(index))
+        finally:
+            os.close(directory)
+
     def delete(self, snapshot: SnapshotId, index: int, target: SnapshotTarget) -> None:
         """Deletes the saved copy of one path, and the snapshot's directory once it is empty."""
         deadline = _deadline(timedelta(minutes=5))
@@ -262,6 +317,7 @@ class CopyBackend:
             raise SnapshotError(SnapshotFault.IO) from None
         try:
             remove_entry(directory, str(index), deadline)
+            remove_entry(directory, str(index) + META_SUFFIX, deadline)
         finally:
             os.close(directory)
         with contextlib.suppress(OSError):  # not empty: other paths of the snapshot remain
@@ -282,12 +338,13 @@ class CopyBackend:
             raise SnapshotError(SnapshotFault.IO) from None
         return True
 
-    def names(self) -> list[str]:
+    def names(self) -> list[SnapshotId]:
         try:
             with os.scandir(self._root) as scan:
-                return [entry.name for entry in scan]
+                found = [_snapshot_id(entry.name) for entry in scan]
         except OSError:
             raise SnapshotError(SnapshotFault.IO) from None
+        return [each for each in found if each is not None]
 
 
 # --- btrfs -------------------------------------------------------------------------------------
@@ -297,11 +354,18 @@ class BtrfsTool(Protocol):
     """What the btrfs backend needs of the file system and the `btrfs` program (a fake in the
     tests; `BtrfsCli` for real)."""
 
-    def same_filesystem(self, opened: OpenedPath, directory: int) -> bool: ...
+    def is_btrfs(self, fd: int) -> bool:
+        """Whether `fd` is on btrfs (`f_type`: the `f_fsid` of two subvolumes differs)."""
+        ...
 
     def subvolume_root(self, opened: OpenedPath, components: int) -> tuple[int, int] | None:
         """(a descriptor for the root of the subvolume `opened` is in, how many directories
         up it is) or None if it is not on a btrfs subvolume. The caller closes the descriptor."""
+        ...
+
+    def has_nested_subvolume(self, fd: int, max_files: int, deadline: float) -> bool:
+        """Whether a subvolume is nested below the folder `fd` (a snapshot leaves it out), or the
+        walk could not tell: fail closed."""
         ...
 
     def snapshot(self, source_fd: int, directory: int, name: str) -> None:
@@ -317,6 +381,11 @@ class BtrfsTool(Protocol):
     def delete(self, directory: int, name: str) -> None: ...
 
 
+@functools.cache
+def _libc() -> ctypes.CDLL:
+    return ctypes.CDLL(None, use_errno=True)
+
+
 @final
 class BtrfsCli:
     """The real thing: `btrfs subvolume snapshot -r` and `btrfs subvolume delete`, run with an
@@ -326,9 +395,14 @@ class BtrfsCli:
     def __init__(self, program: str) -> None:
         self._program = program
 
-    def same_filesystem(self, opened: OpenedPath, directory: int) -> bool:
-        first, second = os.fstatvfs(opened.fd).f_fsid, os.fstatvfs(directory).f_fsid
-        return first != 0 and first == second
+    def is_btrfs(self, fd: int) -> bool:
+        if not Path("/proc/self/fd").is_dir():
+            return False  # statfs's layout is Linux's
+        buffer = ctypes.create_string_buffer(256)
+        if _libc().fstatfs(fd, buffer) != 0:
+            return False
+        (kind,) = struct.unpack_from("@l", buffer.raw)
+        return (int(kind) & 0xFFFFFFFF) == _BTRFS_SUPER_MAGIC
 
     def subvolume_root(self, opened: OpenedPath, components: int) -> tuple[int, int] | None:
         current = os.dup(opened.fd)
@@ -346,6 +420,9 @@ class BtrfsCli:
             pass
         os.close(current)
         return None
+
+    def has_nested_subvolume(self, fd: int, max_files: int, deadline: float) -> bool:
+        return contains_subvolume(fd, max_files=max_files, deadline=deadline)
 
     def _run(self, arguments: list[str], fds: tuple[int, ...]) -> None:
         try:
@@ -385,7 +462,7 @@ class BtrfsCli:
 
 @final
 class BtrfsBackend:
-    """A read-only subvolume snapshot in the dedicated subvolume, of a folder on its file system."""
+    """A read-only subvolume snapshot in the dedicated subvolume, of a folder on btrfs."""
 
     kind = BackendKind.BTRFS
 
@@ -400,7 +477,11 @@ class BtrfsBackend:
             os.close(root)
 
     def accepts(self, opened: OpenedPath) -> bool:
-        return opened.kind is FileKind.DIRECTORY and self._tool.same_filesystem(opened, self._root)
+        return (
+            opened.kind is FileKind.DIRECTORY
+            and self._tool.is_btrfs(opened.fd)
+            and self._tool.is_btrfs(self._root)
+        )
 
     @staticmethod
     def _name(snapshot: SnapshotId, index: int) -> str:
@@ -412,6 +493,7 @@ class BtrfsBackend:
         index: int,
         opened: OpenedPath,
         path: StoredPath,
+        budget: TreeBudget,
         deadline: float,
     ) -> SnapshotTarget:
         found = self._tool.subvolume_root(opened, len(path.components))
@@ -420,7 +502,7 @@ class BtrfsBackend:
         root_fd, depth = found
         name = self._name(snapshot, index)
         try:
-            if contains_subvolume(opened.fd, max_files=self._limits.max_files, deadline=deadline):
+            if self._tool.has_nested_subvolume(opened.fd, self._limits.max_files, deadline):
                 raise SnapshotError(SnapshotFault.UNSUPPORTED)  # a snapshot would leave it out
             self._tool.snapshot(root_fd, self._root, name)
         finally:
@@ -453,15 +535,62 @@ class BtrfsBackend:
             raise SnapshotError(SnapshotFault.STORED_COPY_BAD)
         return current
 
+    def load_meta(self, snapshot: SnapshotId, index: int) -> TreeMeta:
+        return TreeMeta()  # a real snapshot keeps special files and modes itself
+
     def _tool_delete(self, name: str) -> None:
         with contextlib.suppress(SnapshotError):
             self._tool.delete(self._root, name)
 
+    def _exists(self, name: str) -> bool:
+        try:
+            os.stat(name, dir_fd=self._root, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True  # not known to be gone: let the tool say
+        return True
+
     def delete(self, snapshot: SnapshotId, index: int, target: SnapshotTarget) -> None:
-        self._tool.delete(self._root, self._name(snapshot, index))
+        name = self._name(snapshot, index)
+        if self._exists(name):  # a subvolume that is gone is deleted
+            self._tool.delete(self._root, name)
+
+    def _entries(self) -> list[tuple[SnapshotId, str]]:
+        try:
+            with os.scandir(self._root) as scan:
+                names = [entry.name for entry in scan]
+        except OSError:
+            raise SnapshotError(SnapshotFault.IO) from None
+        found: list[tuple[SnapshotId, str]] = []
+        for name in names:
+            snapshot = _snapshot_id(name.rsplit("-", 1)[0])
+            if snapshot is not None:
+                found.append((snapshot, name))
+        return found
+
+    def names(self) -> list[SnapshotId]:
+        return sorted({snapshot for snapshot, _ in self._entries()}, key=str)
+
+    def delete_all(self, snapshot: SnapshotId) -> bool:
+        mine = [name for each, name in self._entries() if each == snapshot]
+        for name in mine:
+            self._tool.delete(self._root, name)
+        return bool(mine)
 
 
 # --- the manager -------------------------------------------------------------------------------
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class TakeResult:
+    """What `SnapshotManager.take` made: the targets, and, for each path a backend that accepted
+    it could not save so that the next did (`index`, the backend that failed, why), the fallbacks:
+    the broker audits them."""
+
+    targets: tuple[SnapshotTarget, ...]
+    fallbacks: tuple[tuple[int, BackendKind, SnapshotFault], ...] = ()
 
 
 @final
@@ -473,7 +602,7 @@ class SnapshotManager:
         self, settings: SnapshotSettings, directory: Path, btrfs: BtrfsTool | None
     ) -> None:
         self._settings = settings
-        limits = TreeLimits(max_bytes=settings.max_bytes, max_files=settings.max_files)
+        self._limits = TreeLimits(max_bytes=settings.max_bytes, max_files=settings.max_files)
         self._copy: CopyBackend | None = None
         self._btrfs: BtrfsBackend | None = None
         backends: list[SnapshotBackend] = []
@@ -483,15 +612,29 @@ class SnapshotManager:
             case SnapshotMode.AUTO | SnapshotMode.COPY:
                 if settings.mode is SnapshotMode.AUTO and settings.btrfs_directory is not None:
                     tool = btrfs if btrfs is not None else BtrfsCli(settings.btrfs_program)
-                    self._btrfs = BtrfsBackend(settings.btrfs_directory, tool, limits)
+                    self._btrfs = BtrfsBackend(settings.btrfs_directory, tool, self._limits)
                     backends.append(self._btrfs)
-                self._copy = CopyBackend(directory, limits)
+                self._copy = CopyBackend(directory)
                 backends.append(self._copy)
         self._backends = tuple(backends)
 
     @property
     def copy_store(self) -> CopyBackend | None:
         return self._copy
+
+    def stored_names(self) -> list[SnapshotId]:
+        """Every snapshot something is saved for, in any backend (for finding what nobody owns)."""
+        found: set[SnapshotId] = set()
+        for backend in self._backends:
+            found.update(backend.names())
+        return sorted(found, key=str)
+
+    def delete_all(self, snapshot: SnapshotId) -> bool:
+        """Delete whatever any backend saved for `snapshot`; False if there was nothing."""
+        deleted = False
+        for backend in self._backends:
+            deleted = backend.delete_all(snapshot) or deleted
+        return deleted
 
     def close(self) -> None:
         for backend in (self._copy, self._btrfs):
@@ -508,20 +651,25 @@ class SnapshotManager:
         self,
         snapshot: SnapshotId,
         targets: Sequence[tuple[StoredPath, OpenedPath]],
-    ) -> tuple[SnapshotTarget, ...]:
+    ) -> TakeResult:
         """Save every path, or none: a path no backend can save fails the whole snapshot and what
-        was saved of the others is deleted. `SnapshotError` says why (the last backend's fault)."""
+        was saved of the others is deleted. One budget (bytes, entries) is shared by all the
+        paths: the cap is the run's. `SnapshotError` says why (the last backend's fault)."""
         deadline = _deadline(self._settings.timeout)
+        budget = TreeBudget(self._limits)
         done: list[tuple[SnapshotBackend, int, SnapshotTarget]] = []
+        fallbacks: list[tuple[int, BackendKind, SnapshotFault]] = []
         try:
             for index, (path, opened) in enumerate(targets):
-                done.append(self._take_one(snapshot, index, path, opened, deadline))
+                done.append(
+                    self._take_one(snapshot, index, path, opened, budget, deadline, fallbacks)
+                )
         except BaseException:
             for backend, index, target in done:
                 with contextlib.suppress(SnapshotError):
                     backend.delete(snapshot, index, target)
             raise
-        return tuple(target for _, _, target in done)
+        return TakeResult(tuple(target for _, _, target in done), tuple(fallbacks))
 
     def _take_one(
         self,
@@ -529,16 +677,24 @@ class SnapshotManager:
         index: int,
         path: StoredPath,
         opened: OpenedPath,
+        budget: TreeBudget,
         deadline: float,
+        fallbacks: list[tuple[int, BackendKind, SnapshotFault]],
     ) -> tuple[SnapshotBackend, int, SnapshotTarget]:
         failure = SnapshotError(SnapshotFault.UNSUPPORTED)
         for backend in self._backends:
             if not backend.accepts(opened):
                 continue
             try:
-                return backend, index, backend.take(snapshot, index, opened, path, deadline)
+                return (
+                    backend,
+                    index,
+                    backend.take(snapshot, index, opened, path, budget, deadline),
+                )
             except SnapshotError as error:
                 failure = error
+                if backend.kind is BackendKind.BTRFS:
+                    fallbacks.append((index, backend.kind, error.fault))
                 if error.fault in {SnapshotFault.TIMEOUT, SnapshotFault.TOO_MANY_BYTES}:
                     break  # a slower or larger try elsewhere would not do better
         raise failure
@@ -550,12 +706,13 @@ class SnapshotManager:
         if record.no_undo or len(opened) != len(record.targets):
             raise SnapshotError(SnapshotFault.STORED_COPY_BAD)
         deadline = _deadline(self._settings.timeout)
-        limits = TreeLimits(max_bytes=2**62, max_files=2**62)
         stats: list[RestoreStats] = []
         for index, (target, onto) in enumerate(zip(record.targets, opened, strict=True)):
-            stored = self._backend_of(target.backend).open_stored(record.id, index, target)
+            backend = self._backend_of(target.backend)
+            stored = backend.open_stored(record.id, index, target)
             try:
-                stats.append(restore_object(stored, onto.fd, limits, deadline))
+                meta = backend.load_meta(record.id, index)
+                stats.append(restore_object(stored, onto.fd, meta, deadline))
             finally:
                 os.close(stored)
         return stats

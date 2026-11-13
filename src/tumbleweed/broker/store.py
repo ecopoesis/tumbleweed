@@ -34,6 +34,7 @@ import os
 import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Final, Literal, Self, final
@@ -141,23 +142,42 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
         ),
     ),
     # S21: snapshots. The record is the JSON of a `SnapshotRecord`; the columns are what is
-    # queried (the newest not-yet-undone run snapshot of a task, the oldest to expire).
+    # queried. `seq` is the order they were taken in (the clock can step back): "the most recent"
+    # is the highest. `superseded_at` is set when a later undo of an overlapping, older snapshot
+    # made this one's changes no longer a thing to undo on its own (D28, H11).
     (
         f"""CREATE TABLE snapshots (
-    id TEXT NOT NULL PRIMARY KEY,
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
     task_id TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('run', 'undo')),
     taken_at INTEGER NOT NULL CHECK (taken_at {_MILLIS}),
     undone_at INTEGER CHECK (undone_at IS NULL OR undone_at {_MILLIS}),
+    superseded_at INTEGER CHECK (superseded_at IS NULL OR superseded_at {_MILLIS}),
     record TEXT NOT NULL CHECK (length(CAST(record AS BLOB)) <= 65536)
 ) STRICT""",
-        "CREATE INDEX snapshots_by_task ON snapshots (task_id, kind, taken_at)",
-        "CREATE INDEX snapshots_by_time ON snapshots (taken_at)",
+        "CREATE INDEX snapshots_by_task ON snapshots (task_id, kind, seq)",
     ),
 )
 
 _GRANTS: Final[TypeAdapter[Grant]] = TypeAdapter(Grant)
 _SNAPSHOTS: Final[TypeAdapter[SnapshotRecord]] = TypeAdapter(SnapshotRecord)
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class StoredSnapshot:
+    """A snapshot with what the database knows of it besides the record: whether it was undone or
+    superseded, and its place in the order they were taken (`seq`)."""
+
+    record: SnapshotRecord
+    undone: bool
+    superseded: bool
+    seq: int
+
+    @property
+    def undoable(self) -> bool:
+        return not (self.record.no_undo or self.undone or self.superseded)
 
 
 def _millis(moment: datetime) -> int:
@@ -695,6 +715,11 @@ class BrokerStore:
         """Forget a snapshot (inside `transaction()`); whether there was one."""
         return self._execute("DELETE FROM snapshots WHERE id = ?", (str(snapshot),)) == 1
 
+    def has_snapshot_row(self, snapshot: SnapshotId) -> bool:
+        """Whether the database has a row for `snapshot`, readable or not: what an orphan check
+        must ask (a record this version cannot read still owns its copy)."""
+        return bool(self._query("SELECT 1 FROM snapshots WHERE id = ?", (str(snapshot),)))
+
     def mark_undone(self, snapshot: SnapshotId, at: datetime) -> bool:
         """Record that a snapshot was undone (inside `transaction()`); False if it already was
         or is not there, so that two undos of one snapshot cannot both go ahead."""
@@ -706,44 +731,67 @@ class BrokerStore:
             == 1
         )
 
-    def snapshot(self, snapshot: SnapshotId) -> tuple[SnapshotRecord, bool] | None:
-        """A snapshot, and whether it was undone; None if there is none (or it cannot be read)."""
+    def mark_superseded(self, snapshots: Sequence[SnapshotId], at: datetime) -> None:
+        """Record that these snapshots' changes were overtaken by an undo (inside
+        `transaction()`)."""
+        for snapshot in snapshots:
+            self._execute(
+                "UPDATE snapshots SET superseded_at = ? "
+                "WHERE id = ? AND superseded_at IS NULL AND undone_at IS NULL",
+                (_millis(at), str(snapshot)),
+            )
+
+    def snapshot(self, snapshot: SnapshotId) -> StoredSnapshot | None:
+        """A snapshot with its state; None if there is none (or it cannot be read)."""
         found = self._snapshots("WHERE id = ?", (str(snapshot),))
         return found[0] if found else None
 
-    def latest_run_snapshot(self, task: TaskId) -> tuple[SnapshotRecord, bool] | None:
-        """The newest `run` snapshot of `task` that has not been undone."""
+    def latest_run_snapshot(self, task: TaskId) -> StoredSnapshot | None:
+        """The newest `run` snapshot of `task` that has been neither undone nor superseded."""
         found = self._snapshots(
-            "WHERE task_id = ? AND kind = 'run' AND undone_at IS NULL "
-            "ORDER BY taken_at DESC, id DESC LIMIT 1",
+            "WHERE task_id = ? AND kind = 'run' AND undone_at IS NULL AND superseded_at IS NULL "
+            "ORDER BY seq DESC LIMIT 1",
             (str(task),),
         )
         return found[0] if found else None
 
-    def recent_snapshots(self, limit: int) -> list[tuple[SnapshotRecord, bool]]:
+    def recent_snapshots(self, limit: int) -> list[StoredSnapshot]:
         """The newest snapshots of every task, newest first."""
-        return self._snapshots("ORDER BY taken_at DESC, id DESC LIMIT ?", (_limit(limit),))
+        return self._snapshots("ORDER BY seq DESC LIMIT ?", (_limit(limit),))
 
-    def oldest_snapshots(self, limit: int) -> list[tuple[SnapshotRecord, bool]]:
+    def oldest_snapshots(self, limit: int) -> list[StoredSnapshot]:
         """The oldest snapshots first (for retention)."""
-        return self._snapshots("ORDER BY taken_at, id LIMIT ?", (_limit(limit),))
+        return self._snapshots("ORDER BY seq LIMIT ?", (_limit(limit),))
+
+    def newer_run_snapshots(self, seq: int) -> list[StoredSnapshot]:
+        """The `run` snapshots taken after `seq` that are still to be undone, oldest first."""
+        return self._snapshots(
+            "WHERE seq > ? AND kind = 'run' AND undone_at IS NULL AND superseded_at IS NULL "
+            "ORDER BY seq LIMIT ?",
+            (seq, MAX_LIST),
+        )
 
     def snapshot_count(self) -> int:
         return _integer(self._query("SELECT count(*) FROM snapshots")[0][0])
 
-    def _snapshots(
-        self, tail: str, parameters: Sequence[object] = ()
-    ) -> list[tuple[SnapshotRecord, bool]]:
-        found: list[tuple[SnapshotRecord, bool]] = []
+    def _snapshots(self, tail: str, parameters: Sequence[object] = ()) -> list[StoredSnapshot]:
+        found: list[StoredSnapshot] = []
         for row in self._query(
-            f"SELECT id, record, undone_at FROM snapshots {tail}",  # noqa: S608  (our own constants)
+            f"SELECT id, record, undone_at, superseded_at, seq FROM snapshots {tail}",  # noqa: S608  (our own constants)
             parameters,
         ):
             try:
                 record = _SNAPSHOTS.validate_json(_text(row[1]), strict=True)
                 if str(record.id) != _text(row[0]):
                     raise StoreCorruptError("a snapshot record disagrees with its row")
-                found.append((record, row[2] is not None))
+                found.append(
+                    StoredSnapshot(
+                        record=record,
+                        undone=row[2] is not None,
+                        superseded=row[3] is not None,
+                        seq=_integer(row[4]),
+                    )
+                )
             except (StoreCorruptError, ValidationError):
                 _log.warning("a snapshot record of the broker's database cannot be read; skipped")
         return found

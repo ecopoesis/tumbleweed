@@ -155,6 +155,7 @@ class PromptCard:
     """For `no_undo`: the places the run may change, spelled out (`visible`), and `cause` why they
     could not be saved: the broker's closed code, shown as our own sentence."""
     cause: str | None = None
+    purpose: str = "run"
 
     @property
     def picks(self) -> bool:
@@ -234,6 +235,7 @@ def card_of(show: ShowPrompt, task_title: str | None = None) -> PromptCard:
         if isinstance(access, NoUndoAccess)
         else (),
         cause=access.cause if isinstance(access, NoUndoAccess) else None,
+        purpose=access.purpose if isinstance(access, NoUndoAccess) else "run",
     )
 
 

@@ -42,6 +42,7 @@ class NoUndoSubject(PolicyModel):
 
     paths: Annotated[tuple[StoredPath, ...], Field(min_length=1, max_length=16)]
     cause: SnapshotFault
+    purpose: Literal["run", "undo"] = "run"
 
 
 @final

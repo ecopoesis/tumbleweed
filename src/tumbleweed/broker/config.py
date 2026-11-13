@@ -63,6 +63,27 @@ FS_CALLS_PER_PROMPT: Final = 3
 rules again after it (a picker resolves after it and builds rules once more)."""
 _MAX_EXTRA: Final = 64
 GIB: Final = 1024**3
+MAX_SNAPSHOT_TIMEOUT: Final = timedelta(minutes=5)
+"""The longest taking or restoring a snapshot may be allowed."""
+SNAPSHOT_SLACK: Final = timedelta(seconds=5)
+"""What the file system worker's deadline allows beyond the snapshot's own (the tree walks check
+their own deadline, so the thread ends by itself)."""
+RUN_SETUP_WAIT: Final = (
+    timedelta(seconds=20)  # opening the grants and measuring the workspace
+    + timedelta(seconds=60)  # making room: deleting the oldest snapshots
+    + MAX_SNAPSHOT_TIMEOUT
+    + SNAPSHOT_SLACK  # the snapshot of what the run may write
+    + MAX_PROMPT_TIMEOUT  # and, if it cannot be taken, the user's answer to "no undo?"
+)
+"""What a caller of `run_in_sandbox` waits for the broker's setup, on top of the run's wall time
+and the launcher's own allowance (S21, D28 H13). The agent and the client derive their deadlines
+from it, so that they cannot give up while the broker still asks."""
+UNDO_WAIT: Final = (
+    timedelta(minutes=3)  # waiting for another undo, and stopping the runs in the way
+    + 3 * (MAX_SNAPSHOT_TIMEOUT + SNAPSHOT_SLACK)  # the safety snapshot, the restore, a rollback
+    + MAX_PROMPT_TIMEOUT  # "undo without being able to undo this undo?"
+)
+"""What a caller of an undo waits."""
 
 
 class SnapshotMode(StrEnum):
@@ -113,7 +134,7 @@ class SnapshotSettings:
         if self.store_max_bytes < self.max_bytes:
             raise InvalidValueError("store_max_bytes must hold at least one snapshot")
         _require_duration("snapshot retention", self.retention, maximum=timedelta(days=3650))
-        _require_duration("snapshot timeout", self.timeout, maximum=timedelta(hours=1))
+        _require_duration("snapshot timeout", self.timeout, maximum=MAX_SNAPSHOT_TIMEOUT)
         if not self.btrfs_program or "\0" in self.btrfs_program or len(self.btrfs_program) > 1024:
             raise InvalidValueError("btrfs_program must be a program name or path")
 

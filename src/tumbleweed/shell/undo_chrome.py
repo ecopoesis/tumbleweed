@@ -38,6 +38,16 @@ class UndoPanel(Gtk.Box):
         self._close.connect("clicked", lambda _button: self.set_visible(False))
         header.append(self._close)
         self.append(header)
+        # Ours, not the model's: what Undo does, so that the person who clicks it knows (D28).
+        self.append(
+            plain_label(
+                "Undo puts the files in those places back as they were before that change, "
+                "including over any edits you made there since. The undo itself is saved first "
+                "and can be undone from this list.",
+                wrap=True,
+                css_classes=["caption", "dim-label"],
+            )
+        )
         self._note = plain_label("", wrap=True, css_classes=["caption", "dim-label"])
         self.append(self._note)
         self._rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)

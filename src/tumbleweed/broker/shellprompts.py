@@ -80,6 +80,7 @@ def _access_of(prompt: GrantPrompt) -> PromptedAccess:
         if prompt.no_undo is not None:
             return NoUndoAccess(
                 kind="no_undo",
+                purpose=prompt.no_undo.purpose,
                 paths=tuple(stored.path for stored in prompt.no_undo.paths),
                 cause=_cause_of(prompt.no_undo.cause),
             )

@@ -23,7 +23,7 @@ from tumbleweed.agent.tasks import TaskError, TaskSession
 from tumbleweed.agent.tools import ToolError, ToolName, ToolRegistry
 from tumbleweed.agent.untrusted import MAX_FRAMED_BYTES, MAX_NAME_CHARS, framed, spelled
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
-from tumbleweed.broker.config import PROMPT_WAIT
+from tumbleweed.broker.config import PROMPT_WAIT, UNDO_WAIT
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.ids import RunId, TaskId
 from tumbleweed.core.types import WorkspaceRelPath
@@ -43,7 +43,7 @@ BROKER_SECONDS: Final = 20.0  # a file system call, or a listing
 READ_LIMIT: Final = MAX_FILE_BYTES  # what the wire carries; the model is shown MAX_FRAMED_BYTES
 MAX_LISTED: Final = 200
 _PROMPT_SECONDS: Final = PROMPT_WAIT.total_seconds() + 10.0
-_UNDO_SECONDS: Final = 300.0  # the broker's own bound on an undo (its snapshot and restore)
+_UNDO_SECONDS: Final = UNDO_WAIT.total_seconds()  # the broker's own bound on an undo
 
 
 type _Task = TaskId
@@ -230,12 +230,22 @@ def register_access_tools(registry: ToolRegistry, tasks: TaskSession, link: Brok
     async def undo_last_change(arguments: UndoInput) -> str:
         async def undo(client: BrokerClient, task: "_Task", run: "_Run") -> str:
             result = await client.undo_last_change(task)
-            return (
+            text = (
                 f"Undone: {result.paths} place{'s' if result.paths != 1 else ''} put back as "
                 f"they were before the last change ({result.written} files written back, "
-                f"{result.removed} new ones removed). The user can undo this too, from the "
-                "undo list."
+                f"{result.removed} new ones removed)."
             )
+            if result.skipped:
+                text += (
+                    f" {result.skipped} socket or device entries that were there before could "
+                    "not be recreated."
+                )
+            if result.superseded:
+                text += (
+                    f" {result.superseded} later change{'s' if result.superseded != 1 else ''} "
+                    "to the same places can no longer be undone one by one."
+                )
+            return text + " The user can undo this too, from the undo list."
 
         return await ask(undo, _UNDO_SECONDS)
 

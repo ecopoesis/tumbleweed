@@ -24,7 +24,7 @@ from datetime import timedelta
 from types import TracebackType
 from typing import Final, Literal, Self, final
 
-from tumbleweed.broker.config import PROMPT_WAIT
+from tumbleweed.broker.config import PROMPT_WAIT, RUN_SETUP_WAIT, UNDO_WAIT
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId
 from tumbleweed.core.types import ToolVersion, WorkspaceRelPath
@@ -87,9 +87,9 @@ _log = logging.getLogger(__name__)
 HEARTBEAT: Final = timedelta(seconds=30)
 """How often a quiet connection is pinged. The broker's idle timeout is three times this."""
 _PING_TIMEOUT: Final = timedelta(seconds=10)
-_RUN_SETUP: Final = timedelta(seconds=60) + PROMPT_WAIT
-"""A run waits for its snapshot and, if none can be saved, for the user's answer (S21)."""
-_UNDO_WAIT: Final = timedelta(minutes=5)
+_RUN_SETUP: Final = timedelta(seconds=60) + RUN_SETUP_WAIT
+"""A run waits for its setup, its snapshot and, if none can be saved, the user (S21)."""
+_UNDO_WAIT: Final = UNDO_WAIT
 
 
 class BrokerRefused(TumbleweedError):  # noqa: N818  (an answer, not a failure of the transport)

@@ -674,7 +674,7 @@
     },
     "NoUndoAccess": {
       "additionalProperties": false,
-      "description": "What the broker asks in the \"no undo\" prompt (S21, I13): `paths` (canonical, the places a\nrun may change) could not be saved, `cause` says why, and the user may let this one run go\nahead with no undo. Only the broker sends it, in a `ShowPrompt`; a model cannot request it.",
+      "description": "What the broker asks in the \"no undo\" prompt (S21, I13): `paths` (canonical, the places a\nrun may change) could not be saved, `cause` says why, and the user may let this one run go\nahead with no undo (`purpose` `run`), or, for an undo, `paths` are what is there now and could\nnot be saved first: the user may let the undo go ahead without being able to undo it\n(`purpose` `undo`). Only the broker sends it, in a `ShowPrompt`; a model cannot request it.",
       "properties": {
         "cause": {
           "enum": [
@@ -706,6 +706,15 @@
           "minItems": 1,
           "title": "Paths",
           "type": "array"
+        },
+        "purpose": {
+          "default": "run",
+          "enum": [
+            "run",
+            "undo"
+          ],
+          "title": "Purpose",
+          "type": "string"
         }
       },
       "required": [
@@ -1638,6 +1647,11 @@
           "title": "Snapshot",
           "type": "string"
         },
+        "superseded": {
+          "default": false,
+          "title": "Superseded",
+          "type": "boolean"
+        },
         "taken_at": {
           "format": "date-time",
           "title": "Taken At",
@@ -2020,14 +2034,33 @@
           "type": "integer"
         },
         "safety": {
-          "pattern": "^snap_[0-7][0-9a-hjkmnp-tv-z]{25}$",
-          "title": "Safety",
-          "type": "string"
+          "anyOf": [
+            {
+              "pattern": "^snap_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Safety"
+        },
+        "skipped": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Skipped",
+          "type": "integer"
         },
         "snapshot": {
           "pattern": "^snap_[0-7][0-9a-hjkmnp-tv-z]{25}$",
           "title": "Snapshot",
           "type": "string"
+        },
+        "superseded": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Superseded",
+          "type": "integer"
         },
         "written": {
           "minimum": 0,

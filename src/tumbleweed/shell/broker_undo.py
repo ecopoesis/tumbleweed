@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Final, final
 from tumbleweed.agent.broker_link import BrokerLink, BrokerUnavailableError
 from tumbleweed.agent.runtime import MainThreadDispatcher
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
+from tumbleweed.broker.config import UNDO_WAIT
 from tumbleweed.core.ids import SnapshotId
 from tumbleweed.ipc.broker_messages import SnapshotInfo
 from tumbleweed.shell.viewmodel.prompts import plain_reason
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 _LIST_SECONDS: Final = 20.0
-_UNDO_SECONDS: Final = 300.0
+_UNDO_SECONDS: Final = UNDO_WAIT.total_seconds()
 
 
 @final
@@ -57,10 +58,12 @@ class BrokerUndoPort:
             except BrokerRefused as refusal:
                 text, _ = plain_reason(f"Not undone: {refusal.message}.", 300)
                 return UndoOutcome("refused", text)
-            return UndoOutcome(
-                "undone",
-                f"Undone: {result.paths} place(s) put back. You can undo this too.",
+            note = (
+                " You can undo this too."
+                if result.safety is not None
+                else " What was there before could not be saved, so this cannot be undone."
             )
+            return UndoOutcome("undone", f"Undone: {result.paths} place(s) put back.{note}")
 
         def finished(future: "concurrent.futures.Future[UndoOutcome]") -> None:
             try:

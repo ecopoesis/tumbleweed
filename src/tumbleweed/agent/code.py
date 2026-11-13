@@ -26,7 +26,7 @@ from tumbleweed.agent.tasks import TaskError, TaskSession
 from tumbleweed.agent.tools import ToolError, ToolName, ToolRegistry
 from tumbleweed.agent.untrusted import PROGRAM_INTRO, framed
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
-from tumbleweed.broker.config import PROMPT_WAIT
+from tumbleweed.broker.config import RUN_SETUP_WAIT
 from tumbleweed.core.ids import RunId, TaskId
 from tumbleweed.ipc.broker_messages import RunResult
 from tumbleweed.sandbox.handler_protocol import (
@@ -47,9 +47,10 @@ HANDLER_SECONDS: Final = 20
 HANDLER_OUTPUT_BYTES: Final = 64 * 1024
 RUN_CODE_OUTPUT_BYTES: Final = 64 * 1024
 FRAME_BYTES: Final = 5 * 1024  # of each of stdout and stderr in a `run_code` result
-_SETUP_SECONDS: Final = 20.0 + PROMPT_WAIT.total_seconds()
-"""The broker's allowance on top of a run's wall time: its setup, and, for a run that can write, the
-snapshot and, if none can be saved, the user's answer to "run without undo?" (S21, I13)."""
+_SETUP_SECONDS: Final = RUN_SETUP_WAIT.total_seconds() + 20.0
+"""The broker's allowance on top of a run's wall time: the launcher's own, and the broker's setup,
+which for a run that can write includes its snapshot and the user's answer to "run without undo?"
+(S21, D28 H13: derived from the broker's constants, so the two cannot drift apart)."""
 
 type HandlerFailure = Literal[
     "input_too_large",
