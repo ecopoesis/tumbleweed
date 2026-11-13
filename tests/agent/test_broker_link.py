@@ -272,7 +272,8 @@ class TestTheSpawner:
                 await attempt
             await asyncio.sleep(0.3)
             assert len(made) == 1  # the process was made all the same, and recorded
-            assert spawner._process is made[0]  # noqa: SLF001
+            recorded: object = spawner._process  # noqa: SLF001
+            assert recorded is made[0]
             assert await spawner() is made[0]
 
         asyncio.run(scenario())
