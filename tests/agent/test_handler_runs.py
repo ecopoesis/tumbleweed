@@ -446,3 +446,15 @@ class TestWhenSomethingBreaks:
         r.runs.stop()
 
         assert r.executor.cancelled == 0
+
+
+def test_an_outcome_with_neither_values_nor_failure_is_not_a_result() -> None:
+    r = rig()
+    r.event("adjust", "button", "click")
+    r.scheduler.advance(1)
+    before = r.runtime.store.snapshot()
+
+    r.executor.finish(HandlerOutcome())
+
+    assert r.runtime.store.snapshot() == before
+    assert r.notices.lines[-1] == "The tool's code did not return a result it can use."
