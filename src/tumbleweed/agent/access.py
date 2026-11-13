@@ -1,7 +1,8 @@
 """The model's tools for tasks and for the user's files (S19, D26).
 
-`start_task`, `request_access`, `list_workspace`, `list_dir` and `read_file`. All of them go to the
-broker, which decides (grants, deny rules, taint, the symlink rules of I11); this module only
+`start_task`, `request_access`, `undo_last_change`, `list_workspace`, `list_dir` and `read_file`.
+All of them go to the broker, which decides (grants, deny rules, taint, the symlink rules of
+I11); this module only
 asks, bounds and frames. A path the model gives is sent to the broker as the text it is: nothing
 here resolves, stats or opens it. What comes back is a fixed message, or data in a frame
 (`tumbleweed.agent.untrusted`) with a size limit.
@@ -35,12 +36,14 @@ from tumbleweed.ipc.broker_messages import (
     PickAccess,
     ReadAccess,
     RequestedAccess,
+    WriteAccess,
 )
 
 BROKER_SECONDS: Final = 20.0  # a file system call, or a listing
 READ_LIMIT: Final = MAX_FILE_BYTES  # what the wire carries; the model is shown MAX_FRAMED_BYTES
 MAX_LISTED: Final = 200
 _PROMPT_SECONDS: Final = PROMPT_WAIT.total_seconds() + 10.0
+_UNDO_SECONDS: Final = 300.0  # the broker's own bound on an undo (its snapshot and restore)
 
 
 type _Task = TaskId
@@ -70,20 +73,27 @@ class StartTaskInput(BaseModel):
 class RequestAccessInput(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
-    kind: Literal["read", "network", "pick_file", "pick_folder"] = Field(
+    kind: Literal["read", "write", "network", "pick_file", "pick_folder"] = Field(
         description=(
-            "read: a file or folder you name by absolute path. pick_file or pick_folder: the "
-            "user chooses in a picker. network: full network access."
+            "read: a file or folder you name by absolute path. write: the same, to change it "
+            "(for the task only; the user is asked and every run that can change it is saved "
+            "first so that undo_last_change can put it back). pick_file or pick_folder: the "
+            "user chooses in a picker (to read). network: full network access."
         )
     )
     path: str | None = Field(
         default=None,
         max_length=MAX_PATH_CHARS,
-        description="Absolute path; for kind read only.",
+        description="Absolute path; for kind read and write only.",
     )
     reason: str = Field(
         max_length=MAX_REASON_CHARS, description="Why you need it, in the user's words."
     )
+
+
+@final
+class UndoInput(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
 
 @final
@@ -179,13 +189,17 @@ def register_access_tools(registry: ToolRegistry, tasks: TaskSession, link: Brok
                 if arguments.path is None:
                     raise ToolError("kind read needs a path.")
                 access = ReadAccess(kind="fs.read", path=arguments.path)
+            case "write":
+                if arguments.path is None:
+                    raise ToolError("kind write needs a path.")
+                access = WriteAccess(kind="fs.write", path=arguments.path)
             case "network":
                 access = NetworkAccess(kind="net.full")
             case "pick_file":
                 access = PickAccess(kind="fs.pick", choose="file")
             case "pick_folder":
                 access = PickAccess(kind="fs.pick", choose="folder")
-        if arguments.kind != "read" and arguments.path is not None:
+        if arguments.kind not in ("read", "write") and arguments.path is not None:
             raise ToolError(f"kind {arguments.kind} takes no path.")
 
         async def grant(client: BrokerClient, task: "_Task", run: "_Run") -> str:
@@ -212,6 +226,18 @@ def register_access_tools(registry: ToolRegistry, tasks: TaskSession, link: Brok
             return text
 
         return await ask(grant, _PROMPT_SECONDS)
+
+    async def undo_last_change(arguments: UndoInput) -> str:
+        async def undo(client: BrokerClient, task: "_Task", run: "_Run") -> str:
+            result = await client.undo_last_change(task)
+            return (
+                f"Undone: {result.paths} place{'s' if result.paths != 1 else ''} put back as "
+                f"they were before the last change ({result.written} files written back, "
+                f"{result.removed} new ones removed). The user can undo this too, from the "
+                "undo list."
+            )
+
+        return await ask(undo, _UNDO_SECONDS)
 
     async def list_workspace(arguments: WorkspaceInput) -> str:
         try:
@@ -257,6 +283,17 @@ def register_access_tools(registry: ToolRegistry, tasks: TaskSession, link: Brok
         RequestAccessInput,
         request_access,
         timeout_seconds=_PROMPT_SECONDS + 5.0,
+    )
+    registry.register(
+        ToolName("undo_last_change"),
+        "Undo the most recent change that code in this task made to the user's files (a run "
+        "with write access that has not been undone yet). Takes no arguments. It restores "
+        "what was there before that run, including files it deleted, and takes away files it "
+        "made; everything in the changed places goes back to how it was, later edits too. The "
+        "user can undo the undo.",
+        UndoInput,
+        undo_last_change,
+        timeout_seconds=_UNDO_SECONDS + 5.0,
     )
     registry.register(
         ToolName("list_workspace"),
