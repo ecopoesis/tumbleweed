@@ -44,6 +44,7 @@ from tumbleweed.ipc.broker_messages import (
     FileContent,
     GrantOutcome,
     ListDir,
+    ListSnapshots,
     ListWorkspace,
     ReadFile,
     ReadWorkspaceFile,
@@ -53,9 +54,13 @@ from tumbleweed.ipc.broker_messages import (
     RevokeGrant,
     RunInSandbox,
     RunResult,
+    SnapshotList,
     StartTask,
     TaskEnded,
     TaskStarted,
+    UndoLastChange,
+    UndoResult,
+    UndoSnapshot,
 )
 from tumbleweed.ipc.prompt_messages import (
     AnswerPrompt,
@@ -121,6 +126,9 @@ RequestBody = Annotated[
     | ListWorkspace
     | ListDir
     | RunInSandbox
+    | UndoLastChange
+    | UndoSnapshot
+    | ListSnapshots
     | ListTools
     | ShowTool
     | ExportTool
@@ -142,6 +150,8 @@ ResponseBody = Annotated[
     | FileContent
     | DirListing
     | RunResult
+    | UndoResult
+    | SnapshotList
     | ToolList
     | ToolShown
     | ToolBundle
@@ -172,6 +182,9 @@ BROKER_SERVES: Final[tuple[type[Request], ...]] = (
     ListWorkspace,
     ListDir,
     RunInSandbox,
+    UndoLastChange,
+    UndoSnapshot,
+    ListSnapshots,
     ListTools,
     ShowTool,
     ExportTool,

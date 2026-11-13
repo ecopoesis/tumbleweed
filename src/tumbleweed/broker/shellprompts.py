@@ -27,21 +27,29 @@ from typing import Final, final
 from pydantic import ValidationError
 
 from tumbleweed.broker.capabilities import FsRead, FsWrite, NetFull
+from tumbleweed.broker.errors import SnapshotFault
 from tumbleweed.broker.grants import GrantScope
 from tumbleweed.broker.owner import Owner
 from tumbleweed.broker.prompts import Allowed, Denied, GrantPrompt, PromptAnswer
 from tumbleweed.core.ids import PromptId
 from tumbleweed.ipc.broker_messages import (
     NetworkAccess,
+    NoUndoAccess,
     PickAccess,
     ReadAccess,
-    RequestedAccess,
     Scope,
+    SnapshotCause,
     WriteAccess,
 )
 from tumbleweed.ipc.connection import Connection
 from tumbleweed.ipc.errors import ErrorCode, IpcError, RemoteError, UnexpectedResponseError
-from tumbleweed.ipc.prompt_messages import ClosePrompt, PromptClosed, PromptShown, ShowPrompt
+from tumbleweed.ipc.prompt_messages import (
+    ClosePrompt,
+    PromptClosed,
+    PromptedAccess,
+    PromptShown,
+    ShowPrompt,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -65,11 +73,17 @@ class _Waiting:
         self.answer: asyncio.Future[PromptAnswer] = asyncio.get_running_loop().create_future()
 
 
-def _access_of(prompt: GrantPrompt) -> RequestedAccess:
+def _access_of(prompt: GrantPrompt) -> PromptedAccess:
     """The wire form of what the prompt asks, from its structure (the shell renders from this)."""
     capability = prompt.capability
     if capability is None:
-        if prompt.pick is None:  # unreachable: `GrantPrompt` holds a capability or a pick
+        if prompt.no_undo is not None:
+            return NoUndoAccess(
+                kind="no_undo",
+                paths=tuple(stored.path for stored in prompt.no_undo.paths),
+                cause=_cause_of(prompt.no_undo.cause),
+            )
+        if prompt.pick is None:  # unreachable: `GrantPrompt` holds one subject
             raise ValueError("a prompt with nothing to ask")
         return PickAccess(kind="fs.pick", choose=prompt.pick)
     match capability:
@@ -79,6 +93,22 @@ def _access_of(prompt: GrantPrompt) -> RequestedAccess:
             return WriteAccess(kind="fs.write", path=stored.path)
         case NetFull():
             return NetworkAccess(kind="net.full")
+
+
+_CAUSES: Final[dict[SnapshotFault, SnapshotCause]] = {
+    SnapshotFault.TOO_MANY_BYTES: "too_many_bytes",
+    SnapshotFault.TOO_MANY_FILES: "too_many_files",
+    SnapshotFault.TOO_DEEP: "too_deep",
+    SnapshotFault.SPECIAL_FILE: "special_file",
+    SnapshotFault.UNREADABLE: "unreadable",
+    SnapshotFault.UNSUPPORTED: "unsupported",
+    SnapshotFault.TIMEOUT: "timeout",
+    SnapshotFault.STORE_FULL: "store_full",
+}
+
+
+def _cause_of(fault: SnapshotFault) -> SnapshotCause:
+    return _CAUSES.get(fault, "io")
 
 
 def _scopes_of(prompt: GrantPrompt) -> tuple[Scope, ...]:

@@ -24,9 +24,11 @@ from typing import Annotated, Final, Literal, Protocol, Self, final
 from pydantic import AwareDatetime, Field, model_validator
 
 from tumbleweed.broker.capabilities import Capability
+from tumbleweed.broker.errors import SnapshotFault
 from tumbleweed.broker.grants import GrantScope
 from tumbleweed.broker.model import PolicyModel
 from tumbleweed.broker.owner import Owner
+from tumbleweed.broker.paths import StoredPath
 from tumbleweed.core.ids import PromptId, RunId, TaskId, ToolId
 
 MAX_REASON_CHARS: Final = 500
@@ -34,23 +36,35 @@ MAX_PICKED_CHARS: Final = 4096
 
 
 @final
+class NoUndoSubject(PolicyModel):
+    """The "no undo" question (S21, I13): `paths` are what the run may change and could not be
+    saved, for `cause`. The answer `Allowed` (scope `once`) lets this one run go ahead."""
+
+    paths: Annotated[tuple[StoredPath, ...], Field(min_length=1, max_length=16)]
+    cause: SnapshotFault
+
+
+@final
 class GrantPrompt(PolicyModel):
     """What the user is asked, for `run` of `task` (and `tool`, if a tool's handler asked), with
-    the model's `reason`: either to allow `capability`, or to choose a file or folder (`pick`).
-    Exactly one of the two is set."""
+    the model's `reason`: to allow `capability`, to choose a file or folder (`pick`), or to run
+    with no undo (`no_undo`, whose `reason` is empty: there is no model text in it). Exactly one
+    of the three is set."""
 
     task: TaskId
     run: RunId
     tool: ToolId | None = None
     capability: Capability | None = None
     pick: Literal["file", "folder"] | None = None
+    no_undo: NoUndoSubject | None = None
     scopes: Annotated[frozenset[GrantScope], Field(min_length=1)]
     reason: Annotated[str, Field(max_length=MAX_REASON_CHARS)]
 
     @model_validator(mode="after")
     def _one_subject(self) -> Self:
-        if (self.capability is None) == (self.pick is None):
-            raise ValueError("a prompt asks for a capability or for a pick, and for one only")
+        subjects = [self.capability, self.pick, self.no_undo]
+        if sum(subject is not None for subject in subjects) != 1:
+            raise ValueError("a prompt asks for one thing: a capability, a pick or no undo")
         return self
 
 

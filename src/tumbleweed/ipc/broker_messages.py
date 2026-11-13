@@ -18,9 +18,9 @@ broker cannot make sense of at all (a body the schema refuses) is the connection
 
 from typing import Annotated, Final, Literal, final
 
-from pydantic import Field
+from pydantic import AwareDatetime, Field
 
-from tumbleweed.core.ids import GrantId, RunId, TaskId
+from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId
 from tumbleweed.core.types import WorkspaceRelPath
 from tumbleweed.ipc.base import IpcMessage, Request, Response
 
@@ -62,6 +62,7 @@ RefusalReason = Literal[
     "timeout",  # the file system took too long
     "failed",  # the sandbox could not be set up
     "conflict",  # the tool store already has a tool with that ID, and it is not this one (S23)
+    "not_undoable",  # S21: nothing to undo that can be: ran with no undo, already undone
     "unknown_prompt",  # not a prompt this connection was sent, or one already answered or closed
 ]
 
@@ -116,7 +117,8 @@ class ReadAccess(IpcMessage):
 
 @final
 class WriteAccess(IpcMessage):
-    """`fs.write` of `path`. Modelled, and refused by the write gate until S21."""
+    """`fs.write` of `path` (S21): asked for the user to decide, for the task only. A run that
+    mounts it starts only after the broker has saved what it may change (I13)."""
 
     kind: Literal["fs.write"]
     path: Annotated[str, Field(min_length=1, max_length=MAX_PATH_CHARS)]
@@ -141,6 +143,35 @@ class PickAccess(IpcMessage):
 RequestedAccess = Annotated[
     ReadAccess | WriteAccess | NetworkAccess | PickAccess, Field(discriminator="kind")
 ]
+
+
+MAX_SNAPSHOT_PATHS: Final = 16
+SnapshotCause = Literal[
+    "too_many_bytes",
+    "too_many_files",
+    "too_deep",
+    "special_file",
+    "unreadable",
+    "unsupported",
+    "timeout",
+    "store_full",
+    "io",
+]
+"""Why nothing could be saved, as the prompt tells the user (the broker's `SnapshotFault`)."""
+
+
+@final
+class NoUndoAccess(IpcMessage):
+    """What the broker asks in the "no undo" prompt (S21, I13): `paths` (canonical, the places a
+    run may change) could not be saved, `cause` says why, and the user may let this one run go
+    ahead with no undo. Only the broker sends it, in a `ShowPrompt`; a model cannot request it."""
+
+    kind: Literal["no_undo"]
+    paths: Annotated[
+        tuple[Annotated[str, Field(min_length=1, max_length=MAX_PATH_CHARS)], ...],
+        Field(min_length=1, max_length=MAX_SNAPSHOT_PATHS),
+    ]
+    cause: SnapshotCause
 
 
 @final
@@ -308,6 +339,71 @@ class RunResult(Response):
     ]
     landlock: Literal["applied", "unavailable", "unknown"]
     mounted_grants: Annotated[int, Field(ge=0, le=64)]
+
+
+# --- snapshots and undo (S21) ---------------------------------------------------------------
+
+
+@final
+class UndoLastChange(Request):
+    """Undo the most recent not-yet-undone write-enabled run of `task` (the model's tool)."""
+
+    kind: Literal["undo_last_change"]
+    task: TaskId
+
+
+@final
+class UndoSnapshot(Request):
+    """Undo one snapshot, named in the list the chrome shows (the user's action, never a model
+    tool)."""
+
+    kind: Literal["undo_snapshot"]
+    snapshot: SnapshotId
+
+
+@final
+class UndoResult(Response):
+    """An undo was done: `snapshot` was put back after `safety` saved what was there (so the undo
+    can be undone), `paths` places were restored (`written` entries written back, `removed` that
+    were new taken away)."""
+
+    kind: Literal["undo_result"]
+    snapshot: SnapshotId
+    safety: SnapshotId
+    paths: Annotated[int, Field(ge=1, le=MAX_SNAPSHOT_PATHS)]
+    written: Annotated[int, Field(ge=0)]
+    removed: Annotated[int, Field(ge=0)]
+
+
+@final
+class ListSnapshots(Request):
+    """The newest snapshots of every task, newest first (the chrome's undo list)."""
+
+    kind: Literal["list_snapshots"]
+    limit: Annotated[int, Field(ge=1, le=100)] = 50
+
+
+@final
+class SnapshotInfo(IpcMessage):
+    """One snapshot, for the list: what it saved (canonical paths, which are data to show, never
+    to believe), when, and whether it can be put back (`undoable`) or already was."""
+
+    snapshot: SnapshotId
+    kind: Literal["run", "undo"]
+    task: TaskId
+    taken_at: AwareDatetime
+    paths: Annotated[
+        tuple[Annotated[str, Field(min_length=1, max_length=MAX_PATH_CHARS)], ...],
+        Field(min_length=1, max_length=MAX_SNAPSHOT_PATHS),
+    ]
+    undoable: bool
+    undone: bool
+
+
+@final
+class SnapshotList(Response):
+    kind: Literal["snapshot_list"]
+    snapshots: Annotated[tuple[SnapshotInfo, ...], Field(max_length=100)]
 
 
 # --- refusal ---------------------------------------------------------------------------------
