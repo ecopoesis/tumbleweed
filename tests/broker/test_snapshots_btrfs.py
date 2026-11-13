@@ -53,7 +53,7 @@ def test_a_folder_on_btrfs_is_snapshotted_read_only_and_put_back(volume: Path) -
     opened = stored(folder).open()
     try:
         assert opened.kind is FileKind.DIRECTORY
-        taken = manager.take(snapshot, [(stored(folder), opened)])
+        taken = manager.take(snapshot, [(stored(folder), opened)]).targets
         assert taken[0].backend is BackendKind.BTRFS
         saved = volume / "snapshots" / f"{snapshot}-0"
         assert saved.is_dir()
@@ -93,7 +93,7 @@ def test_a_folder_that_holds_a_subvolume_falls_back_to_the_copy(volume: Path) ->
     )
     opened = stored(folder).open()
     try:
-        taken = manager.take(SnapshotId.new(), [(stored(folder), opened)])
+        taken = manager.take(SnapshotId.new(), [(stored(folder), opened)]).targets
         assert taken[0].backend is BackendKind.COPY  # a snapshot would have left `nested` out
     finally:
         opened.close()

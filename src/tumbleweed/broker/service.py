@@ -349,7 +349,7 @@ class _WriteRun:
     """A live run that mounts write grants: where, and the flow that can be stopped (D28, H10)."""
 
     paths: tuple[StoredPath, ...]
-    flow: "asyncio.Future[ResponseBody] | asyncio.Task[object]"
+    flow: "asyncio.Task[object]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2419,6 +2419,7 @@ class BrokerService:
                 return
             now = self._now()
             keep = self._inflight | self._protected
+            anchors = self._anchors(task, stored)
             tiers: list[list[StoredSnapshot]] = [
                 [
                     each
@@ -2430,8 +2431,7 @@ class BrokerService:
                 [
                     each
                     for each in stored
-                    if each.record.task == task
-                    and each.record.id not in self._anchors(task, stored)
+                    if each.record.task == task and each.record.id not in anchors
                 ],
             ]
             gone: set[SnapshotId] = set()

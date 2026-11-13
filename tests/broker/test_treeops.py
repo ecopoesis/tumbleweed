@@ -397,7 +397,7 @@ def exact_copy(tmp_path: Path, root: Path, **limits: int) -> None:
     sfd, dfd = open_dir(root), open_dir(tmp_path / "s")
     name = f"c{len(list((tmp_path / 's').iterdir()))}"
     try:
-        copy_object(sfd, dfd, name, TreeBudget(TreeLimits(**limits)), soon())  # type: ignore[arg-type]  # the limits a test names
+        copy_object(sfd, dfd, name, TreeBudget(TreeLimits(**limits)), soon())
     finally:
         os.close(sfd)
         os.close(dfd)

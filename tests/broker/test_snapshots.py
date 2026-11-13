@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import stat
 from datetime import timedelta
 from pathlib import Path
 
@@ -58,13 +59,17 @@ class FakeBtrfs:
 
     def __init__(self, root: Path, *, nested: bool = False) -> None:
         self.root = root
+        self.nested = nested
         self.snapshots: list[str] = []
         self.deleted: list[str] = []
         self.same = True
         self.inodes: dict[int, int] = {}  # a snapshot's inode numbers are its source's, as btrfs's
 
-    def same_filesystem(self, opened: OpenedPath, directory: int) -> bool:
+    def is_btrfs(self, fd: int) -> bool:
         return self.same
+
+    def has_nested_subvolume(self, fd: int, max_files: int, deadline: float) -> bool:
+        return self.nested
 
     def subvolume_root(self, opened: OpenedPath, components: int) -> tuple[int, int] | None:
         current = os.dup(opened.fd)
@@ -98,7 +103,7 @@ class FakeBtrfs:
         return self.inodes.get(number, number)
 
     def delete(self, directory: int, name: str) -> None:
-        shutil.rmtree(f"/proc/self/fd/{directory}/{name}")
+        shutil.rmtree(f"/proc/self/fd/{directory}/{name}")  # a missing one raises, as btrfs does
         self.deleted.append(name)
 
 
@@ -113,7 +118,7 @@ class TestCopy:
         snapshots = manager(tmp_path)
         snapshot = SnapshotId.new()
         with opened(root) as target:
-            taken = snapshots.take(snapshot, [(stored(root), target)])
+            taken = snapshots.take(snapshot, [(stored(root), target)]).targets
             (root / "a.txt").write_text("CHANGED")
             (root / "new").write_text("n")
             (root / "d" / "b.txt").unlink()
@@ -133,7 +138,7 @@ class TestCopy:
         snapshots = manager(tmp_path)
         snapshot = SnapshotId.new()
         with opened(file) as target:
-            taken = snapshots.take(snapshot, [(stored(file), target)])
+            taken = snapshots.take(snapshot, [(stored(file), target)]).targets
             file.write_text("after")
             snapshots.restore(record(snapshot, taken), [target])
 
@@ -169,7 +174,7 @@ class TestCopy:
         snapshots = manager(tmp_path)
         snapshot = SnapshotId.new()
         with opened(root) as target:
-            taken = snapshots.take(snapshot, [(stored(root), target)])
+            taken = snapshots.take(snapshot, [(stored(root), target)]).targets
         made = record(snapshot, taken)
 
         snapshots.delete(made)
@@ -183,7 +188,7 @@ class TestCopy:
         snapshots = manager(tmp_path)
         snapshot = SnapshotId.new()
         with opened(root) as target:
-            taken = snapshots.take(snapshot, [(stored(root), target)])
+            taken = snapshots.take(snapshot, [(stored(root), target)]).targets
             shutil.rmtree(tmp_path / "store" / str(snapshot))
             with pytest.raises(SnapshotError) as caught:
                 snapshots.restore(record(snapshot, taken), [target])
@@ -206,12 +211,14 @@ class TestNoop:
 
 @pytest.mark.linux  # the fake tool copies through /proc/self/fd
 class TestBtrfs:
-    def build(self, tmp_path: Path) -> tuple[SnapshotManager, FakeBtrfs, Path]:
+    def build(
+        self, tmp_path: Path, *, nested: bool = False
+    ) -> tuple[SnapshotManager, FakeBtrfs, Path]:
         volume = tmp_path / "volume"
         root = make_tree(volume)
         volume.mkdir(exist_ok=True)
         directory = tmp_path / "snapshots-subvolume"
-        tool = FakeBtrfs(volume)
+        tool = FakeBtrfs(volume, nested=nested)
         settings = SnapshotSettings(btrfs_directory=directory)
         return SnapshotManager(settings, tmp_path / "store", tool), tool, root
 
@@ -221,7 +228,7 @@ class TestBtrfs:
         snapshots, tool, root = self.build(tmp_path)
         snapshot = SnapshotId.new()
         with opened(root) as target:
-            taken = snapshots.take(snapshot, [(stored(root), target)])
+            taken = snapshots.take(snapshot, [(stored(root), target)]).targets
             (root / "a.txt").write_text("CHANGED")
             (root / "d" / "b.txt").unlink()
             (root / "created").write_text("c")
@@ -238,11 +245,75 @@ class TestBtrfs:
         assert list((tmp_path / "store").iterdir()) == []  # the copy store was not used
         snapshots.close()
 
+    def test_a_folder_that_holds_a_subvolume_is_copied_not_snapshotted(
+        self, tmp_path: Path
+    ) -> None:
+        snapshots, tool, root = self.build(tmp_path, nested=True)
+        with opened(root) as target:
+            taken = snapshots.take(SnapshotId.new(), [(stored(root), target)])
+
+        assert taken.targets[0].backend is BackendKind.COPY  # a snapshot would leave it out
+        assert tool.snapshots == []
+        assert taken.fallbacks == ((0, BackendKind.BTRFS, SnapshotFault.UNSUPPORTED),)
+        snapshots.close()
+
+    def test_a_snapshot_the_tool_cannot_make_falls_back_and_says_so(self, tmp_path: Path) -> None:
+        snapshots, tool, root = self.build(tmp_path)
+
+        def refused(source_fd: int, directory: int, name: str) -> None:
+            raise SnapshotError(SnapshotFault.IO)  # another btrfs, no permission
+
+        tool.snapshot = refused  # type: ignore[method-assign]  # a test double
+        with opened(root) as target:
+            taken = snapshots.take(SnapshotId.new(), [(stored(root), target)])
+
+        assert taken.targets[0].backend is BackendKind.COPY
+        assert taken.fallbacks == ((0, BackendKind.BTRFS, SnapshotFault.IO),)
+        snapshots.close()
+
+    def test_a_timeout_in_btrfs_is_not_retried_by_the_copy(self, tmp_path: Path) -> None:
+        snapshots, tool, root = self.build(tmp_path)
+
+        def slow(source_fd: int, directory: int, name: str) -> None:
+            raise SnapshotError(SnapshotFault.TIMEOUT)
+
+        tool.snapshot = slow  # type: ignore[method-assign]  # a test double
+        with opened(root) as target, pytest.raises(SnapshotError) as caught:
+            snapshots.take(SnapshotId.new(), [(stored(root), target)])
+
+        assert caught.value.fault is SnapshotFault.TIMEOUT
+        assert list((tmp_path / "store").iterdir()) == []  # the copy was not tried
+        snapshots.close()
+
+    def test_deleting_a_subvolume_that_is_gone_is_fine(self, tmp_path: Path) -> None:
+        snapshots, tool, root = self.build(tmp_path)
+        snapshot = SnapshotId.new()
+        with opened(root) as target:
+            taken = snapshots.take(snapshot, [(stored(root), target)]).targets
+        shutil.rmtree(tmp_path / "snapshots-subvolume" / f"{snapshot}-0")
+
+        snapshots.delete(record(snapshot, taken))  # no error: the Protocol says so
+
+        assert tool.deleted == []
+        snapshots.close()
+
+    def test_a_subvolume_nobody_owns_is_found_and_deleted_like_a_copy(self, tmp_path: Path) -> None:
+        snapshots, _tool, root = self.build(tmp_path)
+        snapshot = SnapshotId.new()
+        with opened(root) as target:
+            snapshots.take(snapshot, [(stored(root), target)])
+
+        assert snapshots.stored_names() == [snapshot]
+        assert snapshots.delete_all(snapshot) is True
+        assert snapshots.stored_names() == []
+        assert snapshots.delete_all(snapshot) is False
+        snapshots.close()
+
     def test_a_file_or_another_file_system_uses_the_copy(self, tmp_path: Path) -> None:
         snapshots, tool, root = self.build(tmp_path)
         tool.same = False
         with opened(root) as target:
-            taken = snapshots.take(SnapshotId.new(), [(stored(root), target)])
+            taken = snapshots.take(SnapshotId.new(), [(stored(root), target)]).targets
         assert taken[0].backend is BackendKind.COPY
         assert tool.snapshots == []
         snapshots.close()
@@ -255,7 +326,7 @@ class TestBtrfs:
 
         tool.snapshot = broken  # type: ignore[method-assign]  # a test double
         with opened(root) as target:
-            taken = snapshots.take(SnapshotId.new(), [(stored(root), target)])
+            taken = snapshots.take(SnapshotId.new(), [(stored(root), target)]).targets
         assert taken[0].backend is BackendKind.COPY
         snapshots.close()
 
@@ -263,7 +334,7 @@ class TestBtrfs:
         snapshots, _tool, root = self.build(tmp_path)
         snapshot = SnapshotId.new()
         with opened(root) as target:
-            taken = snapshots.take(snapshot, [(stored(root), target)])
+            taken = snapshots.take(snapshot, [(stored(root), target)]).targets
             # The saved folder is swapped for another directory (another inode number).
             saved = tmp_path / "snapshots-subvolume" / f"{snapshot}-0" / "proj"
             saved.rename(saved.with_name("moved"))  # the old inode stays alive: no reuse
@@ -280,7 +351,7 @@ class TestBtrfs:
         elsewhere = tmp_path / "elsewhere"
         shutil.copytree(root, elsewhere)
         with opened(root) as target:
-            taken = snapshots.take(snapshot, [(stored(root), target)])
+            taken = snapshots.take(snapshot, [(stored(root), target)]).targets
             saved = tmp_path / "snapshots-subvolume" / f"{snapshot}-0" / "proj"
             shutil.rmtree(saved)
             saved.symlink_to(elsewhere)
@@ -336,3 +407,40 @@ def test_a_record_is_a_no_undo_record_exactly_when_nothing_was_saved() -> None:
             targets=(copy,),
             no_undo=True,
         )
+
+
+def test_one_cap_for_all_the_paths_of_one_run(tmp_path: Path) -> None:
+    folders = []
+    for name in ("one", "two"):
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / "f").write_bytes(b"x" * 40)
+        folders.append(folder)
+    one_file = (folders[0] / "f").stat().st_blocks * 512
+    snapshots = manager(tmp_path, max_bytes=one_file + 100, store_max_bytes=GIB)
+    with (
+        opened(folders[0]) as first,
+        opened(folders[1]) as second,
+        pytest.raises(SnapshotError) as caught,
+    ):
+        snapshots.take(
+            SnapshotId.new(), [(stored(folders[0]), first), (stored(folders[1]), second)]
+        )
+
+    assert caught.value.fault is SnapshotFault.TOO_MANY_BYTES  # each fits, together they do not
+    assert list((tmp_path / "store").iterdir()) == []
+    snapshots.close()
+
+
+def test_a_fifo_in_a_tree_does_not_stop_the_snapshot(tmp_path: Path) -> None:
+    root = make_tree(tmp_path)
+    os.mkfifo(root / "pipe")
+    snapshots = manager(tmp_path)
+    snapshot = SnapshotId.new()
+    with opened(root) as target:
+        taken = snapshots.take(snapshot, [(stored(root), target)]).targets
+        (root / "pipe").unlink()
+        snapshots.restore(record(snapshot, taken), [target])
+
+    assert stat.S_ISFIFO((root / "pipe").lstat().st_mode)
+    snapshots.close()

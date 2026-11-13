@@ -10,6 +10,7 @@ import pytest
 from tests.broker.rig import Rig, replace_config, running
 from tests.ipc.bounded import run
 from tumbleweed.broker.audit import (
+    GrantDecision,
     NoUndoAccepted,
     SnapshotDeleted,
     SnapshotRefused,
@@ -146,6 +147,7 @@ class TestWriteThenUndo:
                 undone = await client.undo_last_change(task)
                 assert restored(directory)
 
+                assert undone.safety is not None
                 again = await client.undo_snapshot(undone.safety)  # the user, from the list
 
                 assert (directory / "a.txt").read_text() == "CHANGED"
@@ -341,8 +343,14 @@ class TestUndoRefusesWhatItCannotDo:
                     ),
                 )
 
-                with pytest.raises(BrokerRefused) as refused:
+                # The model's undo needs write access that is still allowed: it is not.
+                with pytest.raises(BrokerRefused) as model:
                     await client.undo_last_change(task)
+                assert model.value.reason == "not_granted"
+                # The user's undo opens the targets under the deny rules too.
+                (listed,) = [i for i in (await client.list_snapshots()).snapshots if i.undoable]
+                with pytest.raises(BrokerRefused) as refused:
+                    await client.undo_snapshot(listed.snapshot)
 
                 assert refused.value.reason == "denied"
                 assert (directory / "a.txt").read_text() == "CHANGED"
@@ -496,7 +504,7 @@ class TestWriteAndReadGrantsAreKeptApart:
 
         run(scenario)
 
-    def test_a_write_grant_inside_a_read_grant_refuses_the_run(self) -> None:
+    def test_a_write_grant_inside_a_read_grant_is_refused_before_anyone_is_asked(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
@@ -504,16 +512,34 @@ class TestWriteAndReadGrantsAreKeptApart:
                 task = (await client.start_task()).task
                 rig.prompts.allow("task")
                 await client.request_read(task, RunId.new(), str(directory), "x")
+                asked = len(rig.prompts.asked)
                 rig.prompts.allow("task")
-                await client.request_write(task, RunId.new(), str(directory / "sub"), "x")
 
-                with pytest.raises(BrokerRefused) as refused:
-                    await client.run_in_sandbox(task, RunId.new(), COMMAND)
+                outcome = await client.request_write(task, RunId.new(), str(directory / "sub"), "x")
 
-                assert refused.value.reason == "invalid_request"
-                assert "write grant lies inside a read grant" in refused.value.message
-                assert rig.sandbox.policies == []
-                assert rig.audit_of(SnapshotTaken) == []
+                assert not outcome.granted
+                assert "may not lie inside" in outcome.message
+                assert len(rig.prompts.asked) == asked  # nobody was asked in vain
+                assert rig.audit_of(GrantDecision)[-1].reason == "grant_nesting"
+
+        run(scenario)
+
+    def test_nor_a_read_grant_around_a_write_grant(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                directory = project(rig)
+                task = await write_task(rig, client, directory / "sub")
+                rig.prompts.allow("task")
+
+                outcome = await client.request_read(task, RunId.new(), str(directory), "x")
+
+                assert not outcome.granted
+                assert rig.audit_of(GrantDecision)[-1].reason == "grant_nesting"
+                # The same place twice is fine: the write is the one that is mounted.
+                rig.prompts.allow("task")
+                same = await client.request_read(task, RunId.new(), str(directory / "sub"), "x")
+                assert same.granted
 
         run(scenario)
 
@@ -616,16 +642,21 @@ class TestRetention:
 
     def test_the_store_size_cap_deletes_the_oldest(self) -> None:
         async def scenario() -> None:
-            # Each snapshot holds 9 bytes; room for two at a time (cap 10 per snapshot).
-            async with running(config=settings(max_bytes=10, store_max_bytes=25)) as rig:
+            # Each snapshot holds two blocks; the store has room for three at a time.
+            directory_blocks = 2 * 4096
+            async with running(
+                config=settings(
+                    max_bytes=directory_blocks, store_max_bytes=3 * directory_blocks + 100
+                )
+            ) as rig:
                 client = await rig.client()
                 directory = project(rig)
                 task = await write_task(rig, client, directory)
-                for _ in range(4):
+                for _ in range(5):
                     rig.clock.advance(timedelta(seconds=1))
                     await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
-                assert len(rig.rows("SELECT id FROM snapshots")) == 2
+                assert len(rig.rows("SELECT id FROM snapshots")) == 3
                 assert {e.reason for e in rig.audit_of(SnapshotDeleted)} == {"size"}
 
         run(scenario)
