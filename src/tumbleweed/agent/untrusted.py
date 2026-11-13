@@ -40,16 +40,17 @@ def cut_bytes(text: str, limit: int) -> tuple[str, bool]:
     return data[:limit].decode("utf-8", errors="ignore"), True
 
 
-def framed(source: str, body: str) -> str:
+def framed(source: str, body: str, *, limit: int = MAX_FRAMED_BYTES) -> str:
     """`body` (data) in a frame that names `source` (our words: what it is).
 
     A body over `MAX_FRAMED_BYTES` is cut, and a line outside the frame says so and how many bytes
-    there were, so the model does not take a part for the whole."""
+    there were, so the model does not take a part for the whole. `limit` lowers the cut where
+    several frames must share one result."""
     marker = secrets.token_hex(12)
     clean = sanitize_text(body)
-    data, was_cut = cut_bytes(clean, MAX_FRAMED_BYTES)
+    data, was_cut = cut_bytes(clean, limit)
     framed_text = f'{_INTRO}\n<data id="{marker}" source="{source}">\n{data}\n</data id="{marker}">'
     if was_cut:
         total = len(clean.encode("utf-8", errors="replace"))
-        framed_text += f"\n(Shown: the first {MAX_FRAMED_BYTES // 1024} KiB of {total} bytes.)"
+        framed_text += f"\n(Shown: the first {limit // 1024} KiB of {total} bytes.)"
     return framed_text

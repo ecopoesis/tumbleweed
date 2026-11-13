@@ -24,6 +24,7 @@ from tumbleweed.agent.broker_images import BrokerImageResolver
 from tumbleweed.agent.broker_link import BrokerLink
 from tumbleweed.agent.canvas import CanvasLink
 from tumbleweed.agent.canvas_events import EventGate, Scheduler
+from tumbleweed.agent.code import BrokerHandlerExecutor
 from tumbleweed.agent.responder import Responder
 from tumbleweed.agent.tasks import TaskSession
 from tumbleweed.core.ids import TaskId
@@ -131,6 +132,10 @@ class ShellWindow(Adw.ApplicationWindow):
             images_for=None
             if broker_link is None
             else (lambda task: BrokerImageResolver(broker_link, task)),
+            executor=None
+            if broker_link is None
+            else BrokerHandlerExecutor(broker_link, GlibDispatcher()),
+            scheduler=None if broker_link is None else GlibScheduler(),
         )
         if canvas_link is not None:
             canvas_link.attach(self.canvas_tools)

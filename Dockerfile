@@ -18,6 +18,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 # GStreamer (S06): the typelibs and the base plugins (audiotestsrc, audioconvert, audioresample,
 # capsfilter, appsink), so that the capture adapter is tested with a test tone, never a microphone;
 # the Pulse and PipeWire source plugins are not installed on purpose (no device in the container).
+# Sandboxed code (S20, D27): Pillow and numpy for the system Python the sandbox's runtime mounts
+# (they land in /usr/lib/python3/dist-packages; the uv venv below does not see them).
 # Build: a toolchain, Python headers and the -dev packages PyGObject and pycairo compile against.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -40,6 +42,8 @@ RUN apt-get update \
         pkg-config \
         python3 \
         python3-dev \
+        python3-numpy \
+        python3-pil \
         slirp4netns \
         sudo \
         webp-pixbuf-loader \

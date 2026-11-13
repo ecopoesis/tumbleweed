@@ -1,0 +1,159 @@
+"""When a `sandbox` handler runs, and what becomes of its result (S20, D27 (5), I9).
+
+`HandlerRuns` is the `SandboxSink` of one tool instance. It runs on the main thread, owns no GTK
+and does no waiting: it decides when a run starts and hands it to a `HandlerExecutor`, which
+reports back on the main thread.
+
+- **Debounce and coalescing.** An event waits for the handler's `debounce_ms`, never less than
+  `CHANGE_FLOOR_MS` for a `change` event (a slider fires on every position), and a newer event of
+  the same handler replaces it, so a burst is one run with the newest inputs.
+- **One run in flight per instance.** A handler that is due meanwhile waits, as the newest inputs
+  of its name (one waiting per handler). For `H` handlers a burst of any length gives at most
+  `1 + H` runs.
+- **The result** is applied with `only=handler.outputs`, whole or not at all, and never fires a
+  handler. A failure or a refused result is one line of ours for the card.
+- **Inert and closed instances** start nothing, and a result that arrives is dropped.
+"""
+
+import logging
+from collections.abc import Callable, Mapping, Sequence
+from functools import partial
+from typing import Final, Protocol, final
+
+from pydantic import JsonValue
+
+from tumbleweed.agent.canvas_events import Scheduler
+from tumbleweed.agent.code import HandlerCall, HandlerExecutor, HandlerOutcome, failure_text
+from tumbleweed.core.ids import TaskId
+from tumbleweed.tools.package import CodeModule
+from tumbleweed.ui.runtime.events import UiEvent
+from tumbleweed.ui.spec import SpecError
+from tumbleweed.ui.spec.handlers import SandboxHandler
+from tumbleweed.ui.spec.names import HandlerName, StateKey
+from tumbleweed.ui.spec.state import StateValue
+
+logger = logging.getLogger(__name__)
+
+CHANGE_FLOOR_MS: Final = 200
+RUNNING_NOTICE: Final = "Running the tool's code..."
+NO_TASK_NOTICE: Final = "This tool has no task to run its code in."
+REFUSED_NOTICE: Final = (
+    "The tool's code returned something the tool does not allow: nothing changed."
+)
+_DETAILED: Final = frozenset({"grant_gone", "not_granted", "denied"})
+
+
+class RunTarget(Protocol):
+    """The instance a run belongs to: where results are applied and the line is shown."""
+
+    def apply(self, handler: SandboxHandler, values: Mapping[str, JsonValue]) -> None:
+        """Apply `values` to the handler's outputs. Raises `SpecError`: refused, nothing applied."""
+        ...
+
+    def notice(self, text: str | None) -> None:
+        """Show a plain line under the tool (None clears it)."""
+        ...
+
+
+@final
+class HandlerRuns:
+    """See the module docstring."""
+
+    def __init__(
+        self,
+        *,
+        task: TaskId | None,
+        code: Sequence[CodeModule],
+        executor: HandlerExecutor,
+        scheduler: Scheduler,
+        target: RunTarget,
+    ) -> None:
+        self._task = task
+        self._code = tuple(code)
+        self._executor = executor
+        self._scheduler = scheduler
+        self._target = target
+        self._latest: dict[HandlerName, tuple[SandboxHandler, Mapping[StateKey, StateValue]]] = {}
+        self._timers: dict[HandlerName, Callable[[], None]] = {}
+        self._ready: list[HandlerName] = []
+        self._in_flight = False
+        self._stopped = False
+        self.started = 0  # runs handed to the executor, for tests and the log
+
+    def run(
+        self, handler: SandboxHandler, event: UiEvent, inputs: Mapping[StateKey, StateValue]
+    ) -> None:
+        if self._stopped:
+            return
+        if self._task is None:
+            self._target.notice(NO_TASK_NOTICE)
+            return
+        name = handler.name
+        self._latest[name] = (handler, inputs)
+        if name in self._ready:
+            return  # already due and waiting for the run in flight: it will take these inputs
+        previous = self._timers.pop(name, None)
+        if previous is not None:
+            previous()
+        delay = handler.debounce_ms
+        if event.event == "change":
+            delay = max(delay, CHANGE_FLOOR_MS)
+        if delay == 0:
+            self._due(name)
+        else:
+            self._timers[name] = self._scheduler.call_later(delay / 1000, partial(self._due, name))
+
+    def stop(self) -> None:
+        """The instance is inert or closed: nothing starts, and a result that arrives is dropped."""
+        self._stopped = True
+        for cancel in self._timers.values():
+            cancel()
+        self._timers.clear()
+        self._latest.clear()
+        self._ready.clear()
+
+    def _due(self, name: HandlerName) -> None:
+        self._timers.pop(name, None)
+        if self._stopped or name not in self._latest:
+            return
+        if name not in self._ready:
+            self._ready.append(name)
+        self._pump()
+
+    def _pump(self) -> None:
+        task = self._task
+        if self._stopped or self._in_flight or not self._ready or task is None:
+            return
+        handler, inputs = self._latest.pop(self._ready.pop(0))
+        self._in_flight = True
+        self.started += 1
+        self._target.notice(RUNNING_NOTICE)
+        self._executor.start(
+            task,
+            HandlerCall(str(handler.module), str(handler.function), inputs, self._code),
+            partial(self._done, handler),
+        )
+
+    def _done(self, handler: SandboxHandler, outcome: HandlerOutcome) -> None:
+        self._in_flight = False
+        if self._stopped:
+            return
+        try:
+            self._target.notice(self._apply(handler, outcome))
+        except Exception:  # a UI path never takes the shell down
+            logger.exception("showing the result of handler %s failed", handler.name)
+        self._pump()
+
+    def _apply(self, handler: SandboxHandler, outcome: HandlerOutcome) -> str | None:
+        if outcome.failure is not None:
+            text = failure_text(outcome.failure)
+            if outcome.failure in _DETAILED and outcome.detail:
+                text += f" ({outcome.detail})"
+            return text
+        if outcome.values is None:
+            return failure_text("bad_result")
+        try:
+            self._target.apply(handler, outcome.values)
+        except SpecError:
+            return REFUSED_NOTICE
+        return None

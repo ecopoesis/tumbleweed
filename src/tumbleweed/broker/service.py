@@ -1771,7 +1771,17 @@ class BrokerService:
             opened.append(workspace)
             granted: list[OpenedPath] = []
             for mount in mounts:
-                granted.append(open_granted(mount.path, rules=rules))
+                try:
+                    granted.append(open_granted(mount.path, rules=rules))
+                except PathError as error:
+                    # Which grant, by its ID (the broker's own, not a path the model can read
+                    # back), so the user can be told and asked again (#86).
+                    raise _Refuse(
+                        _reason_of_fault(error.fault),
+                        f"the access granted as {mount.grant} can no longer be used: its path "
+                        "was removed, replaced or changed",
+                        error.fault.value,
+                    ) from None
                 opened.append(granted[-1])
         except BaseException:
             for each in opened:
