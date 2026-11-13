@@ -78,7 +78,7 @@ from tumbleweed.broker.audit import (
 from tumbleweed.broker.audit import TaskEnded as TaskEndedEntry
 from tumbleweed.broker.audit import TaskStarted as TaskStartedEntry
 from tumbleweed.broker.audit import ToolExported as ToolExportedEntry
-from tumbleweed.broker.capabilities import CapabilityKind, FsRead
+from tumbleweed.broker.capabilities import CapabilityKind, FsRead, FsWrite
 from tumbleweed.broker.compose import InvalidRunError, Mount, disjoint_mounts, sandbox_environment
 from tumbleweed.broker.config import BrokerConfig
 from tumbleweed.broker.deny import DenyRules
@@ -129,7 +129,6 @@ from tumbleweed.broker.policy import (
     TaskEnded,
     TaskMismatch,
     Ungrantable,
-    WriteGateClosed,
     decide,
     describe,
     issue_grant,
@@ -392,7 +391,7 @@ def _reason_of_fault(fault: PathFault) -> RefusalReason:
 
 def _reason_of_refusal(refusal: Refusal) -> RefusalReason:
     match refusal:
-        case StaticDeny() | WriteGateClosed() | TaintConflict():
+        case StaticDeny() | TaintConflict():
             return "denied"
         case TaskEnded() | TaskMismatch():
             return "unknown_task"
@@ -1587,7 +1586,7 @@ class BrokerService:
         """Persist what an `Allow` implies before anything is opened (S16): the consumption of a
         once grant, the task's taint and the audit entry. Returns the path to open."""
         grant = next((g for g in self._grants_for(live) if g.id == allow.grant), None)
-        if grant is None or not isinstance(grant.capability, FsRead):
+        if grant is None or not isinstance(grant.capability, FsRead | FsWrite):
             raise _Refuse("not_granted", "no grant covers that: request access first")
         stored = grant.capability.path
         spent: OnceGrant | None = None

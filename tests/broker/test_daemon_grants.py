@@ -195,7 +195,7 @@ class TestWhatCannotBeGranted:
 
         run(scenario)
 
-    def test_writes_are_refused_by_the_gate_without_asking_anyone(self) -> None:
+    def test_a_write_is_asked_about_and_granted_for_the_task_only(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
@@ -204,10 +204,24 @@ class TestWhatCannotBeGranted:
 
                 outcome = await client.request_write(task, RunId.new(), read_path(rig), "x")
 
+                assert outcome.granted
+                assert outcome.scope == "task"
+                (asked,) = rig.prompts.asked
+                assert asked.scopes == frozenset({GrantScope.TASK})
+                assert rig.audit_of(GrantDecision)[0].capability == "fs.write"
+
+        run(scenario)
+
+    def test_a_write_cannot_be_allowed_once(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = await task_of(client)
+                rig.prompts.allow("once")  # not offered: the broker denies it
+
+                outcome = await client.request_write(task, RunId.new(), read_path(rig), "x")
+
                 assert not outcome.granted
-                assert "not available yet" in outcome.message
-                assert rig.prompts.asked == []
-                assert rig.audit_of(GrantDecision)[0].reason == "write_gate"
 
         run(scenario)
 

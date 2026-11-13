@@ -5,8 +5,8 @@ egress needs a filtering proxy and is post-v1. A capability that holds a path ho
 `StoredPath`, so that it is what a grant keeps and what a prompt shows (S18 renders the prompt
 from this structure, not from text).
 
-`fs.write` can be modelled and stored but not granted: the write gate (`policy`) refuses it
-until snapshots exist (S21).
+`fs.write` is granted for the task only (S21, D28), and a run that mounts one starts only after the
+broker has snapshotted what it may write (I13).
 """
 
 from enum import StrEnum
