@@ -86,6 +86,69 @@ class PathError(BrokerError):
         return (type(self), (self.fault, self.errno_code))
 
 
+class SnapshotFault(StrEnum):
+    """Why a snapshot could not be taken, or a restore could not be done (S21)."""
+
+    TOO_MANY_BYTES = "too_many_bytes"  # over the cap on what one run's snapshot may hold
+    TOO_MANY_FILES = "too_many_files"
+    TOO_DEEP = "too_deep"
+    SPECIAL_FILE = (
+        "special_file"  # a socket, FIFO or device is in the tree: not copied, not guessed
+    )
+    UNREADABLE = "unreadable"  # a file or directory we may not read
+    UNSUPPORTED = "unsupported"  # no backend can snapshot this target (the noop backend, a tool)
+    TIMEOUT = "timeout"
+    STORE_FULL = "store_full"  # the snapshot store as a whole is at its cap
+    IO = "io"  # any other operating-system or tool error
+    TARGET_GONE = "target_gone"  # a restore: the object that was snapshotted is not there any more
+    TARGET_CHANGED = "target_changed"  # a restore: the name now leads somewhere else
+    STORED_COPY_BAD = "stored_copy_bad"  # a restore: the stored copy is missing or is not ours
+
+
+def describe_snapshot_fault(fault: SnapshotFault) -> str:
+    """Fixed text for a fault."""
+    match fault:
+        case SnapshotFault.TOO_MANY_BYTES:
+            return "the files to be changed are larger than a snapshot may hold"
+        case SnapshotFault.TOO_MANY_FILES:
+            return "the folder to be changed has more files than a snapshot may hold"
+        case SnapshotFault.TOO_DEEP:
+            return "the folder to be changed is nested more deeply than a snapshot may hold"
+        case SnapshotFault.SPECIAL_FILE:
+            return "the folder to be changed holds a socket, pipe or device, which cannot be saved"
+        case SnapshotFault.UNREADABLE:
+            return "a file or folder that is to be changed cannot be read, so it cannot be saved"
+        case SnapshotFault.UNSUPPORTED:
+            return "there is no way to save a copy of this place for undo"
+        case SnapshotFault.TIMEOUT:
+            return "saving a copy for undo took too long"
+        case SnapshotFault.STORE_FULL:
+            return "the space for undo copies is full"
+        case SnapshotFault.IO:
+            return "saving or restoring a copy failed"
+        case SnapshotFault.TARGET_GONE:
+            return "a file or folder that was changed is not there any more"
+        case SnapshotFault.TARGET_CHANGED:
+            return "a file or folder that was changed has been replaced by something else"
+        case SnapshotFault.STORED_COPY_BAD:
+            return "the saved copy is missing or damaged"
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+@final
+class SnapshotError(BrokerError):
+    """A snapshot could not be taken or restored. Fail closed. `fault` says why; the text is
+    fixed and never repeats a path."""
+
+    def __init__(self, fault: SnapshotFault) -> None:
+        self.fault = fault
+        super().__init__(f"{fault.value}: {describe_snapshot_fault(fault)}")
+
+    def __reduce__(self) -> tuple[type["SnapshotError"], tuple[SnapshotFault]]:
+        return (type(self), (self.fault,))
+
+
 class PrivateFsError(BrokerError):
     """The broker's own directory or one of its files is not safe to use, or cannot be opened.
 
