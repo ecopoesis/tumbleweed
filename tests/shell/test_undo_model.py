@@ -129,3 +129,24 @@ def test_the_no_undo_prompt_card_carries_the_paths_and_the_cause() -> None:
     assert card.cause == "too_many_bytes"
     assert card.paths == ("/home/u/a\\u{202E}b",)
     assert card.scopes == ("once",)
+
+
+def test_a_superseded_snapshot_is_shown_as_covered_by_a_later_undo() -> None:
+    row = row_of(info(undoable=False, superseded=True))
+
+    assert row.status == "a later undo covers it"
+    assert not row.undoable
+
+
+def test_the_undo_without_a_way_back_card_carries_its_purpose() -> None:
+    card = card_of(
+        show_message(
+            access=NoUndoAccess(
+                kind="no_undo", purpose="undo", paths=("/home/u/a",), cause="too_deep"
+            ),
+            reason="",
+            scopes=("once",),
+        )
+    )
+
+    assert (card.kind, card.purpose, card.cause) == ("no_undo", "undo", "too_deep")

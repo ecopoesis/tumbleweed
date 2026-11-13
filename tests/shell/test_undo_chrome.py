@@ -66,3 +66,13 @@ def test_the_undo_button_asks_the_broker_for_that_row_only() -> None:
     buttons[0].emit("clicked")
 
     assert port.undone == [first.snapshot]
+
+
+def test_the_panel_tells_the_user_what_undo_does_in_text_of_ours() -> None:
+    panel = UndoPanel(Port(()))
+
+    panel.open()
+
+    texts = [label.get_text() for label in labels_in(panel)]
+    assert any("including over any edits you made there since" in text for text in texts)
+    assert any("can be undone from this list" in text for text in texts)

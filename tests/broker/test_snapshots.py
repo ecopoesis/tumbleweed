@@ -63,9 +63,13 @@ class FakeBtrfs:
         self.snapshots: list[str] = []
         self.deleted: list[str] = []
         self.same = True
+        self.directory_inode: int | None = None  # the snapshot directory, which may not be btrfs
+        self.directory_on_btrfs = True
         self.inodes: dict[int, int] = {}  # a snapshot's inode numbers are its source's, as btrfs's
 
     def is_btrfs(self, fd: int) -> bool:
+        if self.directory_inode is not None and os.fstat(fd).st_ino == self.directory_inode:
+            return self.directory_on_btrfs
         return self.same
 
     def has_nested_subvolume(self, fd: int, max_files: int, deadline: float) -> bool:
@@ -307,6 +311,17 @@ class TestBtrfs:
         assert snapshots.delete_all(snapshot) is True
         assert snapshots.stored_names() == []
         assert snapshots.delete_all(snapshot) is False
+        snapshots.close()
+
+    def test_a_snapshot_directory_that_is_not_on_btrfs_means_the_copy(self, tmp_path: Path) -> None:
+        snapshots, tool, root = self.build(tmp_path)
+        tool.directory_inode = (tmp_path / "snapshots-subvolume").stat().st_ino
+        tool.directory_on_btrfs = False
+        with opened(root) as target:
+            taken = snapshots.take(SnapshotId.new(), [(stored(root), target)])
+
+        assert taken.targets[0].backend is BackendKind.COPY
+        assert tool.snapshots == []
         snapshots.close()
 
     def test_a_file_or_another_file_system_uses_the_copy(self, tmp_path: Path) -> None:

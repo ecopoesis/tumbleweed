@@ -944,3 +944,70 @@ def test_the_ipc_handler_may_take_as_long_as_a_write_run_or_an_undo_may(tmp_path
 
         assert limit >= RUN_SETUP_WAIT + timedelta(seconds=MAX_WALL_SECONDS) + config.run_grace
         assert limit >= UNDO_WAIT
+
+
+def test_a_workspace_nested_deeper_than_a_walk_goes_is_full_not_unmeasured() -> None:
+    async def scenario() -> None:
+        async with running() as rig:
+            client = await rig.client()
+            task = (await client.start_task()).task
+            here = rig.workspaces / str(task)
+            for _ in range(70):
+                here = here / "x"
+                here.mkdir()
+
+            with pytest.raises(BrokerRefused) as refused:
+                await client.run_in_sandbox(task, RunId.new(), COMMAND)
+
+            assert refused.value.reason == "workspace_full"
+
+    run(scenario)
+
+
+def test_a_host_that_cannot_write_a_file_in_place_refuses_the_undo_of_one_before_anything_is_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        async with running() as rig:
+            client = await rig.client()
+            file = rig.home / "Documents" / "notes.txt"
+            task = (await client.start_task()).task
+            rig.prompts.allow("task")
+            assert (await client.request_write(task, RunId.new(), str(file), "x")).granted
+            rig.sandbox.on_run = lambda policy: file.write_text("CHANGED")  # type: ignore[assignment]
+            await client.run_in_sandbox(task, RunId.new(), COMMAND)
+            monkeypatch.setattr("tumbleweed.broker.service._writes_in_place", lambda: False)
+
+            with pytest.raises(BrokerRefused) as refused:
+                await client.undo_last_change(task)
+
+            assert refused.value.reason == "unavailable"
+            assert file.read_text() == "CHANGED"
+            assert len(rig.rows("SELECT id FROM snapshots")) == 1  # no safety snapshot was made
+
+    run(scenario)
+
+
+def test_an_undo_whose_record_cannot_be_written_says_the_files_were_put_back() -> None:
+    async def scenario() -> None:
+        async with running() as rig:
+            client = await rig.client()
+            directory = project(rig)
+            task = await write_task(rig, client, directory)
+            rig.sandbox.on_run = edit(directory)
+            await client.run_in_sandbox(task, RunId.new(), COMMAND)
+            service = rig.daemon.service
+
+            def broken(*arguments: object) -> int:
+                raise AuditError("the audit log cannot be written")
+
+            service._record_undone = broken  # type: ignore[method-assign,assignment]  # noqa: SLF001
+
+            with pytest.raises(BrokerRefused) as refused:
+                await client.undo_last_change(task)
+
+            assert refused.value.reason == "unavailable"
+            assert "files were put back" in refused.value.message
+            assert restored(directory)
+
+    run(scenario)
