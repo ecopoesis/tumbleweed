@@ -329,3 +329,60 @@ def test_the_run_is_over_in_the_time_it_was_given() -> None:
             assert base64.b64decode(result.stdout) == b"quick\n"
 
     run(scenario, deadline=120)
+
+
+class TestWriteRunsAndUndo:
+    """A real sandbox writes into a write grant, and the broker's undo puts it back (S21)."""
+
+    def test_code_in_a_sandbox_changes_a_granted_folder_and_undo_restores_it(self) -> None:
+        async def scenario() -> None:
+            async with running(config=development_config, runner=real_runner()) as rig:
+                client = await rig.client()
+                directory = rig.home / "Projects" / "app"
+                (directory / "a.txt").write_text("alpha")
+                task = (await client.start_task()).task
+                rig.prompts.allow("task")
+                assert (await client.request_write(task, RunId.new(), str(directory), "x")).granted
+                code = (
+                    "import os\n"
+                    f"d = {str(directory)!r}\n"
+                    "open(d + '/a.txt', 'w').write('CHANGED')\n"
+                    "open(d + '/new.txt', 'w').write('n')\n"
+                )
+
+                result = await client.run_in_sandbox(task, RunId.new(), (PYTHON, "-c", code))
+
+                assert result.exit_code == 0, base64.b64decode(result.stderr).decode()
+                assert (directory / "a.txt").read_text() == "CHANGED"
+                assert (directory / "new.txt").read_text() == "n"
+                await client.undo_last_change(task)
+                assert (directory / "a.txt").read_text() == "alpha"
+                assert not (directory / "new.txt").exists()
+
+        run(scenario)
+
+    def test_a_read_grant_stays_read_only_beside_a_write_grant(self) -> None:
+        async def scenario() -> None:
+            async with running(config=development_config, runner=real_runner()) as rig:
+                client = await rig.client()
+                directory = rig.home / "Projects" / "app"
+                photos = rig.home / "Photos"
+                task = (await client.start_task()).task
+                rig.prompts.allow("task")
+                assert (await client.request_write(task, RunId.new(), str(directory), "x")).granted
+                rig.prompts.allow("task")
+                assert (await client.request_read(task, RunId.new(), str(photos), "x")).granted
+                code = (
+                    "import sys\n"
+                    f"try:\n open({str(photos / 'x')!r}, 'w').write('no')\n"
+                    "except OSError: print('read-only')\n"
+                    f"open({str(directory / 'ok')!r}, 'w').write('yes')\n"
+                )
+
+                result = await client.run_in_sandbox(task, RunId.new(), (PYTHON, "-c", code))
+
+                assert base64.b64decode(result.stdout).strip() == b"read-only"
+                assert (directory / "ok").read_text() == "yes"
+                assert not (photos / "x").exists()
+
+        run(scenario)

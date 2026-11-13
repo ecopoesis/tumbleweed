@@ -301,6 +301,11 @@ class BtrfsTool(Protocol):
         `directory`."""
         ...
 
+    def inode(self, fd: int) -> int:
+        """The inode number `fd` has in its snapshot: a btrfs snapshot keeps the numbers of the
+        subvolume it was made of, which is what lets a saved folder be recognised."""
+        ...
+
     def delete(self, directory: int, name: str) -> None: ...
 
 
@@ -362,6 +367,9 @@ class BtrfsCli:
             ],
             (source_fd, directory),
         )
+
+    def inode(self, fd: int) -> int:
+        return os.fstat(fd).st_ino
 
     def delete(self, directory: int, name: str) -> None:
         self._run(["subvolume", "delete", f"/proc/self/fd/{directory}/{name}"], (directory,))
@@ -432,7 +440,7 @@ class BtrfsBackend:
             if current >= 0:
                 os.close(current)
             raise SnapshotError(SnapshotFault.STORED_COPY_BAD) from None
-        if os.fstat(current).st_ino != target.path.identity.ino:
+        if self._tool.inode(current) != target.path.identity.ino:
             os.close(current)
             raise SnapshotError(SnapshotFault.STORED_COPY_BAD)
         return current
