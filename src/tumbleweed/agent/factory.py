@@ -20,6 +20,7 @@ from tumbleweed.agent.anthropic_provider import (
 )
 from tumbleweed.agent.broker_link import BrokerLink, connector_from_environment
 from tumbleweed.agent.canvas import CanvasLink, register_canvas_tools
+from tumbleweed.agent.code import register_code_tools
 from tumbleweed.agent.config import (
     SECRET_ENV_VARIABLES,
     AgentConfig,
@@ -103,6 +104,7 @@ def _build_anthropic(
         canvas = CanvasLink(dispatcher)
         register_canvas_tools(registry, canvas, tasks)
         register_access_tools(registry, tasks, broker)
+        register_code_tools(registry, tasks, broker)
         responder = AgentResponder(
             provider=AnthropicProvider(client, effort=config.effort),
             recorder=recorder,
