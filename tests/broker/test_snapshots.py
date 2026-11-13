@@ -126,6 +126,7 @@ class TestCopy:
         assert not (root / "new").exists()
         snapshots.close()
 
+    @pytest.mark.linux
     def test_a_single_file_is_saved_and_restored_in_place(self, tmp_path: Path) -> None:
         file = tmp_path / "f.txt"
         file.write_text("before")
@@ -203,6 +204,7 @@ class TestNoop:
         snapshots.close()
 
 
+@pytest.mark.linux  # the fake tool copies through /proc/self/fd
 class TestBtrfs:
     def build(self, tmp_path: Path) -> tuple[SnapshotManager, FakeBtrfs, Path]:
         volume = tmp_path / "volume"

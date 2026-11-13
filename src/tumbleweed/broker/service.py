@@ -520,6 +520,7 @@ class BrokerService:
         self._snapshots = snapshots
         self._inflight: set[SnapshotId] = set()  # saved, not yet recorded: not orphans
         self._undoing: set[SnapshotId] = set()  # one undo of a snapshot at a time
+        self._sweep_lock = asyncio.Lock()
         self._background: set[asyncio.Task[bool | None]] = set()
 
     # --- life cycle ----------------------------------------------------------------------------
@@ -2230,6 +2231,10 @@ class BrokerService:
     async def _sweep_snapshots(self, now: datetime) -> int:
         """Retention (D28): delete snapshots older than `retention` or past `max_snapshots`
         (oldest first), and saved copies no record names. Returns how many were deleted."""
+        async with self._sweep_lock:  # the start's sweep and a requested one do not interleave
+            return await self._sweep_snapshots_locked(now)
+
+    async def _sweep_snapshots_locked(self, now: datetime) -> int:
         settings = self._config.snapshots
         records = self._store.oldest_snapshots(MAX_LIST)
         deleted = 0

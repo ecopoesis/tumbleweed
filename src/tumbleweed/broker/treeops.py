@@ -31,6 +31,7 @@ import fcntl
 import os
 import secrets
 import stat
+import sys
 import time
 from dataclasses import dataclass
 from typing import Final, final
@@ -460,6 +461,10 @@ def _restore_file_in_place(
     if _same_descriptor_content(stored_fd, target_fd, work):
         _restore_mode(target_fd, stored)
         return
+    if not sys.platform.startswith("linux"):
+        # Only Linux can reopen a descriptor for writing by its inode (`/proc/self/fd`): fail
+        # closed rather than write through a path.
+        raise SnapshotError(SnapshotFault.UNSUPPORTED)
     os.fchmod(target_fd, 0o600)  # the file may have been made read-only
     out = os.open(f"/proc/self/fd/{target_fd}", os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC)
     try:

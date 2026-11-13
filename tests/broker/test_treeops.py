@@ -114,6 +114,7 @@ def test_a_symlink_planted_where_a_file_was_is_not_written_through(tmp_path: Pat
     assert (root / "a.txt").read_text() == "alpha"
 
 
+@pytest.mark.linux
 def test_a_granted_file_is_restored_in_place(tmp_path: Path) -> None:
     target = tmp_path / "f.txt"
     target.write_text("before")
