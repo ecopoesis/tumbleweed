@@ -77,7 +77,7 @@ def test_restore_undoes_changes_creations_and_deletions(tmp_path: Path) -> None:
     assert not (root / "newdir").exists()
     assert not (root / "moved").exists()
     assert (root / "ro.txt").stat().st_mode & 0o777 == 0o444
-    assert os.readlink(root / "link") == "a.txt"
+    assert (root / "link").readlink().as_posix() == "a.txt"
 
 
 def test_a_symlink_planted_where_a_directory_was_is_replaced_not_followed(tmp_path: Path) -> None:

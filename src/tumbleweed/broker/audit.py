@@ -36,7 +36,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, V
 
 from tumbleweed.broker.errors import AuditError
 from tumbleweed.broker.privatefs import open_private_directory, open_private_file
-from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId
+from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId
 from tumbleweed.core.types import ContentHash, ToolVersion
 
 _log = logging.getLogger(__name__)
@@ -248,6 +248,75 @@ class ToolImportRefused(_AuditModel):
     reason: Literal["invalid", "too_large", "conflict", "full", "integrity", "error"]
 
 
+type PathTexts = Annotated[tuple[PathText, ...], Field(max_length=_MAX_LIST)]
+
+
+class SnapshotTaken(_AuditModel):
+    """A snapshot of the paths a run may write was taken (`kind` run), or of what an undo is about
+    to replace (`kind` undo). Written, with the snapshot's record, before the run starts (I13)."""
+
+    kind: Literal["snapshot_taken"] = "snapshot_taken"
+    snapshot: SnapshotId
+    snapshot_kind: Literal["run", "undo"]
+    task: TaskId
+    run: RunId | None
+    paths: PathTexts
+    backends: Annotated[tuple[Literal["copy", "btrfs"], ...], Field(max_length=_MAX_LIST)]
+    files: Annotated[int, Field(ge=0)]
+    bytes: Annotated[int, Field(ge=0)]
+
+
+class SnapshotRefused(_AuditModel):
+    """No snapshot could be taken for a write run (or for an undo), for `reason` (a fault of
+    `SnapshotFault`, or `user_declined`/`no_prompt`...). What happened next is the next entry."""
+
+    kind: Literal["snapshot_refused"] = "snapshot_refused"
+    task: TaskId
+    run: RunId | None
+    paths: PathTexts
+    reason: Text
+
+
+class NoUndoAccepted(_AuditModel):
+    """The user accepted, in a trusted prompt, that `run` goes ahead with nothing saved. For this
+    run only; the record `snapshot` says so and an undo of it is refused."""
+
+    kind: Literal["no_undo_accepted"] = "no_undo_accepted"
+    snapshot: SnapshotId
+    task: TaskId
+    run: RunId
+    paths: PathTexts
+    cause: Text
+
+
+class UndoDone(_AuditModel):
+    """An undo: of `snapshot`, asked for by the model (`model`) or the user in the chrome (`user`).
+    `safety` is the snapshot taken of the present state first. `outcome` `failed` means that the
+    restore did not finish and what was done to roll it back is in `reason`."""
+
+    kind: Literal["undo"] = "undo"
+    snapshot: SnapshotId
+    safety: SnapshotId | None
+    task: TaskId | None
+    asked_by: Literal["model", "user"]
+    outcome: Literal["restored", "refused", "failed"]
+    reason: Text | None
+    paths: PathTexts
+    written: Annotated[int, Field(ge=0)] = 0
+    removed: Annotated[int, Field(ge=0)] = 0
+
+
+class SnapshotDeleted(_AuditModel):
+    """A snapshot's saved copy and record were deleted: retention (`age`, `count`), the store's
+    size cap (`size`), a snapshot taken for a run that did not start (`discarded`) or a copy
+    nobody owns (`orphan`)."""
+
+    kind: Literal["snapshot_deleted"] = "snapshot_deleted"
+    snapshot: SnapshotId
+    reason: Literal["age", "count", "size", "discarded", "orphan"]
+    outcome: Literal["deleted", "failed"]
+
+
 type AuditEntry = Annotated[
     DaemonStart
     | TaskStarted
@@ -261,6 +330,11 @@ type AuditEntry = Annotated[
     | ToolSaved
     | ToolExported
     | ToolImportRefused
+    | SnapshotTaken
+    | SnapshotRefused
+    | NoUndoAccepted
+    | UndoDone
+    | SnapshotDeleted
     | RolledBack,
     Field(discriminator="kind"),
 ]

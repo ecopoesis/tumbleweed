@@ -51,9 +51,10 @@ from tumbleweed.broker.privatefs import (
     open_private_file,
     same_file,
 )
+from tumbleweed.broker.snapshots import SnapshotRecord
 from tumbleweed.broker.task import TaintKind
 from tumbleweed.core.errors import InvalidValueError
-from tumbleweed.core.ids import GrantId, TaskId, ToolId
+from tumbleweed.core.ids import GrantId, SnapshotId, TaskId, ToolId
 from tumbleweed.core.types import ByteCount, ContentHash, ToolVersion
 from tumbleweed.tools.limits import MAX_PACKAGE_BYTES
 from tumbleweed.tools.package import Description, Name, ToolTag
@@ -139,9 +140,24 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
             "name, description, tags, tokenize = 'unicode61 remove_diacritics 2')"
         ),
     ),
+    # S21: snapshots. The record is the JSON of a `SnapshotRecord`; the columns are what is
+    # queried (the newest not-yet-undone run snapshot of a task, the oldest to expire).
+    (
+        f"""CREATE TABLE snapshots (
+    id TEXT NOT NULL PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('run', 'undo')),
+    taken_at INTEGER NOT NULL CHECK (taken_at {_MILLIS}),
+    undone_at INTEGER CHECK (undone_at IS NULL OR undone_at {_MILLIS}),
+    record TEXT NOT NULL CHECK (length(CAST(record AS BLOB)) <= 65536)
+) STRICT""",
+        "CREATE INDEX snapshots_by_task ON snapshots (task_id, kind, taken_at)",
+        "CREATE INDEX snapshots_by_time ON snapshots (taken_at)",
+    ),
 )
 
 _GRANTS: Final[TypeAdapter[Grant]] = TypeAdapter(Grant)
+_SNAPSHOTS: Final[TypeAdapter[SnapshotRecord]] = TypeAdapter(SnapshotRecord)
 
 
 def _millis(moment: datetime) -> int:
@@ -659,6 +675,75 @@ class BrokerStore:
                 # A grant that cannot be read grants nothing. Only its ID is logged.
                 _log.warning("a grant record of the broker's database cannot be read; skipped")
         return grants
+
+    # --- snapshots (S21) -----------------------------------------------------------------
+
+    def insert_snapshot(self, record: SnapshotRecord) -> None:
+        """Add a snapshot (inside `transaction()`)."""
+        self._execute(
+            "INSERT INTO snapshots (id, task_id, kind, taken_at, record) VALUES (?, ?, ?, ?, ?)",
+            (
+                str(record.id),
+                str(record.task),
+                record.kind.value,
+                _millis(record.taken_at),
+                _SNAPSHOTS.dump_json(record).decode("utf-8"),
+            ),
+        )
+
+    def delete_snapshot(self, snapshot: SnapshotId) -> bool:
+        """Forget a snapshot (inside `transaction()`); whether there was one."""
+        return self._execute("DELETE FROM snapshots WHERE id = ?", (str(snapshot),)) == 1
+
+    def mark_undone(self, snapshot: SnapshotId, at: datetime) -> bool:
+        """Record that a snapshot was undone (inside `transaction()`); False if it already was
+        or is not there, so that two undos of one snapshot cannot both go ahead."""
+        return (
+            self._execute(
+                "UPDATE snapshots SET undone_at = ? WHERE id = ? AND undone_at IS NULL",
+                (_millis(at), str(snapshot)),
+            )
+            == 1
+        )
+
+    def snapshot(self, snapshot: SnapshotId) -> tuple[SnapshotRecord, bool] | None:
+        """A snapshot, and whether it has been undone; None if there is none (or it is unreadable)."""
+        found = self._snapshots("WHERE id = ?", (str(snapshot),))
+        return found[0] if found else None
+
+    def latest_run_snapshot(self, task: TaskId) -> tuple[SnapshotRecord, bool] | None:
+        """The newest `run` snapshot of `task` that has not been undone."""
+        found = self._snapshots(
+            "WHERE task_id = ? AND kind = 'run' AND undone_at IS NULL "
+            "ORDER BY taken_at DESC, id DESC LIMIT 1",
+            (str(task),),
+        )
+        return found[0] if found else None
+
+    def recent_snapshots(self, limit: int) -> list[tuple[SnapshotRecord, bool]]:
+        """The newest snapshots of every task, newest first."""
+        return self._snapshots("ORDER BY taken_at DESC, id DESC LIMIT ?", (_limit(limit),))
+
+    def oldest_snapshots(self, limit: int) -> list[tuple[SnapshotRecord, bool]]:
+        """The oldest snapshots first (for retention)."""
+        return self._snapshots("ORDER BY taken_at, id LIMIT ?", (_limit(limit),))
+
+    def snapshot_count(self) -> int:
+        return _integer(self._query("SELECT count(*) FROM snapshots")[0][0])
+
+    def _snapshots(
+        self, tail: str, parameters: Sequence[object] = ()
+    ) -> list[tuple[SnapshotRecord, bool]]:
+        found: list[tuple[SnapshotRecord, bool]] = []
+        for row in self._query(f"SELECT id, record, undone_at FROM snapshots {tail}", parameters):
+            try:
+                record = _SNAPSHOTS.validate_json(_text(row[1]), strict=True)
+                if str(record.id) != _text(row[0]):
+                    raise StoreCorruptError("a snapshot record disagrees with its row")
+                found.append((record, row[2] is not None))
+            except (StoreCorruptError, ValidationError):
+                _log.warning("a snapshot record of the broker's database cannot be read; skipped")
+        return found
 
     # --- tools (S23) ---------------------------------------------------------------------
 

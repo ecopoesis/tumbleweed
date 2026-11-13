@@ -30,6 +30,7 @@ import posixpath
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Final, final
 
@@ -61,6 +62,60 @@ FS_CALLS_PER_PROMPT: Final = 3
 """A grant request resolves the path and builds the deny rules before the prompt and builds the
 rules again after it (a picker resolves after it and builds rules once more)."""
 _MAX_EXTRA: Final = 64
+GIB: Final = 1024**3
+
+
+class SnapshotMode(StrEnum):
+    """Which snapshot backends a broker may use (S21, D28)."""
+
+    AUTO = "auto"  # btrfs where the target is on the configured btrfs file system, else copy
+    COPY = "copy"  # always copy (or reflink)
+    NOOP = "noop"  # none: every write run needs the user's "no undo"
+
+
+@final
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SnapshotSettings:
+    """What the snapshots may take and keep (D28).
+
+    - `max_bytes`, `max_files`: what one run's copy snapshot may hold (1 GiB, 100,000 files); a
+      tree over either is refused before the run (the user may accept "no undo" instead).
+    - `store_max_bytes`: all the copies together; over it the oldest are deleted (audited).
+    - `retention`, `max_snapshots`: a snapshot is kept 7 days or until 100 newer ones exist.
+    - `timeout`: how long taking or restoring one may take.
+    - `btrfs_directory`: the dedicated btrfs subvolume snapshots are made in, if the host has
+      one; it is on the deny list. Only a target on the same file system uses the btrfs backend.
+    - `btrfs_program`: the `btrfs` tool's path (an argv entry, never run through a shell).
+    """
+
+    mode: SnapshotMode = SnapshotMode.AUTO
+    max_bytes: int = GIB
+    max_files: int = 100_000
+    store_max_bytes: int = 8 * GIB
+    retention: timedelta = timedelta(days=7)
+    max_snapshots: int = 100
+    timeout: timedelta = timedelta(seconds=60)
+    btrfs_directory: Path | None = None
+    btrfs_program: str = "btrfs"
+
+    def __post_init__(self) -> None:
+        if type(self.mode) is not SnapshotMode:
+            raise InvalidValueError("snapshot mode must be a SnapshotMode")
+        for name, high in (
+            ("max_bytes", 1024 * GIB),
+            ("max_files", 10_000_000),
+            ("store_max_bytes", 1024 * GIB),
+            ("max_snapshots", 100_000),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= high:
+                raise InvalidValueError(f"{name} must be an int from 1 to {high}")
+        if self.store_max_bytes < self.max_bytes:
+            raise InvalidValueError("store_max_bytes must hold at least one snapshot")
+        _require_duration("snapshot retention", self.retention, maximum=timedelta(days=3650))
+        _require_duration("snapshot timeout", self.timeout, maximum=timedelta(hours=1))
+        if not self.btrfs_program or "\0" in self.btrfs_program or len(self.btrfs_program) > 1024:
+            raise InvalidValueError("btrfs_program must be a program name or path")
 
 
 def _require_duration(name: str, value: object, *, maximum: timedelta) -> None:
@@ -90,6 +145,8 @@ class BrokerConfig:
     - `run_grace`: how long past its wall-clock limit a run may take to set up and be reaped.
     - `sandbox_path`: the `PATH` inside a sandbox (the runtime decides where its programs are).
     - `limits`: the sandbox limits of a run, except what a request may lower.
+    - `snapshots`: undo (D28). `workspace_max_bytes`, `workspace_max_files`: what a task's
+      workspace may hold; a run is refused while it holds more (#74's disk box, D28).
     """
 
     data_home: Path
@@ -112,6 +169,9 @@ class BrokerConfig:
     prompt_window: timedelta = timedelta(minutes=10)
     run_grace: timedelta = timedelta(seconds=20)
     sandbox_path: str = "/usr/bin:/bin"
+    snapshots: SnapshotSettings = field(default_factory=SnapshotSettings)
+    workspace_max_bytes: int = 512 * 1024 * 1024
+    workspace_max_files: int = 50_000
 
     def __post_init__(self) -> None:
         for name in ("require_landlock", "require_scope_limits"):
@@ -140,6 +200,15 @@ class BrokerConfig:
                 raise InvalidValueError(f"{name} must be an int from 1 to {high}")
         if type(self.max_runs_per_task) is not int or not 1 <= self.max_runs_per_task <= 100_000:
             raise InvalidValueError("max_runs_per_task must be an int from 1 to 100000")
+        if type(self.snapshots) is not SnapshotSettings:
+            raise InvalidValueError("snapshots must be SnapshotSettings")
+        for name, high in (
+            ("workspace_max_bytes", 1024 * GIB),
+            ("workspace_max_files", 10_000_000),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= high:
+                raise InvalidValueError(f"{name} must be an int from 1 to {high}")
         if not self.sandbox_path or "\0" in self.sandbox_path or len(self.sandbox_path) > 1024:
             raise InvalidValueError("sandbox_path must be a non-empty path list")
 
@@ -147,6 +216,12 @@ class BrokerConfig:
     def broker_directory(self) -> Path:
         """Grants, audit log and the rest of the broker's data (ARCHITECTURE section 9)."""
         return self.data_home / "tumbleweed" / "broker"
+
+    @property
+    def snapshots_directory(self) -> Path:
+        """Where copy snapshots live (ARCHITECTURE section 9); inside the broker's data, which is
+        denied, and named on its own so that a rule that moves the data still covers it."""
+        return self.broker_directory / "snapshots"
 
     @property
     def workspaces_directory(self) -> Path:
@@ -158,12 +233,15 @@ class BrokerConfig:
         entries: list[tuple[str, str]] = [
             ("broker data", str(self.broker_directory)),
             ("broker workspaces", str(self.workspaces_directory)),
+            ("broker snapshots", str(self.snapshots_directory)),
             ("broker sockets", str(self.socket_directory)),
             ("sandbox /tmp", TMPFS_TARGET),
             ("sandbox /workspace", WORKSPACE_TARGET),
             ("sandbox /inputs", INPUTS_TARGET),
             ("sandbox launcher", HELPER_TARGET),
         ]
+        if self.snapshots.btrfs_directory is not None:
+            entries.append(("btrfs snapshots", str(self.snapshots.btrfs_directory)))
         entries += [(f"sandbox runtime {root}", root) for root in _runtime_roots(self.runtime)]
         agent = _directory_of(environ.get("SSH_AUTH_SOCK", ""))
         if agent is not None:

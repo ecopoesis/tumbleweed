@@ -46,6 +46,7 @@ CHUNK: Final = 1024 * 1024
 MAX_DEPTH: Final = 64
 _TEMP_PREFIX: Final = ".tw-restore-"
 _ATTEMPTS: Final = 8
+_SUBVOLUME_ROOT_INODE: Final = 256
 
 
 @final
@@ -575,3 +576,33 @@ def _measure(directory: int, work: _Work, *, depth: int) -> None:
                     _measure(child, work, depth=depth + 1)
                 finally:
                     os.close(child)
+
+
+def contains_subvolume(directory: int, *, max_files: int, deadline: float) -> bool:
+    """Whether a directory below `directory` is the root of a btrfs subvolume (inode 256), which
+    a snapshot of the enclosing subvolume leaves out. Only meaningful on btrfs. A walk that cannot
+    finish (a limit, the deadline, an unreadable directory) answers True: fail closed."""
+    work = _Work(TreeLimits(max_bytes=2**62, max_files=max_files), deadline)
+    try:
+        return _find_subvolume(directory, work, depth=0)
+    except (SnapshotError, OSError):
+        return True
+
+
+def _find_subvolume(directory: int, work: _Work, *, depth: int) -> bool:
+    work.check_depth(depth)
+    with os.scandir(directory) as scan:
+        for entry in scan:
+            work.add_entry()
+            info = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            if info.st_ino == _SUBVOLUME_ROOT_INODE:
+                return True
+            child = open_directory(directory, entry.name)
+            try:
+                if _find_subvolume(child, work, depth=depth + 1):
+                    return True
+            finally:
+                os.close(child)
+    return False
