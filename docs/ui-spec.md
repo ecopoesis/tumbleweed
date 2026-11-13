@@ -802,14 +802,21 @@ A handler has a `name` and a `kind`.
   applied. A `set` handler holds at most <!-- limit: MAX_HANDLER_ITEMS -->16<!-- /limit --> assignments and a `sandbox` handler at most
   <!-- limit: MAX_HANDLER_ITEMS -->16<!-- /limit --> inputs and <!-- limit: MAX_HANDLER_ITEMS -->16<!-- /limit --> outputs, at least one output (the result is a patch: a call that may write nothing gives
   the user no feedback, and a handler that only has side effects can write a status entry). `debounce_ms` (0 to <!-- limit: MAX_DEBOUNCE_MS -->10,000<!-- /limit -->) waits that long after the last event before calling; 0
-  calls at once in the spec, but S20's runtime applies a minimum debounce floor to a sandbox
-  handler driven by `on_change` of a slider or a spin button (I9: slider-driven handlers are
-  debounced), and coalesces events that arrive while a call is in flight. At most one call per tool instance runs at a time (I9). The spec holds no code and
-  does not say whether the module exists: the tool package does (S23). There is no field for source,
-  a command, a path, an environment, the network or a timeout; the broker's policy decides those.
-  Until S20 connects a sandbox, the renderer builds a control whose handler is a `sandbox` one
-  disabled, with a plain line under it that says it needs a sandbox that is not available yet
-  (never a tooltip), and no event of it is passed on (S12).
+  calls at once, except that a `change` event (a slider, a spin button or an entry fires on every
+  edit) never waits less than a fifth of a second (I9), and a newer event of the same handler replaces one that
+  is waiting. At most one call per tool instance runs at a time (I9); a handler that becomes due
+  meanwhile waits for it, with its newest inputs. The spec holds no code and does not say whether the module exists: `show_ui`
+  takes the modules in `code`, a list of `{name, source}`, and every `sandbox` handler's `module` must
+  be one of them (a saved tool keeps the same modules in its package, S23). The function is called
+  as `function(inputs)`, with one dict of the declared inputs, and returns a dict of outputs, at
+  most 48 KiB of JSON. It runs in the task's sandbox (D27): no network, no home directory, only
+  what the user granted for the task and the task's workspace, which is its working directory, at
+  most 20 seconds. An `image` output is the name of a file it wrote there. There is no field for
+  source, a command, a path, an environment, the network or a timeout; the broker's policy decides
+  those. A result that does not fit the outputs is refused whole, and a plain line under the tool
+  says what happened (never the code's own text). Without a broker to run code, the renderer
+  builds a control whose handler is a `sandbox` one disabled, with a plain line under it (never
+  a tooltip), and no event of it is passed on (S12).
 - **`agent`** sends the event and a snapshot of the state to the agent as untrusted input (S12).
   `note` is the author's hint about what the event means, and is data too. The agent gets the
   event in a frame that says it is data, with the whole state as it was at the event, capped: a
@@ -951,7 +958,8 @@ one means, is `tumbleweed.ui/2`.
   `uv run python -m tumbleweed.agent.spec_prompt --write`. The host is `tumbleweed.agent.canvas`
   (`show_ui`, `patch_state`, `CanvasHost`) and the events are `tumbleweed.agent.canvas_events`.
 - **Sandboxed code (S20).** `validate_patch(result, current=..., only=handler.outputs)` on every
-  result; the debounce floor and the one call in flight of [section 9](#9-handlers).
+  result; the debounce floor and the one call in flight of [section 9](#9-handlers), run by
+  `tumbleweed.agent.handler_runs`.
 - **Tool store and composition (S23, S25).** `PortType` and `port_type_of`, `ImageRef`, `FileRef`,
   `Table`, and the canonical form above (`tumbleweed.core.jcs.canonicalize`, which refuses an
   integer that stands for no double instead of rounding it).

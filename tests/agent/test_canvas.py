@@ -97,6 +97,70 @@ def canvas_rig(
         yield rig
 
 
+PHOTO = json.loads(golden_text("photo_adjuster"))
+MODULE: dict[str, JsonValue] = {"name": "photo", "source": "def adjust(inputs):\n    return {}\n"}
+
+
+class TestCodeModules:
+    """`show_ui(spec, placement, code)` (S20, D27 (4)): a handler's module must be passed."""
+
+    def test_a_sandbox_handler_whose_module_is_missing_is_a_problem_and_nothing_is_shown(
+        self,
+    ) -> None:
+        canvas = FakeCanvas()
+        script = [
+            FakeTurn(tool_calls=(call("show_ui", spec=PHOTO),)),
+            FakeTurn(tool_calls=(call("show_ui", spec=PHOTO, code=[MODULE]),)),
+            FakeTurn(chunks=("Done.",)),
+        ]
+        with canvas_rig(script, canvas) as rig:
+            rig.send_and_wait("photo tool")
+
+            (error,) = tool_results(rig, 1)
+            assert error.is_error
+            assert "handler adjust" in error.content
+            assert "photo" in error.content
+            assert len(canvas.shown) == 1  # only the second
+            assert [m.name for m in canvas.code[0]] == ["photo"]  # handed to the canvas as text
+
+    def test_two_modules_of_one_name_are_refused(self) -> None:
+        canvas = FakeCanvas()
+        script = [
+            FakeTurn(tool_calls=(call("show_ui", spec=PHOTO, code=[MODULE, MODULE]),)),
+            FakeTurn(chunks=("Done.",)),
+        ]
+        with canvas_rig(script, canvas) as rig:
+            rig.send_and_wait("photo tool")
+
+            (error,) = tool_results(rig, 1)
+            assert error.is_error
+            assert "same name" in error.content
+            assert canvas.shown == []
+
+    def test_a_module_over_the_size_limit_is_refused_by_the_input_model(self) -> None:
+        big: dict[str, JsonValue] = {"name": "photo", "source": "#" * 60_000}
+        canvas = FakeCanvas()
+        script = [
+            FakeTurn(tool_calls=(call("show_ui", spec=PHOTO, code=[big]),)),
+            FakeTurn(chunks=("Done.",)),
+        ]
+        with canvas_rig(script, canvas) as rig:
+            rig.send_and_wait("photo tool")
+
+            (error,) = tool_results(rig, 1)
+            assert error.is_error
+            assert canvas.shown == []
+
+    def test_a_spec_without_sandbox_handlers_needs_no_code(self) -> None:
+        canvas = FakeCanvas()
+        script = [FakeTurn(tool_calls=(call("show_ui", spec=TIP),)), FakeTurn(chunks=("ok",))]
+        with canvas_rig(script, canvas) as rig:
+            rig.send_and_wait("tip")
+
+            assert len(canvas.shown) == 1
+            assert canvas.code == [()]
+
+
 class TestShowUi:
     def test_a_scripted_spec_is_validated_and_shown_on_the_main_thread(self) -> None:
         canvas = FakeCanvas()
