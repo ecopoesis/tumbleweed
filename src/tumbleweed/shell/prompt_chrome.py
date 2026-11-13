@@ -381,6 +381,17 @@ class PromptBanner(Gtk.Box):
         self.append(plain_label("Permission request", css_classes=[TITLE_CLASS]))
         source = f"From task {card.task}" + ("" if card.tool is None else f", tool {card.tool}")
         self.append(plain_label(source, wrap=True, css_classes=["caption", "dim-label"]))
+        if card.task_title is not None:
+            self.append(
+                plain_label(
+                    "The assistant named this task (its own words, not checked):",
+                    wrap=True,
+                    css_classes=["caption", "dim-label"],
+                )
+            )
+            self.append(
+                plain_label(display_text(card.task_title), wrap=True, css_classes=[REASON_CLASS])
+            )
         for line, detail in self._what(card):
             self.append(plain_label(line, wrap=True))
             if detail is not None:

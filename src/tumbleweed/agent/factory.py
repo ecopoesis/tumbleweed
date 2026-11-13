@@ -12,11 +12,13 @@ from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass
 from typing import final
 
+from tumbleweed.agent.access import register_access_tools
 from tumbleweed.agent.anthropic_provider import (
     AnthropicProvider,
     build_client,
     response_byte_limit,
 )
+from tumbleweed.agent.broker_link import BrokerLink, connector_from_environment
 from tumbleweed.agent.canvas import CanvasLink, register_canvas_tools
 from tumbleweed.agent.config import (
     SECRET_ENV_VARIABLES,
@@ -37,6 +39,7 @@ from tumbleweed.agent.prompts import (
 from tumbleweed.agent.recorder import InvocationRecorder, JsonlInvocationLog
 from tumbleweed.agent.responder import Responder
 from tumbleweed.agent.runtime import AgentResponder, MainThreadDispatcher, UnavailableResponder
+from tumbleweed.agent.tasks import TaskSession
 from tumbleweed.agent.tools import ToolRegistry
 from tumbleweed.core.errors import TumbleweedError
 
@@ -52,6 +55,10 @@ class AgentSetup:
     responder: Responder
     close: Callable[[], None]
     canvas: CanvasLink | None = None
+    broker: BrokerLink | None = None
+    tasks: TaskSession | None = None
+    """The link to the broker and the task session, for the shell to wire (S19, D26); None when
+    the responder has no tools."""
 
 
 def _nothing() -> None:
@@ -91,8 +98,11 @@ def _build_anthropic(
         )
         model = config.model_for(ModelRole.CHAT)
         registry = ToolRegistry()
+        broker = BrokerLink(connector_from_environment(environ))
+        tasks = TaskSession(broker, dispatcher)
         canvas = CanvasLink(dispatcher)
-        register_canvas_tools(registry, canvas)
+        register_canvas_tools(registry, canvas, tasks)
+        register_access_tools(registry, tasks, broker)
         responder = AgentResponder(
             provider=AnthropicProvider(client, effort=config.effort),
             recorder=recorder,
@@ -102,6 +112,7 @@ def _build_anthropic(
             limits=config.limits,
             dispatcher=dispatcher,
             cleanup=client.close,
+            tasks=tasks,
         )
     except TumbleweedError as exc:
         # No key, a key file that is too open, an unreadable prompt: say so in the chat.
@@ -115,4 +126,11 @@ def _build_anthropic(
             _nothing,
         )
     logger.info("responder: %s (prompt %s)", model, SYSTEM_PROMPT_VERSION)
-    return AgentSetup(responder, responder.close, canvas)
+
+    def close() -> None:
+        try:
+            responder.close()
+        finally:
+            broker.close()
+
+    return AgentSetup(responder, close, canvas, broker, tasks)

@@ -17,11 +17,14 @@ from typing import Final
 
 from tumbleweed.core.errors import InvalidValueError
 
-SYSTEM_PROMPT_VERSION: Final = "v2"
+SYSTEM_PROMPT_VERSION: Final = "v3"
 MAX_PROMPT_BYTES: Final = 16 * 1024  # of the prompt's own file
 MAX_SPEC_REFERENCE_BYTES: Final = 64 * 1024  # of the generated reference
 _VERSION = re.compile(r"[A-Za-z0-9]{1,16}")
-_SPEC_REFERENCE_OF: Final = {"v2": "ui_spec_v1"}  # prompt version -> file of its spec reference
+_SPEC_REFERENCE_OF: Final = {
+    "v2": "ui_spec_v1",
+    "v3": "ui_spec_v1",
+}  # prompt version -> file of its spec reference
 
 
 def _read(name: str, limit: int, what: str) -> str:

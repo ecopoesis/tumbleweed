@@ -17,6 +17,7 @@ from tumbleweed.agent.limits import AgentLimits
 from tumbleweed.agent.llm import LlmEvent, LlmProvider, LlmRequest, TextDelta
 from tumbleweed.agent.recorder import InvocationRecord, InvocationRecorder
 from tumbleweed.agent.runtime import AgentResponder
+from tumbleweed.agent.tasks import TaskSession
 from tumbleweed.agent.tools import ToolRegistry
 from tumbleweed.core.types import ModelName
 from tumbleweed.shell.viewmodel.chat import ChatController
@@ -133,6 +134,7 @@ def make_rig(
     limits: AgentLimits | None = None,
     provider: LlmProvider | None = None,
     dispatcher: ManualDispatcher | None = None,
+    tasks: TaskSession | None = None,
 ) -> Iterator[Rig]:
     dispatcher = dispatcher or ManualDispatcher()
     fake = FakeProvider(script)
@@ -145,9 +147,13 @@ def make_rig(
         system_prompt="You are a test.",
         limits=limits or AgentLimits(),
         dispatcher=dispatcher,
+        tasks=tasks,
     )
     transcript = Transcript()
-    rig = Rig(transcript, ChatController(transcript, responder), responder, fake, dispatcher, log)
+    controller = ChatController(
+        transcript, responder, (lambda: None) if tasks is None else (lambda: tasks.current)
+    )
+    rig = Rig(transcript, controller, responder, fake, dispatcher, log)
     try:
         yield rig
     finally:

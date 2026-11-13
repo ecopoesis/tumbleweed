@@ -93,9 +93,12 @@ def _problems(error: ValidationError) -> str:
 
 @final
 class _Entry:
-    def __init__(self, spec: ToolSpec, invoke: Callable[[str], Awaitable[str]]) -> None:
+    def __init__(
+        self, spec: ToolSpec, invoke: Callable[[str], Awaitable[str]], timeout: float | None
+    ) -> None:
         self.spec = spec
         self.invoke = invoke
+        self.timeout = timeout
 
 
 @final
@@ -112,8 +115,12 @@ class ToolRegistry:
         description: str,
         input_model: type[I],
         handler: Callable[[I], Awaitable[str]],
+        *,
+        timeout_seconds: float | None = None,
     ) -> None:
-        """Add a tool. The name must be new, and `input_model` must forbid extra fields."""
+        """Add a tool. The name must be new, and `input_model` must forbid extra fields.
+
+        `timeout_seconds` replaces the registry's for a tool that waits for a person."""
         if name in self._entries:
             raise InvalidValueError(f"tool {excerpt(str(name))} is already registered")
         if len(self._entries) >= MAX_TOOLS:
@@ -126,7 +133,7 @@ class ToolRegistry:
             return await handler(input_model.model_validate_json(raw))
 
         spec = ToolSpec(name=str(name), description=description, input_schema=schema)
-        self._entries[str(name)] = _Entry(spec, invoke)
+        self._entries[str(name)] = _Entry(spec, invoke, timeout_seconds)
 
     def specs(self) -> tuple[ToolSpec, ...]:
         return tuple(entry.spec for entry in self._entries.values())
@@ -140,7 +147,7 @@ class ToolRegistry:
         if len(raw.encode("utf-8", errors="replace")) > MAX_TOOL_INPUT_BYTES:
             return ToolOutcome(text="The tool input is too large.", is_error=True)
         try:
-            async with asyncio.timeout(self._timeout):
+            async with asyncio.timeout(self._timeout if entry.timeout is None else entry.timeout):
                 return ToolOutcome(text=_bounded(await entry.invoke(raw)))
         except ValidationError as exc:
             return ToolOutcome(text=f"Invalid input for {name}: {_problems(exc)}", is_error=True)

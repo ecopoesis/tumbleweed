@@ -25,9 +25,11 @@ The notice is fixed text from `HistoryError`s and this module, never text from t
 
 import logging
 from collections.abc import Callable
-from typing import Final, final
+from typing import Final, Protocol, final
 
+from tumbleweed.agent.responder import HIDDEN_TASK
 from tumbleweed.core.errors import TumbleweedError
+from tumbleweed.core.ids import TaskId
 from tumbleweed.history.errors import HistoryError
 from tumbleweed.history.records import (
     MessageRole,
@@ -56,6 +58,20 @@ _NOT_RESTORABLE = (
     "changed."
 )
 type HistoryOpener = Callable[[], ChatHistory]
+
+
+class TaskLineage(Protocol):
+    """What the chat tells the agent's tasks about its sessions (D26 (1), (3))."""
+
+    def restore(self, head: TaskId | None) -> None:
+        """A chat was restored; `head` is the task of its newest tagged message."""
+        ...
+
+    def end_session(self) -> None:
+        """A new chat session starts: the task ends and nothing carries over."""
+        ...
+
+
 type NoticeObserver = Callable[[str], None]
 
 
@@ -66,6 +82,7 @@ def _transcript_message(stored: StoredMessage) -> TranscriptMessage:
         text=stored.text,
         state=MessageState(stored.state.value),
         error=stored.error,
+        task=stored.task_id,
     )
 
 
@@ -75,7 +92,7 @@ def _new_message(message: TranscriptMessage) -> NewMessage | None:
         return None
     return NewMessage(
         id=message.id,
-        task_id=None,  # no tasks until S19
+        task_id=message.task,
         role=MessageRole(message.role.value),
         state=StoredState(message.state.value),
         text=message.text,
@@ -92,7 +109,9 @@ class ChatSession:
         transcript: Transcript,
         controller: ChatController,
         open_history: HistoryOpener | None,
+        lineage: TaskLineage | None = None,
     ) -> None:
+        self._lineage = lineage
         self._transcript = transcript
         self._controller = controller
         self._open_history = open_history
@@ -153,6 +172,14 @@ class ChatSession:
                 return
         else:
             self._controller.set_session(restored.session.id)
+            if self._lineage is not None:
+                # A hidden reply (D26 (3)) is never the task to inherit from.
+                tagged = (
+                    m.task_id
+                    for m in reversed(restored.messages)
+                    if m.task_id is not None and m.task_id != HIDDEN_TASK
+                )
+                self._lineage.restore(next(tagged, None))
         self._saving = True
         self._set_notice(notice)
         self._transcript.subscribe(self)
@@ -160,6 +187,8 @@ class ChatSession:
     def new_session(self) -> None:
         """End the reply in flight, start a fresh session and empty the transcript."""
         self._controller.cancel()  # the failed message is saved to the session it belongs to
+        if self._lineage is not None:
+            self._lineage.end_session()
         if self._history is not None:
             try:
                 self._controller.set_session(self._history.new_session().id)

@@ -32,7 +32,7 @@ from typing import Final, Protocol, Self, assert_never, final
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 
 from tumbleweed.core.errors import InvalidValueError, TumbleweedError
-from tumbleweed.core.ids import MessageId
+from tumbleweed.core.ids import MessageId, TaskId
 from tumbleweed.core.types import ByteCount
 
 MAX_USER_BYTES: Final = ByteCount(16 * 1024)
@@ -106,6 +106,8 @@ class TranscriptMessage(BaseModel):
     text: str
     state: MessageState
     error: str | None = None
+    task: TaskId | None = None
+    """The task the message belongs to (D26): what decides whether the model is sent it later."""
 
     @model_validator(mode="after")
     def _is_consistent(self, info: ValidationInfo[object]) -> Self:
@@ -197,7 +199,7 @@ class Transcript:
             raise TranscriptError(f"no message {message_id} in the transcript")
         return self._messages[position]
 
-    def add_user(self, text: str) -> TranscriptMessage:
+    def add_user(self, text: str, task: TaskId | None = None) -> TranscriptMessage:
         """Add a user message (surrounding whitespace trimmed) and return it.
 
         Raises `InvalidValueError` if the text is not a `str`, is blank or is over
@@ -211,7 +213,7 @@ class Transcript:
             raise ReplyInFlightError("a reply is still streaming")
         if len(self._messages) + 2 > MAX_MESSAGES:  # one slot is kept for the reply
             raise TranscriptError(f"the transcript is full ({MAX_MESSAGES} messages)")
-        return self._add(Role.USER, cleaned, MessageState.COMPLETE)
+        return self._add(Role.USER, cleaned, MessageState.COMPLETE, task)
 
     def replace(self, messages: Sequence[TranscriptMessage]) -> None:
         """Replace every message with `messages` (oldest first) and tell the observers once.
@@ -266,18 +268,20 @@ class Transcript:
         self._streaming_bytes = size
         return self._change(message, message.text + cleaned, MessageState.STREAMING, None)
 
-    def finish(self, message_id: MessageId) -> TranscriptMessage:
-        """End the streaming message normally."""
+    def finish(self, message_id: MessageId, task: TaskId | None = None) -> TranscriptMessage:
+        """End the streaming message normally, as a message of `task` (D26)."""
         message = self._streaming_message(message_id)
-        return self._change(message, message.text, MessageState.COMPLETE, None)
+        return self._change(message, message.text, MessageState.COMPLETE, None, task)
 
-    def fail(self, message_id: MessageId, reason: str) -> TranscriptMessage:
+    def fail(
+        self, message_id: MessageId, reason: str, task: TaskId | None = None
+    ) -> TranscriptMessage:
         """End the streaming message as failed, keeping what arrived and recording `reason`.
 
         The reason is untrusted (it may come from a provider): it is shown as one bounded line.
         """
         message = self._streaming_message(message_id)
-        return self._change(message, message.text, MessageState.FAILED, _one_line(reason))
+        return self._change(message, message.text, MessageState.FAILED, _one_line(reason), task)
 
     def _streaming_message(self, message_id: MessageId) -> TranscriptMessage:
         message = self.message(message_id)
@@ -285,8 +289,12 @@ class Transcript:
             raise TranscriptError(f"message {message_id} is not streaming")
         return message
 
-    def _add(self, role: Role, text: str, state: MessageState) -> TranscriptMessage:
-        message = TranscriptMessage(id=MessageId.new(), role=role, text=text, state=state)
+    def _add(
+        self, role: Role, text: str, state: MessageState, task: TaskId | None = None
+    ) -> TranscriptMessage:
+        message = TranscriptMessage(
+            id=MessageId.new(), role=role, text=text, state=state, task=task
+        )
         self._positions[message.id] = len(self._messages)
         self._messages.append(message)
         if state is MessageState.STREAMING:
@@ -296,12 +304,24 @@ class Transcript:
         return message
 
     def _change(
-        self, old: TranscriptMessage, text: str, state: MessageState, error: str | None
+        self,
+        old: TranscriptMessage,
+        text: str,
+        state: MessageState,
+        error: str | None,
+        task: TaskId | None = None,
     ) -> TranscriptMessage:
         # Rebuilt through validation, so every invariant is checked again; the text is not scanned
         # again, because it is the checked text of `old` plus a delta checked by `append`.
         message = TranscriptMessage.model_validate(
-            {"id": old.id, "role": old.role, "text": text, "state": state, "error": error},
+            {
+                "id": old.id,
+                "role": old.role,
+                "text": text,
+                "state": state,
+                "error": error,
+                "task": old.task if task is None else task,
+            },
             context=_TEXT_CHECKED,  # forgery-ok: the transcript's own checked-text path
         )
         self._messages[self._positions[old.id]] = message

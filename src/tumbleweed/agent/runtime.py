@@ -27,20 +27,22 @@ The responder remembers nothing between replies. The conversation so far arrives
 
 import asyncio
 import concurrent.futures
+import contextlib
 import functools
 import logging
 import threading
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Final, Protocol, final
 
-from tumbleweed.agent.canvas_events import frame_turn
+from tumbleweed.agent.canvas_events import CanvasTurn, frame_turn
 from tumbleweed.agent.context import fit_history, history_budget
 from tumbleweed.agent.errors import AgentBusyError, AgentError, LimitError, describe_unexpected
 from tumbleweed.agent.limits import MAX_USER_TEXT_BYTES, AgentLimits
-from tumbleweed.agent.llm import LlmMessage, LlmProvider
+from tumbleweed.agent.llm import LlmProvider
 from tumbleweed.agent.loop import AgentLoop
 from tumbleweed.agent.recorder import InvocationRecorder
 from tumbleweed.agent.responder import (
+    ContextTurn,
     ReplyDelta,
     ReplyEvent,
     ReplyFailed,
@@ -49,8 +51,9 @@ from tumbleweed.agent.responder import (
     ReplyRequest,
     ReplySink,
 )
+from tumbleweed.agent.tasks import TaskError, TaskSession
 from tumbleweed.agent.tools import ToolRegistry
-from tumbleweed.core.ids import SessionId
+from tumbleweed.core.ids import SessionId, TaskId
 from tumbleweed.core.types import ModelName
 
 logger = logging.getLogger(__name__)
@@ -165,7 +168,9 @@ class AgentResponder:
         limits: AgentLimits,
         dispatcher: MainThreadDispatcher,
         cleanup: Callable[[], Awaitable[None]] | None = None,
+        tasks: TaskSession | None = None,
     ) -> None:
+        self._tasks = tasks
         self._dispatcher = dispatcher
         self._limits = limits
         self._system_prompt = system_prompt
@@ -201,12 +206,6 @@ class AgentResponder:
         run = _Run(sink)
         self._active = run
         try:
-            history = fit_history(
-                self._system_prompt,
-                request.history,
-                text,
-                budget=history_budget(self._limits.max_turn_output_tokens),
-            )
             loop = AgentLoop(
                 provider=self._recorder.record(
                     self._provider, session_id=request.session_id or self._session_id
@@ -215,8 +214,11 @@ class AgentResponder:
                 model=self._model,
                 system_prompt=self._system_prompt,
                 limits=self._limits,
+                tasks=self._tasks,
             )
-            run.future = self._worker.submit(self._drive(run, loop, history, text))
+            run.future = self._worker.submit(
+                self._drive(run, loop, request.history, text, request.canvas_turn)
+            )
         except BaseException:
             self._active = None
             raise
@@ -245,19 +247,45 @@ class AgentResponder:
     # On the worker thread.
 
     async def _drive(
-        self, run: _Run, loop: AgentLoop, history: tuple[LlmMessage, ...], text: str
+        self,
+        run: _Run,
+        loop: AgentLoop,
+        turns: tuple[ContextTurn, ...],
+        text: str,
+        canvas: CanvasTurn | None,
     ) -> None:
+        tasks = self._tasks
         try:
-            await loop.run(history, text, lambda piece: self._post(run, ReplyDelta(text=piece)))
+            if tasks is not None:
+                tasks.begin_reply()
+                if tasks.unverified:
+                    # A restored chat: ask the broker whether the task its turns belong to is
+                    # still known, which decides what of them the model may see (D26 (3)).
+                    with contextlib.suppress(TaskError):
+                        await tasks.ensure()
+                tasks.anchor_reply()
+                turns = tuple(turn for turn in turns if tasks.visible(turn.task))
+            history = fit_history(
+                self._system_prompt,
+                turns,
+                text,
+                budget=history_budget(self._limits.max_turn_output_tokens),
+            )
+            await loop.run(
+                history,
+                text,
+                lambda piece: self._post(run, ReplyDelta(text=piece)),
+                typed=canvas is None,
+            )
         except AgentError as exc:
-            self._post(run, ReplyFailed(reason=str(exc)))
+            self._post(run, ReplyFailed(reason=str(exc), task=_tag(tasks)))
         except Exception as exc:  # noqa: BLE001  (the worker is a boundary)
             # A bug (everything a provider can do wrong is a ProviderError by now): by type and
             # place only, because its message could hold what a server said.
             logger.error("the reply failed unexpectedly: %s", describe_unexpected(exc))
-            self._post(run, ReplyFailed(reason=_INTERNAL_FAILURE))
+            self._post(run, ReplyFailed(reason=_INTERNAL_FAILURE, task=_tag(tasks)))
         else:
-            self._post(run, ReplyFinished())
+            self._post(run, ReplyFinished(task=_tag(tasks)))
 
     def _post(self, run: _Run, event: ReplyEvent) -> None:
         try:
@@ -275,6 +303,10 @@ class AgentResponder:
             if self._active is run:
                 self._active = None
         run.sink.emit(event)
+
+
+def _tag(tasks: TaskSession | None) -> TaskId | None:
+    return None if tasks is None else tasks.reply_tag()
 
 
 @final

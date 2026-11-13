@@ -62,6 +62,10 @@ class FakeProvider:
         self.calls_cancelled = 0
         self.calls_completed = 0
 
+    def extend(self, turns: list[FakeTurn]) -> None:
+        """Add turns to the end of the script (a test learns what to script after it is built)."""
+        self._script.extend(turns)
+
     async def stream(self, request: LlmRequest) -> AsyncIterator[LlmEvent]:
         self.requests.append(request)
         if not self._script:

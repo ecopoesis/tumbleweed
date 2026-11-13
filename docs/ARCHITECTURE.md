@@ -140,7 +140,10 @@ on them).
   ends the current task and starts a new one; a new session or a shell restart ends the
   current task. Ending a task revokes its `task`/`once` grants. Its workspace is retained
   for 7 days (configurable) and then deleted.
-- **Context scoping.** Tool results (file contents, run output, UI event payloads) are tagged
+- **Context scoping (S19, D26 (3), (4)).** The agent keeps no taint: it keeps the *context set*,
+  the tasks whose turns the model may be sent (reset by `fresh_context=true`, extended by a
+  non-fresh start), which follows the chain along which the broker copies taint. Inside a reply a
+  task switch replaces earlier tool results with a placeholder. Tool results (file contents, run output, UI event payloads) are tagged
   with their task and are never included in the model context of a later task. Only
   user and assistant text turns carry across tasks, and **none** of an fs-tainted task's
   turns are included in the context of a net-tainted task (I12). A task whose context
@@ -150,7 +153,9 @@ on them).
   task ends, its instances become inert: `set` handlers and computed state still work
   locally, but `sandbox` and `agent` handlers are disabled until the tool is reopened into
   the current task. (S12 makes the instances and puts up to four on the canvas, `replace` or
-  `stack`; they belong to no task until S19 adds tasks.)
+  `stack`; S19 gives each the task current when it was shown, and `CanvasTools.task_ended` makes
+  them inert: their `agent` sink drops events, their images are refused by the broker, `set`
+  handlers, computed state and `patch_state` still work, D26 (5).)
 - **Where the sandbox boundary sits.** The agent loop itself runs in the trusted shell
   process because it never executes model output; every *action* it takes is confined
   (grant-checked by the broker; code runs in bubblewrap). This deliberately differs from
@@ -546,8 +551,9 @@ the broker imports the agent or an LLM (I2).
   tumbleweed.broker.daemon` detached, from `/`, with a minimal environment of its own (never the
   shell's: the API key is not passed on, I6; `-I` and the working directory keep a module planted
   where the shell runs from out of the broker) and retries with backoff for at most 30 s; on the
-  target a systemd user service starts the daemon (S27). The shell wires it in S19 (#89, and
-  S19's scope in the plan). `BrokerClient`'s heartbeat stops only when the connection ends; a ping
+  target a systemd user service starts the daemon (S27). The shell wires it in S19 (#89, D26 (8)): `agent.broker_link.BrokerLink` owns the one
+  `BrokerClient` on a loop and thread of its own, connects on first use and reconnects with a
+  growing pause. `BrokerClient`'s heartbeat stops only when the connection ends; a ping
   that times out or is refused is logged and the next is tried.
 
 ### Voice input (S06, D20)
@@ -817,7 +823,7 @@ the user's own, and `edit_before_send` (and its forcing over plain http) applies
 | `show_ui(spec, placement?, code?)` | Validate and render a tool draft on the canvas; `placement` is `replace` (default) or `stack` | S12 (code: S20) |
 | `patch_state(instance, patch)` | Update a rendered tool's state (never fires handlers) | S12 |
 | `start_task(title, fresh_context?)` | End the current task; new workspace, no grants; optionally no prior turns | S19 |
-| `request_access(capability \| pick, reason)` | Ask for a grant, or ask the user to pick a file/folder | S19 |
+| `request_access(kind, path?, reason)` | Ask for a grant (`read`, `network`), or ask the user to pick a file/folder (`pick_file`, `pick_folder`); a picked path comes back in the result | S19 |
 | `list_workspace()` / `list_dir(path)` / `read_file(path)` | Grant-checked, size-capped listings and reads via the broker | S19 |
 | `run_code(source, timeout)` | One-off sandboxed Python in the task workspace | S20 |
 | `undo_last_change()` | Restore the paths written by the task's last write-enabled run | S21 |

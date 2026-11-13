@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Final, final
 
 from tumbleweed.agent.canvas_events import Scheduler
 from tumbleweed.agent.runtime import MainThreadDispatcher
-from tumbleweed.core.ids import PromptId
+from tumbleweed.core.ids import PromptId, TaskId
 from tumbleweed.ipc.broker_messages import Refused
 from tumbleweed.ipc.connection import Connection
 from tumbleweed.ipc.errors import ErrorCode, IpcError, RequestRefused
@@ -92,7 +92,9 @@ class BrokerPrompts:
         dispatcher: MainThreadDispatcher,
         scheduler: Scheduler,
         clock: Callable[[], float] = time.monotonic,
+        titles: Callable[[TaskId], str | None] = lambda _task: None,
     ) -> None:
+        self._titles = titles
         self.controller = PromptController(view, self._answered, scheduler, clock)
         self._dispatcher = dispatcher
         # Where each prompt came from, so that its answer goes back on that connection. Main thread.
@@ -170,7 +172,7 @@ class BrokerPrompts:
     ) -> bool:
         if self._closed or connection.is_closed:
             return False
-        card = card_of(request)
+        card = card_of(request, self._titles(request.task))
         if not self.controller.offer(card, request.expires_in_ms / 1000):
             return False
         self._routes[card.prompt] = (connection, loop)

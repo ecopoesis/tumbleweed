@@ -33,9 +33,17 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from tumbleweed.agent.canvas_events import CanvasTurn
 from tumbleweed.agent.limits import MAX_REPLY_BYTES, MAX_USER_TEXT_BYTES
-from tumbleweed.core.ids import MessageId, SessionId
+from tumbleweed.core.ids import MessageId, SessionId, TaskId
 
 MAX_CONTEXT_TURNS = 500  # half of the transcript's 1000 messages
+
+HIDDEN_TASK = TaskId("tsk_00000000000000000000000000")
+"""The task a reply is tagged with when no task may ever see it (D26 (3)): a reply in which the
+context was cut (a fresh start, or the broker not knowing the task to inherit from) after the model
+had begun to write. Its text derives from the earlier context, so it is not for the new task, and
+from the later one, so it is not for the earlier. It is a value of the strict `TaskId` type that no
+broker ever issues: it is in no context set, and a restore skips it when it looks for the task to
+inherit from. The reply stays in the transcript and the history; it is only never sent."""
 
 
 @final
@@ -50,6 +58,10 @@ class ContextTurn(BaseModel):
 
     user: str = Field(max_length=MAX_USER_TEXT_BYTES)
     assistant: str = Field(max_length=MAX_REPLY_BYTES)
+    task: TaskId | None = None
+    """The task of the reply (D26). The agent sends the turn only if that task is one whose turns
+    the current task may see; a turn with no task (written before tasks, or with no broker) is
+    sent."""
 
 
 @final
@@ -86,6 +98,8 @@ class ReplyFinished(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
     kind: Literal["finished"] = "finished"
+    task: TaskId | None = None
+    """The task the reply belongs to, for the transcript to tag it with (D26)."""
 
 
 @final
@@ -100,6 +114,7 @@ class ReplyFailed(BaseModel):
 
     kind: Literal["failed"] = "failed"
     reason: str
+    task: TaskId | None = None
 
 
 type ReplyEvent = Annotated[ReplyDelta | ReplyFinished | ReplyFailed, Field(discriminator="kind")]

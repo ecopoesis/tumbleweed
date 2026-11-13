@@ -23,7 +23,7 @@ from tumbleweed.agent.canvas import (
 from tumbleweed.agent.fake import FakeToolCall, FakeTurn
 from tumbleweed.agent.llm import ToolResultBlock
 from tumbleweed.agent.tools import ToolRegistry
-from tumbleweed.core.ids import ToolInstanceId
+from tumbleweed.core.ids import TaskId, ToolInstanceId
 from tumbleweed.ui.runtime import UiRuntime
 from tumbleweed.ui.spec import UiSpec
 from tumbleweed.ui.spec.names import StateKey
@@ -41,7 +41,7 @@ class FakeCanvas:
         self.runtimes: dict[ToolInstanceId, UiRuntime] = {}
         self.threads: set[int] = set()
 
-    def show(self, spec: UiSpec, placement: Placement) -> ShownTool:
+    def show(self, spec: UiSpec, placement: Placement, task: TaskId | None) -> ShownTool:
         self.threads.add(threading.get_ident())
         instance = self._ids.pop(0) if self._ids else ToolInstanceId.new()
         if placement == "replace":

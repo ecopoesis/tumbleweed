@@ -28,8 +28,12 @@ class TestEvents:
         ("event", "json"),
         [
             (ReplyDelta(text="hi"), '{"kind":"delta","text":"hi"}'),
-            (ReplyFinished(), '{"kind":"finished"}'),
-            (ReplyFailed(reason="no key"), '{"kind":"failed","reason":"no key"}'),
+            (ReplyFinished(), '{"kind":"finished","task":null}'),
+            (
+                ReplyFinished(task=TaskId("tsk_01m77ec7w9qmsk08knr5e76wtg")),
+                '{"kind":"finished","task":"tsk_01m77ec7w9qmsk08knr5e76wtg"}',
+            ),
+            (ReplyFailed(reason="no key"), '{"kind":"failed","reason":"no key","task":null}'),
         ],
     )
     def test_the_union_round_trips_on_its_kind(self, event: ReplyEvent, json: str) -> None:
