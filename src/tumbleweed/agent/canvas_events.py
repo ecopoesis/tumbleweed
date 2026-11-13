@@ -114,7 +114,7 @@ def _dumps(value: JsonValue) -> str:
     return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
-def _json_of(value: StateValue) -> JsonValue:
+def json_of(value: StateValue) -> JsonValue:
     if isinstance(value, Table | ImageRef | FileRef):
         return _JSON.validate_python(value.model_dump(mode="json"))
     if isinstance(value, tuple):
@@ -159,7 +159,7 @@ def snapshot_of(state: Mapping[StateKey, StateValue]) -> StateSnapshot:
     kinds: list[str] = []
     omitted: set[int] = set()
     for index, (key, raw) in enumerate(state.items()):
-        value = _json_of(raw)
+        value = json_of(raw)
         size = len(_dumps(value))
         kind = _kind_of(raw)
         if size > MAX_VALUE_BYTES:

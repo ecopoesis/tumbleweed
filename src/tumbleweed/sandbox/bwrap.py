@@ -11,9 +11,11 @@ so the order only keeps the arguments stable), the launcher's own file, and last
 remount of the root, which would otherwise be a writable tmpfs.
 """
 
+from tumbleweed.sandbox.errors import InvalidPolicyError
 from tumbleweed.sandbox.hardening import HardeningFds, exec_command
 from tumbleweed.sandbox.policy import (
     HELPER_TARGET,
+    PAYLOAD_TARGET,
     WORKSPACE_TARGET,
     GrantAccess,
     OpenedDescriptor,
@@ -76,6 +78,10 @@ def build_bwrap_argv(
     if hardening is not None:
         # A file of the root tmpfs, so before the remount below makes it read-only.
         argv += ["--ro-bind-data", str(hardening.helper), HELPER_TARGET]
+    if policy.payload is not None:
+        if hardening is None or hardening.payload is None:
+            raise InvalidPolicyError("a payload needs the hardened launcher")
+        argv += ["--ro-bind-data", str(hardening.payload), PAYLOAD_TARGET]
     argv += ["--remount-ro", "/", "--chdir", WORKSPACE_TARGET]
     if hardening is None:
         for var in sorted(policy.env, key=lambda item: item.name):

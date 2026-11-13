@@ -37,9 +37,13 @@ from tumbleweed.agent.tasks import TaskError
 from tumbleweed.agent.tools import ToolError, ToolName, ToolRegistry
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import TaskId, ToolInstanceId
+from tumbleweed.tools.limits import MAX_MODULES, MAX_MODULES_BYTES
+from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.spec import SpecError, UiSpec, validate_ui_spec
+from tumbleweed.ui.spec.handlers import SandboxHandler
 from tumbleweed.ui.spec.names import StateKey
 from tumbleweed.ui.spec.state import BoolState, FloatState, IntState, StringState
+from tumbleweed.ui.spec.text import text_bytes
 
 if TYPE_CHECKING:
     from tumbleweed.agent.tasks import TaskSession
@@ -71,8 +75,16 @@ class ShownTool:
 class CanvasHost(Protocol):
     """The canvas, as the agent needs it. Called on the main thread only."""
 
-    def show(self, spec: UiSpec, placement: Placement, task: TaskId | None) -> ShownTool:
-        """Show `spec` as an instance that belongs to `task` (None: to no task, S12's case)."""
+    def show(
+        self,
+        spec: UiSpec,
+        placement: Placement,
+        task: TaskId | None,
+        code: tuple[CodeModule, ...] = (),
+    ) -> ShownTool:
+        """Show `spec` as an instance that belongs to `task` (None: to no task, S12's case).
+        `code` is the source of the modules its `sandbox` handlers call (S20): text, never run
+        here."""
         ...
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
@@ -99,9 +111,13 @@ class CanvasLink:
         self._host = None
 
     async def show(
-        self, spec: UiSpec, placement: Placement, task: TaskId | None = None
+        self,
+        spec: UiSpec,
+        placement: Placement,
+        task: TaskId | None = None,
+        code: tuple[CodeModule, ...] = (),
     ) -> ShownTool:
-        return await self._on_main(lambda host: host.show(spec, placement, task))
+        return await self._on_main(lambda host: host.show(spec, placement, task, code))
 
     async def patch(
         self, instance: ToolInstanceId, patch: Mapping[str, object]
@@ -160,6 +176,14 @@ class ShowUiInput(BaseModel):
             "stack: the tool goes below the tools already there."
         ),
     )
+    code: tuple[CodeModule, ...] = Field(
+        default=(),
+        max_length=MAX_MODULES,
+        description=(
+            "Python modules for the spec's sandbox handlers: a list of {name, source}. Each "
+            "sandbox handler's module must be one of them. See the reference."
+        ),
+    )
 
 
 @final
@@ -174,6 +198,25 @@ class PatchStateInput(BaseModel):
 
 def _failure_of(error: SpecError, lead: str) -> ToolError:
     return ToolError("\n".join([lead, *(f"- {problem}" for problem in error.problems)]))
+
+
+def _code_problems(spec: UiSpec, code: tuple[CodeModule, ...]) -> list[str]:
+    """What is wrong with the modules, for the model to fix (names only, no source echoed)."""
+    problems: list[str] = []
+    names = [str(module.name) for module in code]
+    if len(set(names)) != len(names):
+        problems.append("two code modules have the same name")
+    # Defence in depth: the tool input's own limit (64 KiB) is lower today, and this one is what a
+    # package may hold (S23), should the input limit be raised.
+    if sum(text_bytes(module.source) for module in code) > MAX_MODULES_BYTES:
+        problems.append(f"the code modules hold more than {MAX_MODULES_BYTES // 1024} KiB in all")
+    for handler in spec.handlers:
+        if isinstance(handler, SandboxHandler) and handler.module not in names:
+            problems.append(
+                f"handler {handler.name}: its module {handler.module} is not in code "
+                "(pass it as {name, source})"
+            )
+    return problems
 
 
 def _describe_entries(spec: UiSpec) -> str:
@@ -201,11 +244,14 @@ def register_canvas_tools(
             spec = validate_ui_spec(arguments.spec)
         except SpecError as error:
             raise _failure_of(error, _FIX_AND_RETRY) from None
+        problems = _code_problems(spec, arguments.code)
+        if problems:
+            raise ToolError("\n".join([_FIX_AND_RETRY, *(f"- {problem}" for problem in problems)]))
         task: TaskId | None = None
         if tasks is not None:
             with contextlib.suppress(TaskError):
                 task = await tasks.ensure()
-        shown = await link.show(spec, arguments.placement, task)
+        shown = await link.show(spec, arguments.placement, task, arguments.code)
         count = "" if shown.on_canvas == 1 else f" ({shown.on_canvas} tools)"
         where = f"on the canvas{count}"
         return (

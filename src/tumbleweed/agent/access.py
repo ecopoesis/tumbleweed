@@ -200,6 +200,11 @@ def register_access_tools(registry: ToolRegistry, tasks: TaskSession, link: Brok
                 else "(already covered)"
             )
             text = f"Granted {scope}."
+            if outcome.scope == "once":
+                text += (
+                    " Code you run (run_code, or a tool's code) cannot use it: only access "
+                    "for the task reaches code."
+                )
             if outcome.picked is not None:
                 text += " The user chose:\n" + framed(
                     "the path the user picked", spelled(outcome.picked)

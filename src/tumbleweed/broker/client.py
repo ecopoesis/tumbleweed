@@ -265,6 +265,7 @@ class BrokerClient:
         wall_seconds: int = 30,
         cpu_seconds: int = 30,
         max_output_bytes: int = 64 * 1024,
+        payload: str | None = None,
     ) -> RunResult:
         request = RunInSandbox(
             kind="run_in_sandbox",
@@ -275,6 +276,7 @@ class BrokerClient:
             wall_seconds=wall_seconds,
             cpu_seconds=cpu_seconds,
             max_output_bytes=max_output_bytes,
+            payload=payload,
         )
         wait = timedelta(seconds=wall_seconds) + _RUN_SETUP
         return await self._ask(request, RunResult, wait=wait)

@@ -87,6 +87,23 @@ class TestChoice:
 
         assert isinstance(agent.responder, AgentResponder)
 
+    def test_the_model_is_offered_the_canvas_access_and_code_tools(
+        self, home: Path, agents: AgentFactory
+    ) -> None:
+        agent, _ = agents(environ_for(home, ANTHROPIC_API_KEY=CANARY))
+
+        assert isinstance(agent.responder, AgentResponder)
+        assert {
+            "show_ui",
+            "patch_state",
+            "start_task",
+            "request_access",
+            "list_workspace",
+            "list_dir",
+            "read_file",
+            "run_code",
+        } <= set(agent.responder.tool_names)
+
     def test_no_key_says_so_in_the_chat_instead_of_failing_to_start(
         self, home: Path, agents: AgentFactory
     ) -> None:

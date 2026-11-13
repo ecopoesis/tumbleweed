@@ -574,7 +574,17 @@ def test_sandbox_handlers_are_disabled_with_a_reason_and_cannot_fire_in_the_shel
 
     photo = json.loads(golden_text("photo_adjuster"))
     shell, provider = canvas_shell(
-        [FakeTurn(tool_calls=(show(photo),)), FakeTurn(chunks=("Made it.",))]
+        [
+            FakeTurn(
+                tool_calls=(
+                    show(
+                        photo,
+                        code=[{"name": "photo", "source": "def adjust(inputs):\n  return {}\n"}],
+                    ),
+                )
+            ),
+            FakeTurn(chunks=("Made it.",)),
+        ]
     )
     say(shell, "photo tool")
     tool = only_tool(shell)

@@ -638,7 +638,7 @@ class TestMoreRefusalsAreRecorded:
                 with pytest.raises(BrokerRefused) as caught:
                     await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
-                assert caught.value.reason == "busy"
+                assert caught.value.reason == "exhausted"
                 assert len(rig.sandbox.policies) == 3
                 entries = rig.audit_of(SandboxRun)
                 assert [e.outcome for e in entries if e.outcome == "authorised"] == [

@@ -375,6 +375,24 @@ shell, voice or `gi` (section 10).
   (`--allow-unenforced-limits`, for a development host), a run on a host whose runner reports the
   pids or memory-total limit as unenforced (S17); these and the other gaps are tracked in #74.
 
+- **Running code (S20, D27).** The runtime's Python is the system one, found as `python3` on the
+  sandbox's own `PATH` and run as `-I` (in the Linux image Pillow and numpy come from Ubuntu's
+  packages under `/usr`). Code and inputs are not arguments, which another user of the host could
+  read in its process list: they are the run's **payload**, bytes the broker (`RunInSandbox.payload`,
+  `SandboxPolicy.payload`) puts in the sandbox as the read-only file `/tw-payload`, which bwrap makes
+  from a memfd (`--ro-bind-data`, as it does the launcher). The path is a reserved target, and
+  Landlock allows reading that one file. For a handler the command is the shim
+  (`tumbleweed.sandbox.handler_shim`, standard library only, passed as `-c`) on that file, which
+  holds one JSON document of the declared inputs and the tool's modules; for `run_code` the command
+  runs the payload, the source, as a script. The shim imports a module by
+  `spec_from_file_location` under a private package whose path is a directory it just made, so no
+  module name can resolve to the standard library (#56). The shell and the broker never compile,
+  import or evaluate that text. A handler's result is one JSON line that the trusted side parses
+  again with a closed model and applies only to the declared outputs
+  (`UiRuntime.apply_sandbox_result`). `tumbleweed.sandbox.handler_protocol` builds the command and
+  payload and reads the line (the broker may use it for stored code, S24); `agent.handler_runs`
+  decides when runs start (debounce, one in flight per instance) and `agent.code` starts them.
+
 ### Broker daemon
 
 `tumbleweed-broker` (`tumbleweed.broker.daemon`, S17, D17) serves the broker over the IPC of this
@@ -392,7 +410,7 @@ the broker imports the agent or an LLM (I2).
   bounded fields before the service sees it, so a request the schema refuses ends the connection
   like any malformed frame. A request the broker declines is *answered* with `Refused`: a closed
   reason (`unknown_task`, `invalid_request`, `denied`, `not_granted`, `not_found`, `unsafe`,
-  `too_large`, `busy`, `unavailable`, `timeout`, `failed`, `conflict`) and fixed text that never
+  `too_large`, `busy`, `exhausted`, `unavailable`, `timeout`, `failed`, `conflict`) and fixed text that never
   repeats a path, a command, a name from a tool or the model's reason. A denied grant is an ordinary answer (`GrantOutcome(granted=false)`).
 - **Tasks.** `start_task(previous, fresh_context)` ends `previous` and makes the new task, with a
   private workspace (`<workspaces>/<TaskId>`, mode 0700), copying `previous`'s taint unless
@@ -820,12 +838,12 @@ the user's own, and `edit_before_send` (and its forcing over plain http) applies
 
 | Tool | Effect | Step |
 |---|---|---|
-| `show_ui(spec, placement?, code?)` | Validate and render a tool draft on the canvas; `placement` is `replace` (default) or `stack` | S12 (code: S20) |
+| `show_ui(spec, placement?, code?)` | Validate and render a tool draft on the canvas; `placement` is `replace` (default) or `stack`; `code` is the list of `{name, source}` modules its `sandbox` handlers call | S12, S20 |
 | `patch_state(instance, patch)` | Update a rendered tool's state (never fires handlers) | S12 |
 | `start_task(title, fresh_context?)` | End the current task; new workspace, no grants; optionally no prior turns | S19 |
 | `request_access(kind, path?, reason)` | Ask for a grant (`read`, `network`), or ask the user to pick a file/folder (`pick_file`, `pick_folder`); a picked path comes back in the result | S19 |
 | `list_workspace()` / `list_dir(path)` / `read_file(path)` | Grant-checked, size-capped listings and reads via the broker | S19 |
-| `run_code(source, timeout)` | One-off sandboxed Python in the task workspace | S20 |
+| `run_code(source, timeout_seconds)` | One-off sandboxed Python in the task workspace; stdout and stderr come back framed as data | S20 |
 | `undo_last_change()` | Restore the paths written by the task's last write-enabled run | S21 |
 | `find_tools(query)` / `open_tool(id, version?)` | Retrieve and reopen saved tools | S24 |
 | `save_tool(name, description)` / `revert_tool(id, version)` | Persist and version tools | S24 |
@@ -892,8 +910,8 @@ the last entries are counted and left out), and a note is cut at 2 KiB (all meas
 ours that names the handler, not the data. **Rate limit (I9, #57).** An instance starts at most one
 turn every 3 seconds and one turn runs at a time; an event that waits is replaced by a newer one of
 its instance (the turn says how many it replaces); at most one waits per instance. `sandbox`
-handlers have nowhere to go until S20: their controls are built disabled, with the reason in the
-tool, and no event of one is passed on while no sandbox is connected.
+handlers run their code through the broker since S20 (D27, below); while no broker is connected
+their controls are built disabled, with the reason in the tool, and no event of one is passed on.
 
 ## 5. Saved tools
 

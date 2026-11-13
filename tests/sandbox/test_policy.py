@@ -95,6 +95,7 @@ class TestGrantMount:
             "/workspace/sub",
             "/inputs",
             "/inputs/conn_x",
+            "/tw-payload",
         ],
     )
     def test_refuses_what_the_sandbox_builds_itself(self, workspace: Opened, target: str) -> None:

@@ -1665,7 +1665,7 @@ class BrokerService:
         if request.run in live.runs or request.run in live.pending_runs:
             raise _Refuse("invalid_request", "that run ID was already used", "run_id_reused")
         if len(live.runs) + len(live.pending_runs) >= config.max_runs_per_task:
-            raise _Refuse("busy", "the task has used all the runs it may", "run_cap")
+            raise _Refuse("exhausted", "the task has used all the runs it may", "run_cap")
         if self._slots.locked():
             raise _Refuse("busy", "too many runs are in progress", "run_slots")
         live.pending_runs.add(request.run)
@@ -1771,7 +1771,17 @@ class BrokerService:
             opened.append(workspace)
             granted: list[OpenedPath] = []
             for mount in mounts:
-                granted.append(open_granted(mount.path, rules=rules))
+                try:
+                    granted.append(open_granted(mount.path, rules=rules))
+                except PathError as error:
+                    # Which grant, by its ID (the broker's own, not a path the model can read
+                    # back), so the user can be told and asked again (#86).
+                    raise _Refuse(
+                        _reason_of_fault(error.fault),
+                        f"the access granted as {mount.grant} can no longer be used: "
+                        f"{describe_fault(error.fault)}",
+                        error.fault.value,
+                    ) from None
                 opened.append(granted[-1])
         except BaseException:
             for each in opened:
@@ -1810,6 +1820,7 @@ class BrokerService:
                 env=variables,
                 env_allowlist=allowlist,
                 require_landlock=self._config.require_landlock,
+                payload=None if request.payload is None else request.payload.encode("utf-8"),
             )
             policy.check_descriptors()
         except InvalidValueError:  # InvalidPolicyError is one
@@ -1838,7 +1849,7 @@ class BrokerService:
         if request.run in live.runs:
             raise _Refuse("invalid_request", "that run ID was already used", "run_id_reused")
         if len(live.runs) >= self._config.max_runs_per_task:
-            raise _Refuse("busy", "the task has used all the runs it may", "run_cap")
+            raise _Refuse("exhausted", "the task has used all the runs it may", "run_cap")
         now = self._now()
         again = select_grants(live.state, context, self._grants_for(live), rules=rules, now=now)
         if [g.id for g in again.applicable] != [g.id for g in selection.applicable] or (

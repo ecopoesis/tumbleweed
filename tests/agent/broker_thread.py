@@ -17,6 +17,7 @@ from tests.broker.rig import Rig, ScriptedPrompts, running
 from tumbleweed.agent.broker_link import BrokerLink
 from tumbleweed.broker.client import BrokerConnector
 from tumbleweed.broker.config import BrokerConfig
+from tumbleweed.broker.service import Sandbox
 from tumbleweed.ipc.connection import RequestHandler
 
 DEADLINE = 20.0
@@ -29,7 +30,9 @@ class BrokerThread:
         *,
         prompts: ScriptedPrompts | None = None,
         config: Callable[[BrokerConfig], BrokerConfig] | None = None,
+        runner: Sandbox | None = None,
     ) -> None:
+        self._runner = runner
         self._prompts = prompts
         self._config = config
         self._ready = threading.Event()
@@ -55,7 +58,7 @@ class BrokerThread:
     async def _serve(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._stop = asyncio.Event()
-        async with running(prompts=self._prompts, config=self._config) as rig:
+        async with running(prompts=self._prompts, config=self._config, runner=self._runner) as rig:
             self._rig = rig
             self._ready.set()
             await self._stop.wait()

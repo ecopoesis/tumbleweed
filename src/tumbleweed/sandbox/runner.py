@@ -276,6 +276,9 @@ class SandboxRunner:
                     seccomp=_child_memfd(child_ends, "tumbleweed-seccomp", program),
                     helper=_child_memfd(child_ends, "tumbleweed-sandbox-exec", helper_source()),
                     report=report_fd,
+                    payload=None
+                    if policy.payload is None
+                    else _child_memfd(child_ends, "tumbleweed-payload", policy.payload),
                 )
                 argv = [
                     *scope_argv(plan, policy.limits),

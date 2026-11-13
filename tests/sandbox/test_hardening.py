@@ -6,6 +6,7 @@ rules are exactly the policy's mounts, that the filter and the launcher are wire
 launcher's report is read.
 """
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -28,6 +29,8 @@ from tumbleweed.sandbox.hardening import (
 )
 from tumbleweed.sandbox.policy import (
     HELPER_TARGET,
+    MAX_PAYLOAD_BYTES,
+    PAYLOAD_TARGET,
     GrantAccess,
     GrantMount,
     MountPath,
@@ -246,6 +249,36 @@ class TestCommandAndArgv:
         )
         assert head.index("--ro-bind-data") < root_ro
         assert argv[argv.index("--") + 1] == "/usr/bin/python3"
+
+    def test_a_payload_is_bound_read_only_from_its_own_memfd_and_landlock_may_read_just_it(
+        self, workspace: Opened
+    ) -> None:
+        made = dataclasses.replace(policy(workspace, "true"), payload=b"{}")
+        fds = dataclasses.replace(FDS, payload=13)
+
+        argv = build_bwrap_argv(made, hardening=fds)
+
+        assert ("13", PAYLOAD_TARGET) in operations(argv, "--ro-bind-data", 2)
+        rules = {(rule.kind, rule.path) for rule in landlock_rules(made)}
+        assert (RuleKind.READ, PAYLOAD_TARGET) in rules
+        assert (RuleKind.WRITE, PAYLOAD_TARGET) not in rules
+        assert not any(
+            rule.path == PAYLOAD_TARGET for rule in landlock_rules(policy(workspace, "true"))
+        )
+
+    def test_a_payload_without_the_hardened_launcher_is_refused(self, workspace: Opened) -> None:
+        made = dataclasses.replace(policy(workspace, "true"), payload=b"{}")
+
+        with pytest.raises(InvalidPolicyError):
+            build_bwrap_argv(made)
+
+    def test_a_payload_over_the_limit_or_not_bytes_is_refused(self, workspace: Opened) -> None:
+        base = policy(workspace, "true")
+
+        with pytest.raises(InvalidPolicyError):
+            dataclasses.replace(base, payload=b"x" * (MAX_PAYLOAD_BYTES + 1))
+        with pytest.raises(InvalidPolicyError):
+            dataclasses.replace(base, payload="text")  # type: ignore[arg-type]  # the point
 
     def test_without_hardening_the_argv_has_neither_the_filter_nor_the_launcher(
         self, workspace: Opened

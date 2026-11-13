@@ -187,6 +187,11 @@ class AgentResponder:
         self._closed = False
         self._thread = threading.get_ident()
 
+    @property
+    def tool_names(self) -> tuple[str, ...]:
+        """The names of the tools the model is offered (for tests and the log)."""
+        return tuple(spec.name for spec in self._registry.specs())
+
     def _check_thread(self) -> None:
         if threading.get_ident() != self._thread:
             raise AgentBusyError("The agent must be used from the thread that created it.")
