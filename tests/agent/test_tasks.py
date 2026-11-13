@@ -176,6 +176,16 @@ class TestAccess:
             assert not error and "Granted for this task" in text and str(w.home / "Photos") in text
             assert not listing_error and "a.jpg" in listing
 
+    def test_a_once_grant_tells_the_model_that_code_cannot_use_it(self) -> None:
+        with world() as w:
+            w.allow("once")
+            once, _ = w.run_tool(
+                "request_access", kind="read", path=str(w.home / PHOTO), reason="r"
+            )
+
+            assert "one read or listing" in once
+            assert "Code you run" in once
+
     def test_a_once_grant_is_spent_by_the_first_read_of_the_reply_and_not_before(self) -> None:
         with world() as w:
             w.allow("once")

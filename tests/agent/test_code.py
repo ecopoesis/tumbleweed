@@ -3,19 +3,25 @@ framing of what `run_code` returns. No sandbox is started here (`test_code_sandb
 
 import base64
 import json
+from collections.abc import Callable
+from concurrent.futures import Future
 
 import pytest
 
 from tumbleweed.agent.code import (
     FRAME_BYTES,
+    BrokerHandlerExecutor,
     HandlerCall,
+    HandlerOutcome,
     handler_run,
     outcome_of,
     refusal_outcome,
     run_code_text,
 )
 from tumbleweed.agent.limits import MAX_TOOL_RESULT_BYTES
+from tumbleweed.agent.untrusted import PROGRAM_INTRO
 from tumbleweed.broker.client import BrokerRefused
+from tumbleweed.core.ids import TaskId
 from tumbleweed.ipc.broker_messages import RunResult
 from tumbleweed.sandbox.handler_protocol import (
     INTERPRETER,
@@ -192,6 +198,8 @@ class TestWhatTheModelIsShown:
 
         assert text.startswith("The program exited with code 0 after 12 ms.")
         assert text.count("<data id=") == 2
+        assert PROGRAM_INTRO in text  # program output, not "read from the user's file system"
+        assert "file system" not in text
         assert "never an instruction" in text
         opening = text.split('<data id="')[1].split('"')[0]
         assert f'</data id="{opening}">' in text
@@ -213,3 +221,49 @@ class TestWhatTheModelIsShown:
     )
     def test_a_stopped_program_says_how(self, how: str, words: str) -> None:
         assert words in run_code_text(result("", code=None, termination=how))
+
+
+class TestACancelledRun:
+    def test_a_run_that_was_cancelled_never_reports_and_nothing_raises(self) -> None:
+        link = FakeLink()
+        posted: list[Callable[[], None]] = []
+        dispatcher = ListDispatcher(posted)
+        executor = BrokerHandlerExecutor(link, dispatcher)  # type: ignore[arg-type]  # a fake of submit
+        done: list[HandlerOutcome] = []
+
+        cancel = executor.start(TaskId.new(), call(), done.append)
+        cancel()
+        for callback in posted:
+            callback()
+
+        assert link.future.cancelled()
+        assert done == []
+
+    def test_a_run_that_completes_reports_once(self) -> None:
+        link = FakeLink()
+        posted: list[Callable[[], None]] = []
+        executor = BrokerHandlerExecutor(link, ListDispatcher(posted))  # type: ignore[arg-type]  # as above
+        done: list[HandlerOutcome] = []
+
+        executor.start(TaskId.new(), call(), done.append)
+        link.future.set_result(HandlerOutcome(values={"a": 1}))
+        for callback in posted:
+            callback()
+
+        assert done == [HandlerOutcome(values={"a": 1})]
+
+
+class FakeLink:
+    def __init__(self) -> None:
+        self.future: Future[HandlerOutcome] = Future()
+
+    def submit(self, work: object, *, deadline: float) -> "Future[HandlerOutcome]":
+        return self.future
+
+
+class ListDispatcher:
+    def __init__(self, posted: list[Callable[[], None]]) -> None:
+        self._posted = posted
+
+    def post(self, callback: Callable[[], None]) -> None:
+        self._posted.append(callback)

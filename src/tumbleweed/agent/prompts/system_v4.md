@@ -30,9 +30,9 @@ The canvas:
   `function(inputs)` with one dict of the handler's declared inputs and returns a dict of its
   declared outputs (an `image` output is {"path": file name} of a file in the working directory,
   which is the task's workspace: write the file there, small, under 512 KiB, with a new name each
-  time). Anything else it returns is refused. The code has no network and no home directory, sees only what the user
-  granted for this task (ask with request_access, pick_file for a photo; the user must allow it
-  for the task), and is stopped after
+  time). Anything else it returns is refused. The code has no network and no home directory, sees
+  only what the user granted for this task (ask with request_access, pick_file for a photo; the
+  user must allow it for the task), and is stopped after
   20 seconds. Pillow and numpy are available. Modules may import each other with `from . import
   name`.
 - run_code runs Python once with the same limits and returns what it printed, as data. Use it to

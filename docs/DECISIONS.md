@@ -1454,10 +1454,12 @@ an agent handler or a file in the workspace. Each run pays one Python
 start in the sandbox (about 50 ms with Pillow imported) on top of the launcher's. *Code that the user allowed once.* A
 `once` grant is bound to a reply's run and spent by a read or listing of the model's (D26 (2));
 every code run has a run of its own, so `run_code` and handlers see only `task` grants. The result
-of `request_access` says so when the user chose once, the system prompt says it, and a handler that
-lacks access shows the plain line about it. *The disk.* Code can now write the task's workspace:
+of `request_access` says so when the user chose once, the system prompt says it, and with a once grant a
+handler's run goes ahead without the mount (the broker does not refuse it), so the card shows
+whatever the tool's code writes, for example the photo tool's "Could not open that photo." *The disk.* Code can now write the task's workspace:
 the per-file limit holds, a total per task does not (#74): S20 makes that gap reachable by the model,
-and S27's quota or a budget the broker checks after each run is its fix. A name that is new each
+and a per-task byte budget or quota is its fix, which S21 owns (it owns the workspaces' btrfs
+subvolumes and snapshots); S27 has none. A name that is new each
 time (the photo tool's) grows the workspace by one file per run. *The run cap.* Every handler run
 counts against the task's 1,000 runs, so a long, steady drag of a slider can use them up (the card
 then says the task has used its runs, and `run_code` says the same): a count that skips runs that

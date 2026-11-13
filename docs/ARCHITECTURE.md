@@ -375,17 +375,23 @@ shell, voice or `gi` (section 10).
   (`--allow-unenforced-limits`, for a development host), a run on a host whose runner reports the
   pids or memory-total limit as unenforced (S17); these and the other gaps are tracked in #74.
 
-- **Running code (S20, D27).** The runtime's Python is the system one (`/usr/bin/python3 -I`; in
-  the Linux image Pillow and numpy come from Ubuntu's packages under `/usr`). Code reaches the
-  sandbox as arguments, never as a file the caller made: for a handler, the shim
-  (`tumbleweed.sandbox.handler_shim`, standard library only) followed by one JSON document of
-  the declared inputs and the tool's modules in chunks; for `run_code`, the source as `-c`. The
-  shim imports a module by `spec_from_file_location` under a private package whose path is a
-  directory it just made, so no module name can resolve to the standard library (#56). The shell
-  and the broker never compile, import or evaluate that text. A handler's result is one JSON line
-  that the trusted side parses again with a closed model and applies only to the declared
-  outputs (`UiRuntime.apply_sandbox_result`); `agent.handler_runs` decides when runs start
-  (debounce, one in flight per instance) and `agent.code` builds and reads them.
+- **Running code (S20, D27).** The runtime's Python is the system one, found as `python3` on the
+  sandbox's own `PATH` and run as `-I` (in the Linux image Pillow and numpy come from Ubuntu's
+  packages under `/usr`). Code and inputs are not arguments, which another user of the host could
+  read in its process list: they are the run's **payload**, bytes the broker (`RunInSandbox.payload`,
+  `SandboxPolicy.payload`) puts in the sandbox as the read-only file `/tw-payload`, which bwrap makes
+  from a memfd (`--ro-bind-data`, as it does the launcher). The path is a reserved target, and
+  Landlock allows reading that one file. For a handler the command is the shim
+  (`tumbleweed.sandbox.handler_shim`, standard library only, passed as `-c`) on that file, which
+  holds one JSON document of the declared inputs and the tool's modules; for `run_code` the command
+  runs the payload, the source, as a script. The shim imports a module by
+  `spec_from_file_location` under a private package whose path is a directory it just made, so no
+  module name can resolve to the standard library (#56). The shell and the broker never compile,
+  import or evaluate that text. A handler's result is one JSON line that the trusted side parses
+  again with a closed model and applies only to the declared outputs
+  (`UiRuntime.apply_sandbox_result`). `tumbleweed.sandbox.handler_protocol` builds the command and
+  payload and reads the line (the broker may use it for stored code, S24); `agent.handler_runs`
+  decides when runs start (debounce, one in flight per instance) and `agent.code` starts them.
 
 ### Broker daemon
 
@@ -404,7 +410,7 @@ the broker imports the agent or an LLM (I2).
   bounded fields before the service sees it, so a request the schema refuses ends the connection
   like any malformed frame. A request the broker declines is *answered* with `Refused`: a closed
   reason (`unknown_task`, `invalid_request`, `denied`, `not_granted`, `not_found`, `unsafe`,
-  `too_large`, `busy`, `unavailable`, `timeout`, `failed`, `conflict`) and fixed text that never
+  `too_large`, `busy`, `exhausted`, `unavailable`, `timeout`, `failed`, `conflict`) and fixed text that never
   repeats a path, a command, a name from a tool or the model's reason. A denied grant is an ordinary answer (`GrantOutcome(granted=false)`).
 - **Tasks.** `start_task(previous, fresh_context)` ends `previous` and makes the new task, with a
   private workspace (`<workspaces>/<TaskId>`, mode 0700), copying `previous`'s taint unless
