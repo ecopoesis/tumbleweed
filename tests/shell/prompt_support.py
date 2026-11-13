@@ -12,10 +12,9 @@ from tumbleweed.ipc.broker_messages import (
     NetworkAccess,
     PickAccess,
     ReadAccess,
-    RequestedAccess,
     Scope,
 )
-from tumbleweed.ipc.prompt_messages import PromptDecision, ShowPrompt
+from tumbleweed.ipc.prompt_messages import PromptDecision, PromptedAccess, ShowPrompt
 from tumbleweed.shell.viewmodel.prompts import PromptCard, card_of
 
 
@@ -126,7 +125,7 @@ class FakePicker:
 
 def show_message(
     *,
-    access: RequestedAccess | None = None,
+    access: PromptedAccess | None = None,
     reason: str = "to look",
     scopes: tuple[Scope, ...] = ("once", "task"),
     task: TaskId | None = None,

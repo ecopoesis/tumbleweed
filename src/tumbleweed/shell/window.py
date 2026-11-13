@@ -30,6 +30,7 @@ from tumbleweed.agent.tasks import TaskSession
 from tumbleweed.core.ids import TaskId
 from tumbleweed.shell._gi import Adw, Gio, Gtk
 from tumbleweed.shell.broker_prompts import BrokerPrompts
+from tumbleweed.shell.broker_undo import BrokerUndoPort
 from tumbleweed.shell.canvas import CanvasView
 from tumbleweed.shell.canvas_tools import CanvasTools
 from tumbleweed.shell.chat_panel import ChatPanel
@@ -40,6 +41,7 @@ from tumbleweed.shell.prompt_guard import PromptGuard
 from tumbleweed.shell.speech_feed import SpeechFeed
 from tumbleweed.shell.status_strip import StatusStrip
 from tumbleweed.shell.terminal_pane import TerminalPane, default_settings
+from tumbleweed.shell.undo_chrome import UndoPanel
 from tumbleweed.shell.viewmodel.chat import ChatController
 from tumbleweed.shell.viewmodel.session import ChatSession, HistoryOpener
 from tumbleweed.shell.viewmodel.terminal import TerminalSettings
@@ -198,6 +200,16 @@ class ShellWindow(Adw.ApplicationWindow):
             (lambda _task: None) if tasks is None else tasks.title_of,
         )
         self.prompt_banner.bind(self.broker_prompts.controller)
+        # The undo list (S21): in the chrome region, opened by the strip's button, the user's own
+        # action. Only with a broker to ask.
+        self.undo_panel: UndoPanel | None = None
+        if broker_link is not None:
+            self.undo_panel = UndoPanel(BrokerUndoPort(broker_link, GlibDispatcher()))
+            self.chrome.append(self.undo_panel)
+            self.status_strip.undo_button.set_visible(True)
+            self.status_strip.undo_button.connect(
+                "clicked", lambda _button: self.undo_panel.toggle() if self.undo_panel else None
+            )
         # The shell's one connection to the broker answers the broker's prompts with this window's
         # (S19); the broker is started when something first needs it.
         self._task_watch = _TaskWatch(self.status_strip, self.canvas_tools)

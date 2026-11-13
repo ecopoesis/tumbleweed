@@ -950,6 +950,8 @@
             "timeout",
             "failed",
             "conflict",
+            "no_undo",
+            "workspace_full",
             "not_undoable",
             "unknown_prompt"
           ],

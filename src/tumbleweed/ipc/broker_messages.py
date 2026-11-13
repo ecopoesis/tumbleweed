@@ -62,6 +62,8 @@ RefusalReason = Literal[
     "timeout",  # the file system took too long
     "failed",  # the sandbox could not be set up
     "conflict",  # the tool store already has a tool with that ID, and it is not this one (S23)
+    "no_undo",  # S21: a run that can change files may not start: nothing could be saved for undo
+    "workspace_full",  # S21: the task's workspace holds more than it may
     "not_undoable",  # S21: nothing to undo that can be: ran with no undo, already undone
     "unknown_prompt",  # not a prompt this connection was sent, or one already answered or closed
 ]

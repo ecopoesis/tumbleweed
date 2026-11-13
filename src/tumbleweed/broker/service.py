@@ -1864,7 +1864,7 @@ class BrokerService:
             ) from None
         if usage.over:
             raise _Refuse(
-                "too_large",
+                "workspace_full",
                 "the task's workspace is full: remove files from it or start a new task",
                 "workspace_full",
             )
@@ -2099,14 +2099,7 @@ class BrokerService:
             self._audit_snapshot_refused(request, [path for path, _ in writable], fault.value)
             if not await self._ask_no_undo(owner, request, live, [p for p, _ in writable], fault):
                 raise _Refuse(
-                    "too_large"
-                    if fault
-                    in {
-                        SnapshotFault.TOO_MANY_BYTES,
-                        SnapshotFault.TOO_MANY_FILES,
-                        SnapshotFault.TOO_DEEP,
-                    }
-                    else "unavailable",
+                    "no_undo",
                     "the run could change files and a copy for undo could not be saved "
                     f"({describe_snapshot_fault(fault)}); the user did not allow running "
                     "without undo",

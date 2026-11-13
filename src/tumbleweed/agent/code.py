@@ -70,6 +70,8 @@ type HandlerFailure = Literal[
     "denied",
     "ended",
     "unavailable",
+    "no_undo",
+    "workspace_full",
 ]
 
 
@@ -115,6 +117,13 @@ def failure_text(failure: HandlerFailure) -> str:
             return "The task this tool belongs to has ended."
         case "unavailable":
             return "The sandbox is not available right now."
+        case "no_undo":
+            return (
+                "That code could change your files and no copy for undo could be saved, so it "
+                "did not run."
+            )
+        case "workspace_full":
+            return "This task's workspace is full. Start a new task to run more."
         case _ as unreachable:
             assert_never(unreachable)
 
@@ -195,6 +204,10 @@ def refusal_outcome(refusal: BrokerRefused) -> HandlerOutcome:
             failure = "not_granted"
         case "unknown_task":
             failure = "ended"
+        case "no_undo":
+            failure = "no_undo"
+        case "workspace_full":
+            failure = "workspace_full"
         case _:
             failure = "unavailable"
     return HandlerOutcome(failure=failure)

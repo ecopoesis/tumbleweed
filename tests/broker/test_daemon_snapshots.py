@@ -362,7 +362,7 @@ class TestNoUndo:
                 with pytest.raises(BrokerRefused) as refused:
                     await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
-                assert refused.value.reason == "unavailable"
+                assert refused.value.reason == "no_undo"
                 assert rig.sandbox.policies == []  # the run never started
                 assert (directory / "a.txt").read_text() == "alpha"
                 (asked,) = [p for p in rig.prompts.asked if p.no_undo is not None]
@@ -444,7 +444,7 @@ class TestNoUndo:
                 with pytest.raises(BrokerRefused) as refused:
                     await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
-                assert refused.value.reason == "too_large"
+                assert refused.value.reason == "no_undo"
                 assert rig.sandbox.policies == []
                 assert rig.audit_of(SnapshotRefused)[0].reason == "too_many_bytes"
                 assert not any(rig.config.snapshots_directory.iterdir())  # nothing left behind
@@ -470,7 +470,7 @@ class TestNoUndo:
                 with pytest.raises(BrokerRefused) as refused:
                     await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
-                assert refused.value.reason == "unavailable"
+                assert refused.value.reason == "no_undo"
                 assert rig.sandbox.policies == []
                 assert rig.audit_of(SnapshotRefused)[0].reason == "timeout"
 
@@ -662,7 +662,7 @@ class TestTheWorkspaceBudget:
                 with pytest.raises(BrokerRefused) as refused:
                     await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
-                assert refused.value.reason == "too_large"
+                assert refused.value.reason == "workspace_full"
                 assert "workspace is full" in refused.value.message
                 assert len(rig.sandbox.policies) == 1
                 (workspace / "big").unlink()
@@ -688,7 +688,7 @@ class TestTheWorkspaceBudget:
                 with pytest.raises(BrokerRefused) as refused:
                     await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
-                assert refused.value.reason == "too_large"
+                assert refused.value.reason == "workspace_full"
 
         run(scenario)
 
