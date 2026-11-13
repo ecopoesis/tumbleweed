@@ -342,6 +342,7 @@ class TestAnInertOrClosedInstance:
         assert r.scheduler.pending == 1
 
         r.runs.stop()
+        assert r.scheduler.pending == 0  # cancelled, not merely harmless when they fire
         r.scheduler.advance(5)
         r.event("adjust", "button", "click")
         r.scheduler.advance(5)
