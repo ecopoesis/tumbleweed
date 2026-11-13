@@ -12,11 +12,14 @@ from tests.broker.support import World, make_world, resolve
 from tumbleweed.broker import DenyRelation, DenyRules
 from tumbleweed.broker.config import (
     FS_CALLS_PER_PROMPT,
+    GIB,
     MAX_PROMPT_TIMEOUT,
     PROMPT_MARGIN,
     PROMPT_SLACK,
     PROMPT_WAIT,
     BrokerConfig,
+    SnapshotMode,
+    SnapshotSettings,
 )
 from tumbleweed.broker.daemon import ipc_limits
 from tumbleweed.broker.deny import DenyMatch
@@ -262,3 +265,27 @@ class TestTheSettings:
     ) -> None:
         with pytest.raises(InvalidValueError):
             config_for(home_world, **changes)
+
+
+class TestSnapshotSettings:
+    def test_the_defaults_are_the_plan(self) -> None:
+        settings = SnapshotSettings()
+
+        assert settings.mode is SnapshotMode.AUTO
+        assert settings.max_bytes == GIB
+        assert settings.retention == timedelta(days=7)
+        assert settings.max_snapshots == 100
+
+    def test_the_snapshot_places_are_on_the_deny_list(self, home_world: World) -> None:
+        snapshots = home_world.base / "vol" / "snaps"
+        config = config_for(home_world, snapshots=SnapshotSettings(btrfs_directory=snapshots))
+
+        paths = {entry.path for entry in config.deny_context({}).extra}
+
+        assert str(config.snapshots_directory) in paths
+        assert str(snapshots) in paths
+        assert str(config.broker_directory) in paths
+
+    def test_a_workspace_budget_is_validated(self, home_world: World) -> None:
+        with pytest.raises(InvalidValueError):
+            config_for(home_world, workspace_max_bytes=0)

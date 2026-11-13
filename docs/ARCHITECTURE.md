@@ -1162,8 +1162,14 @@ audited.
   whatever it says, and a refinement keeps the taint of what it refines. Data reaches a net-tainted task from an fs-tainted one only
   through a cross-task connection the user approved in a trusted prompt; the model context
   of a net-tainted task excludes every turn of fs-tainted tasks (§2).
-- **Writes are off until undo exists.** Until snapshots ship (S21), policy refuses every
-  `fs.write` grant; the sandbox writes only to its own workspace.
+- **Writes need undo (I13, S21, D28).** An `fs.write` grant is made only in a trusted prompt, for
+  the task only, and is covered and denied by the same rules as a read (it implies reading). A run
+  that mounts one starts only after the broker has snapshotted the outermost write grants of the
+  run (the same descriptors it mounts), recorded the snapshot in the transaction that authorises
+  the run, or after the user accepted "no undo" for that one run in a trusted prompt. A write grant
+  is kept disjoint from the read grants of the run: a read inside a write is merged into it, a write
+  inside a read refuses the run. Undo restores through descriptors only, after a snapshot of what
+  is there, so it can be undone.
 - **Decisions** come from static policy, existing grants, or a **trusted permission prompt**.
   A prompt may instead be a **trusted file/folder picker** (`Gtk.FileDialog` in chrome, S18):
   picking is itself the user's grant decision, and it doubles as the handoff's fallback
@@ -1463,7 +1469,9 @@ Each invariant names where it is enforced. Reviews check every change against th
   through a user-approved cross-task connection (§6, §7).
 - **I13 — No write without undo.** A run with write grants starts only after a snapshot of
   its writable paths has been taken, unless the user accepted "no undo" for that run in a
-  trusted prompt.
+  trusted prompt. The snapshot's record and the run's authorisation are one transaction, and the
+  acceptance is for that run only (a `once` answer, never kept). Implemented in
+  `BrokerService._snapshot_for_run` and `_authorise_run` (D28).
 
 **Residual risks accepted for v1** (tracked as issues): image decoding of sandbox-produced
 files happens in the shell (mitigated by format allowlist, sniffing and dimension/size
@@ -1490,8 +1498,9 @@ only, so it can only refuse more; and case folding is not every file system's ow
 | Piper and its voice models (installed by the user, named by absolute path in `[voice.tts]`) | Wherever the user put them | Never |
 | Synthesised speech | Nowhere: held in memory from Piper's pipe to the player, never written (S07) | n/a |
 | Broker data: grants, tasks and the tool store's index (`broker.sqlite3`), tool packages (`tool-blobs/`), audit log (`audit.jsonl`) | `$XDG_DATA_HOME/tumbleweed/broker/` | Never |
-| Copy/reflink snapshots | `$XDG_DATA_HOME/tumbleweed/broker/snapshots/` | Never |
-| btrfs snapshots | dedicated subvolume on the same filesystem, on the deny list | Never |
+| Copy/reflink snapshots (`<SnapshotId>/<n>`; kept 7 days or 100 snapshots, 8 GiB in all) | `$XDG_DATA_HOME/tumbleweed/broker/snapshots/` | Never |
+| btrfs snapshots (read-only, `<SnapshotId>-<n>`) | dedicated subvolume on the same filesystem (`SnapshotSettings.btrfs_directory`), on the deny list | Never |
+| Snapshot records (task, run, paths with identities, backend, size) | `broker.sqlite3`, table `snapshots` | Never |
 | Workspaces (kept 7 days after their task ends) | `$XDG_DATA_HOME/tumbleweed/workspaces/<TaskId>/` | Only their own, at `/workspace` |
 | Sockets | `$XDG_RUNTIME_DIR/tumbleweed/` (mode 0700) | Never |
 
