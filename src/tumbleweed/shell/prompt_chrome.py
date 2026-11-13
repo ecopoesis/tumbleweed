@@ -446,14 +446,14 @@ class PromptBanner(Gtk.Box):
                 return [("The assistant asks you to choose a folder it may read.", None)]
             case "no_undo":
                 why = _NO_UNDO_CAUSE.get(card.cause or "", "it failed")
+                sentence = (
+                    "A program the assistant is running may change the places below, and "
+                    f"a copy for undo could not be saved: {why}. If you allow it, this "
+                    "run goes ahead and its changes cannot be undone. Only this run: the "
+                    "next one asks again."
+                )
                 return [
-                    (
-                        "A program the assistant is running may change the places below, and "
-                        f"a copy for undo could not be saved: {why}. If you allow it, this "
-                        "run goes ahead and its changes cannot be undone. Only this run: the "
-                        "next one asks again.",
-                        None,
-                    ),
+                    (sentence, None),
                     *[("Place:", each) for each in card.paths],
                 ]
             case _:
