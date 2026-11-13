@@ -1299,7 +1299,7 @@ class BrokerService:
         Nothing about the path can be decided before the user chooses, so before the prompt there
         are only the checks that do not need it (a net-tainted task can be given no file, the grant
         cap, the rate limit); the choice is then resolved and goes through the same issuance as any
-        other grant (the deny rules, the write gate, the taint rule, the cap).
+        other grant (the deny rules, the taint rule, the cap).
         """
         capability = CapabilityKind.FS_READ
         live = self._owned(owner, request.task)

@@ -1470,7 +1470,7 @@ reading of the shim's line are `tumbleweed.sandbox.handler_protocol`, which the 
 a run of a stored tool's code (I8) is built there, from the broker's own store. *Inputs of a
 waiting run* are those of the event, not of the moment it starts.
 
-## D28 — Snapshots and undo: a snapshot per write-enabled run, recorded with the run's authorisation, copy/btrfs/noop backends, undo that snapshots first (2026-11-13, accepted)
+## D28 — Snapshots and undo: a snapshot per write-enabled run, recorded with the run's authorisation, copy/btrfs/noop backends, undo that snapshots first and that a run cannot disable (2026-11-13, accepted)
 
 **Context.** S20 let model-written code run. The write gate (D17/S16) kept it from writing the user's
 files. S21 lifts it, under I13: nothing writes without a way back. **Decision.** (1) *Write grants.*
@@ -1482,81 +1482,137 @@ apply to it as to a read (including a stored grant that now overlaps them), and 
 read-only. `WriteGateClosed` and `SkipReason.WRITE_GATE` are gone. (2) *Disjoint mounts (#74).* A run
 mounts the outermost grants: a read grant at or inside a write grant is merged into it (the program
 gets what the write grant gave there, which includes reading); a write grant inside a read grant
-**refuses the run** (`invalid_request`, "a write grant lies inside a read grant"): mounting the outer
-one writable would exceed what was granted, mounting it read-only would take away the inner write.
-(3) *What is snapshotted, and when.* The writable paths of one run: the outer write mounts, taken from
-the very descriptors the run will mount (opened by identity, no symlink followed). The snapshot is
-taken after the grants are opened and before the policy is built; its record (`SnapshotRecord`:
-`SnapshotId`, kind, task, run, time, per path the `StoredPath` identity, backend, files, bytes) is
-inserted in the **same transaction** as the run's `sandbox_run` authorisation and the audit entry
-`snapshot_taken` (written first). So a run that can write starts only after its snapshot is recorded.
-A snapshot taken for a run that then does not start (a grant changed, the user's answer, a
-cancellation) has no record; its copy is deleted at once in the background and, if that fails, as an
-orphan at the next sweep (in-flight copies are not orphans). (4) *Backends* (`SnapshotBackend`
-Protocol, tried per path in order): `BtrfsBackend` (a read-only subvolume snapshot of the subvolume
-the folder is in, in the dedicated subvolume `SnapshotSettings.btrfs_directory`, only when the folder
-is on that file system (`f_fsid`), is a directory, holds no nested subvolume (a snapshot would leave it
-out, and an undo would then delete its files: found by inode 256 while walking) and `btrfs` works; run
-as an argv list on `/proc/self/fd/N` paths so nothing is looked up twice; the saved folder is found
-again by walking names with `O_NOFOLLOW` and by its inode number, which a snapshot keeps);
-`CopyBackend` (a copy, a reflink via `FICLONE` where there is one, in `broker/snapshots/<id>/<n>`;
-caps 1 GiB, 100,000 files, depth 64, each configurable, checked before and while copying; a special
-file (socket, FIFO, device) in the tree refuses the snapshot rather than being skipped, so no undo is
-silently partial; hard links are saved as separate files, owners and xattrs are not saved); and
-`NoopBackend` (takes nothing and says `unsupported`; the only backend with `mode = noop`). A failure
-of the btrfs path falls through to the copy; a cap or a timeout does not. Every walk checks a monotonic
-deadline itself, so a thread the broker gave up on ends by itself. (5) *No undo (I13's other branch).*
-If no backend can save a path, the broker audits `snapshot_refused` and asks, in a **trusted prompt of
-the same kind** (`GrantPrompt.no_undo`, wire `NoUndoAccess`, a card that names the places and the cause
-in our words and has no model text), whether this run may go ahead with no undo. The only scope offered
-is `once`; any other answer, a denial, a timeout or a failing prompt refuses the run (`no_undo`). The
-acceptance is of that run only and is never kept: the next run asks again; it is recorded (`no_undo`
-snapshot record with the paths, audit `no_undo_accepted`) so that `undo_last_change` can say that run
-cannot be undone. It counts against the prompt rate limit like any prompt (I5). Tests use a fake user
-at the `PromptInterface` Protocol, never a hook in `src/`. (6) *Undo.* `undo_last_change(task)` (model
-tool) undoes the current task's newest `run` snapshot not yet undone; the chrome's list (`list_snapshots`,
-`undo_snapshot`, **no model tool reaches them**) shows the newest 30 across tasks, each with an Undo
-button, an undo of an undo included. In order: refuse a no-undo or already-undone record; open every
-target by its stored identity with the deny rules (a target that is gone, replaced or now protected
-refuses the whole undo, nothing done: `unsafe`/`denied`); **snapshot what is there now** (kind `undo`,
-recorded and audited; if it cannot be saved the undo is refused, there is no "no undo" for an undo);
-restore through descriptors; mark the snapshot undone and audit `undo`. A restore makes the folder
-**exactly** what it was: new files and folders are removed, deleted or changed ones are written back
-(content compared by reading, never trusting size and times a program can set), links are recreated,
-modes and times restored. It never follows a link: a symlink where the copy has a directory is
-replaced, a file is written to a new name and renamed over the old one, directories are opened with
-`O_NOFOLLOW` and compared with `lstat`; a granted file is rewritten in place through the verified
-descriptor. Edits made by the user in those places **after** the run are reverted too: the tool's
-description and the system prompt (v5) say so, and the safety snapshot keeps them (the list shows it,
-and undoing it brings them back). A restore that fails part way is rolled back from the safety
-snapshot and the answer says whether that worked (`failed`). One undo of a snapshot at a time. (7)
-*Retention.* 7 days or 100 snapshots, whichever first, and 8 GiB of copies in all (the oldest go first,
-before a new snapshot and at the sweep); each configurable (`SnapshotSettings`); every deletion is
-audited (`snapshot_deleted`: `age`, `count`, `size`, `discarded`, `orphan`); copies no record names are
-removed at the sweep. Records unreadable by a newer or older version are skipped and kept. (8) *Deny
-entries.* The copy store is inside the broker's data directory (already denied) and is named on its
-own (`BrokerConfig.snapshots_directory`); the btrfs subvolume is a deny entry through
-`deny_context`; a grant request for either is refused (tests). (9) *The disk box (#74).* A task's
-workspace may hold `workspace_max_bytes` (512 MiB of disk use, `st_blocks`) and `workspace_max_files`
-(50,000 entries): before each run the broker walks the workspace through descriptors (no link followed,
-bounded, with a deadline) and refuses a run while it holds more (`workspace_full`). One run can pass the
-budget by what it writes in its wall time; the next is refused; a quota would stop it in the middle but
-needs a subvolume per workspace, which S27 may add. S21 owns this and does it here. (10) *Audit (#82).*
-S21 adds `snapshot_taken`, `snapshot_refused`, `no_undo_accepted`, `undo` and `snapshot_deleted`. The
+**refuses the run** (`invalid_request`): mounting the outer one writable would exceed what was granted,
+mounting it read-only would take away the inner write. Such a pair is also **refused when the grant is
+asked for** (before anyone is prompted, and again after a picker), in either order, so the user is never
+asked for a grant that would make every later run refuse; the same place twice is fine. A run may write
+at most 16 places (`MAX_TARGETS`): more refuses it before anything is saved. (3) *What is snapshotted,
+and when.* The writable paths of one run: the outer write mounts, taken from the very descriptors the
+run will mount (opened by identity, no symlink followed). The snapshot is taken after the grants are
+opened and before the policy is built; its record (`SnapshotRecord`: `SnapshotId`, kind, task, run,
+time, per path the `StoredPath` identity, backend, files, bytes) is inserted in the **same
+transaction** as the run's `sandbox_run` authorisation and the audit entry `snapshot_taken` (written
+first). So a run that can write starts only after its snapshot is recorded. A snapshot taken for a run
+that then does not start (a grant changed, the user's answer, a cancellation, any error) has no record;
+its id is held in `_inflight` from before its copy exists until the record is, and its copy is deleted
+at once in the background (`snapshot_deleted`, `discarded`) and, if that fails, as an orphan at the next
+sweep. The sweep decides per name, synchronously, with no `await` between the check and the delete
+being submitted, that the id is not in flight and has **no row at all** (a raw `SELECT`: a record this
+version cannot read still owns its copy); making room and the sweep take one lock. (4) *Backends*
+(`SnapshotBackend` Protocol, tried per path in order). `BtrfsBackend`: a read-only subvolume snapshot
+of the subvolume the folder is in, in the dedicated subvolume `SnapshotSettings.btrfs_directory`,
+when the folder and that directory are both on btrfs (`f_type`, not `f_fsid`, which btrfs makes differ
+per subvolume), the target is a directory, it holds no nested subvolume (a snapshot would leave it out,
+and an undo would then delete its files: found by inode 256 while walking, fail closed) and `btrfs`
+works; run as an argv list on `/proc/self/fd/N` paths so nothing is looked up twice; the saved folder
+is found again by walking names with `O_NOFOLLOW` and by its inode number, which a snapshot keeps. A
+snapshot the tool cannot make (another btrfs, no permission) or a nested subvolume **falls through to
+the copy and is audited** (`snapshot_fallback`); a timeout does not. Deleting a subvolume that is gone
+succeeds, and `<id>-<n>` subvolumes with no record are swept like copies. **Accepted v1 risk:** a btrfs
+snapshot is of the *whole enclosing subvolume* (all of `/home`, say), so for the retention period the
+store holds files outside the granted folder and files the user deletes meanwhile; the store is on the
+deny list and unreadable to sandboxes, and the S27 layout decides whether the user's data should be
+split into subvolumes to narrow this. `CopyBackend`: a copy (a reflink via `FICLONE` where there is
+one) in `broker/snapshots/<id>/<n>` with a `<n>.meta` file. **One budget for the whole run** (1 GiB of
+*allocated* bytes (`st_blocks`), 100,000 entries, depth 64; each configurable): a file is counted before
+it is copied and again chunk by chunk if it grows, so a sparse file costs what it holds and is copied
+sparse-aware (`SEEK_DATA`/`SEEK_HOLE`), and a tree over a cap fails closed before the run. **What a run
+leaves behind cannot stop its own undo:** a FIFO, socket or device is *recorded, never opened* (place,
+kind, mode, in `.meta`): a restore removes one the saved state lacked, keeps one of the saved kind,
+recreates a FIFO and reports a socket or device it cannot recreate as skipped; a directory or file of
+ours with mode 000 is made readable through an `O_PATH` descriptor checked against what `lstat` saw
+for the copy and its mode put back at once, the true mode kept in `.meta`. Hard links are saved as
+separate files; owners and xattrs are not saved. `NoopBackend` takes nothing and says `unsupported`
+(the only backend with `mode = noop`). Every walk checks a monotonic deadline itself, so a thread the
+broker gave up on ends by itself. (5) *No undo (I13's other branch).* If no backend can save a path (or
+the store is full of what must be kept, (7)), the broker audits `snapshot_refused` and asks, in a
+**trusted prompt of the same kind** (`GrantPrompt.no_undo`, wire `NoUndoAccess`, a card that names the
+places and the cause in our words and has no model text), whether this run may go ahead with no undo.
+The only scope offered is `once`; any other answer, a denial, a timeout or a failing prompt refuses the
+run (`no_undo`). The acceptance is of that run only and is never kept: the next run asks again; it is
+recorded (`no_undo` snapshot record with the paths, audit `no_undo_accepted`) so that
+`undo_last_change` can say that run cannot be undone. It counts against the prompt rate limit like any
+prompt (I5), and a run refused for that says the user was not asked. Tests use a fake user at the
+`PromptInterface` Protocol, never a hook in `src/`. (6) *Undo.* `undo_last_change(task)` (model tool)
+undoes the current task's newest `run` snapshot that is neither undone nor superseded **and only while
+the task still holds an applicable `fs.write` grant that covers every place it changed**: after the user
+revokes or lets it expire the model cannot touch those files, and is told to ask the user. The chrome's
+list (`list_snapshots`, `undo_snapshot`; **no model tool reaches them**, and like the tool store's
+requests they are served to any connection of the user: a same-uid process is outside the threat model)
+shows the newest 30 across tasks with an Undo button each, an undo of an undo included, and says in
+plain text of ours that undo puts the files back as they were before that change *including over
+edits made since*, and that the undo itself can be undone. **One undo at a time in the whole broker**:
+the user's waits (90 s) for another, the model's is refused `busy` (audited). An undo and a run on the
+same places do not overlap: a run whose write mounts overlap an undo in progress is refused (`busy`),
+and a live write run that overlaps the places of the **user's** undo is *stopped* (the broker's own stop
+path, its flow cancelled; its caller is told so) before the restore, while the **model's** undo is
+refused (`busy`), so the model can never hold the user's undo off. In order: refuse a no-undo,
+already-undone or superseded record; open every target by its stored identity with the deny rules (a
+target that is gone, replaced or now protected refuses the whole undo, nothing done: `unsafe`,
+`denied`); **snapshot what is there now** (kind `undo`, recorded and audited); restore through
+descriptors; mark the snapshot undone, and every later `run` snapshot of any task that overlaps its
+places **superseded** (H11: their changes were overtaken, so they are no longer undone one by one, are
+shown so in the list and are never what `undo_last_change` picks; there is no "undo the newer first"
+rule, so a later undo cannot bring the first run's changes back and a hostile task cannot bury a
+change under cheap runs; the undo of the undo brings everything back). "Most recent" is by a
+monotonic sequence (`seq`), not the clock. **If the safety snapshot cannot be taken** (a cap, depth,
+I/O, the store full), the model's undo is refused and points the user to the list; the *chrome's* undo
+asks the user, in a trusted prompt of the no-undo kind (purpose `undo`, once scope: "undo without being
+able to undo this undo?"); a no refuses it; a yes does it and says `safety: none`. A restore makes the
+folder **exactly** what it was: new files and folders are removed (iteratively, to 400 levels, one
+descriptor per level), deleted or changed ones are written back (content compared by reading, never by
+size and times a program can set), links, FIFOs, modes and times restored. It never follows a link: a
+symlink where the copy has a directory is replaced, a file is written to a new name and renamed over
+the old one, directories are opened with `O_NOFOLLOW` and compared with `lstat`; a granted file is
+rewritten in place through the verified descriptor (Linux; elsewhere the undo is refused before
+anything is done). Edits made by the user in those places **after** the run are reverted too: the
+tool's description, the system prompt (v5) and the panel say so, and the safety snapshot keeps them. A
+restore that fails part way is rolled back from the safety snapshot and the answer says whether that
+worked (`failed`); the restore thread ends by its own deadline before the rollback runs. If the files
+were put back but the record of it cannot be written, the answer says the files were put back. (7)
+*Retention and making room* (the deliberate reading of PLAN's "7 days or 100 snapshots, whichever
+comes first"). A snapshot is deleted at the sweep when it is past 7 days. The count (100) and size
+(8 GiB of copies) caps are enforced when **room is needed** for a new snapshot of task T, and the
+victims are chosen so that no task can evict the undo that matters: (1) snapshots already undone or
+superseded, and any past retention, of any task; (2) T's *own* snapshots that are not **anchors**,
+oldest first (an anchor of T is, per place, its oldest not-undone snapshot, the state before T touched
+it, its newest not-undone run snapshot, which is what `undo_last_change` needs, and every not-undone
+safety snapshot, which holds the user's later edits); (3) otherwise `STORE_FULL`, which goes to the
+no-undo prompt so the user decides. Another task's not-undone, in-retention snapshot, an anchor, one
+being undone or one being taken is never deleted. So a busy task's handler runs stay quiet (step 2)
+while one damaging run followed by any number of cheap ones keeps its pre-damage snapshot; a snapshot
+in the middle may be gone, and undoing it is then refused (it is no longer listed). The sweep also
+enforces the size cap against undone and superseded snapshots (a lowered cap), and deletes copies no
+row names. Everything is configurable (`SnapshotSettings`) and every deletion audited
+(`snapshot_deleted`: `age`, `count`, `size`, `discarded`, `orphan`). (8) *Deny entries.* The copy store
+is inside the broker's data directory (already denied) and is named on its own
+(`BrokerConfig.snapshots_directory`); the btrfs subvolume is a deny entry through `deny_context`; a
+grant request for either is refused (tests). (9) *The disk box (#74).* A task's workspace may hold
+`workspace_max_bytes` (512 MiB of disk use, `st_blocks`) and `workspace_max_files` (50,000 entries):
+before each run the broker walks the workspace through descriptors (no link followed, bounded, with
+a deadline) and refuses a run while it holds more or is nested deeper than 64 (`workspace_full`: the
+task's own code made it, and a new task starts clean). One run can pass the budget by what it writes in
+its wall time; the next is refused; a quota would stop it in the middle but needs a subvolume per
+workspace, which S27 may add. (10) *Audit (#82).* S21 adds `snapshot_taken`, `snapshot_fallback`,
+`snapshot_refused`, `no_undo_accepted`, `undo` (a `busy` refusal included) and `snapshot_deleted`. The
 log is still append-only, not fsynced and not tamper evident; the snapshot entry precedes the run it
 protects, so a crash can leave a copy without a record (swept as an orphan) but never a write run
 without an entry. Rotation and tamper evidence are not needed by S21 and stay open on #82. (11) *The
 model.* The `undo_last_change` result is our fixed text with counts, nothing a file contained, so it
 carries nothing untrusted to frame; a refusal is the broker's fixed text. The system prompt becomes v5.
-`request_access` gains `kind=write`. A run's wait on the link now includes the broker's prompt wait (a
-write run may wait for the user's answer to "run without undo?"). (12) *#157.* S21 reads no stored task
-id (the chrome list does not show tasks, and `undo_last_change` uses the live task), so
-`HIDDEN_TASK` does not apply. **Tests.** A real daemon with a fake sandbox that writes files (every
-acceptance item over IPC), the real sandbox under `linux` (a write run and its undo), the btrfs backend
-with a fake tool everywhere and against a loopback btrfs under `btrfs` (S27's VM covers it end to end),
-and mutants for each check listed in the PR. **Consequences.** Every run of a task that holds a write
-grant takes a snapshot, a handler run included: a copy of up to 1 GiB per slider event is slow where
-there is no btrfs or reflink (the retention and size caps bound the disk; a run that would exceed
-them deletes the oldest); a later step may skip a snapshot when nothing changed since the last. A
-write grant is not the same as the user having looked at what the code will do: the prompt names the
-place, and undo is the net.
+`request_access` gains `kind=write`. **Waits:** a write run's caller waits for the broker's setup, its
+snapshot and, if none can be saved, the user's answer (`RUN_SETUP_WAIT`), an undo's caller for the
+lock, the stop, two snapshots and a prompt (`UNDO_WAIT`); the agent, the client and the IPC handler
+timeout derive from those constants, and a test checks the relation. (12) *#157.* S21 reads no stored
+task id (the chrome list shows no task), so `HIDDEN_TASK` does not apply. **Tests.** A real daemon with
+a fake sandbox that writes files (every acceptance item over IPC), the real sandbox under `linux` (a
+write run and its undo), the btrfs backend with a fake tool everywhere (nested subvolumes, fallbacks,
+missing subvolumes, orphans) and against a loopback btrfs under `btrfs` (S27's VM covers it end to end),
+each reviewer probe as a regression test, swap-between-`lstat`-and-`open` hooks for every I11 guard, and
+mutants for each check listed in the PR. **Consequences.** Every run of a task that holds a write grant
+takes a snapshot, a handler run included: a copy of up to 1 GiB per slider event is slow where there
+is no btrfs or reflink (the retention and size caps bound the disk, and step 2 of (7) keeps one task's
+churn from costing another's undo); a later step may skip a snapshot when nothing changed since the
+last. A write grant is not the same as the user having looked at what the code will do: the prompt
+names the place, and undo is the net. Not done and listed for the polish issue: `sandbox_run.mounted`
+does not list read grants merged into a write mount.

@@ -9,7 +9,7 @@ Pure Python with no daemon, no IPC and no storage (those are S17), and no LLM, a
   only by identity (`StoredPath.open`, component by component, no symlink followed), and how
   files are read safely from a hostile workspace (`workspace`, I11).
 - `deny`: the static deny rules and the ancestor rule, which nothing overrides.
-- `policy`: `decide` and `issue_grant`, with typed reasons and the write gate.
+- `policy`: `decide` and `issue_grant`, with typed reasons; write grants are task-scoped (S21, D28).
 
 ARCHITECTURE section 7 is the contract.
 """

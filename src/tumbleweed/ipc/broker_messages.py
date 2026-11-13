@@ -51,7 +51,7 @@ Scope = Literal["once", "task"]
 RefusalReason = Literal[
     "unknown_task",  # not a live task of this connection
     "invalid_request",  # the content is not acceptable (a path, a command, an environment)
-    "denied",  # the static rules, the write gate or the taint rule refuse it
+    "denied",  # the static rules or the taint rule refuse it
     "not_granted",  # no grant covers it; request access first
     "not_found",
     "unsafe",  # a symlink, a special file, not the object that was granted, a tampered package
