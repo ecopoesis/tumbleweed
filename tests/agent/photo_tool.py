@@ -27,7 +27,7 @@ def adjust(inputs):
     mean = float(numpy.asarray(image).mean())
     name = "adjusted-" + hashlib.sha256(image.tobytes()).hexdigest()[:10] + ".jpg"
     image.save(name, "JPEG", quality=85)
-    return {"result": name, "status": "Done. Average level " + str(round(mean)) + "."}
+    return {"result": {"path": name}, "status": "Done. Average level " + str(round(mean)) + "."}
 """
 
 

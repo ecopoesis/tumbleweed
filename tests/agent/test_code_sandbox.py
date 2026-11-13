@@ -109,12 +109,16 @@ class World:
         return asyncio.run(self.tasks.ensure())
 
     def handler(
-        self, source: str, inputs: dict[str, object] | None = None, module: str = "main"
+        self,
+        source: str,
+        inputs: dict[str, object] | None = None,
+        module: str = "main",
+        function: str = "f",
     ) -> HandlerOutcome:
         task = self.task()
         call = HandlerCall(
             module,
-            "f",
+            function,
             {StateKey(k): v for k, v in (inputs or {}).items()},  # type: ignore[misc]  # test
             (CodeModule(name=ModuleName(module), source=source),),
         )
@@ -282,11 +286,13 @@ class TestHandlerRuns:
             w.grant(photo)
             inputs = {"photo_path": str(photo), "brightness": 20, "contrast": 0, "grayscale": False}
 
-            outcome = w.handler(PHOTO_MODULE, inputs, module="photo")
+            outcome = w.handler(PHOTO_MODULE, inputs, module="photo", function="adjust")
 
             assert outcome.failure is None, outcome
             assert outcome.values is not None
-            name = outcome.values["result"]
+            ref = outcome.values["result"]
+            assert isinstance(ref, dict)
+            name = ref["path"]
             assert isinstance(name, str)
             assert name.startswith("adjusted-")
             listing, _ = w.tool("list_workspace")
@@ -302,7 +308,7 @@ class TestHandlerRuns:
             photo = write_photo(w.home / "Photos")  # the user said nothing about it
             inputs = {"photo_path": str(photo), "brightness": 0, "contrast": 0, "grayscale": False}
 
-            outcome = w.handler(PHOTO_MODULE, inputs, module="photo")
+            outcome = w.handler(PHOTO_MODULE, inputs, module="photo", function="adjust")
 
             assert outcome.values == {"status": "Could not open that photo."}
 
@@ -314,7 +320,7 @@ class TestHandlerRuns:
             assert text.startswith("Not granted")
             inputs = {"photo_path": str(photo), "brightness": 0, "contrast": 0, "grayscale": False}
 
-            outcome = w.handler(PHOTO_MODULE, inputs, module="photo")
+            outcome = w.handler(PHOTO_MODULE, inputs, module="photo", function="adjust")
 
             assert outcome.values == {"status": "Could not open that photo."}
 
@@ -367,9 +373,9 @@ class TestHandlerRuns:
                 "import os\n"
                 "def f(i):\n"
                 "    os.symlink('/etc/passwd', 'evil.png')\n"
-                "    return {'result': 'evil.png'}\n"
+                "    return {'result': {'path': 'evil.png'}}\n"
             )
-            assert outcome.values == {"result": "evil.png"}
+            assert outcome.values == {"result": {"path": "evil.png"}}
 
             with pytest.raises(ImageNotAllowedError):
                 BrokerImageResolver(w.link, w.task()).read(

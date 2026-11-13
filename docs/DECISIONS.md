@@ -1370,8 +1370,9 @@ a result becomes state, and what the model is told. **Decision.** (1) *Runtime.*
 Python is the system one the runtime already mounts (`/usr/bin/python3`, run as `-I`: no cwd or
 `PYTHON*` on the path, so a file in the writable workspace can never shadow a module). The Linux
 image gets Pillow and numpy from Ubuntu's own packages (`python3-pil`, `python3-numpy`: they land in
-`/usr/lib/python3/dist-packages`, under the runtime's `/usr`), so nothing is installed at test time
-and the venv, which is under `$HOME`, is never mounted. S26 supplies the same two packages in the
+`/usr/lib/python3/dist-packages`, under the runtime's `/usr`), so nothing is installed at test time (numpy's `libblas.so.3` and `liblapack.so.3` are Debian
+alternatives, links into `/etc/alternatives`, which a runtime does not have: the image relinks them
+straight to their files, as a Nix runtime's are) and the venv, which is under `$HOME`, is never mounted. S26 supplies the same two packages in the
 runtime's store closure. (2) *The shim.* `tumbleweed.sandbox.handler_shim` uses the standard library
 only (a test checks it imports nothing of `tumbleweed`) and is never imported by the shell: its text
 is the `-c` argument (`/usr/bin/python3 -I -c <shim> <chunk>...`). The chunks, joined, are one JSON
@@ -1421,8 +1422,8 @@ is the current task's, so the broker owns taint as in D26: reading granted files
 and a run that reached the network (none can: S22) stays refused. The run's `trigger` stays `model`
 until S24, because only tool grants look at it. (7) *Outputs.* The sandbox's `/workspace` is the
 task's workspace, bound by the descriptor the broker verified; code writes its files there and
-returns the workspace-relative name as the value of an `image` output (a `WorkspaceRelPath`, which
-`validate_patch` checks). The image is then read by the existing `BrokerImageResolver`
+returns `{"path": <workspace-relative name>}` as the value of an `image` output (an `ImageRef`, whose
+path `validate_patch` checks). The image is then read by the existing `BrokerImageResolver`
 (`read_workspace_file`, which opens without following a symlink: I11), so a symlink code plants
 is refused. The wire carries 512 KiB: the photo tool's module downsizes to fit (#154 stays open).
 (8) *What the model sees.* Only `run_code`'s result, framed. A handler's stdout and stderr never

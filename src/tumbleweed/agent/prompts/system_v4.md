@@ -28,8 +28,8 @@ The canvas:
 - A `sandbox` handler runs Python you pass in show_ui's `code`, a list of {name, source}; each
   sandbox handler's `module` must be one of the names. The function is called as
   `function(inputs)` with one dict of the handler's declared inputs and returns a dict of its
-  declared outputs (an `image` output is a file name in the working directory, which is the task's
-  workspace: write the file there, small, under 512 KiB, with a new name each time). Anything else
+  declared outputs (an `image` output is {"path": file name} of a file in the working directory, which is the
+  task's workspace: write the file there, small, under 512 KiB, with a new name each time). Anything else
   it returns is refused. The code has no network and no home directory, sees only what the user
   granted for this task (ask with request_access, pick_file for a photo), and is stopped after
   20 seconds. Pillow and numpy are available. Modules may import each other with `from . import

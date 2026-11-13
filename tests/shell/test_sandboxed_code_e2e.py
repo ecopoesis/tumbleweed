@@ -215,7 +215,7 @@ def press_adjust(s: Setup) -> None:
     from tumbleweed.shell._gi import Gtk
 
     buttons = [w for w in descendants(the_tool(s).widget) if isinstance(w, Gtk.Button)]
-    (adjust,) = [b for b in buttons if b.get_label() == "Adjust"]
+    adjust = buttons[0]  # Adjust, then Reset (the golden spec's order)
     assert adjust.get_sensitive()  # a broker is connected: the control is on
     adjust.emit("clicked")
 
@@ -233,7 +233,11 @@ def test_the_user_picks_a_photo_the_tool_adjusts_it_in_the_sandbox_and_the_image
 
         press_adjust(s)
 
-        assert pump_until(lambda: image.texture is not None, timeout=60)
+        assert pump_until(lambda: image.texture is not None, timeout=60), (
+            card_lines(s)[-4:],
+            str(tool.runtime.store.value(StateKey("status"))),
+            str(tool.runtime.store.value(StateKey("result"))),
+        )
         status = tool.runtime.store.value(StateKey("status"))
         assert isinstance(status, str)
         assert status.startswith("Done. Average level")
@@ -334,11 +338,9 @@ def test_an_instance_of_an_ended_task_runs_nothing(monkeypatch: pytest.MonkeyPat
 
         from tumbleweed.shell._gi import Gtk
 
-        (adjust,) = [
-            w
-            for w in descendants(the_tool(s).widget)
-            if isinstance(w, Gtk.Button) and w.get_label() == "Adjust"
-        ]
+        adjust = next(
+            w for w in descendants(the_tool(s).widget) if isinstance(w, Gtk.Button)
+        )  # Adjust is the first button
         adjust.emit("clicked")
         pump(1.0)
 

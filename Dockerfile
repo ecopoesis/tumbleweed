@@ -50,6 +50,16 @@ RUN apt-get update \
         weston \
     && rm -rf /var/lib/apt/lists/*
 
+# numpy links libblas.so.3 and liblapack.so.3, which Debian points at /etc/alternatives: the
+# sandbox's runtime has /usr and two files of /etc, not that, so each is made a link straight to
+# its file under /usr (as a Nix runtime's are, S26). The build fails if either is missing.
+RUN set -e; multiarch="$(gcc -dumpmachine)"; \
+    for lib in libblas.so.3 liblapack.so.3; do \
+        target="$(readlink -f "/usr/lib/$multiarch/$lib")"; \
+        test -f "$target"; \
+        ln -sfn "$target" "/usr/lib/$multiarch/$lib"; \
+    done
+
 COPY --from=ghcr.io/astral-sh/uv:0.12.1@sha256:cf4eedcaa81655197f625739489effcbe71b61ceb1506f332c3facae5deceded /uv /usr/local/bin/uv
 
 # Not root: bubblewrap must work for an unprivileged user, which is the case that matters.
