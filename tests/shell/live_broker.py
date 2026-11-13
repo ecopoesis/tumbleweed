@@ -18,6 +18,7 @@ from tests.broker.rig import Rig, running
 from tests.shell.gtk_support import pump_until
 from tumbleweed.broker.client import BrokerClient
 from tumbleweed.broker.config import BrokerConfig
+from tumbleweed.broker.service import Sandbox
 from tumbleweed.core.ids import TaskId
 from tumbleweed.ipc.connection import RequestHandler
 
@@ -36,7 +37,9 @@ class LiveBroker:
         handler: RequestHandler,
         *,
         config: Callable[[BrokerConfig], BrokerConfig] | None = None,
+        runner: Sandbox | None = None,
     ) -> None:
+        self._runner = runner
         self._handler = handler
         self._config = config
         self._ready = threading.Event()
@@ -63,7 +66,7 @@ class LiveBroker:
     async def _serve(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._stop = asyncio.Event()
-        async with running(ask_shell=True, config=self._config) as rig:
+        async with running(ask_shell=True, config=self._config, runner=self._runner) as rig:
             self._rig = rig
             self._client = await rig.client(handler=self._handler)
             self._task = (await self._client.start_task()).task
