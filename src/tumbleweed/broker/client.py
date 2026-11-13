@@ -26,7 +26,7 @@ from typing import Final, Literal, Self, final
 
 from tumbleweed.broker.config import PROMPT_WAIT
 from tumbleweed.core.errors import TumbleweedError
-from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId
+from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId
 from tumbleweed.core.types import ToolVersion, WorkspaceRelPath
 from tumbleweed.ipc.broker_messages import (
     DirListing,
@@ -35,6 +35,7 @@ from tumbleweed.ipc.broker_messages import (
     FileContent,
     GrantOutcome,
     ListDir,
+    ListSnapshots,
     ListWorkspace,
     NetworkAccess,
     PickAccess,
@@ -49,9 +50,13 @@ from tumbleweed.ipc.broker_messages import (
     RevokeGrant,
     RunInSandbox,
     RunResult,
+    SnapshotList,
     StartTask,
     TaskEnded,
     TaskStarted,
+    UndoLastChange,
+    UndoResult,
+    UndoSnapshot,
     WriteAccess,
 )
 from tumbleweed.ipc.client import connect
@@ -82,7 +87,9 @@ _log = logging.getLogger(__name__)
 HEARTBEAT: Final = timedelta(seconds=30)
 """How often a quiet connection is pinged. The broker's idle timeout is three times this."""
 _PING_TIMEOUT: Final = timedelta(seconds=10)
-_RUN_SETUP: Final = timedelta(seconds=60)
+_RUN_SETUP: Final = timedelta(seconds=60) + PROMPT_WAIT
+"""A run waits for its snapshot and, if none can be saved, for the user's answer (S21)."""
+_UNDO_WAIT: Final = timedelta(minutes=5)
 
 
 class BrokerRefused(TumbleweedError):  # noqa: N818  (an answer, not a failure of the transport)
@@ -280,6 +287,21 @@ class BrokerClient:
         )
         wait = timedelta(seconds=wall_seconds) + _RUN_SETUP
         return await self._ask(request, RunResult, wait=wait)
+
+    async def undo_last_change(self, task: TaskId) -> UndoResult:
+        """Undo the most recent not-yet-undone write-enabled run of `task` (S21)."""
+        return await self._ask(
+            UndoLastChange(kind="undo_last_change", task=task), UndoResult, wait=_UNDO_WAIT
+        )
+
+    async def undo_snapshot(self, snapshot: SnapshotId) -> UndoResult:
+        """Undo one snapshot of the chrome's list (the user's action)."""
+        return await self._ask(
+            UndoSnapshot(kind="undo_snapshot", snapshot=snapshot), UndoResult, wait=_UNDO_WAIT
+        )
+
+    async def list_snapshots(self, limit: int = 50) -> SnapshotList:
+        return await self._ask(ListSnapshots(kind="list_snapshots", limit=limit), SnapshotList)
 
     async def list_tools(self, query: str | None = None, *, limit: int | None = None) -> ToolList:
         """The newest version of each stored tool, or those matching `query` (words, not a

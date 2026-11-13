@@ -105,7 +105,7 @@ class SnapshotSettings:
             ("max_bytes", 1024 * GIB),
             ("max_files", 10_000_000),
             ("store_max_bytes", 1024 * GIB),
-            ("max_snapshots", 100_000),
+            ("max_snapshots", 1000),
         ):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= high:

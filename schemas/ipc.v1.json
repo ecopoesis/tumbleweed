@@ -561,6 +561,29 @@
       "title": "ListDir",
       "type": "object"
     },
+    "ListSnapshots": {
+      "additionalProperties": false,
+      "description": "The newest snapshots of every task, newest first (the chrome's undo list).",
+      "properties": {
+        "kind": {
+          "const": "list_snapshots",
+          "title": "Kind",
+          "type": "string"
+        },
+        "limit": {
+          "default": 50,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "ListSnapshots",
+      "type": "object"
+    },
     "ListTools": {
       "additionalProperties": false,
       "description": "The newest version of each tool, most recently saved first; or, with `query`, the tools\nthat match it in name, description or tags, best first. The query is words, not a syntax:\npunctuation is dropped, at most eight words count, each matches as a prefix.",
@@ -647,6 +670,50 @@
         "kind"
       ],
       "title": "NetworkAccess",
+      "type": "object"
+    },
+    "NoUndoAccess": {
+      "additionalProperties": false,
+      "description": "What the broker asks in the \"no undo\" prompt (S21, I13): `paths` (canonical, the places a\nrun may change) could not be saved, `cause` says why, and the user may let this one run go\nahead with no undo. Only the broker sends it, in a `ShowPrompt`; a model cannot request it.",
+      "properties": {
+        "cause": {
+          "enum": [
+            "too_many_bytes",
+            "too_many_files",
+            "too_deep",
+            "special_file",
+            "unreadable",
+            "unsupported",
+            "timeout",
+            "store_full",
+            "io"
+          ],
+          "title": "Cause",
+          "type": "string"
+        },
+        "kind": {
+          "const": "no_undo",
+          "title": "Kind",
+          "type": "string"
+        },
+        "paths": {
+          "items": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Paths",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "paths",
+        "cause"
+      ],
+      "title": "NoUndoAccess",
       "type": "object"
     },
     "PickAccess": {
@@ -883,6 +950,7 @@
             "timeout",
             "failed",
             "conflict",
+            "not_undoable",
             "unknown_prompt"
           ],
           "title": "Reason",
@@ -911,6 +979,7 @@
               "export_tool": "#/$defs/ExportTool",
               "import_tool": "#/$defs/ImportTool",
               "list_dir": "#/$defs/ListDir",
+              "list_snapshots": "#/$defs/ListSnapshots",
               "list_tools": "#/$defs/ListTools",
               "list_workspace": "#/$defs/ListWorkspace",
               "ping": "#/$defs/Ping",
@@ -921,7 +990,9 @@
               "run_in_sandbox": "#/$defs/RunInSandbox",
               "show_prompt": "#/$defs/ShowPrompt",
               "show_tool": "#/$defs/ShowTool",
-              "start_task": "#/$defs/StartTask"
+              "start_task": "#/$defs/StartTask",
+              "undo_last_change": "#/$defs/UndoLastChange",
+              "undo_snapshot": "#/$defs/UndoSnapshot"
             },
             "propertyName": "kind"
           },
@@ -958,6 +1029,15 @@
             },
             {
               "$ref": "#/$defs/RunInSandbox"
+            },
+            {
+              "$ref": "#/$defs/UndoLastChange"
+            },
+            {
+              "$ref": "#/$defs/UndoSnapshot"
+            },
+            {
+              "$ref": "#/$defs/ListSnapshots"
             },
             {
               "$ref": "#/$defs/ListTools"
@@ -1081,12 +1161,14 @@
               "refused": "#/$defs/Refused",
               "revoked": "#/$defs/Revoked",
               "run_result": "#/$defs/RunResult",
+              "snapshot_list": "#/$defs/SnapshotList",
               "task_ended": "#/$defs/TaskEnded",
               "task_started": "#/$defs/TaskStarted",
               "tool_bundle": "#/$defs/ToolBundle",
               "tool_imported": "#/$defs/ToolImported",
               "tool_list": "#/$defs/ToolList",
-              "tool_shown": "#/$defs/ToolShown"
+              "tool_shown": "#/$defs/ToolShown",
+              "undo_result": "#/$defs/UndoResult"
             },
             "propertyName": "kind"
           },
@@ -1117,6 +1199,12 @@
             },
             {
               "$ref": "#/$defs/RunResult"
+            },
+            {
+              "$ref": "#/$defs/UndoResult"
+            },
+            {
+              "$ref": "#/$defs/SnapshotList"
             },
             {
               "$ref": "#/$defs/ToolList"
@@ -1395,7 +1483,8 @@
               "fs.pick": "#/$defs/PickAccess",
               "fs.read": "#/$defs/ReadAccess",
               "fs.write": "#/$defs/WriteAccess",
-              "net.full": "#/$defs/NetworkAccess"
+              "net.full": "#/$defs/NetworkAccess",
+              "no_undo": "#/$defs/NoUndoAccess"
             },
             "propertyName": "kind"
           },
@@ -1411,6 +1500,9 @@
             },
             {
               "$ref": "#/$defs/PickAccess"
+            },
+            {
+              "$ref": "#/$defs/NoUndoAccess"
             }
           ],
           "title": "Access"
@@ -1514,6 +1606,89 @@
         "tool"
       ],
       "title": "ShowTool",
+      "type": "object"
+    },
+    "SnapshotInfo": {
+      "additionalProperties": false,
+      "description": "One snapshot, for the list: what it saved (canonical paths, which are data to show, never\nto believe), when, and whether it can be put back (`undoable`) or already was.",
+      "properties": {
+        "kind": {
+          "enum": [
+            "run",
+            "undo"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "paths": {
+          "items": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "title": "Paths",
+          "type": "array"
+        },
+        "snapshot": {
+          "pattern": "^snap_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Snapshot",
+          "type": "string"
+        },
+        "taken_at": {
+          "format": "date-time",
+          "title": "Taken At",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        },
+        "undoable": {
+          "title": "Undoable",
+          "type": "boolean"
+        },
+        "undone": {
+          "title": "Undone",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "snapshot",
+        "kind",
+        "task",
+        "taken_at",
+        "paths",
+        "undoable",
+        "undone"
+      ],
+      "title": "SnapshotInfo",
+      "type": "object"
+    },
+    "SnapshotList": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "snapshot_list",
+          "title": "Kind",
+          "type": "string"
+        },
+        "snapshots": {
+          "items": {
+            "$ref": "#/$defs/SnapshotInfo"
+          },
+          "maxItems": 100,
+          "title": "Snapshots",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "snapshots"
+      ],
+      "title": "SnapshotList",
       "type": "object"
     },
     "StartTask": {
@@ -1800,9 +1975,100 @@
       "title": "ToolSummary",
       "type": "object"
     },
+    "UndoLastChange": {
+      "additionalProperties": false,
+      "description": "Undo the most recent not-yet-undone write-enabled run of `task` (the model's tool).",
+      "properties": {
+        "kind": {
+          "const": "undo_last_change",
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task"
+      ],
+      "title": "UndoLastChange",
+      "type": "object"
+    },
+    "UndoResult": {
+      "additionalProperties": false,
+      "description": "An undo was done: `snapshot` was put back after `safety` saved what was there (so the undo\ncan be undone), `paths` places were restored (`written` entries written back, `removed` that\nwere new taken away).",
+      "properties": {
+        "kind": {
+          "const": "undo_result",
+          "title": "Kind",
+          "type": "string"
+        },
+        "paths": {
+          "maximum": 16,
+          "minimum": 1,
+          "title": "Paths",
+          "type": "integer"
+        },
+        "removed": {
+          "minimum": 0,
+          "title": "Removed",
+          "type": "integer"
+        },
+        "safety": {
+          "pattern": "^snap_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Safety",
+          "type": "string"
+        },
+        "snapshot": {
+          "pattern": "^snap_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Snapshot",
+          "type": "string"
+        },
+        "written": {
+          "minimum": 0,
+          "title": "Written",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "snapshot",
+        "safety",
+        "paths",
+        "written",
+        "removed"
+      ],
+      "title": "UndoResult",
+      "type": "object"
+    },
+    "UndoSnapshot": {
+      "additionalProperties": false,
+      "description": "Undo one snapshot, named in the list the chrome shows (the user's action, never a model\ntool).",
+      "properties": {
+        "kind": {
+          "const": "undo_snapshot",
+          "title": "Kind",
+          "type": "string"
+        },
+        "snapshot": {
+          "pattern": "^snap_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Snapshot",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "snapshot"
+      ],
+      "title": "UndoSnapshot",
+      "type": "object"
+    },
     "WriteAccess": {
       "additionalProperties": false,
-      "description": "`fs.write` of `path`. Modelled, and refused by the write gate until S21.",
+      "description": "`fs.write` of `path` (S21): asked for the user to decide, for the task only. A run that\nmounts it starts only after the broker has saved what it may change (I13).",
       "properties": {
         "kind": {
           "const": "fs.write",

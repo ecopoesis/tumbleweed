@@ -158,7 +158,7 @@ from tumbleweed.broker.snapshots import (
     SnapshotRecord,
     SnapshotTarget,
 )
-from tumbleweed.broker.store import BrokerStore, TaskRecord, ToolRecord
+from tumbleweed.broker.store import MAX_LIST, BrokerStore, TaskRecord, ToolRecord
 from tumbleweed.broker.task import TaintKind, TaskState
 from tumbleweed.broker.toolstore import StoredTool, ToolStore, taint_names
 from tumbleweed.broker.treeops import RestoreStats, measure
@@ -2218,7 +2218,7 @@ class BrokerService:
         settings by deleting the oldest (audited). A snapshot that is the only one left is not
         deleted for size: the cap on one snapshot is lower than the cap on all."""
         settings = self._config.snapshots
-        records = self._store.oldest_snapshots(10_000)
+        records = self._store.oldest_snapshots(MAX_LIST)
         total = sum(record.saved_bytes for record, _ in records)
         count = len(records)
         for record, _ in records:
@@ -2238,7 +2238,7 @@ class BrokerService:
         """Retention (D28): delete snapshots older than `retention` or past `max_snapshots`
         (oldest first), and saved copies no record names. Returns how many were deleted."""
         settings = self._config.snapshots
-        records = self._store.oldest_snapshots(10_000)
+        records = self._store.oldest_snapshots(MAX_LIST)
         deleted = 0
         count = len(records)
         for record, _ in records:
@@ -2254,7 +2254,7 @@ class BrokerService:
                 count -= 1
         store = self._snapshots.copy_store
         if store is not None:
-            known = {record.id for record, _ in self._store.oldest_snapshots(10_000)}
+            known = {record.id for record, _ in self._store.oldest_snapshots(MAX_LIST)}
             for name in await self._fs.call(store.names):
                 try:
                     orphan = SnapshotId(name)

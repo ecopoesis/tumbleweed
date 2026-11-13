@@ -95,17 +95,22 @@ class TestWhatTheShellIsShown:
 
         run(scenario)
 
-    def test_a_write_request_never_reaches_the_shell(self) -> None:
+    def test_a_write_request_reaches_the_shell_with_the_task_scope_only(self) -> None:
         async def scenario() -> None:
             async with running(ask_shell=True) as rig:
                 shell = FakeShell()
                 client = await rig.client(handler=shell)
                 task = await task_of(client)
 
-                outcome = await client.request_write(task, RunId.new(), photos(rig), "write")
+                pending = asyncio.create_task(
+                    client.request_write(task, RunId.new(), photos(rig), "write")
+                )
+                shown = await shell.next_prompt()
+                await deny(client, shown)
 
-                assert not outcome.granted
-                assert shell.shown == []  # the write gate (S16) refused it first
+                assert not (await pending).granted
+                assert shown.access.kind == "fs.write"
+                assert shown.scopes == ("task",)
 
         run(scenario)
 
