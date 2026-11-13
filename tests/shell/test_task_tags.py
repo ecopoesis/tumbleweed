@@ -119,3 +119,33 @@ def test_a_restored_chat_tells_the_tasks_the_newest_tagged_task_and_a_new_sessio
     session.new_session()
     assert lineage.ended == 1
     session.close()
+
+
+def test_a_hidden_reply_is_never_the_task_a_restart_inherits_from(tmp_path: Path) -> None:
+    from tests.history.support import history_directory
+    from tumbleweed.agent.responder import HIDDEN_TASK
+    from tumbleweed.history.store import HistoryStore
+    from tumbleweed.shell.viewmodel.session import ChatSession
+
+    older = TaskId.new()
+    first = SessionRig(tmp_path)
+    for task in (older, HIDDEN_TASK):
+        first.controller.send("q")
+        first.responder.sink.emit(ReplyDelta(text="a"))
+        first.responder.sink.emit(ReplyFinished(task=task))
+    first.session.close()
+
+    transcript, responder = Transcript(), ManualResponder()
+    lineage = _Lineage()
+    directory = history_directory(tmp_path)
+    session = ChatSession(
+        transcript,
+        ChatController(transcript, responder),
+        lambda: HistoryStore.open(directory),
+        lineage,
+    )
+    session.start()
+
+    assert lineage.restored == [older]
+    assert [m.task for m in transcript.messages if m.role is Role.ASSISTANT] == [older, HIDDEN_TASK]
+    session.close()

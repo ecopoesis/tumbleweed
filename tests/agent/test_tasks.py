@@ -689,6 +689,7 @@ class TestRoundOne:
             assert "\\u{E000}" in text  # spelled out, not shown
             assert "\ue000" not in text
             assert "more names are not shown" in text
+            assert "(Shown:" not in text  # the listing stopped at a line, the frame cut nothing
             assert not re.search(r"\\u\{[0-9A-F]{0,3}$", text.split("</data")[0], re.MULTILINE)
             assert len(text.encode()) <= MAX_TOOL_RESULT_BYTES
 

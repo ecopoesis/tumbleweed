@@ -1275,82 +1275,87 @@ accepts when it has the record (an ended task's record keeps its taint): the new
 taint of everything it may see. If the broker answers `unknown_task` for it, the agent starts the
 task with no `previous` and an empty set, dropping the tagged turns (fail closed). **A lost
 connection**: the broker ended the task; the next call connects again and starts a task with
-`previous` = the old one, the set kept. A reply that spans a switch is tagged with the task it began
-in if a `fresh_context` start happened in it (its text may hold what the old task read, and the new
-task must not see it; the cost is that the model does not see that one turn afterwards), and with
-the last task otherwise (which inherited the taint of the earlier ones). A reply that failed or was
-cancelled is not sent to the model at all, as before. (4) *Inside a reply.* Tool results are never
-kept across tasks, so when a `start_task` succeeds the loop rewrites its messages before the next
-model call: every earlier `tool_result` becomes a fixed placeholder (the ids stay paired with their
-`tool_use`), and so do the results of sibling calls that ran before the `start_task` in the same
-assistant message (later siblings run in the new task and keep theirs). With `fresh_context` the
-loop also drops the history, the earlier assistant turns and the text and opaque blocks of the
-assistant message that called it, and the **inputs** of its calls (the title, a reason, a path are
-the model's, written from the tainted context; they become `{}`, the ids stay paired). Calls after
-the fresh start in the same message are not run (they were written in the old context and would run
-in the clean task); their result is a fixed "not run" error. What is kept is the user's own typed
-message of this turn (not model output) and the calls' ids and results; a turn the shell wrote from
-a canvas event (it holds the old tool's state) becomes a fixed note. (An opaque thinking block
-dropped there is a cost if a provider insists on it: the call then fails visibly.) (5) *Instances
-belong to a task.* `show_ui` starts a task if there is none (so the broker is reached on the first
-`show_ui`) and passes the current task to the canvas; `CanvasTools` keeps `instance -> task`. When a
-task ends (`TaskObserver.task_ended`, on the main thread) its instances' `agent` sink drops events,
-their sandbox sink does not exist yet (S20), their images are refused by the broker (the task is
-gone), an event already waiting in the gate is forgotten, and the card says so in a plain line; an
-instance shown while the broker could not be reached belongs to no task and goes inert with the next
-task that starts or ends; `set` handlers, computed state and `patch_state` still work (#139). (6)
-*Model tools*, all through `BrokerLink`: `start_task`, `request_access(kind, path?, reason)`
-(`read`, `network`, `pick_file`, `pick_folder`: no `write` until S21), `list_workspace`,
-`list_dir(path)`, `read_file(path)`. The path text goes to the broker as it is: the shell never
-resolves, stats or opens a model's path. Results are text in a frame: our sentence that the block is
-data from the user's file system and never instructions, then the content between tags that carry a
-fresh random nonce, so no content can close the block; file text is decoded as UTF-8 with
-replacement (a file with NULs or invalid UTF-8 is reported as binary, its size only), cut at 12 KiB,
-and a directory shows at most 200 names, each cut at 100 characters and then `spelled()` (control,
-format, separator, private-use and unassigned characters written as `\u{XXXX}`), as many as fit the
-frame. The broker is asked for up to its 512 KiB cap and the model is shown the first 12 KiB, with a
-line outside the frame saying how many bytes there were. The picked path is spelled and framed too.
-A refusal carries the broker's fixed message. `request_access` waits up to the broker's
-`PROMPT_WAIT` (a per-tool timeout; the others keep 30 s). The picker's outcome has to tell the model
-what the user chose, or `list_dir` has nothing to name: `GrantOutcome` gains `picked`, the canonical
-text of the picked path, set for a picker grant only (amends D25 (7): the user chose that path to
-give it to the assistant; it is the broker's resolved text and is framed as data). (7) *Images.*
-`BrokerImageResolver(link, task)` reads `read_workspace_file(task, path)`, with a deadline of 10 s
-(#109) on the decode worker's thread, and maps `not_found` to `ImageNotFoundError`,
-`unsafe`/`denied`/`invalid_request`/`unknown_task` to `ImageNotAllowedError` and `too_large` to
-`ImageTooLargeError`; it passes `ResolverContract` unchanged against a real broker. The wire caps a
-read at 512 KiB while `MAX_IMAGE_BYTES` is 8 MiB: larger images are refused until S20 needs chunked
-reads (open). `DirfdResolver._descend` is made exception-safe (#137). #141: `ui-spec` section 6
-stays out of the generated reference; the system prompt (v3) says in two sentences that an image
-path is a file in the task's workspace. (8) *One link to the broker.* `BrokerLink`
-(`tumbleweed.agent.broker_link`) owns a daemon thread with an asyncio loop, the `BrokerConnector`,
-the one `BrokerClient` (its constructor needs the running loop; its heartbeat and `BrokerPrompts`'
-answers run there) and a supervisor that notices the connection ending. Other threads reach it with
-`call` (awaitable from the agent's loop) and `call_blocking` (the decode worker), each with a
-deadline. It connects on first use, so a shell with the echo or unavailable responder never starts a
-broker; the connection's request handler is `BrokerPrompts`, attached by the window (a request that
-arrives before that is refused `busy`). Reconnection is the connector's backoff, bounded to 8 s per
-attempt (below every call's deadline), plus a pause of 1 s doubling to 30 s after a failed attempt,
-so a dead broker does not cost every tool call its deadline; one broker is started per window (a
-broker still coming up is waited for). In development the connector starts the broker with a minimal
-environment (`TUMBLEWEED_BROKER_SPAWN=0` for the target, `TUMBLEWEED_BROKER_DEV_FLAGS` for the two
-development flags). A request in flight when the connection drops fails as a tool error ("the
-connection to the broker was lost"); the next one reconnects. (9) *#147.* A reconnect starts the
-prompt allowance over, as before, and is not changed: the model cannot drop the connection, and a
-key that survived it would have to be an identity of the shell, which a process of the same user
-(outside the threat model, section 8) can claim as well. A test reconnects in a loop and shows each
-connection keeping its ceiling and the pause bounding the rate of reconnecting after failures (a
-connection that is made and lost again is not paused). (10) *The task title in the prompt (#142)* is
-looked up by `TaskId` on the shell side (`TaskSession.title_of`), set apart as the assistant's own
-words, plain, capped, and never part of the broker's wire. **Tests.** The fake user is
-`ScriptedPrompts` (the broker's `PromptInterface`) for agent-level tests and the real prompt
-controller, driven by real input, for window tests; `src/` has no hook that grants. The symlink,
-swap-after-grant and outside-grant negatives run through the model tools against a real daemon.
-**Not done.** #86 (which grant failed) is about `run_in_sandbox`: it goes with S20/S24, commented on
-the issue. Reads over 512 KiB and reading in windows are #154; a reply timeout that waits while the
-user decides (a 120 s reply timeout can run out during a long prompt) is #155. The development
-default of starting a broker on demand (`TUMBLEWEED_BROKER_SPAWN`) is off on the target: S27's
-service sets it. **Consequences.** After a restart the new task inherits the taint of the newest
-tagged turn's task, which may be more than the model's real lineage had (safe, and the model may
-then be unable to get the network until it starts a fresh task). The model sees one fewer turn after
-a `fresh_context` switch.
+`previous` = the old one, the set kept. A reply in which the context was cut after the model began
+to write (a `fresh_context` start, or the broker not knowing the task to inherit from, which starts
+a clean task) belongs to no task: its text derives from the old context and from the new one. It is
+tagged with `HIDDEN_TASK` (`tsk_0000...`, a value of the strict `TaskId` type that no broker issues;
+no schema change): it is in no context set, a restore never takes it for the task to inherit from,
+and the chat still shows it. The cost is that the model does not see that one turn afterwards. A cut
+made before the model has been called (the check of a restored chat at the start of a reply)
+re-anchors the reply to the task it ends in. Any other reply is tagged with the last task, or with
+the task to inherit from while there is none current (a lost connection, an unchecked restore):
+never with no task while the context set is not empty. A reply that failed or was cancelled is not
+sent to the model at all, as before. (4) *Inside a reply.* Tool results are never kept across tasks,
+so when a `start_task` succeeds the loop rewrites its messages before the next model call: every
+earlier `tool_result` becomes a fixed placeholder (the ids stay paired with their `tool_use`), and
+so do the results of sibling calls that ran before the `start_task` in the same assistant message
+(later siblings run in the new task and keep theirs). With `fresh_context` the loop also drops the
+history, the earlier assistant turns and the text and opaque blocks of the assistant message that
+called it, and the **inputs** of its calls (the title, a reason, a path are the model's, written
+from the tainted context; they become `{}`, the ids stay paired). Calls after the fresh start in the
+same message are not run (they were written in the old context and would run in the clean task);
+their result is a fixed "not run" error. What is kept is the user's own typed message of this turn
+(not model output) and the calls' ids and results; a turn the shell wrote from a canvas event (it
+holds the old tool's state) becomes a fixed note. (An opaque thinking block dropped there is a cost
+if a provider insists on it: the call then fails visibly.) (5) *Instances belong to a task.*
+`show_ui` starts a task if there is none (so the broker is reached on the first `show_ui`) and
+passes the current task to the canvas; `CanvasTools` keeps `instance -> task`. When a task ends
+(`TaskObserver.task_ended`, on the main thread) its instances' `agent` sink drops events, their
+sandbox sink does not exist yet (S20), their images are refused by the broker (the task is gone), an
+event already waiting in the gate is forgotten, and the card says so in a plain line; an instance
+shown while the broker could not be reached belongs to no task and goes inert with the next task
+that starts or ends; `set` handlers, computed state and `patch_state` still work (#139). (6) *Model
+tools*, all through `BrokerLink`: `start_task`, `request_access(kind, path?, reason)` (`read`,
+`network`, `pick_file`, `pick_folder`: no `write` until S21), `list_workspace`, `list_dir(path)`,
+`read_file(path)`. The path text goes to the broker as it is: the shell never resolves, stats or
+opens a model's path. Results are text in a frame: our sentence that the block is data from the
+user's file system and never instructions, then the content between tags that carry a fresh random
+nonce, so no content can close the block; file text is decoded as UTF-8 (a file with NULs or that is
+not valid UTF-8 is reported as binary, its size only), cut at 12 KiB, and a directory shows at most
+200 names, each cut at 100 characters and then `spelled()` (control, format, separator, private-use
+and unassigned characters written as `\u{XXXX}`), as many as fit the frame. The broker is asked for
+up to its 512 KiB cap and the model is shown the first 12 KiB, with a line outside the frame saying
+how many bytes there were. The picked path is spelled and framed too. A refusal carries the broker's
+fixed message. `request_access` waits up to the broker's `PROMPT_WAIT` (a per-tool timeout; the
+others keep 30 s). The picker's outcome has to tell the model what the user chose, or `list_dir` has
+nothing to name: `GrantOutcome` gains `picked`, the canonical text of the picked path, set for a
+picker grant only (amends D25 (7): the user chose that path to give it to the assistant; it is the
+broker's resolved text and is framed as data). (7) *Images.* `BrokerImageResolver(link, task)` reads
+`read_workspace_file(task, path)`, with a deadline of 10 s (#109) on the decode worker's thread, and
+maps `not_found` to `ImageNotFoundError`, `unsafe`/`denied`/`invalid_request`/`unknown_task` to
+`ImageNotAllowedError` and `too_large` to `ImageTooLargeError`; it passes `ResolverContract`
+unchanged against a real broker. The wire caps a read at 512 KiB while `MAX_IMAGE_BYTES` is 8 MiB:
+larger images are refused until S20 needs chunked reads (open). `DirfdResolver._descend` is made
+exception-safe (#137). #141: `ui-spec` section 6 stays out of the generated reference; the system
+prompt (v3) says in two sentences that an image path is a file in the task's workspace. (8) *One
+link to the broker.* `BrokerLink` (`tumbleweed.agent.broker_link`) owns a daemon thread with an
+asyncio loop, the `BrokerConnector`, the one `BrokerClient` (its constructor needs the running loop;
+its heartbeat and `BrokerPrompts`' answers run there) and a supervisor that notices the connection
+ending. Other threads reach it with `call` (awaitable from the agent's loop) and `call_blocking`
+(the decode worker), each with a deadline. It connects on first use, so a shell with the echo or
+unavailable responder never starts a broker; the connection's request handler is `BrokerPrompts`,
+attached by the window (a request that arrives before that is refused `busy`). Reconnection is the
+connector's backoff, bounded to 8 s per attempt (below every call's deadline), plus a pause of 1 s
+doubling to 30 s after a failed attempt, so a dead broker does not cost every tool call its
+deadline; one broker is started per window (a broker still coming up is waited for). In development
+the connector starts the broker with a minimal environment (`TUMBLEWEED_BROKER_SPAWN=0` for the
+target, `TUMBLEWEED_BROKER_DEV_FLAGS` for the two development flags). A request in flight when the
+connection drops fails as a tool error ("the connection to the broker was lost"); the next one
+reconnects. (9) *#147.* A reconnect starts the prompt allowance over, as before, and is not changed:
+the model cannot drop the connection, and a key that survived it would have to be an identity of the
+shell, which a process of the same user (outside the threat model, section 8) can claim as well. A
+test reconnects in a loop and shows each connection keeping its ceiling and the pause bounding the
+rate of reconnecting after failures (a connection that is made and lost again is not paused). (10)
+*The task title in the prompt (#142)* is looked up by `TaskId` on the shell side
+(`TaskSession.title_of`), set apart as the assistant's own words, plain, capped, and never part of
+the broker's wire. **Tests.** The fake user is `ScriptedPrompts` (the broker's `PromptInterface`)
+for agent-level tests and the real prompt controller, driven by real input, for window tests; `src/`
+has no hook that grants. The symlink, swap-after-grant and outside-grant negatives run through the
+model tools against a real daemon. **Not done.** #86 (which grant failed) is about `run_in_sandbox`:
+it goes with S20/S24, commented on the issue. Reads over 512 KiB and reading in windows are #154; a
+reply timeout that waits while the user decides (a 120 s reply timeout can run out during a long
+prompt) is #155. The development default of starting a broker on demand (`TUMBLEWEED_BROKER_SPAWN`)
+is off on the target: the S27 service must set it (#156). **Consequences.** After a restart the new
+task inherits the taint of the newest tagged turn's task, which may be more than the model's real
+lineage had (safe, and the model may then be unable to get the network until it starts a fresh
+task). The model sees one fewer turn after a `fresh_context` switch.

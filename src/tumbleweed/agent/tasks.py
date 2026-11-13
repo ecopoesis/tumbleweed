@@ -24,7 +24,8 @@ import unicodedata
 from functools import partial
 from typing import TYPE_CHECKING, Final, Protocol, final
 
-from tumbleweed.agent.broker_link import BrokerLink, BrokerUnavailableError
+from tumbleweed.agent.broker_link import BrokerLink, BrokerNotReachedError, BrokerUnavailableError
+from tumbleweed.agent.responder import HIDDEN_TASK
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import RunId, TaskId
@@ -97,7 +98,7 @@ class TaskSession:
         self._unverified = False
         self._run = RunId.new()
         self._reply_first: TaskId | None = None
-        self._reply_fresh = False
+        self._reply_hidden = False  # the context was cut after the model began (D26 (3))
         self._reply_open = False
         self._reply_had = False  # a task was current at some point in this reply
         link.on_lost(self._connection_lost)
@@ -175,17 +176,26 @@ class TaskSession:
             self._run = RunId.new()
             self._reply_first = self._current if self._current is not None else self._head
             self._reply_had = self._current is not None
-            self._reply_fresh = False
+            self._reply_hidden = False
             self._reply_open = True
             return self._run
+
+    def anchor_reply(self) -> None:
+        """Called once the reply's task is settled and before the model has been called: a cut of
+        the context so far (the check of a restored chat) was made before anything was written, so
+        the reply belongs to the task it ended in, not nowhere."""
+        with self._lock:
+            self._reply_first = self._current if self._current is not None else self._head
+            self._reply_had = self._current is not None
+            self._reply_hidden = False
 
     def reply_tag(self) -> TaskId | None:
         """The task to tag the reply with: the one it began in if a fresh start happened in it,
         else the last one (D26 (3))."""
         with self._lock:
             self._reply_open = False
-            if self._reply_fresh:
-                return self._reply_first
+            if self._reply_hidden:
+                return HIDDEN_TASK
             # Never None while the context set is not empty: None is visible to every task. After
             # a lost connection or a restore that could not be checked, the task to inherit from
             # (the head) is the one the reply belongs to.
@@ -252,7 +262,7 @@ class TaskSession:
                         self._reply_first = task
                     if self._reply_had or reset:
                         self._generation += 1
-                    self._reply_fresh = self._reply_fresh or fresh
+                    self._reply_hidden = self._reply_hidden or reset
                     self._reply_had = True
                 elif reset:
                     self._generation += 1
@@ -270,6 +280,8 @@ class TaskSession:
 
         try:
             return await self._link.call(work, deadline=TASK_CALL_SECONDS)
+        except BrokerNotReachedError as error:
+            raise TaskError(str(error)) from None  # nothing was sent: nothing can have happened
         except BrokerUnavailableError as error:
             raise TaskUnsureError(str(error)) from None
 

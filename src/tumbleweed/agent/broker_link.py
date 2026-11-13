@@ -32,7 +32,9 @@ import concurrent.futures
 import contextlib
 import logging
 import threading
+import time
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import timedelta
 from typing import Final, final
 
 from tumbleweed.broker.client import (
@@ -40,6 +42,7 @@ from tumbleweed.broker.client import (
     BrokerConnector,
     BrokerRefused,
     spawn_broker_process,
+    terminate,
 )
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.ipc.broker_messages import Refused
@@ -52,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 RETRY_FLOOR: Final = 1.0
 RETRY_CEILING: Final = 30.0
+SPAWN_PATIENCE: Final = 60.0
 CONNECT_SECONDS: Final = 8.0
 """The most one attempt to connect may take: below the deadline of every call, so that a call
 waiting for a broker that is not there fails by this and starts the pause, not by its own."""
@@ -71,6 +75,10 @@ class BrokerUnavailableError(TumbleweedError):
     """The broker could not be reached, or the connection was lost or did not answer in time.
 
     The message is fixed text, safe to give to the model."""
+
+
+class BrokerNotReachedError(BrokerUnavailableError):
+    """The broker could not be connected to: nothing was sent, so nothing can have happened."""
 
 
 @final
@@ -215,19 +223,19 @@ class BrokerLink:
                 return client
             loop = asyncio.get_running_loop()
             if loop.time() < self._retry_at:
-                raise BrokerUnavailableError("The broker is not reachable right now.")
+                raise BrokerNotReachedError("The broker is not reachable right now.")
             if self._connector is None:
                 try:
                     self._connector = self._make_connector(self._relay)
                 except (TumbleweedError, OSError):
                     self._fail(loop)
-                    raise BrokerUnavailableError("The broker's socket cannot be used.") from None
+                    raise BrokerNotReachedError("The broker's socket cannot be used.") from None
             try:
                 async with asyncio.timeout(self._connect_seconds):
                     client = await self._connector.connect()
             except (IpcError, OSError, TimeoutError):
                 self._fail(loop)
-                raise BrokerUnavailableError("The broker is not reachable right now.") from None
+                raise BrokerNotReachedError("The broker is not reachable right now.") from None
             except asyncio.CancelledError:
                 self._fail(loop)  # the caller's own deadline ended the attempt: still a failure
                 raise
@@ -283,6 +291,49 @@ class BrokerLink:
             logger.warning("the broker link's thread did not stop in time")
 
 
+@final
+class _Spawner:
+    """Starts the broker for the connector: one process at a time (D26 (8)).
+
+    A broker that was started and is still coming up is waited for, not started again by the next
+    call. One that has run for `SPAWN_PATIENCE` seconds and still cannot be connected to never
+    bound its socket: it is stopped and replaced. Only the newest process is kept. The process is
+    recorded when it exists, even if the call that started it was cancelled meanwhile, so a second
+    one is not started on top of it.
+    """
+
+    def __init__(
+        self,
+        environ: Mapping[str, str],
+        flags: tuple[str, ...],
+        *,
+        patience: float = SPAWN_PATIENCE,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._environ = environ
+        self._flags = flags
+        self._patience = patience
+        self._clock = clock
+        self._process: asyncio.subprocess.Process | None = None
+        self._since = 0.0
+
+    async def __call__(self) -> object:
+        process = self._process
+        if process is not None and process.returncode is None:
+            if self._clock() - self._since < self._patience:
+                return process
+            await terminate(process, wait=timedelta(seconds=_STOP_TIMEOUT))
+        starting = asyncio.ensure_future(
+            spawn_broker_process(self._environ, extra_args=self._flags)
+        )
+        starting.add_done_callback(self._record)
+        return await asyncio.shield(starting)
+
+    def _record(self, starting: "asyncio.Future[asyncio.subprocess.Process]") -> None:
+        if not starting.cancelled() and starting.exception() is None:
+            self._process, self._since = starting.result(), self._clock()
+
+
 def connector_from_environment(environ: Mapping[str, str]) -> ConnectorFactory:
     """The connector a shell uses: the broker's socket under the user's runtime directory, and in
     development (`TUMBLEWEED_BROKER_SPAWN` not `0`) a broker started on demand.
@@ -300,23 +351,14 @@ def connector_from_environment(environ: Mapping[str, str]) -> ConnectorFactory:
         )
         if name in _DEV_FLAGS
     )
+    spawner = _Spawner(dict(environ), flags)
     snapshot = dict(environ)
-    started: list[asyncio.subprocess.Process] = []
 
     def make(handler: RequestHandler) -> BrokerConnector:
         from tumbleweed.broker.daemon import SOCKET_NAME  # lazily: the daemon's module is large
 
         path = SocketDirectory.from_environment(snapshot, create=True).socket_path(SOCKET_NAME)
 
-        async def spawn() -> object:
-            # One broker per attempt window: a broker that was started and is still coming up is
-            # waited for, not started again by the next call.
-            if started and started[-1].returncode is None:
-                return started[-1]
-            process = await spawn_broker_process(snapshot, extra_args=flags)
-            started.append(process)
-            return process
-
-        return BrokerConnector(path, spawn=spawn if spawn_enabled else None, handler=handler)
+        return BrokerConnector(path, spawn=spawner if spawn_enabled else None, handler=handler)
 
     return make

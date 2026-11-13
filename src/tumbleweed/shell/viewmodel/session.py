@@ -27,6 +27,7 @@ import logging
 from collections.abc import Callable
 from typing import Final, Protocol, final
 
+from tumbleweed.agent.responder import HIDDEN_TASK
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import TaskId
 from tumbleweed.history.errors import HistoryError
@@ -172,12 +173,13 @@ class ChatSession:
         else:
             self._controller.set_session(restored.session.id)
             if self._lineage is not None:
-                self._lineage.restore(
-                    next(
-                        (m.task_id for m in reversed(restored.messages) if m.task_id is not None),
-                        None,
-                    )
+                # A hidden reply (D26 (3)) is never the task to inherit from.
+                tagged = (
+                    m.task_id
+                    for m in reversed(restored.messages)
+                    if m.task_id is not None and m.task_id != HIDDEN_TASK
                 )
+                self._lineage.restore(next(tagged, None))
         self._saving = True
         self._set_notice(notice)
         self._transcript.subscribe(self)

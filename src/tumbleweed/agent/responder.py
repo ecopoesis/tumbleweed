@@ -37,6 +37,14 @@ from tumbleweed.core.ids import MessageId, SessionId, TaskId
 
 MAX_CONTEXT_TURNS = 500  # half of the transcript's 1000 messages
 
+HIDDEN_TASK = TaskId("tsk_00000000000000000000000000")
+"""The task a reply is tagged with when no task may ever see it (D26 (3)): a reply in which the
+context was cut (a fresh start, or the broker not knowing the task to inherit from) after the model
+had begun to write. Its text derives from the earlier context, so it is not for the new task, and
+from the later one, so it is not for the earlier. It is a value of the strict `TaskId` type that no
+broker ever issues: it is in no context set, and a restore skips it when it looks for the task to
+inherit from. The reply stays in the transcript and the history; it is only never sent."""
+
 
 @final
 class ContextTurn(BaseModel):

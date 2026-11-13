@@ -263,6 +263,7 @@ class AgentResponder:
                     # still known, which decides what of them the model may see (D26 (3)).
                     with contextlib.suppress(TaskError):
                         await tasks.ensure()
+                tasks.anchor_reply()
                 turns = tuple(turn for turn in turns if tasks.visible(turn.task))
             history = fit_history(
                 self._system_prompt,

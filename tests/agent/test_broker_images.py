@@ -117,3 +117,15 @@ def test_bytes_over_the_limit_are_refused_even_if_the_broker_sent_them(
             workspace.resolver().read(ref("a.png"), ByteCount(10))
     finally:
         broker.stop()
+
+
+def test_the_resolver_the_shell_makes_waits_ten_seconds_at_most() -> None:
+    from tumbleweed.agent.broker_images import READ_DEADLINE
+    from tumbleweed.agent.broker_link import BrokerLink
+    from tumbleweed.core.ids import TaskId
+
+    link = BrokerLink(lambda handler: (_ for _ in ()).throw(AssertionError("not connected")))
+    resolver = BrokerImageResolver(link, TaskId.new())
+
+    assert READ_DEADLINE == 10.0
+    assert resolver._deadline == 10.0  # noqa: SLF001

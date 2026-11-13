@@ -135,3 +135,54 @@ def test_a_model_asks_the_user_through_the_trusted_prompt_and_reads_what_was_all
         assert "jpeg" in read[0].content
         assert last.task is not None  # the reply is tagged with the task it ended in
         assert window.status_strip.task_text == f"{TASK_PREFIX}Second job"
+
+
+def settled_with_a_task(s: "Setup") -> None:
+    window = s.shell.window
+    type_text(s.shell.shell, "list it")
+    click_send(s.shell.shell)
+    assert pump_until(lambda: not window.controller.busy)
+    assert s.tasks.current is not None
+
+
+def inert_notes(s: "Setup") -> int:
+    from tests.shell.gtk_support import descendants
+    from tumbleweed.shell._gi import Gtk
+    from tumbleweed.shell.canvas_tools import INERT_NOTICE
+
+    return [
+        w.get_text() for w in descendants(s.shell.window.canvas) if isinstance(w, Gtk.Label)
+    ].count(INERT_NOTICE)
+
+
+def test_a_task_that_starts_makes_an_instance_that_belongs_to_no_task_inert() -> None:
+    from tests.shell.test_canvas_agent import asking_spec
+    from tumbleweed.ui.spec import validate_ui_spec
+
+    with agent_shell(
+        lambda photos: [FakeTurn(tool_calls=(call("list_workspace"),)), FakeTurn(chunks=("ok",))]
+    ) as s:
+        s.shell.window.canvas_tools.show(validate_ui_spec(asking_spec()), "replace", None)
+        assert inert_notes(s) == 0
+
+        settled_with_a_task(s)  # the default task started: the window was told on the main thread
+
+        assert inert_notes(s) == 1
+
+
+def test_a_new_chat_session_makes_the_instances_of_the_task_and_of_no_task_inert() -> None:
+    from tests.shell.test_canvas_agent import asking_spec
+    from tumbleweed.ui.spec import validate_ui_spec
+
+    with agent_shell(
+        lambda photos: [FakeTurn(tool_calls=(call("list_workspace"),)), FakeTurn(chunks=("ok",))]
+    ) as s:
+        settled_with_a_task(s)
+        tools = s.shell.window.canvas_tools
+        task = s.tasks.current
+        tools.show(validate_ui_spec(asking_spec()), "stack", task)
+        tools.show(validate_ui_spec(asking_spec()), "stack", None)
+        assert inert_notes(s) == 0
+
+        s.shell.window.session.new_session()  # ends the task: the window hears it
+        assert pump_until(lambda: inert_notes(s) == 2)

@@ -2,6 +2,7 @@
 # ruff: noqa: PT018  (compound assertions read better here)
 
 import asyncio
+import contextlib
 import time
 from pathlib import Path
 from typing import cast
@@ -9,7 +10,9 @@ from typing import cast
 import pytest
 
 from tests.agent.broker_thread import BrokerThread
+from tumbleweed.agent import broker_link
 from tumbleweed.agent.broker_link import BrokerLink, BrokerUnavailableError
+from tumbleweed.agent.tasks import TaskError
 from tumbleweed.broker.client import BrokerClient, BrokerConnector
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.ipc.broker_messages import Refused
@@ -202,3 +205,93 @@ def test_a_broker_that_is_still_coming_up_is_not_started_twice(
             link.close()
 
     assert started == [1]
+
+
+class FakeProcess:
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.stopped = False
+
+    def terminate(self) -> None:
+        self.stopped = True
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.stopped = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        return self.returncode or 0
+
+
+class TestTheSpawner:
+    def make(
+        self, monkeypatch: pytest.MonkeyPatch, clock: list[float], *, slow: bool = False
+    ) -> tuple["broker_link._Spawner", list[FakeProcess]]:
+        made: list[FakeProcess] = []
+
+        async def fake(*args: object, **kwargs: object) -> FakeProcess:
+            if slow:
+                await asyncio.sleep(0.2)
+            process = FakeProcess()
+            made.append(process)
+            return process
+
+        monkeypatch.setattr(broker_link, "spawn_broker_process", fake)
+        return broker_link._Spawner({}, (), patience=60.0, clock=lambda: clock[0]), made  # noqa: SLF001
+
+    def test_a_broker_coming_up_is_waited_for_and_one_that_never_bound_is_replaced(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = [0.0]
+        spawner, made = self.make(monkeypatch, clock)
+
+        async def scenario() -> None:
+            first = await spawner()
+            clock[0] = 10.0
+            assert await spawner() is first  # still within its time: not started again
+            clock[0] = 61.0
+            second = await spawner()  # it never bound its socket: stopped and replaced
+            assert second is not first
+            assert made[0].stopped and not made[1].stopped
+            assert spawner._process is second  # noqa: SLF001  (only the newest is kept)
+
+        asyncio.run(scenario())
+
+    def test_a_cancelled_spawn_still_records_the_process_so_that_no_second_one_starts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = [0.0]
+        spawner, made = self.make(monkeypatch, clock, slow=True)
+
+        async def scenario() -> None:
+            attempt = asyncio.ensure_future(spawner())
+            await asyncio.sleep(0.05)
+            attempt.cancel()  # the connect timed out while the process was being made
+            with contextlib.suppress(asyncio.CancelledError):
+                await attempt
+            await asyncio.sleep(0.3)
+            assert len(made) == 1  # the process was made all the same, and recorded
+            assert spawner._process is made[0]  # noqa: SLF001
+            assert await spawner() is made[0]
+
+        asyncio.run(scenario())
+
+        assert len(made) == 1
+
+
+def test_a_start_that_never_reached_the_broker_is_a_plain_failure_not_an_unsure_one() -> None:
+    from tumbleweed.agent.tasks import TaskSession, TaskUnsureError
+
+    class Posts:
+        def post(self, callback: object) -> None: ...
+
+    link = BrokerLink(lambda handler: (_ for _ in ()).throw(TumbleweedError("no socket")))
+    try:
+        tasks = TaskSession(link, Posts())
+        with pytest.raises(TaskError) as raised:
+            asyncio.run(tasks.start("x", fresh_context=False))
+        assert not isinstance(raised.value, TaskUnsureError)
+        assert tasks.current is None
+    finally:
+        link.close()
