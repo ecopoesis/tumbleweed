@@ -267,12 +267,20 @@ class CopyBackend:
         with contextlib.suppress(OSError):  # not empty: other paths of the snapshot remain
             os.rmdir(str(snapshot), dir_fd=self._root)
 
-    def delete_all(self, snapshot: SnapshotId) -> None:
-        """Delete everything saved for `snapshot` (a directory that exists with no record too)."""
+    def delete_all(self, snapshot: SnapshotId) -> bool:
+        """Delete everything saved for `snapshot` (a directory that exists with no record too).
+        False if there was nothing (another sweep got there first)."""
+        try:
+            os.stat(str(snapshot), dir_fd=self._root, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise SnapshotError(SnapshotFault.IO) from None
         try:
             remove_entry(self._root, str(snapshot), _deadline(timedelta(minutes=5)))
         except OSError:
             raise SnapshotError(SnapshotFault.IO) from None
+        return True
 
     def names(self) -> list[str]:
         try:

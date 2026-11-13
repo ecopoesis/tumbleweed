@@ -2257,15 +2257,16 @@ class BrokerService:
                 if orphan in known or orphan in self._inflight:
                     continue
                 with contextlib.suppress(SnapshotError, FsTimeoutError):
-                    await self._fs.call(
+                    existed = await self._fs.call(
                         partial(store.delete_all, orphan), deadline=self._config.delete_timeout
                     )
-                    self._audit.append(
-                        SnapshotDeleted(
-                            at=self._now(), snapshot=orphan, reason="orphan", outcome="deleted"
+                    if existed:
+                        self._audit.append(
+                            SnapshotDeleted(
+                                at=self._now(), snapshot=orphan, reason="orphan", outcome="deleted"
+                            )
                         )
-                    )
-                    deleted += 1
+                        deleted += 1
         return deleted
 
     def _list_snapshots(self, request: ListSnapshots) -> ResponseBody:
