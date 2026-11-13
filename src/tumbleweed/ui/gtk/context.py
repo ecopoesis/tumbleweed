@@ -254,8 +254,8 @@ class BuildContext:
         return self._guarded(lambda: self.runtime.user_event(event))
 
     def is_unavailable(self, event: UiEvent) -> bool:
-        """Whether `event` names a `sandbox` handler while none can run (until S20): it does
-        not fire, whatever reaches the widget (the control is disabled as well)."""
+        """Whether `event` names a `sandbox` handler while none can run (no broker is connected):
+        it does not fire, whatever reaches the widget (the control is disabled as well)."""
         return not self.runtime.sandbox_connected and self.names_sandbox_handler(event.handler)
 
     def names_sandbox_handler(self, name: HandlerName | None) -> bool:

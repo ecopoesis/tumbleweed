@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 from tumbleweed.sandbox import sandbox_exec
 from tumbleweed.sandbox.policy import (
     HELPER_TARGET,
+    PAYLOAD_TARGET,
     TMPFS_TARGET,
     WORKSPACE_TARGET,
     GrantAccess,
@@ -61,6 +62,8 @@ class HardeningFds:
     """A memfd holding `tumbleweed-sandbox-exec`'s source (`--ro-bind-data`)."""
     report: int
     """The write end of the report pipe, which the launcher passes on as `--report-fd`."""
+    payload: int | None = None
+    """A memfd holding the policy's payload (`--ro-bind-data`), when it has one."""
 
 
 def shown(text: str) -> str:
@@ -94,6 +97,8 @@ def landlock_rules(policy: SandboxPolicy) -> tuple[LandlockRule, ...]:
         LandlockRule(RuleKind.READ, "/proc"),
     ]
     rules += [LandlockRule(RuleKind.READ, item.target) for item in policy.inputs]
+    if policy.payload is not None:
+        rules.append(LandlockRule(RuleKind.READ, PAYLOAD_TARGET))
     for grant in policy.grants:
         kind = RuleKind.WRITE if grant.access is GrantAccess.WRITE else RuleKind.READ
         rules.append(LandlockRule(kind, grant.target))

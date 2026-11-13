@@ -54,6 +54,7 @@ from tumbleweed.broker.config import BrokerConfig
 from tumbleweed.core.types import ModelName
 from tumbleweed.ipc.connection import RequestHandler
 from tumbleweed.sandbox.runner import SandboxRunner
+from tumbleweed.ui.spec.handlers import SandboxHandler
 from tumbleweed.ui.spec.names import StateKey
 
 if TYPE_CHECKING:
@@ -160,6 +161,26 @@ def code_shell(script: Callable[[str], list[FakeTurn]]) -> Iterator[Setup]:
         window.destroy()
         link.close()
         responder.close()
+
+
+def counted_runs(monkeypatch: pytest.MonkeyPatch) -> tuple[list[int], list[int]]:
+    """Every run the window's executor starts, and every cancel of one, counted (and still done)."""
+    starts: list[int] = []
+    cancels: list[int] = []
+    original = BrokerHandlerExecutor.start
+
+    def counting(self: BrokerHandlerExecutor, *args: object) -> Callable[[], None]:
+        starts.append(1)
+        cancel: Callable[[], None] = original(self, *args)  # type: ignore[arg-type]  # forwards
+
+        def counted() -> None:
+            cancels.append(1)
+            cancel()
+
+        return counted
+
+    monkeypatch.setattr(BrokerHandlerExecutor, "start", counting)
+    return starts, cancels
 
 
 def photo_spec(photo: str) -> dict[str, JsonValue]:
@@ -292,14 +313,7 @@ def test_a_burst_of_slider_events_gives_a_bounded_number_of_runs(
 ) -> None:
     from tumbleweed.shell._gi import Gtk
 
-    starts: list[int] = []
-    original = BrokerHandlerExecutor.start
-
-    def counting(self: BrokerHandlerExecutor, *args: object) -> None:
-        starts.append(1)
-        original(self, *args)  # type: ignore[arg-type]  # forwards what it was given
-
-    monkeypatch.setattr(BrokerHandlerExecutor, "start", counting)
+    starts, _ = counted_runs(monkeypatch)
     with code_shell(
         lambda photo: [ask_for_the_photo(photo), show_the_tool(photo), FakeTurn(chunks=("ok",))]
     ) as s:
@@ -317,18 +331,12 @@ def test_a_burst_of_slider_events_gives_a_bounded_number_of_runs(
         pump(1.0)  # whatever else was going to run has run
 
         assert tool.runtime.store.value(StateKey("brightness")) == 29
-        assert 1 <= len(starts) <= 3  # 60 events: not 60 runs
+        handlers = sum(isinstance(h, SandboxHandler) for h in tool.runtime.spec.handlers)
+        assert 1 <= len(starts) <= 1 + handlers  # 60 events: at most one in flight and one waiting
 
 
 def test_an_instance_of_an_ended_task_runs_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    starts: list[int] = []
-    original = BrokerHandlerExecutor.start
-
-    def counting(self: BrokerHandlerExecutor, *args: object) -> None:
-        starts.append(1)
-        original(self, *args)  # type: ignore[arg-type]  # forwards what it was given
-
-    monkeypatch.setattr(BrokerHandlerExecutor, "start", counting)
+    starts, _ = counted_runs(monkeypatch)
     with code_shell(
         lambda photo: [ask_for_the_photo(photo), show_the_tool(photo), FakeTurn(chunks=("ok",))]
     ) as s:
@@ -345,3 +353,25 @@ def test_an_instance_of_an_ended_task_runs_nothing(monkeypatch: pytest.MonkeyPat
         pump(1.0)
 
         assert starts == []
+
+
+def test_closing_a_tool_cancels_the_run_it_has_in_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+    _, cancels = counted_runs(monkeypatch)
+    slow = "import time\ndef adjust(inputs):\n    time.sleep(5)\n    return {'status': 'late'}\n"
+    with code_shell(
+        lambda photo: [
+            ask_for_the_photo(photo),
+            show_the_tool(photo, slow),
+            FakeTurn(chunks=("ok",)),
+        ]
+    ) as s:
+        choose_in_the_picker(s)
+        tool = the_tool(s)
+        press_adjust(s)
+        assert pump_until(lambda: any("Running" in line for line in card_lines(s)), timeout=10)
+
+        s.shell.window.canvas_tools.close()  # a replaced or closed tool
+
+        assert cancels == [1]
+        pump(0.5)
+        assert tool.runtime.store.value(StateKey("status")) != "late"

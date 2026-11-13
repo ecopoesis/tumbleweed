@@ -1360,14 +1360,15 @@ task inherits the taint of the newest tagged turn's task, which may be more than
 lineage had (safe, and the model may then be unable to get the network until it starts a fresh
 task). The model sees one fewer turn after a `fresh_context` switch.
 
-## D27 — Sandboxed code: a shim that takes its program as arguments, handler runs scheduled in the agent package, the model sees only what `run_code` returns (2026-10-21, accepted)
+## D27 — Sandboxed code: a shim that reads its program from a payload file, handler runs scheduled in the agent package, the model sees only what `run_code` returns (2026-10-21, accepted)
 
 **Context.** S20 is the first step where model-written code runs. The pieces exist (a sandbox that
 confines one argv, D13/D15; a broker that composes grants and runs it, D17; a canvas that shows
 specs and has a `SandboxSink` seam, D24; tasks, `BrokerLink` and framing, D26). What is open is how
-code and inputs get into a sandbox that has no stdin and no way for a caller to put files in it, how
+code and inputs get into a sandbox that has no stdin, how
 a result becomes state, and what the model is told. **Decision.** (1) *Runtime.* The sandbox's
-Python is the system one the runtime already mounts (`/usr/bin/python3`, run as `-I`: no cwd or
+Python is the system one the runtime already mounts, found as `python3` on the sandbox's own
+`PATH` (the broker sets it from the runtime, so a Nix runtime needs no change here), run as `-I`: no cwd or
 `PYTHON*` on the path, so a file in the writable workspace can never shadow a module). The Linux
 image gets Pillow and numpy from Ubuntu's own packages (`python3-pil`, `python3-numpy`: they land in
 `/usr/lib/python3/dist-packages`, under the runtime's `/usr`), so nothing is installed at test time (numpy's `libblas.so.3` and `liblapack.so.3` are Debian
@@ -1375,21 +1376,24 @@ alternatives, links into `/etc/alternatives`, which a runtime does not have: the
 straight to their files, as a Nix runtime's are) and the venv, which is under `$HOME`, is never mounted. S26 supplies the same two packages in the
 runtime's store closure. (2) *The shim.* `tumbleweed.sandbox.handler_shim` uses the standard library
 only (a test checks it imports nothing of `tumbleweed`) and is never imported by the shell: its text
-is the `-c` argument (`/usr/bin/python3 -I -c <shim> <chunk>...`). The chunks, joined, are one JSON
-document `{"module", "function", "inputs", "code"}`, split into pieces of at most 8,000 characters
-(each under the 32 KiB an argument may have: no field of the document is a file, a path or a shell
-word), at most 100 KiB in all (the argv's own cap is 128 KiB). The shim writes each module's source
+is the `-c` argument (`python3 -I -c <shim> /tw-payload`). The code and inputs are not arguments: a
+host's process list is readable by other users, so they are the **payload**, bytes the broker puts
+in the sandbox as the read-only file `/tw-payload` (`SandboxPolicy.payload`, made by bwrap from a
+memfd with `--ro-bind-data`, as the launcher is; `RunInSandbox.payload` carries it, at most 256 KiB,
+and Landlock allows reading just that file). It is one JSON document `{"module", "function",
+"inputs", "code"}` of at most 255 KiB. The shim writes each module's source
 to a fresh directory on the sandbox's `/tmp` and imports it with `spec_from_file_location` as
 `_tw_tool.<name>`, a package it made itself with only that directory in its `__path__`: no `sys.path`
 lookup is involved, so a module named `os`, `subprocess` or `builtins` is `_tw_tool.os` and can
 neither shadow nor resolve to the standard library (#56). It calls `function(inputs)` (one dict, the
 declared inputs and nothing else), with `sys.stdout` pointed at `sys.stderr` meanwhile, and writes one
 JSON line to the real stdout: `{"ok": true, "outputs": {...}}`, or `{"ok": false, "error": <closed
-set>}` (`no_module`, `no_function`, `raised`, `bad_result`), with the traceback on stderr only. The
+set>}` (`bad_payload`, `no_module`, `no_function`, `raised`, `bad_result`, `too_large`), with the
+traceback on stderr only. The
 trusted side never trusts that line: it is parsed with `model_validate_json` into a closed strict
 model, and a stdout that is anything else is `bad_result`. (3) *`run_code(source, timeout_seconds)`.*
-`/usr/bin/python3 -I -c <source>` in the task's sandbox (source at most 24 KiB; the argument limit
-is 32 KiB), 1 to 60 s (default 10), no network (there is none to give), no `$HOME`, the task's
+`python3 -I /tw-payload` in the task's sandbox, the source being the payload (at most 24 KiB;
+the check counts bytes, not characters), 1 to 60 s (default 10), no network (there is none to give), no `$HOME`, the task's
 grants and workspace only. The result is `exit code / how it ended`, then stdout and stderr each in
 its own frame (`agent.untrusted`, now with a per-frame limit of 5 KiB so that both fit the 16 KiB
 tool result), and the model is told when a stream was cut. (4) *`show_ui(spec, placement, code)`.*
@@ -1444,6 +1448,22 @@ and the real sandbox under the `linux` marker; the user is `ScriptedPrompts` or 
 a fake picker at the `FilePicker` Protocol, never a hook in `src/`. The mutants that remove each
 check (undeclared output, only-outputs, the loader's isolation, the debounce, one in flight, the
 sandbox policy under `run_code`) are run and listed in the PR. **Consequences.** A handler's input
-(state as JSON) and code share a 100 KiB argv, so a tool with a large table as input cannot run;
-state that big is a reason for an agent handler or a file in the workspace. Each run pays one Python
-start in the sandbox (about 50 ms with Pillow imported) on top of the launcher's.
+(state as JSON) and code share one payload of at most 255 KiB (and the model's 64 KiB tool input
+bounds the code), so a tool with a large table as input cannot run; state that big is a reason for
+an agent handler or a file in the workspace. Each run pays one Python
+start in the sandbox (about 50 ms with Pillow imported) on top of the launcher's. *Code that the user allowed once.* A
+`once` grant is bound to a reply's run and spent by a read or listing of the model's (D26 (2));
+every code run has a run of its own, so `run_code` and handlers see only `task` grants. The result
+of `request_access` says so when the user chose once, the system prompt says it, and a handler that
+lacks access shows the plain line about it. *The disk.* Code can now write the task's workspace:
+the per-file limit holds, a total per task does not (#74): S20 makes that gap reachable by the model,
+and S27's quota or a budget the broker checks after each run is its fix. A name that is new each
+time (the photo tool's) grows the workspace by one file per run. *The run cap.* Every handler run
+counts against the task's 1,000 runs, so a long, steady drag of a slider can use them up (the card
+then says the task has used its runs, and `run_code` says the same): a count that skips runs that
+never start, or a cap per window, is for when it is seen. *A cancelled run.* Closing or ending an
+instance cancels the wait for its run in flight; the broker has no request to stop the run, so it
+holds one of its run slots for at most its wall time. *S24.* The command, the payload and the
+reading of the shim's line are `tumbleweed.sandbox.handler_protocol`, which the broker may import:
+a run of a stored tool's code (I8) is built there, from the broker's own store. *Inputs of a
+waiting run* are those of the event, not of the moment it starts.

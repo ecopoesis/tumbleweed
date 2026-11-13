@@ -33,6 +33,10 @@ WORKSPACE_TARGET: Final = "/workspace"
 INPUTS_TARGET: Final = "/inputs"
 HELPER_TARGET: Final = "/tumbleweed-sandbox-exec"
 """Where `tumbleweed-sandbox-exec` is put inside the sandbox (S15): bwrap makes this file."""
+PAYLOAD_TARGET: Final = "/tw-payload"
+"""Where a run's payload is put (S20): the code and inputs of a run, as a read-only file bwrap
+makes from a memfd. Not on any argv, so other users of the host cannot read it in /proc."""
+MAX_PAYLOAD_BYTES: Final = 256 * 1024
 # Paths of the sandbox that are not the policy's to hand out, nor anything inside them: bwrap makes
 # them itself, or (the workspace and inputs) a mount point inside would be created in the host's
 # directory. /tmp is the sandbox's own tmpfs and Landlock gives it write rights (S15), which a
@@ -45,6 +49,7 @@ RESERVED_TARGETS: Final = (
     WORKSPACE_TARGET,
     INPUTS_TARGET,
     HELPER_TARGET,
+    PAYLOAD_TARGET,
     TMPFS_TARGET,
 )
 
@@ -436,6 +441,8 @@ class SandboxPolicy:
       empty one; a variable whose name is not on the allowlist, or that looks like a secret, is
       refused rather than dropped.
     - `limits`: see `SandboxLimits`.
+    - `payload`: bytes the program reads at `/tw-payload` (S20): a handler's code and inputs, or
+      the source of `run_code`. A read-only file of the sandbox's own, never an argument.
     - `require_landlock`: refuse to run (`SandboxUnavailable`) when the kernel has no Landlock,
       which is what the target needs: a sandbox there that silently lost a layer would be a
       weaker one nobody chose. A dev kernel without it (Docker Desktop's, #44) sets this false,
@@ -454,9 +461,14 @@ class SandboxPolicy:
     env: tuple[EnvVar, ...] = ()
     env_allowlist: frozenset[EnvName] = frozenset()
     require_landlock: bool = True
+    payload: bytes | None = None
 
     def __post_init__(self) -> None:
         self._check_command()
+        if self.payload is not None and (
+            type(self.payload) is not bytes or len(self.payload) > MAX_PAYLOAD_BYTES
+        ):
+            raise InvalidPolicyError(f"the payload must be at most {MAX_PAYLOAD_BYTES} bytes")
         _require_type(self.require_landlock, bool, "require_landlock")
         descriptor_number(self.workspace, "the workspace")
         _require_type(self.runtime, RuntimeSpec, "runtime")

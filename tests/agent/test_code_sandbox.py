@@ -99,11 +99,12 @@ class World:
         outcome = asyncio.run(self.registry.call(name, dict(arguments)))
         return outcome.text, outcome.is_error
 
-    def grant(self, path: Path) -> None:
-        self.prompts.answers.append(Allowed(scope=GrantScope.TASK))
+    def grant(self, path: Path, scope: GrantScope = GrantScope.TASK) -> str:
+        self.prompts.answers.append(Allowed(scope=scope))
         text, is_error = self.tool("request_access", kind="read", path=str(path), reason="r")
         assert not is_error
         assert text.startswith("Granted"), text
+        return text
 
     def task(self) -> TaskId:
         return asyncio.run(self.tasks.ensure())
@@ -147,6 +148,42 @@ def world(wall_seconds: int = 20) -> Iterator[World]:
         broker.stop()
 
 
+@contextmanager
+def loopback_server() -> Iterator[tuple[int, list[bool]]]:
+    """A TCP server on this host's loopback, and whether anything connected to it."""
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    server.settimeout(1.0)
+    seen: list[bool] = []
+
+    def accept() -> None:
+        try:
+            server.accept()
+            seen.append(True)
+        except OSError:
+            pass
+
+    thread = threading.Thread(target=accept)
+    thread.start()
+    try:
+        yield server.getsockname()[1], seen
+    finally:
+        thread.join(5)
+        server.close()
+
+
+def connect_code(port: int) -> str:
+    return (
+        "import socket\n"
+        "try:\n"
+        f"    socket.create_connection(('127.0.0.1', {port}), timeout=3)\n"
+        "    print('CONNECTED')\n"
+        "except OSError as error:\n"
+        "    print('blocked', type(error).__name__)\n"
+    )
+
+
 class TestRunCode:
     def test_a_program_runs_and_its_output_comes_back_framed_as_data(self) -> None:
         with world() as w:
@@ -171,39 +208,12 @@ class TestRunCode:
 
     def test_it_cannot_reach_the_network(self) -> None:
         """A server on this host's loopback: a sandbox that shared the network would connect."""
-        server = socket.socket()
-        server.bind(("127.0.0.1", 0))
-        server.listen()
-        server.settimeout(0.5)
-        port = server.getsockname()[1]
-        seen: list[bool] = []
+        with world() as w, loopback_server() as (port, seen):
+            text, _ = w.run_code(connect_code(port))
 
-        def accept() -> None:
-            try:
-                server.accept()
-                seen.append(True)
-            except OSError:
-                pass
-
-        thread = threading.Thread(target=accept)
-        thread.start()
-        try:
-            with world() as w:
-                text, _ = w.run_code(
-                    "import socket\n"
-                    "try:\n"
-                    f"    socket.create_connection(('127.0.0.1', {port}), timeout=3)\n"
-                    "    print('CONNECTED')\n"
-                    "except OSError as error:\n"
-                    "    print('blocked', type(error).__name__)\n"
-                )
             assert "blocked" in text
             assert "CONNECTED" not in text
-            thread.join(5)
-            assert seen == []  # and the server never saw a connection
-        finally:
-            server.close()
-            thread.join(5)
+        assert seen == []  # and the server never saw a connection
 
     def test_it_cannot_read_the_users_home(self) -> None:
         with world() as w:
@@ -251,6 +261,23 @@ class TestRunCode:
             assert "granted" in text
             assert "neighbour blocked" in text
             assert "not granted" not in text
+
+    def test_access_allowed_once_is_for_the_models_own_reads_and_does_not_reach_code(self) -> None:
+        with world() as w:
+            (w.home / "Photos").mkdir(parents=True, exist_ok=True)
+            (w.home / "Photos" / "a.txt").write_text("granted once")
+            told = w.grant(w.home / "Photos", GrantScope.ONCE)
+            assert "cannot use it" in told  # the model is told so
+
+            text, _ = w.run_code(
+                "try:\n"
+                f"    print(open({str(w.home / 'Photos' / 'a.txt')!r}).read())\n"
+                "except OSError:\n"
+                "    print('not mounted')\n"
+            )
+
+            assert "not mounted" in text
+            assert "granted once" not in text
 
     def test_a_program_that_runs_forever_is_stopped_and_reported(self) -> None:
         with world() as w:
@@ -339,33 +366,66 @@ class TestHandlerRuns:
 
             assert outcome.failure == "output_limit"
 
-    def test_a_handler_that_uses_too_much_memory_fails_and_the_tool_goes_on(self) -> None:
+    def test_a_handler_over_its_memory_is_stopped_and_the_tool_goes_on(self) -> None:
         with world() as w:
-            outcome = w.handler("def f(i):\n    return {'a': bytearray(1 << 40)}\n")
+            # Twice the broker's limit, touched page by page: only a real limit stops it.
+            limit = int(w.broker.rig.config.limits.memory)
+            greedy = (
+                "def f(i):\n"
+                f"    block = bytearray({2 * limit})\n"
+                "    for at in range(0, len(block), 4096):\n"
+                "        block[at] = 1\n"
+                "    return {'touched': True}\n"
+            )
+
+            outcome = w.handler(greedy)
+            again = w.handler("def f(i):\n    return {'ok': 1}\n")
 
             assert outcome.values is None
             assert outcome.failure in {"raised", "crashed"}
+            assert again.values == {"ok": 1}
 
-    def test_a_handler_cannot_read_the_users_home_or_reach_the_network(self) -> None:
+    def test_a_handler_cannot_read_the_users_home(self) -> None:
         with world() as w:
             secret = w.home / "secret.txt"
             secret.write_text("PRIVATE")
             outcome = w.handler(
-                "import socket\n"
                 "def f(i):\n"
                 "    try:\n"
                 f"        data = open({str(secret)!r}).read()\n"
                 "    except OSError:\n"
                 "        data = 'blocked'\n"
+                "    return {'file': data}\n"
+            )
+
+            assert outcome.values == {"file": "blocked"}
+
+    def test_a_handler_cannot_reach_the_network(self) -> None:
+        with world() as w, loopback_server() as (port, seen):
+            outcome = w.handler(
+                "import socket\n"
+                "def f(i):\n"
                 "    try:\n"
-                "        socket.create_connection(('127.0.0.1', 9), timeout=1)\n"
+                f"        socket.create_connection(('127.0.0.1', {port}), timeout=3)\n"
                 "        net = 'connected'\n"
                 "    except OSError:\n"
                 "        net = 'blocked'\n"
-                "    return {'file': data, 'net': net}\n"
+                "    return {'net': net}\n"
             )
 
-            assert outcome.values == {"file": "blocked", "net": "blocked"}
+            assert outcome.values == {"net": "blocked"}
+        assert seen == []
+
+    @needs_pillow
+    def test_access_allowed_once_does_not_reach_a_handler(self) -> None:
+        with world() as w:
+            photo = write_photo(w.home / "Photos")
+            w.grant(photo, GrantScope.ONCE)
+            inputs = {"photo_path": str(photo), "brightness": 0, "contrast": 0, "grayscale": False}
+
+            outcome = w.handler(PHOTO_MODULE, inputs, module="photo", function="adjust")
+
+            assert outcome.values == {"status": "Could not open that photo."}
 
     def test_a_symlink_the_code_plants_is_not_followed_when_its_image_is_read(self) -> None:
         with world() as w:
@@ -382,7 +442,7 @@ class TestHandlerRuns:
                     ImageRef.model_validate({"path": "evil.png"}), ByteCount(512 * 1024)
                 )
 
-    def test_a_grant_that_has_gone_is_named_to_the_user_not_to_the_model(self) -> None:
+    def test_a_grant_that_has_gone_is_a_failure_of_ours(self) -> None:
         with world() as w:
             folder = w.home / "Photos"
             folder.mkdir(parents=True, exist_ok=True)
@@ -393,6 +453,3 @@ class TestHandlerRuns:
             outcome = w.handler("def f(i):\n    return {}\n")
 
             assert outcome.failure == "grant_gone"
-            assert outcome.detail is not None
-            assert "grt_" in outcome.detail
-            assert str(w.home) not in outcome.detail

@@ -878,6 +878,7 @@
             "unsafe",
             "too_large",
             "busy",
+            "exhausted",
             "unavailable",
             "timeout",
             "failed",
@@ -1246,6 +1247,19 @@
           "minimum": 1,
           "title": "Max Output Bytes",
           "type": "integer"
+        },
+        "payload": {
+          "anyOf": [
+            {
+              "maxLength": 262144,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Payload"
         },
         "run": {
           "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$",

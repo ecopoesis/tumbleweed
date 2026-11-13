@@ -12,7 +12,10 @@ reports back on the main thread.
   `1 + H` runs.
 - **The result** is applied with `only=handler.outputs`, whole or not at all, and never fires a
   handler. A failure or a refused result is one line of ours for the card.
-- **Inert and closed instances** start nothing, and a result that arrives is dropped.
+- **Inert and closed instances** start nothing, the run in flight is cancelled (nothing waits for
+  it; the broker has no cancel yet, so it ends at its own limits), and a result is dropped.
+- **Inputs** are those of the event, kept until the run starts: a run that waited behind another
+  one uses what the state held when the user acted, not what a later `Reset` made it.
 """
 
 import logging
@@ -40,7 +43,6 @@ NO_TASK_NOTICE: Final = "This tool has no task to run its code in."
 REFUSED_NOTICE: Final = (
     "The tool's code returned something the tool does not allow: nothing changed."
 )
-_DETAILED: Final = frozenset({"grant_gone", "not_granted", "denied"})
 
 
 class RunTarget(Protocol):
@@ -77,6 +79,7 @@ class HandlerRuns:
         self._timers: dict[HandlerName, Callable[[], None]] = {}
         self._ready: list[HandlerName] = []
         self._in_flight = False
+        self._cancel: Callable[[], None] | None = None
         self._stopped = False
         self.started = 0  # runs handed to the executor, for tests and the log
 
@@ -106,11 +109,14 @@ class HandlerRuns:
     def stop(self) -> None:
         """The instance is inert or closed: nothing starts, and a result that arrives is dropped."""
         self._stopped = True
-        for cancel in self._timers.values():
-            cancel()
+        for cancel_timer in self._timers.values():
+            cancel_timer()
         self._timers.clear()
         self._latest.clear()
         self._ready.clear()
+        cancel, self._cancel = self._cancel, None
+        if cancel is not None:
+            cancel()
 
     def _due(self, name: HandlerName) -> None:
         self._timers.pop(name, None)
@@ -128,28 +134,37 @@ class HandlerRuns:
         self._in_flight = True
         self.started += 1
         self._target.notice(RUNNING_NOTICE)
-        self._executor.start(
-            task,
-            HandlerCall(str(handler.module), str(handler.function), inputs, self._code),
-            partial(self._done, handler),
-        )
+        try:
+            cancel = self._executor.start(
+                task,
+                HandlerCall(str(handler.module), str(handler.function), inputs, self._code),
+                partial(self._done, handler),
+            )
+            self._cancel = cancel
+        except Exception:  # an executor is another component's code; the tool must not wedge
+            logger.exception("starting a run of handler %s failed", handler.name)
+            self._in_flight = False
+            self._target.notice(failure_text("unavailable"))
 
     def _done(self, handler: SandboxHandler, outcome: HandlerOutcome) -> None:
         self._in_flight = False
+        self._cancel = None
         if self._stopped:
             return
         try:
-            self._target.notice(self._apply(handler, outcome))
+            line = self._apply(handler, outcome)
         except Exception:  # a UI path never takes the shell down
+            logger.exception("applying the result of handler %s failed", handler.name)
+            line = failure_text("unavailable")
+        try:
+            self._target.notice(line)
+        except Exception:
             logger.exception("showing the result of handler %s failed", handler.name)
         self._pump()
 
     def _apply(self, handler: SandboxHandler, outcome: HandlerOutcome) -> str | None:
         if outcome.failure is not None:
-            text = failure_text(outcome.failure)
-            if outcome.failure in _DETAILED and outcome.detail:
-                text += f" ({outcome.detail})"
-            return text
+            return failure_text(outcome.failure)
         if outcome.values is None:
             return failure_text("bad_result")
         try:

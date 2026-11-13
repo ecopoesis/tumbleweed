@@ -73,7 +73,9 @@ from tumbleweed.ui.spec.values import ImageRef, Table
 
 WARNING_CLASS = "warning"
 WARNING_ICON = "dialog-warning-symbolic"
-SANDBOX_UNAVAILABLE = "This control runs code in a sandbox, which is not available yet."
+SANDBOX_UNAVAILABLE = (
+    "This control runs code in a sandbox, which needs the broker: it is not connected."
+)
 TITLE_WIDTH_CHARS = 32  # a tab's title is this wide at most, then an ellipsis
 
 

@@ -206,6 +206,8 @@ def _code_problems(spec: UiSpec, code: tuple[CodeModule, ...]) -> list[str]:
     names = [str(module.name) for module in code]
     if len(set(names)) != len(names):
         problems.append("two code modules have the same name")
+    # Defence in depth: the tool input's own limit (64 KiB) is lower today, and this one is what a
+    # package may hold (S23), should the input limit be raised.
     if sum(text_bytes(module.source) for module in code) > MAX_MODULES_BYTES:
         problems.append(f"the code modules hold more than {MAX_MODULES_BYTES // 1024} KiB in all")
     for handler in spec.handlers:

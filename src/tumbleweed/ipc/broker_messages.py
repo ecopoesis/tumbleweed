@@ -34,6 +34,7 @@ MAX_ARG_CHARS: Final = 32 * 1024
 MAX_ENV_PAIRS: Final = 8
 MAX_ENV_VALUE_CHARS: Final = 256
 MAX_MESSAGE_CHARS: Final = 300
+MAX_PAYLOAD_CHARS: Final = 256 * 1024
 MAX_WALL_SECONDS: Final = 120
 """The longest a sandbox run may be asked to last (the broker's own ceiling, I9)."""
 
@@ -55,7 +56,8 @@ RefusalReason = Literal[
     "not_found",
     "unsafe",  # a symlink, a special file, not the object that was granted, a tampered package
     "too_large",
-    "busy",  # the broker is at one of its limits
+    "busy",  # the broker is at one of its limits, for now
+    "exhausted",  # the task has used all the runs it may: waiting will not help
     "unavailable",  # this host cannot do it safely
     "timeout",  # the file system took too long
     "failed",  # the sandbox could not be set up
@@ -283,6 +285,9 @@ class RunInSandbox(Request):
     wall_seconds: Annotated[int, Field(ge=1, le=MAX_WALL_SECONDS)] = 30
     cpu_seconds: Annotated[int, Field(ge=1, le=MAX_WALL_SECONDS)] = 30
     max_output_bytes: Annotated[int, Field(ge=1, le=MAX_OUTPUT_BYTES)] = 64 * 1024
+    payload: Annotated[str, Field(max_length=MAX_PAYLOAD_CHARS)] | None = None
+    """Text the program reads as the file `/tw-payload` (S20): its code and inputs. Never an
+    argument, so it is not on the host's process list."""
 
 
 @final

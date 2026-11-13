@@ -1,11 +1,12 @@
 """The handler shim: what runs inside a sandbox to call one function of a tool's code (S20, D27).
 
-The shell does not import this module into any process of its own: the agent reads its text and
-passes it to the sandbox's own interpreter as `python3 -I -c <text> <chunk>...`. So it uses the
-standard library only (`tests/sandbox/test_handler_shim.py` checks that it imports nothing of
-`tumbleweed`), and it runs as `__main__`.
+The shell does not import this module into any process of its own: its text is passed to the
+sandbox's own interpreter as `python3 -I -c <text> /tw-payload`. So it uses the standard library
+only (`tests/sandbox/test_handler_shim.py` checks that it imports nothing of `tumbleweed`), and it
+runs as `__main__`.
 
-The chunks, joined, are one JSON document:
+The file named by its one argument, which the sandbox policy made from a memfd (never an
+argument of the host's process list), holds one JSON document:
 
     {"module": "photo", "function": "adjust", "inputs": {...}, "code": {"photo": "<source>", ...}}
 
@@ -51,10 +52,10 @@ class _Failure(Exception):  # noqa: N818  (an answer, not a fault)
 
 def _decode(argv: list[str]) -> tuple[str, str, dict[str, object], dict[str, str]]:
     try:
-        payload = json.loads("".join(argv))
+        payload = json.loads(Path(argv[0]).read_text(encoding="utf-8"))
         module, function = payload["module"], payload["function"]
         inputs, code = payload["inputs"], payload["code"]
-    except (ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
         raise _Failure("bad_payload") from None
     if not (
         isinstance(module, str)

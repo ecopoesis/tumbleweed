@@ -428,6 +428,34 @@ class TestTheHostMustBeAbleToEnforceTheLimits:
         run(scenario)
 
 
+class TestThePayload:
+    def test_the_payload_reaches_the_policy_as_bytes_and_is_never_an_argument(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+
+                await client.run_in_sandbox(task, RunId.new(), COMMAND, payload="d\u00e9j\u00e0 vu")
+
+                (policy,) = rig.sandbox.policies
+                assert policy.payload == "d\u00e9j\u00e0 vu".encode()
+                assert policy.command == COMMAND
+
+        run(scenario)
+
+    def test_a_run_without_one_has_none(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+
+                await client.run_in_sandbox(task, RunId.new(), COMMAND)
+
+                assert rig.sandbox.policies[0].payload is None
+
+        run(scenario)
+
+
 class TestWhenTheGrantsAreNoLongerWhatWasGranted:
     def test_a_granted_directory_that_became_a_symlink_refuses_the_run(self) -> None:
         async def scenario() -> None:
@@ -554,7 +582,7 @@ class TestBounds:
                 with pytest.raises(BrokerRefused) as caught:
                     await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
-                assert caught.value.reason == "busy"
+                assert caught.value.reason == "exhausted"
 
         run(scenario)
 

@@ -1,49 +1,60 @@
 """The handler shim (S20, D27): its protocol, and that tool modules resolve only inside the tool.
 
-The shim is run here as the agent will run it in a sandbox: `python -I -c <shim> <chunks>`, with the
-argv `handler_command` builds, so these tests also cover that command. The sandbox itself is
-covered in `tests/agent/test_code_sandbox.py`.
+The shim is run here as the broker will run it in a sandbox: `python -I -c <shim> <payload file>`,
+with the argv `handler_command` builds, so these tests also cover that command. The sandbox itself
+is covered in `tests/agent/test_code_sandbox.py`.
 """
 
 import ast
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 from pydantic import JsonValue
 
-from tumbleweed.agent.code import HandlerCall, handler_command
 from tumbleweed.sandbox import handler_shim
+from tumbleweed.sandbox.handler_protocol import handler_command, handler_payload
+from tumbleweed.sandbox.policy import PAYLOAD_TARGET
 from tumbleweed.tools.package import CodeModule
-from tumbleweed.ui.spec.names import ModuleName, StateKey
-from tumbleweed.ui.spec.state import StateValue
+from tumbleweed.ui.spec.names import ModuleName
 
 
 def modules(**sources: str) -> tuple[CodeModule, ...]:
     return tuple(CodeModule(name=ModuleName(name), source=text) for name, text in sources.items())
 
 
-def run(
-    code: tuple[CodeModule, ...],
-    module: str = "main",
-    function: str = "f",
-    inputs: dict[str, StateValue] | None = None,
-    cwd: Path | None = None,
-) -> tuple[dict[str, JsonValue], int, str]:
-    call = HandlerCall(module, function, {StateKey(k): v for k, v in (inputs or {}).items()}, code)
-    command = handler_command(call)
-    assert command is not None
-    # The host's interpreter stands in for the runtime's; everything else is the real argv.
-    done = subprocess.run(  # noqa: S603  (our own argv, no shell)
-        [sys.executable, *command[1:]],
+def shim(
+    payload: str, directory: Path, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """The shim as the sandbox runs it, on a payload file (the host's interpreter stands in)."""
+    file = directory / "payload"
+    file.write_text(payload, encoding="utf-8")
+    command = handler_command()
+    assert command[-1] == PAYLOAD_TARGET
+    return subprocess.run(  # noqa: S603  (our own argv, no shell)
+        [sys.executable, *command[1:-1], str(file)],
         capture_output=True,
         text=True,
         timeout=30,
         cwd=cwd,
         check=False,
     )
+
+
+def run(
+    code: tuple[CodeModule, ...],
+    module: str = "main",
+    function: str = "f",
+    inputs: dict[str, JsonValue] | None = None,
+    cwd: Path | None = None,
+) -> tuple[dict[str, JsonValue], int, str]:
+    payload = handler_payload(module, function, inputs or {}, {str(m.name): m.source for m in code})
+    assert payload is not None
+    with tempfile.TemporaryDirectory() as directory:
+        done = shim(payload, Path(directory), cwd)
     line = json.loads(done.stdout)
     assert isinstance(line, dict)
     return line, done.returncode, done.stderr
@@ -104,15 +115,41 @@ def test_a_failure_is_one_closed_word_and_never_the_codes_text(
         assert "secret detail" in stderr or "at import" in stderr  # on stderr only
 
 
-def test_a_payload_that_is_not_the_protocol_is_refused() -> None:
+def _doc(
+    module: str = "main", function: str = "f", inputs: object = None, code: object = None
+) -> str:
+    return json.dumps(
+        {
+            "module": module,
+            "function": function,
+            "inputs": {} if inputs is None else inputs,
+            "code": {module: "def f(i): return {}"} if code is None else code,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{",
+        "[]",
+        '{"module": "main"}',
+        _doc(module="../x"),  # a name that could be a path
+        _doc(function="__import__"),
+        _doc(code={"Main": "x"}),
+        _doc(inputs=[]),
+    ],
+)
+def test_a_payload_that_is_not_the_protocol_is_refused(payload: str, tmp_path: Path) -> None:
+    done = shim(payload, tmp_path)
+
+    assert json.loads(done.stdout) == {"ok": False, "error": "bad_payload"}
+
+
+def test_a_missing_payload_file_is_refused(tmp_path: Path) -> None:
+    command = handler_command()
     done = subprocess.run(  # noqa: S603  (our own argv, no shell)
-        [
-            sys.executable,
-            "-I",
-            "-c",
-            handler_shim.__file__ and Path(handler_shim.__file__).read_text(),
-            "{",
-        ],
+        [sys.executable, *command[1:-1], str(tmp_path / "none")],
         capture_output=True,
         text=True,
         timeout=30,

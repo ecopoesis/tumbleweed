@@ -32,12 +32,21 @@ CODE = (CodeModule(name=ModuleName("photo"), source="def adjust(inputs):\n    re
 @dataclass
 class FakeExecutor:
     calls: list[tuple[HandlerCall, Callable[[HandlerOutcome], None]]] = field(default_factory=list)
+    cancelled: int = 0
+    explode: bool = False
 
     def start(
         self, task: TaskId, call: HandlerCall, done: Callable[[HandlerOutcome], None]
-    ) -> None:
+    ) -> Callable[[], None]:
         assert task == TASK
+        if self.explode:
+            raise RuntimeError("the executor broke")
         self.calls.append((call, done))
+
+        def cancel() -> None:
+            self.cancelled += 1
+
+        return cancel
 
     def finish(self, outcome: HandlerOutcome, which: int = -1) -> None:
         self.calls[which][1](outcome)
@@ -307,7 +316,10 @@ class TestTheResult:
             (HandlerOutcome(failure="output_limit"), "printed too much"),
             (HandlerOutcome(failure="raised"), "failed"),
             (HandlerOutcome(failure="busy"), "busy"),
-            (HandlerOutcome(failure="grant_gone", detail="grt_X is gone"), "grt_X is gone"),
+            (HandlerOutcome(failure="run_cap"), "used all the code runs"),
+            (HandlerOutcome(failure="rejected"), "would not run"),
+            (HandlerOutcome(failure="not_granted"), "allow it for the task"),
+            (HandlerOutcome(failure="grant_gone"), "Ask for it again"),
         ],
     )
     def test_a_failure_is_one_line_of_ours_and_the_state_is_untouched(
@@ -375,3 +387,62 @@ class TestAnInertOrClosedInstance:
         r.executor.finish(OK)
 
         assert len(r.executor.calls) == 1
+
+
+class TestWhenSomethingBreaks:
+    def test_an_executor_that_raises_leaves_the_tool_able_to_run_again(self) -> None:
+        r = rig()
+        r.executor.explode = True
+        r.event("adjust", "button", "click")
+        r.scheduler.advance(1)
+
+        assert r.notices.lines[-1] == "The sandbox is not available right now."
+        assert r.runs.started == 1
+
+        r.executor.explode = False
+        r.event("adjust", "button", "click")
+        r.scheduler.advance(1)
+
+        assert len(r.executor.calls) == 1  # not stuck "in flight" behind the one that raised
+
+    def test_a_target_that_raises_when_applying_clears_the_running_line(self) -> None:
+        r = rig()
+        r.event("adjust", "button", "click")
+        r.scheduler.advance(1)
+        assert r.notices.lines[-1] == RUNNING_NOTICE
+
+        original = r.runtime.apply_sandbox_result
+
+        def broken(handler: SandboxHandler, values: Mapping[str, object]) -> None:
+            raise RuntimeError("a bug")
+
+        r.runtime.apply_sandbox_result = broken  # type: ignore[method-assign]  # a fault to inject
+        r.executor.finish(OK)
+        r.runtime.apply_sandbox_result = original  # type: ignore[method-assign]
+
+        assert r.notices.lines[-1] == "The sandbox is not available right now."
+        r.event("adjust", "button", "click")
+        r.scheduler.advance(1)
+        assert len(r.executor.calls) == 2  # and the tool goes on
+
+    def test_stopping_cancels_the_run_in_flight_and_only_that(self) -> None:
+        r = rig()
+        r.runs.stop()
+        assert r.executor.cancelled == 0  # nothing was running
+
+        r = rig()
+        r.event("adjust", "button", "click")
+        r.scheduler.advance(1)
+        r.runs.stop()
+
+        assert r.executor.cancelled == 1
+
+    def test_a_finished_run_is_not_cancelled_by_a_later_stop(self) -> None:
+        r = rig()
+        r.event("adjust", "button", "click")
+        r.scheduler.advance(1)
+        r.executor.finish(OK)
+
+        r.runs.stop()
+
+        assert r.executor.cancelled == 0

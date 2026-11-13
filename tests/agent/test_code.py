@@ -7,20 +7,22 @@ import json
 import pytest
 
 from tumbleweed.agent.code import (
-    CHUNK_CHARS,
     FRAME_BYTES,
-    INTERPRETER,
-    MAX_PAYLOAD_BYTES,
     HandlerCall,
-    handler_command,
+    handler_run,
     outcome_of,
     refusal_outcome,
     run_code_text,
-    shim_source,
 )
 from tumbleweed.agent.limits import MAX_TOOL_RESULT_BYTES
 from tumbleweed.broker.client import BrokerRefused
 from tumbleweed.ipc.broker_messages import RunResult
+from tumbleweed.sandbox.handler_protocol import (
+    INTERPRETER,
+    MAX_DOCUMENT_BYTES,
+    shim_source,
+)
+from tumbleweed.sandbox.policy import PAYLOAD_TARGET
 from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.spec.names import ModuleName, StateKey
 from tumbleweed.ui.spec.values import ImageRef
@@ -69,39 +71,40 @@ def call(
     )
 
 
-class TestTheCommand:
-    def test_it_is_the_runtimes_interpreter_isolated_with_the_shim_as_text(self) -> None:
-        command = handler_command(call(brightness=5))
+class TestTheRun:
+    def test_the_command_is_the_isolated_interpreter_with_the_shim_as_text_and_a_payload_file(
+        self,
+    ) -> None:
+        run = handler_run(call(brightness=5))
 
-        assert command is not None
-        assert command[:3] == (INTERPRETER, "-I", "-c")
-        assert command[3] == shim_source()
+        assert run is not None
+        command, _ = run
+        assert command == (INTERPRETER, "-I", "-c", shim_source(), PAYLOAD_TARGET)
+        assert INTERPRETER == "python3"  # looked up on the sandbox's own PATH, not a host path
 
-    def test_the_chunks_join_to_one_document_of_the_declared_inputs_and_the_code(self) -> None:
-        command = handler_command(
-            call(brightness=5, photo=ImageRef.model_validate({"path": "a.png"}))
-        )
+    def test_the_payload_is_one_document_of_the_declared_inputs_and_the_code(self) -> None:
+        run = handler_run(call(brightness=5, photo=ImageRef.model_validate({"path": "a.png"})))
 
-        assert command is not None
-        document = json.loads("".join(command[4:]))
+        assert run is not None
+        document = json.loads(run[1])
         assert document["inputs"] == {"brightness": 5, "photo": {"path": "a.png"}}
         assert document["module"] == "main"
         assert set(document["code"]) == {"main"}
 
-    def test_every_chunk_fits_one_argument_even_in_four_byte_characters(self) -> None:
-        command = handler_command(call(source="# " + "\U0001f600" * 11_000 + "\n"))
+    def test_neither_the_code_nor_the_inputs_are_on_the_argv(self) -> None:
+        run = handler_run(call(source="SECRET_CODE = 1\n", note="SECRET_INPUT"))
 
-        assert command is not None
-        assert len(command[4:]) > 1
-        assert all(len(chunk) <= CHUNK_CHARS for chunk in command[4:])
-        assert all(len(chunk.encode()) <= 32 * 1024 for chunk in command)
+        assert run is not None
+        assert not any("SECRET" in word for word in run[0])
+        assert "SECRET_CODE" in run[1]
+        assert "SECRET_INPUT" in run[1]
 
     def test_code_and_inputs_over_the_cap_are_not_run(self) -> None:
-        assert handler_command(call(extra=3)) is None  # 120,000 bytes of code
-        assert MAX_PAYLOAD_BYTES < 120_000
+        assert handler_run(call(extra=7)) is None  # 280,000 bytes of code
+        assert MAX_DOCUMENT_BYTES < 280_000
 
     def test_an_input_that_is_not_text_is_not_run(self) -> None:
-        assert handler_command(call(note="\ud800")) is None
+        assert handler_run(call(note="\ud800")) is None
 
     def test_the_shim_is_read_as_data(self) -> None:
         assert "def main" in shim_source()
@@ -161,6 +164,9 @@ class TestReadingAnAnswer:
         ("reason", "failure"),
         [
             ("busy", "busy"),
+            ("exhausted", "run_cap"),
+            ("invalid_request", "rejected"),
+            ("too_large", "rejected"),
             ("not_found", "grant_gone"),
             ("unsafe", "grant_gone"),
             ("denied", "denied"),
@@ -176,7 +182,6 @@ class TestReadingAnAnswer:
         outcome = refusal_outcome(refusal)
 
         assert outcome.failure == failure
-        assert outcome.detail == "fixed text"
 
 
 class TestWhatTheModelIsShown:
