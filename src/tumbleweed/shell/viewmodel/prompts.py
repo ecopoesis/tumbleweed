@@ -112,6 +112,7 @@ from tumbleweed.agent.canvas_events import Scheduler
 from tumbleweed.core.ids import PromptId, TaskId, ToolId
 from tumbleweed.ipc.broker_messages import (
     NetworkAccess,
+    NoUndoAccess,
     PickAccess,
     ReadAccess,
     Scope,
@@ -131,7 +132,7 @@ _ELLIPSIS: Final = "…"
 
 _SPELLED_OUT: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 
-type CardKind = Literal["read", "write", "network", "pick_file", "pick_folder"]
+type CardKind = Literal["read", "write", "network", "pick_file", "pick_folder", "no_undo"]
 
 
 @final
@@ -150,6 +151,10 @@ class PromptCard:
     reason_cut: bool
     task_title: str | None = None
     """The title the assistant gave the task (plain, capped), or None: set apart as its words."""
+    paths: tuple[str, ...] = ()
+    """For `no_undo`: the places the run may change, spelled out (`visible`), and `cause` why they
+    could not be saved: the broker's closed code, shown as our own sentence."""
+    cause: str | None = None
 
     @property
     def picks(self) -> bool:
@@ -209,6 +214,8 @@ def card_of(show: ShowPrompt, task_title: str | None = None) -> PromptCard:
             kind = "network"
         case PickAccess():
             kind = "pick_file" if access.choose == "file" else "pick_folder"
+        case NoUndoAccess():
+            kind = "no_undo"
         case _:
             assert_never(access)
     reason, cut = plain_reason(show.reason)
@@ -223,6 +230,10 @@ def card_of(show: ShowPrompt, task_title: str | None = None) -> PromptCard:
         reason=reason,
         reason_cut=cut,
         task_title=title,
+        paths=tuple(visible(each) for each in access.paths)
+        if isinstance(access, NoUndoAccess)
+        else (),
+        cause=access.cause if isinstance(access, NoUndoAccess) else None,
     )
 
 

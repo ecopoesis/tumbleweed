@@ -66,12 +66,17 @@ from tumbleweed.broker.audit import (
     FileAccess,
     GrantDecision,
     GrantRevoked,
+    NoUndoAccepted,
     RolledBack,
     SandboxRun,
     SandboxRunResult,
+    SnapshotDeleted,
+    SnapshotRefused,
+    SnapshotTaken,
     TaskEndReason,
     ToolImportRefused,
     ToolSaved,
+    UndoDone,
     WorkspaceDeleted,
     cut,
 )
@@ -87,6 +92,8 @@ from tumbleweed.broker.errors import (
     FsTimeoutError,
     PathError,
     PathFault,
+    SnapshotError,
+    SnapshotFault,
     StoreError,
     ToolBlobError,
     ToolBlobWriteError,
@@ -98,6 +105,7 @@ from tumbleweed.broker.errors import (
     UnknownTaskError,
     WorkspaceError,
     describe_fault,
+    describe_snapshot_fault,
 )
 from tumbleweed.broker.fdio import FileKind, OpenedPath, read_capped
 from tumbleweed.broker.fsworker import FsWorker
@@ -135,14 +143,29 @@ from tumbleweed.broker.policy import (
     open_granted,
     select_grants,
 )
-from tumbleweed.broker.prompts import Allowed, Denied, GrantPrompt, PromptAnswer, PromptInterface
+from tumbleweed.broker.prompts import (
+    Allowed,
+    Denied,
+    GrantPrompt,
+    NoUndoSubject,
+    PromptAnswer,
+    PromptInterface,
+)
+from tumbleweed.broker.snapshots import (
+    BackendKind,
+    SnapshotKind,
+    SnapshotManager,
+    SnapshotRecord,
+    SnapshotTarget,
+)
 from tumbleweed.broker.store import BrokerStore, TaskRecord, ToolRecord
 from tumbleweed.broker.task import TaintKind, TaskState
 from tumbleweed.broker.toolstore import StoredTool, ToolStore, taint_names
+from tumbleweed.broker.treeops import RestoreStats, measure
 from tumbleweed.broker.workspace import open_in_workspace, read_workspace_file
 from tumbleweed.broker.workspaces import Listing, Workspaces, list_directory
 from tumbleweed.core.errors import InvalidValueError
-from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId
+from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId
 from tumbleweed.core.types import ByteCount, WorkspaceRelPath
 from tumbleweed.ipc.broker_messages import (
     DirEntry,
@@ -151,6 +174,7 @@ from tumbleweed.ipc.broker_messages import (
     FileContent,
     GrantOutcome,
     ListDir,
+    ListSnapshots,
     ListWorkspace,
     NetworkAccess,
     PickAccess,
@@ -165,9 +189,14 @@ from tumbleweed.ipc.broker_messages import (
     RunInSandbox,
     RunResult,
     Scope,
+    SnapshotInfo,
+    SnapshotList,
     StartTask,
     Taint,
     TaskStarted,
+    UndoLastChange,
+    UndoResult,
+    UndoSnapshot,
     WriteAccess,
 )
 from tumbleweed.ipc.broker_messages import TaskEnded as TaskEndedReply
@@ -240,6 +269,9 @@ _DENIAL_MESSAGES: Final = {
 _DENIED: Final = "the request was denied"
 _PROBE_WAIT: Final = timedelta(seconds=15)
 _SWEEP_BATCH: Final = 100
+_SNAPSHOT_SLACK: Final = timedelta(seconds=5)
+"""What the file system worker's deadline allows beyond the snapshot's own (which the tree walks
+check themselves, so that the thread ends by itself)."""
 _UNAVAILABLE_AUDIT: Final = "the audit log is unavailable, so nothing is done"
 
 
@@ -459,6 +491,7 @@ class BrokerService:
         sandbox: Sandbox,
         prompts: PromptInterface,
         environ: Mapping[str, str],
+        snapshots: SnapshotManager,
         clock: Callable[[], datetime] = utc_now,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -484,6 +517,10 @@ class BrokerService:
         self._sweeper: asyncio.Task[None] | None = None
         self._starting = 0  # tasks being made: counted against the cap before the first await
         self._creating: set[TaskId] = set()  # their workspaces, which are not orphans
+        self._snapshots = snapshots
+        self._inflight: set[SnapshotId] = set()  # saved, not yet recorded: not orphans
+        self._undoing: set[SnapshotId] = set()  # one undo of a snapshot at a time
+        self._background: set[asyncio.Task[bool | None]] = set()
 
     # --- life cycle ----------------------------------------------------------------------------
 
@@ -523,6 +560,7 @@ class BrokerService:
         await asyncio.gather(*running, return_exceptions=True)
         self._fs.close()
         self._workspaces.close()
+        self._snapshots.close()
         self._audit.close()
         self._tools.close()
         self._store.close()
@@ -578,6 +616,7 @@ class BrokerService:
                         at=self._now(), task=record.task, outcome=outcome, reason=reason
                     )
                 )
+        await self._sweep_snapshots(now)
         return deleted
 
     async def _remove_orphans(self) -> None:
@@ -706,6 +745,12 @@ class BrokerService:
                 return await self._list_dir(owner, request)
             case RunInSandbox():
                 return await self._run_in_sandbox(owner, request)
+            case UndoLastChange():
+                return await self._undo_last_change(owner, request)
+            case UndoSnapshot():
+                return await self._undo_snapshot(request)
+            case ListSnapshots():
+                return self._list_snapshots(request)
             case ListTools():
                 return self._list_tools(request)
             case ShowTool():
@@ -1691,9 +1736,13 @@ class BrokerService:
             )
             mounts = disjoint_mounts(
                 [
-                    Mount(grant.id, grant.capability.path)
+                    Mount(
+                        grant.id,
+                        grant.capability.path,
+                        writable=isinstance(grant.capability, FsWrite),
+                    )
                     for grant in selection.applicable
-                    if isinstance(grant.capability, FsRead)
+                    if isinstance(grant.capability, FsRead | FsWrite)
                 ]
             )
             paths: _RunPaths = await self._fs.call(
@@ -1702,12 +1751,19 @@ class BrokerService:
                 ),
                 discard=_close_paths,
             )
+            snapshot: SnapshotRecord | None = None
             try:
+                if any(mount.writable for mount in mounts):
+                    # I13: nothing that can write starts before its snapshot is recorded (below,
+                    # in the transaction that authorises the run) or the user accepted no undo.
+                    snapshot = await self._snapshot_for_run(owner, request, live, mounts, paths)
                 policy, limits = self._policy(request, paths, mounts, variables, allowlist)
-                self._authorise_run(request, live, context, selection, mounts, rules)
+                self._authorise_run(request, live, context, selection, mounts, rules, snapshot)
                 authorised[0] = True
             except BaseException:
                 paths.close()
+                if snapshot is not None:
+                    self._forget_unrecorded(snapshot)
                 raise
             return await self._run_authorised(request, policy, limits, paths)
 
@@ -1768,6 +1824,7 @@ class BrokerService:
         try:
             workspace = self._workspaces.open_workspace(task, identity)
             opened.append(workspace)
+            self._require_room(workspace)
             granted: list[OpenedPath] = []
             for mount in mounts:
                 try:
@@ -1787,6 +1844,30 @@ class BrokerService:
                 each.close()
             raise
         return _RunPaths(workspace=workspace, mounts=tuple(granted))
+
+    def _require_room(self, workspace: OpenedPath) -> None:
+        """Refuse a run while the task's workspace holds more than it may (#74's disk box, D28):
+        code can write up to 64 MiB a file, a thousand runs, and nothing else bounded the total.
+        The check is before a run, so one run can pass the budget by what it writes in its wall
+        time (the next is refused), and it counts disk use (`st_blocks`), never following a link."""
+        config = self._config
+        try:
+            usage = measure(
+                workspace.fd,
+                max_bytes=config.workspace_max_bytes,
+                max_files=config.workspace_max_files,
+                deadline=time.monotonic() + config.fs_timeout.total_seconds(),
+            )
+        except SnapshotError:
+            raise _Refuse(
+                "unavailable", "the task's workspace could not be measured", "workspace_unmeasured"
+            ) from None
+        if usage.over:
+            raise _Refuse(
+                "too_large",
+                "the task's workspace is full: remove files from it or start a new task",
+                "workspace_full",
+            )
 
     def _policy(
         self,
@@ -1812,7 +1893,7 @@ class BrokerService:
                     GrantMount(
                         source=opened,
                         target=MountPath(mount.path.path),
-                        access=GrantAccess.READ,
+                        access=GrantAccess.WRITE if mount.writable else GrantAccess.READ,
                     )
                     for mount, opened in zip(mounts, paths.mounts, strict=True)
                 ),
@@ -1836,10 +1917,12 @@ class BrokerService:
         selection: GrantSelection,
         mounts: Sequence[Mount],
         rules: DenyRules,
+        snapshot: SnapshotRecord | None,
     ) -> None:
         """Record that the run is authorised, before it starts: the once grants it uses are
-        consumed, the task's taint is raised to what the applied grants imply, and the audit
-        entry is written, in one transaction (S16: persist before acting)."""
+        consumed, the task's taint is raised to what the applied grants imply, the snapshot of
+        its writable paths is recorded (I13) and the audit entries are written, in one
+        transaction (S16: persist before acting)."""
         if self._live.get(live.state.task) is not live:
             raise _Refuse("unknown_task", "the task ended")
         # Defence in depth, not observable on its own: the reservation made at the start already
@@ -1867,6 +1950,21 @@ class BrokerService:
                 self._store.revoke_grant(grant.id, now)
             if selection.task_taint != live.state.taint:
                 self._store.set_taint(live.state.task, selection.task_taint)
+            if snapshot is not None:
+                self._store.insert_snapshot(snapshot)
+                if snapshot.no_undo:
+                    entries.append(
+                        NoUndoAccepted(
+                            at=now,
+                            snapshot=snapshot.id,
+                            task=snapshot.task,
+                            run=request.run,
+                            paths=_texts(snapshot),
+                            cause="user accepted",
+                        )
+                    )
+                else:
+                    entries.append(_snapshot_entry(snapshot, now))
             entries.append(
                 SandboxRun(
                     at=now,
@@ -1883,6 +1981,8 @@ class BrokerService:
                     require_landlock=self._config.require_landlock,
                 )
             )
+        if snapshot is not None:
+            self._inflight.discard(snapshot.id)
         live.runs.add(request.run)
         for old in once:
             live.grants.remove(old)  # used up by this run
@@ -1965,6 +2065,480 @@ class BrokerService:
             )
         except AuditError:
             _log.error("the result of a sandbox run could not be audited")
+
+    # --- snapshots and undo (S21, D28) ---------------------------------------------------------
+
+    async def _snapshot_for_run(
+        self,
+        owner: Owner,
+        request: RunInSandbox,
+        live: _Live,
+        mounts: Sequence[Mount],
+        paths: _RunPaths,
+    ) -> SnapshotRecord:
+        """The snapshot of the writable paths of a run (I13), taken and not yet recorded: the
+        record is made in the transaction that authorises the run. If nothing can be saved, the
+        user is asked, in a trusted prompt, whether this one run may go ahead with no undo; a no,
+        no answer or a prompt that fails refuses the run."""
+        writable = [
+            (mount.path, opened)
+            for mount, opened in zip(mounts, paths.mounts, strict=True)
+            if mount.writable
+        ]
+        snapshot = SnapshotId.new()
+        await self._make_room()
+        self._inflight.add(snapshot)
+        try:
+            taken = await self._fs.call(
+                partial(self._snapshots.take, snapshot, writable),
+                deadline=self._config.snapshots.timeout + _SNAPSHOT_SLACK,
+            )
+        except (SnapshotError, FsTimeoutError) as error:
+            fault = error.fault if isinstance(error, SnapshotError) else SnapshotFault.TIMEOUT
+            self._inflight.discard(snapshot)
+            self._audit_snapshot_refused(request, [path for path, _ in writable], fault.value)
+            if not await self._ask_no_undo(owner, request, live, [p for p, _ in writable], fault):
+                raise _Refuse(
+                    "too_large"
+                    if fault
+                    in {
+                        SnapshotFault.TOO_MANY_BYTES,
+                        SnapshotFault.TOO_MANY_FILES,
+                        SnapshotFault.TOO_DEEP,
+                    }
+                    else "unavailable",
+                    "the run could change files and a copy for undo could not be saved "
+                    f"({describe_snapshot_fault(fault)}); the user did not allow running "
+                    "without undo",
+                    "no_snapshot_" + fault.value,
+                ) from None
+            return SnapshotRecord(
+                id=snapshot,
+                kind=SnapshotKind.RUN,
+                task=live.state.task,
+                run=request.run,
+                taken_at=self._now(),
+                targets=tuple(
+                    SnapshotTarget(path=p, backend=BackendKind.NOOP) for p, _ in writable
+                ),
+                no_undo=True,
+            )
+        return SnapshotRecord(
+            id=snapshot,
+            kind=SnapshotKind.RUN,
+            task=live.state.task,
+            run=request.run,
+            taken_at=self._now(),
+            targets=taken,
+        )
+
+    def _audit_snapshot_refused(
+        self,
+        request: RunInSandbox,
+        paths: Sequence[StoredPath],
+        reason: str,
+    ) -> None:
+        try:
+            self._audit.append(
+                SnapshotRefused(
+                    at=self._now(),
+                    task=request.task,
+                    run=request.run,
+                    paths=tuple(cut(path.path, 4096) for path in paths[:MAX_AUDITED_IDS]),
+                    reason=cut(reason),
+                )
+            )
+        except AuditError:
+            _log.error("a refused snapshot could not be audited")
+
+    async def _ask_no_undo(
+        self,
+        owner: Owner,
+        request: RunInSandbox,
+        live: _Live,
+        paths: Sequence[StoredPath],
+        fault: SnapshotFault,
+    ) -> bool:
+        """Ask the user whether this run may go ahead with no undo. Per run: the answer is not
+        kept, and the same limits as any prompt apply (I5)."""
+        if self._rate_limited(live) is not None:
+            return False
+        self._count_prompt(live)
+        prompt = GrantPrompt(
+            task=request.task,
+            run=request.run,
+            no_undo=NoUndoSubject(paths=tuple(paths), cause=fault),
+            scopes=frozenset({GrantScope.ONCE}),
+            reason="",
+        )
+        answer = await self._ask(prompt, owner)
+        return isinstance(answer, Allowed) and answer.scope is GrantScope.ONCE
+
+    def _forget_unrecorded(self, snapshot: SnapshotRecord) -> None:
+        """A snapshot was taken for a run that did not start: delete its copy (in the background,
+        so that a refusal is answered at once). Nothing was recorded, so nothing refers to it."""
+        self._inflight.discard(snapshot.id)
+        if snapshot.no_undo:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._delete_saved(snapshot, "discarded"), name=f"snapshot-discard-{snapshot.id}"
+        )
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _delete_saved(
+        self,
+        snapshot: SnapshotRecord,
+        reason: Literal["age", "count", "size", "discarded", "orphan"],
+    ) -> bool:
+        """Delete what a snapshot saved, audit it, and forget the record if there is one."""
+        outcome: Literal["deleted", "failed"] = "deleted"
+        try:
+            await self._fs.call(
+                partial(self._snapshots.delete, snapshot), deadline=self._config.delete_timeout
+            )
+        except (SnapshotError, FsTimeoutError):
+            outcome = "failed"
+        try:
+            with self._atomic() as entries:
+                if outcome == "deleted":
+                    self._store.delete_snapshot(snapshot.id)
+                entries.append(
+                    SnapshotDeleted(
+                        at=self._now(), snapshot=snapshot.id, reason=reason, outcome=outcome
+                    )
+                )
+        except (AuditError, StoreError):
+            _log.error("a deleted snapshot could not be recorded")
+            return False
+        return outcome == "deleted"
+
+    async def _make_room(self) -> None:
+        """Before a snapshot: keep the number and the total size of the stored ones within the
+        settings by deleting the oldest (audited). A snapshot that is the only one left is not
+        deleted for size: the cap on one snapshot is lower than the cap on all."""
+        settings = self._config.snapshots
+        records = self._store.oldest_snapshots(10_000)
+        total = sum(record.saved_bytes for record, _ in records)
+        count = len(records)
+        for record, _ in records:
+            if (
+                count < settings.max_snapshots
+                and total + settings.max_bytes <= settings.store_max_bytes
+            ):
+                break
+            reason: Literal["count", "size"] = (
+                "count" if count >= settings.max_snapshots else "size"
+            )
+            if await self._delete_saved(record, reason):
+                count -= 1
+                total -= record.saved_bytes
+
+    async def _sweep_snapshots(self, now: datetime) -> int:
+        """Retention (D28): delete snapshots older than `retention` or past `max_snapshots`
+        (oldest first), and saved copies no record names. Returns how many were deleted."""
+        settings = self._config.snapshots
+        records = self._store.oldest_snapshots(10_000)
+        deleted = 0
+        count = len(records)
+        for record, _ in records:
+            reason: Literal["age", "count"]
+            if now - record.taken_at >= settings.retention:
+                reason = "age"
+            elif count > settings.max_snapshots:
+                reason = "count"
+            else:
+                break
+            if await self._delete_saved(record, reason):
+                deleted += 1
+                count -= 1
+        store = self._snapshots.copy_store
+        if store is not None:
+            known = {record.id for record, _ in self._store.oldest_snapshots(10_000)}
+            for name in await self._fs.call(store.names):
+                try:
+                    orphan = SnapshotId(name)
+                except InvalidValueError:
+                    continue
+                # Judged now: a snapshot that is being taken has its copy before its record.
+                if orphan in known or orphan in self._inflight:
+                    continue
+                with contextlib.suppress(SnapshotError, FsTimeoutError):
+                    await self._fs.call(
+                        partial(store.delete_all, orphan), deadline=self._config.delete_timeout
+                    )
+                    self._audit.append(
+                        SnapshotDeleted(
+                            at=self._now(), snapshot=orphan, reason="orphan", outcome="deleted"
+                        )
+                    )
+                    deleted += 1
+        return deleted
+
+    def _list_snapshots(self, request: ListSnapshots) -> ResponseBody:
+        infos: list[SnapshotInfo] = []
+        for record, undone in self._store.recent_snapshots(request.limit):
+            infos.append(
+                SnapshotInfo(
+                    snapshot=record.id,
+                    kind=record.kind.value,
+                    task=record.task,
+                    taken_at=record.taken_at,
+                    paths=tuple(target.path.path for target in record.targets),
+                    undoable=not record.no_undo and not undone,
+                    undone=undone,
+                )
+            )
+        return SnapshotList(kind="snapshot_list", snapshots=tuple(infos))
+
+    async def _undo_last_change(self, owner: Owner, request: UndoLastChange) -> ResponseBody:
+        """The model's undo: this task's newest write-enabled run that has not been undone."""
+        live = self._owned(owner, request.task)
+        found = self._store.latest_run_snapshot(live.state.task)
+        if found is None:
+            raise _Refuse("not_found", "this task has no change to undo", "nothing_to_undo")
+        return await self._undo(found[0], found[1], asked_by="model")
+
+    async def _undo_snapshot(self, request: UndoSnapshot) -> ResponseBody:
+        """The user's undo, from the chrome's list."""
+        found = self._store.snapshot(request.snapshot)
+        if found is None:
+            raise _Refuse("not_found", "there is no such snapshot", "no_such_snapshot")
+        return await self._undo(found[0], found[1], asked_by="user")
+
+    async def _undo(
+        self, record: SnapshotRecord, undone: bool, *, asked_by: Literal["model", "user"]
+    ) -> ResponseBody:
+        """Put `record` back. In order: refuse what cannot be undone; open every target by its
+        identity (a target that is gone or is another object refuses the undo, nothing done);
+        snapshot what is there now, recorded and audited (so the undo can be undone); restore;
+        then record the undo. A restore that fails part way is rolled back from that snapshot,
+        and the answer says so. Never silently partial."""
+        task = record.task
+        paths = tuple(target.path for target in record.targets)
+
+        def refused(reason: str, kind: RefusalReason, message: str) -> _Refuse:
+            self._audit_undo(record, None, asked_by, "refused", reason, paths)
+            return _Refuse(kind, message, reason)
+
+        if record.no_undo:
+            raise refused(
+                "no_undo", "not_undoable", "that run was done with no undo, at the user's request"
+            )
+        if undone:
+            raise refused("already_undone", "not_undoable", "that change was already undone")
+        if record.id in self._undoing:
+            raise _Refuse("busy", "that change is being undone", "undo_in_progress")
+        self._undoing.add(record.id)
+        try:
+            rules = await self._rules()
+            opened: list[OpenedPath] = []
+            try:
+                opened = await self._fs.call(
+                    partial(self._open_undo_targets, record, rules),
+                    discard=_close_all,
+                )
+            except PathError as error:
+                gone = error.fault in {
+                    PathFault.MISSING,
+                    PathFault.IDENTITY_MISMATCH,
+                    PathFault.SYMLINK,
+                }
+                raise refused(
+                    "target_" + error.fault.value,
+                    "unsafe" if gone else "denied",
+                    "a file or folder that was changed is not there any more, or is not the "
+                    "same one: nothing was undone"
+                    if gone
+                    else "the broker may not open what was changed: nothing was undone",
+                ) from None
+            try:
+                return await self._undo_opened(record, opened, asked_by, paths, task)
+            finally:
+                for each in opened:
+                    each.close()
+        finally:
+            self._undoing.discard(record.id)
+
+    def _open_undo_targets(self, record: SnapshotRecord, rules: DenyRules) -> list[OpenedPath]:
+        opened: list[OpenedPath] = []
+        try:
+            for target in record.targets:
+                opened.append(open_granted(target.path, rules=rules))
+        except BaseException:
+            for each in opened:
+                each.close()
+            raise
+        return opened
+
+    async def _undo_opened(
+        self,
+        record: SnapshotRecord,
+        opened: list[OpenedPath],
+        asked_by: Literal["model", "user"],
+        paths: tuple[StoredPath, ...],
+        task: TaskId,
+    ) -> ResponseBody:
+        safety = SnapshotId.new()
+        self._inflight.add(safety)
+        try:
+            await self._make_room()
+            try:
+                taken = await self._fs.call(
+                    partial(
+                        self._snapshots.take,
+                        safety,
+                        [
+                            (target.path, each)
+                            for target, each in zip(record.targets, opened, strict=True)
+                        ],
+                    ),
+                    deadline=self._config.snapshots.timeout + _SNAPSHOT_SLACK,
+                )
+            except (SnapshotError, FsTimeoutError) as error:
+                fault = error.fault if isinstance(error, SnapshotError) else SnapshotFault.TIMEOUT
+                self._audit_undo(record, None, asked_by, "refused", "safety_" + fault.value, paths)
+                raise _Refuse(
+                    "unavailable",
+                    "what is there now could not be saved first, so nothing was undone "
+                    f"({describe_snapshot_fault(fault)})",
+                    "safety_" + fault.value,
+                ) from None
+            now = self._now()
+            before = SnapshotRecord(
+                id=safety,
+                kind=SnapshotKind.UNDO,
+                task=task,
+                run=None,
+                taken_at=now,
+                targets=taken,
+                undoes=record.id,
+            )
+            with self._atomic() as entries:
+                self._store.insert_snapshot(before)
+                entries.append(_snapshot_entry(before, now))
+        finally:
+            self._inflight.discard(safety)
+        restored: list[RestoreStats] = []
+        try:
+            restored = await self._fs.call(
+                partial(self._snapshots.restore, record, opened),
+                deadline=self._config.snapshots.timeout + _SNAPSHOT_SLACK,
+            )
+        except (SnapshotError, FsTimeoutError) as error:
+            fault = error.fault if isinstance(error, SnapshotError) else SnapshotFault.TIMEOUT
+            rolled = await self._roll_back(before, opened)
+            self._audit_undo(
+                record,
+                safety,
+                asked_by,
+                "failed",
+                f"{fault.value}; {'rolled back' if rolled else 'not rolled back'}",
+                paths,
+            )
+            raise _Refuse(
+                "failed",
+                "the undo did not finish "
+                f"({describe_snapshot_fault(fault)}); "
+                + (
+                    "what was there before it was put back"
+                    if rolled
+                    else "some files may be partly restored: the copy taken just before it is "
+                    "in the undo list"
+                ),
+                "restore_" + fault.value,
+            ) from None
+        written = sum(item.written for item in restored)
+        removed = sum(item.removed for item in restored)
+        with self._atomic() as entries:
+            if not self._store.mark_undone(record.id, self._now()):
+                raise _Refuse("not_undoable", "that change was already undone", "already_undone")
+            entries.append(
+                UndoDone(
+                    at=self._now(),
+                    snapshot=record.id,
+                    safety=safety,
+                    task=task,
+                    asked_by=asked_by,
+                    outcome="restored",
+                    reason=None,
+                    paths=tuple(cut(p.path, 4096) for p in paths[:MAX_AUDITED_IDS]),
+                    written=written,
+                    removed=removed,
+                )
+            )
+        return UndoResult(
+            kind="undo_result",
+            snapshot=record.id,
+            safety=safety,
+            paths=len(record.targets),
+            written=written,
+            removed=removed,
+        )
+
+    async def _roll_back(self, before: SnapshotRecord, opened: Sequence[OpenedPath]) -> bool:
+        try:
+            await self._fs.call(
+                partial(self._snapshots.restore, before, opened),
+                deadline=self._config.snapshots.timeout + _SNAPSHOT_SLACK,
+            )
+        except (SnapshotError, FsTimeoutError):
+            return False
+        return True
+
+    def _audit_undo(
+        self,
+        record: SnapshotRecord,
+        safety: SnapshotId | None,
+        asked_by: Literal["model", "user"],
+        outcome: Literal["restored", "refused", "failed"],
+        reason: str | None,
+        paths: Sequence[StoredPath],
+    ) -> None:
+        try:
+            self._audit.append(
+                UndoDone(
+                    at=self._now(),
+                    snapshot=record.id,
+                    safety=safety,
+                    task=record.task,
+                    asked_by=asked_by,
+                    outcome=outcome,
+                    reason=None if reason is None else cut(reason),
+                    paths=tuple(cut(path.path, 4096) for path in paths[:MAX_AUDITED_IDS]),
+                )
+            )
+        except AuditError:
+            _log.error("an undo could not be audited")
+
+
+def _texts(snapshot: SnapshotRecord) -> tuple[str, ...]:
+    return tuple(cut(target.path.path, 4096) for target in snapshot.targets[:MAX_AUDITED_IDS])
+
+
+def _close_all(opened: list[OpenedPath]) -> None:
+    for each in opened:
+        each.close()
+
+
+def _snapshot_entry(snapshot: SnapshotRecord, at: datetime) -> SnapshotTaken:
+    backends: list[Literal["copy", "btrfs"]] = []
+    for target in snapshot.targets:
+        if target.backend is BackendKind.COPY and "copy" not in backends:
+            backends.append("copy")
+        elif target.backend is BackendKind.BTRFS and "btrfs" not in backends:
+            backends.append("btrfs")
+    return SnapshotTaken(
+        at=at,
+        snapshot=snapshot.id,
+        snapshot_kind=snapshot.kind.value,
+        task=snapshot.task,
+        run=snapshot.run,
+        paths=_texts(snapshot),
+        backends=tuple(backends),
+        files=sum(target.files for target in snapshot.targets),
+        bytes=sum(target.bytes for target in snapshot.targets),
+    )
 
 
 def _tool_summary(record: ToolRecord) -> ToolSummary:

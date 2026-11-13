@@ -42,6 +42,7 @@ from tumbleweed.broker.owner import Owner
 from tumbleweed.broker.prompts import PromptInterface
 from tumbleweed.broker.service import BrokerService, Sandbox, utc_now
 from tumbleweed.broker.shellprompts import ShellPrompts
+from tumbleweed.broker.snapshots import BtrfsTool, SnapshotManager
 from tumbleweed.broker.store import BrokerStore
 from tumbleweed.broker.toolblobs import ToolBlobs
 from tumbleweed.broker.toolstore import ToolStore
@@ -161,6 +162,7 @@ async def start_broker(
     monotonic: Callable[[], float] = time.monotonic,
     limits: IpcLimits | None = None,
     credentials: PeerCredentialsProvider | None = None,
+    btrfs: BtrfsTool | None = None,
 ) -> BrokerDaemon:
     """Open the store, audit log and workspaces, start the service and listen on `socket`.
 
@@ -175,12 +177,14 @@ async def start_broker(
     audit_log: AuditLog | None = None
     workspaces: Workspaces | None = None
     tools: ToolStore | None = None
+    snapshots: SnapshotManager | None = None
     fs = FsWorker(timeout=config.fs_timeout)
     service: BrokerService | None = None
     try:
         audit_log = AuditLog.open(config.broker_directory)
         workspaces = Workspaces.open(config.workspaces_directory)
         tools = ToolStore(store, ToolBlobs.open(config.broker_directory))
+        snapshots = SnapshotManager(config.snapshots, config.snapshots_directory, btrfs)
         shell_prompts: ShellPrompts | None = None
         if prompts is None:  # the shell's trusted prompt, over the connection that asked
             shell_prompts = ShellPrompts(timeout=config.prompt_timeout)
@@ -195,6 +199,7 @@ async def start_broker(
             sandbox=runner,
             prompts=prompts,
             environ=env,
+            snapshots=snapshots,
             clock=clock,
             monotonic=monotonic,
         )
@@ -210,6 +215,8 @@ async def start_broker(
         )
         await server.start()
     except BaseException:
+        if snapshots is not None and service is None:
+            snapshots.close()
         if service is not None:
             await service.close()
         else:

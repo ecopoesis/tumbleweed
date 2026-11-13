@@ -707,7 +707,7 @@ class BrokerStore:
         )
 
     def snapshot(self, snapshot: SnapshotId) -> tuple[SnapshotRecord, bool] | None:
-        """A snapshot, and whether it has been undone; None if there is none (or it is unreadable)."""
+        """A snapshot, and whether it was undone; None if there is none (or it cannot be read)."""
         found = self._snapshots("WHERE id = ?", (str(snapshot),))
         return found[0] if found else None
 
@@ -735,7 +735,10 @@ class BrokerStore:
         self, tail: str, parameters: Sequence[object] = ()
     ) -> list[tuple[SnapshotRecord, bool]]:
         found: list[tuple[SnapshotRecord, bool]] = []
-        for row in self._query(f"SELECT id, record, undone_at FROM snapshots {tail}", parameters):
+        for row in self._query(
+            f"SELECT id, record, undone_at FROM snapshots {tail}",  # noqa: S608  (our own constants)
+            parameters,
+        ):
             try:
                 record = _SNAPSHOTS.validate_json(_text(row[1]), strict=True)
                 if str(record.id) != _text(row[0]):

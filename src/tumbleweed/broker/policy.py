@@ -376,7 +376,8 @@ def select_grants(
 
     A grant applies if it has not expired, belongs here (a once grant: to this task and this run
     and is not consumed; a task grant: to this task; a tool grant: the run is a user-triggered
-    run of exactly that tool and content hash), does not overlap the deny list, and does not conflict with the task's taint.
+    run of exactly that tool and content hash), does not overlap the deny list, and does not
+    conflict with the task's taint.
 
     **Applying a tool grant counts as issuing it** (I12): the tool grants that apply are taken
     in order of issue (`issued_at`, then ID) and each adds its taint to the running taint, so
