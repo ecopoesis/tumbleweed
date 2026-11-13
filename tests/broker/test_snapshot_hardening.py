@@ -296,7 +296,7 @@ def test_a_sweep_that_lists_before_a_run_is_recorded_does_not_delete_its_copy() 
                 release_listing.wait(10)  # the list is old by the time it is used
                 return found
 
-            manager.take = held_take  # type: ignore[method-assign]  # a test double
+            manager.take = held_take  # type: ignore[method-assign,assignment]  # a test double
             manager.stored_names = slow_names  # type: ignore[method-assign]  # a test double
             running_run = asyncio.create_task(client.run_in_sandbox(task, RunId.new(), COMMAND))
             await until_set(taken)
@@ -382,7 +382,7 @@ def test_a_run_refused_after_its_copy_was_taken_has_the_copy_deleted() -> None:
             def refuse(*arguments: object) -> None:
                 raise _Refuse("busy", "the grants changed while the run was being set up")
 
-            service._authorise_run = refuse  # noqa: SLF001  # type: ignore[method-assign,assignment]  # a test double
+            service._authorise_run = refuse  # type: ignore[method-assign,assignment]  # noqa: SLF001
             with pytest.raises(BrokerRefused):
                 await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
@@ -412,7 +412,7 @@ def test_one_failed_audit_does_not_end_the_orphan_sweep() -> None:
                     raise AuditError("the audit log cannot be written")
                 real(entry)  # type: ignore[arg-type]  # the entry is one
 
-            service._audit.append = flaky  # noqa: SLF001  # type: ignore[method-assign]  # a test double
+            service._audit.append = flaky  # type: ignore[method-assign]  # noqa: SLF001
             await service.sweep()
 
             assert calls == ["failed"]
@@ -843,3 +843,104 @@ def test_the_no_undo_prompt_is_rate_limited_and_says_so() -> None:
             assert len(rig.sandbox.policies) == 1
 
     run(scenario)
+
+
+# --- boundaries and relations ---------------------------------------------------------------------
+
+
+def test_a_snapshot_exactly_as_old_as_the_retention_is_deleted_and_one_instant_less_is_kept() -> (
+    None
+):
+    async def scenario() -> None:
+        async with running() as rig:
+            client = await rig.client()
+            directory = project(rig)
+            task = await write_task(rig, client, directory)
+            await client.run_in_sandbox(task, RunId.new(), COMMAND)
+            retention = rig.config.snapshots.retention
+            rig.clock.advance(retention - timedelta(milliseconds=1))
+            await rig.daemon.service.sweep()
+            assert len(rig.rows("SELECT id FROM snapshots")) == 1
+
+            rig.clock.advance(timedelta(milliseconds=1))
+            await rig.daemon.service.sweep()
+
+            assert rig.rows("SELECT id FROM snapshots") == []
+
+    run(scenario)
+
+
+def test_room_is_made_only_when_one_more_would_pass_the_caps() -> None:
+    async def scenario() -> None:
+        # Exactly enough room for three snapshots: the fourth needs one gone, the third does not.
+        async with running(
+            config=settings(max_bytes=BLOCKS, store_max_bytes=3 * BLOCKS, max_snapshots=100)
+        ) as rig:
+            client = await rig.client()
+            directory = project(rig)
+            task = await write_task(rig, client, directory)
+            for _ in range(3):
+                rig.clock.advance(timedelta(seconds=1))
+                await client.run_in_sandbox(task, RunId.new(), COMMAND)
+            assert len(rig.rows("SELECT id FROM snapshots")) == 3
+            assert rig.audit_of(SnapshotDeleted) == []
+
+            rig.clock.advance(timedelta(seconds=1))
+            await client.run_in_sandbox(task, RunId.new(), COMMAND)
+
+            assert len(rig.rows("SELECT id FROM snapshots")) == 3
+            assert [e.reason for e in rig.audit_of(SnapshotDeleted)] == ["size"]
+
+    run(scenario)
+
+
+def test_the_list_shows_an_undone_snapshot_as_not_undoable() -> None:
+    async def scenario() -> None:
+        async with running() as rig:
+            client = await rig.client()
+            directory = project(rig)
+            task = await write_task(rig, client, directory)
+            rig.sandbox.on_run = edit(directory)
+            await client.run_in_sandbox(task, RunId.new(), COMMAND)
+            await client.undo_last_change(task)
+
+            infos = (await client.list_snapshots()).snapshots
+
+            by_kind = {(i.kind, i.undone): i.undoable for i in infos}
+            assert by_kind == {("run", True): False, ("undo", False): True}
+
+    run(scenario)
+
+
+def test_the_callers_wait_covers_what_the_broker_may_spend_on_a_run() -> None:
+    from tumbleweed.agent import code
+    from tumbleweed.broker.config import (
+        MAX_SNAPSHOT_TIMEOUT,
+        RUN_SETUP_WAIT,
+        SNAPSHOT_SLACK,
+        UNDO_WAIT,
+        SnapshotSettings,
+    )
+
+    assert SnapshotSettings().timeout <= MAX_SNAPSHOT_TIMEOUT
+    worst_setup = MAX_SNAPSHOT_TIMEOUT + SNAPSHOT_SLACK + timedelta(seconds=120)  # and the prompt
+    assert worst_setup <= RUN_SETUP_WAIT
+    assert RUN_SETUP_WAIT.total_seconds() <= code._SETUP_SECONDS  # noqa: SLF001
+    assert 3 * (MAX_SNAPSHOT_TIMEOUT + SNAPSHOT_SLACK) + timedelta(seconds=120) <= UNDO_WAIT
+
+
+def test_the_ipc_handler_may_take_as_long_as_a_write_run_or_an_undo_may(tmp_path: Path) -> None:
+    from tests.broker.rig import scratch_home
+    from tests.broker.support import make_world
+    from tumbleweed.broker.config import RUN_SETUP_WAIT, UNDO_WAIT
+    from tumbleweed.broker.daemon import ipc_limits
+    from tumbleweed.ipc.broker_messages import MAX_WALL_SECONDS
+
+    with scratch_home() as root:
+        world = make_world(root)
+        config = BrokerConfig(data_home=root / "d", socket_directory=root / "s", deny=world.context)
+
+        limit = ipc_limits(config).handler_timeout
+
+        assert limit >= RUN_SETUP_WAIT + timedelta(seconds=MAX_WALL_SECONDS) + config.run_grace
+        assert limit >= UNDO_WAIT
