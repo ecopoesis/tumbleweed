@@ -91,6 +91,12 @@ class UiRuntime:
         """Apply the model's patch (`SpecError` if it is refused). Fires no handler."""
         self.store.patch(patch, origin=Origin.PATCH)
 
+    def apply_sandbox_result(self, handler: SandboxHandler, values: Mapping[str, object]) -> None:
+        """Apply what a `sandbox` handler returned (`SpecError` if it is refused, and then nothing
+        is applied). Only the handler's declared outputs may be written, every value is checked
+        against its declaration and the state budget, and no handler fires."""
+        self.store.patch(values, origin=Origin.SANDBOX, only=handler.outputs)
+
     def _fire(self, event: UiEvent) -> Dispatch:
         handler = self._handlers.get(event.handler)
         if handler is None:

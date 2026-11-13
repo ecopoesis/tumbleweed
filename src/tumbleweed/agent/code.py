@@ -228,7 +228,14 @@ class BrokerHandlerExecutor:
     once on the main thread with an outcome: a failure of the link is `unavailable`.
     """
 
-    def __init__(self, link: BrokerLink, dispatcher: MainThreadDispatcher) -> None:
+    def __init__(
+        self,
+        link: BrokerLink,
+        dispatcher: MainThreadDispatcher,
+        *,
+        wall_seconds: int = HANDLER_SECONDS,
+    ) -> None:
+        self._wall_seconds = wall_seconds
         self._link = link
         self._dispatcher = dispatcher
 
@@ -247,8 +254,8 @@ class BrokerHandlerExecutor:
                     task,
                     run,
                     command,
-                    wall_seconds=HANDLER_SECONDS,
-                    cpu_seconds=HANDLER_SECONDS,
+                    wall_seconds=self._wall_seconds,
+                    cpu_seconds=self._wall_seconds,
                     max_output_bytes=HANDLER_OUTPUT_BYTES,
                 )
             except BrokerRefused as refusal:
@@ -256,7 +263,7 @@ class BrokerHandlerExecutor:
             return outcome_of(result)
 
         try:
-            future = self._link.submit(work, deadline=HANDLER_SECONDS + _SETUP_SECONDS)
+            future = self._link.submit(work, deadline=self._wall_seconds + _SETUP_SECONDS)
         except BrokerUnavailableError:
             self._dispatcher.post(lambda: done(HandlerOutcome(failure="unavailable")))
             return

@@ -36,7 +36,6 @@ from tumbleweed.ui.gtk.text import line_label
 from tumbleweed.ui.images import ImageResolver
 from tumbleweed.ui.runtime import UiEvent, UiRuntime
 from tumbleweed.ui.runtime.events import AgentSink
-from tumbleweed.ui.runtime.store import Origin
 from tumbleweed.ui.spec import UiSpec
 from tumbleweed.ui.spec.handlers import AgentHandler, SandboxHandler
 from tumbleweed.ui.spec.names import StateKey
@@ -88,7 +87,7 @@ class _Notice:
         self._label = label
 
     def apply(self, handler: SandboxHandler, values: Mapping[str, JsonValue]) -> None:
-        self._runtime().store.patch(values, origin=Origin.SANDBOX, only=handler.outputs)
+        self._runtime().apply_sandbox_result(handler, values)
 
     def notice(self, text: str | None) -> None:
         self._label.set_text("" if text is None else display_text(text))
