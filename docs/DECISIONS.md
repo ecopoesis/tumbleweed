@@ -1359,3 +1359,90 @@ is off on the target: the S27 service must set it (#156). **Consequences.** Afte
 task inherits the taint of the newest tagged turn's task, which may be more than the model's real
 lineage had (safe, and the model may then be unable to get the network until it starts a fresh
 task). The model sees one fewer turn after a `fresh_context` switch.
+
+## D27 — Sandboxed code: a shim that takes its program as arguments, handler runs scheduled in the agent package, the model sees only what `run_code` returns (2026-10-21, accepted)
+
+**Context.** S20 is the first step where model-written code runs. The pieces exist (a sandbox that
+confines one argv, D13/D15; a broker that composes grants and runs it, D17; a canvas that shows
+specs and has a `SandboxSink` seam, D24; tasks, `BrokerLink` and framing, D26). What is open is how
+code and inputs get into a sandbox that has no stdin and no way for a caller to put files in it, how
+a result becomes state, and what the model is told. **Decision.** (1) *Runtime.* The sandbox's
+Python is the system one the runtime already mounts (`/usr/bin/python3`, run as `-I`: no cwd or
+`PYTHON*` on the path, so a file in the writable workspace can never shadow a module). The Linux
+image gets Pillow and numpy from Ubuntu's own packages (`python3-pil`, `python3-numpy`: they land in
+`/usr/lib/python3/dist-packages`, under the runtime's `/usr`), so nothing is installed at test time
+and the venv, which is under `$HOME`, is never mounted. S26 supplies the same two packages in the
+runtime's store closure. (2) *The shim.* `tumbleweed.sandbox.handler_shim` uses the standard library
+only (a test checks it imports nothing of `tumbleweed`) and is never imported by the shell: its text
+is the `-c` argument (`/usr/bin/python3 -I -c <shim> <chunk>...`). The chunks, joined, are one JSON
+document `{"module", "function", "inputs", "code"}`, split into pieces of at most 8,000 characters
+(each under the 32 KiB an argument may have: no field of the document is a file, a path or a shell
+word), at most 100 KiB in all (the argv's own cap is 128 KiB). The shim writes each module's source
+to a fresh directory on the sandbox's `/tmp` and imports it with `spec_from_file_location` as
+`_tw_tool.<name>`, a package it made itself with only that directory in its `__path__`: no `sys.path`
+lookup is involved, so a module named `os`, `subprocess` or `builtins` is `_tw_tool.os` and can
+neither shadow nor resolve to the standard library (#56). It calls `function(inputs)` (one dict, the
+declared inputs and nothing else), with `sys.stdout` pointed at `sys.stderr` meanwhile, and writes one
+JSON line to the real stdout: `{"ok": true, "outputs": {...}}`, or `{"ok": false, "error": <closed
+set>}` (`no_module`, `no_function`, `raised`, `bad_result`), with the traceback on stderr only. The
+trusted side never trusts that line: it is parsed with `model_validate_json` into a closed strict
+model, and a stdout that is anything else is `bad_result`. (3) *`run_code(source, timeout_seconds)`.*
+`/usr/bin/python3 -I -c <source>` in the task's sandbox (source at most 24 KiB; the argument limit
+is 32 KiB), 1 to 60 s (default 10), no network (there is none to give), no `$HOME`, the task's
+grants and workspace only. The result is `exit code / how it ended`, then stdout and stderr each in
+its own frame (`agent.untrusted`, now with a per-frame limit of 5 KiB so that both fit the 16 KiB
+tool result), and the model is told when a stream was cut. (4) *`show_ui(spec, placement, code)`.*
+`code` is a list of `{name, source}` (`tumbleweed.tools.package.CodeModule`, the type S23 stores, so
+a tool that works here saves unchanged: at most 16 modules, 48 KiB each, 96 KiB in all). Every
+`sandbox` handler must name a module that is present, or `show_ui` returns that as a problem and
+shows nothing. The shell never compiles, imports or evaluates the source (I1): it is text that goes
+into an argument. `MAX_TOOL_INPUT_BYTES` stays 64 KiB (#139's first box): spec and code share it, a
+tool that does not fit is told "too large", and the model's output budget was the real bound
+anyway; a larger limit for `show_ui` is a decision for when a real tool hits it. (5) *Running a
+handler.* `HandlerRuns` (`tumbleweed.agent.handler_runs`, no GTK) is the instance's `SandboxSink`.
+An event is **coalesced and debounced**: the handler's `debounce_ms`, never less than 200 ms for a
+`change` event (the floor `docs/ui-spec.md` section 9 promised for sliders; entries and spins
+fire per edit too, so all `change` events get it); events of one handler inside the window collapse
+into one call with the newest inputs. **One run per instance is in flight**; a handler that becomes
+due meanwhile waits as the newest inputs of its own name (at most one waiting per handler), so for
+`H` handlers a burst of any size gives at most `1 + H` runs. Each run asks the broker for
+`run_in_sandbox` in the instance's task with a fresh `RunId` (so a `once` grant, which is one reply's
+(D26 (2)), does not apply to a handler run, and the picker is the way to give a tool a file: a task
+grant), wall and CPU limits of 20 s, 64 KiB of output; memory, file size, tmpfs and pids are the
+broker's. The result is applied on the main thread with `store.patch(values, origin=SANDBOX,
+only=handler.outputs)`: an output the handler did not declare, a value of the wrong type, a value
+that breaks a bound or the state budget, or anything but an object, refuses the whole result and
+nothing is applied; a patch never fires a handler. Failure and refusal (limits, a grant that has
+gone, a task cap) are one plain line of ours on the card, chosen from a closed set, never the
+sandbox's text and never a path. An instance that is inert (its task ended) neither starts runs nor
+applies a result that arrives; closing an instance cancels its timers. Every wait is bounded: the
+broker link gives up at the run's wall time plus its setup allowance. (6) *Grants and taint.* A run
+is the current task's, so the broker owns taint as in D26: reading granted files taints the task `fs`
+and a run that reached the network (none can: S22) stays refused. The run's `trigger` stays `model`
+until S24, because only tool grants look at it. (7) *Outputs.* The sandbox's `/workspace` is the
+task's workspace, bound by the descriptor the broker verified; code writes its files there and
+returns the workspace-relative name as the value of an `image` output (a `WorkspaceRelPath`, which
+`validate_patch` checks). The image is then read by the existing `BrokerImageResolver`
+(`read_workspace_file`, which opens without following a symlink: I11), so a symlink code plants
+is refused. The wire carries 512 KiB: the photo tool's module downsizes to fit (#154 stays open).
+(8) *What the model sees.* Only `run_code`'s result, framed. A handler's stdout and stderr never
+reach the model: a handler runs when the user acts, outside a reply, and a feed of sandbox text
+into the model would be a new channel of injection with no request of the model behind it; the
+model learns what happened to a tool from the state (`patch_state` has no reader yet) or from an
+`agent` handler. S24 may add a bounded, framed "last error" for the model to read. (9) *#86.* The
+broker names the grant that could not be mounted (its `GrantId`, which is the broker's and not a
+path) in the refusal, and the card says which grant failed, so the user can grant again; the model
+reads a path back from nothing. **Folded in.** #56 (the loader, tested with modules named `os`,
+`subprocess`, `builtins` and `json`); #86 as above; #79 `noexec`/`IOCTL_DEV`: decided against for
+now (a native file code writes is confined by the same mounts, Landlock and seccomp as the
+interpreter that wrote it, so `noexec` buys nothing against code that is already running and breaks
+legitimate helpers, and `/dev` holds the six harmless nodes with no terminal to inject into), the
+boxes left open with that argument; #139 first box decided above; #157 does not apply (S20 reads no
+stored task id: an instance's task comes from the broker's own answer). **Tests.** A real daemon
+and the real sandbox under the `linux` marker; the user is `ScriptedPrompts` or the real prompt with
+a fake picker at the `FilePicker` Protocol, never a hook in `src/`. The mutants that remove each
+check (undeclared output, only-outputs, the loader's isolation, the debounce, one in flight, the
+sandbox policy under `run_code`) are run and listed in the PR. **Consequences.** A handler's input
+(state as JSON) and code share a 100 KiB argv, so a tool with a large table as input cannot run;
+state that big is a reason for an agent handler or a file in the workspace. Each run pays one Python
+start in the sandbox (about 50 ms with Pillow imported) on top of the launcher's.
