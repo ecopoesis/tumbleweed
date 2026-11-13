@@ -94,7 +94,14 @@ def plant_big(directory: Path) -> Callable[[SandboxPolicy], None]:
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
-@pytest.mark.parametrize("plant", [plant_fifo, plant_sparse, plant_locked])
+@pytest.mark.parametrize(
+    "plant",
+    [
+        plant_fifo,
+        plant_sparse,
+        pytest.param(plant_locked, marks=pytest.mark.linux),  # unlocking needs an O_PATH descriptor
+    ],
+)
 def test_what_a_run_leaves_behind_does_not_block_either_undo(
     plant: Callable[[Path], Callable[[SandboxPolicy], None]],
 ) -> None:

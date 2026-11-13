@@ -447,6 +447,7 @@ def test_one_cap_for_all_the_paths_of_one_run(tmp_path: Path) -> None:
     snapshots.close()
 
 
+@pytest.mark.linux  # the FIFO is recreated relative to a descriptor
 def test_a_fifo_in_a_tree_does_not_stop_the_snapshot(tmp_path: Path) -> None:
     root = make_tree(tmp_path)
     os.mkfifo(root / "pipe")

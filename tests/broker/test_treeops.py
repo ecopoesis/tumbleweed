@@ -225,6 +225,7 @@ def test_a_fifo_is_recorded_not_opened_and_a_new_one_is_removed_by_a_restore(
     assert (root / "a.txt").read_text() == "alpha"
 
 
+@pytest.mark.linux  # mkfifo relative to a descriptor
 def test_a_fifo_the_saved_state_had_is_recreated_and_a_socket_is_reported_skipped(
     tmp_path: Path,
 ) -> None:
@@ -248,6 +249,7 @@ def test_a_fifo_the_saved_state_had_is_recreated_and_a_socket_is_reported_skippe
     assert stats.written >= 1
 
 
+@pytest.mark.linux  # mkfifo relative to a descriptor
 def test_a_special_file_of_the_saved_kind_is_kept_and_one_of_another_kind_replaced(
     tmp_path: Path,
 ) -> None:
@@ -297,6 +299,7 @@ def test_the_workspace_measure_counts_allocated_blocks_not_apparent_size(tmp_pat
     assert not usage.over
 
 
+@pytest.mark.linux  # unlocking goes through an O_PATH descriptor
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
 def test_an_unreadable_directory_and_file_of_ours_are_copied_and_their_modes_come_back(
     tmp_path: Path,

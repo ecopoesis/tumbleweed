@@ -602,7 +602,7 @@ def _restore_special(target: int, name: str, kind: str, mode: int, work: _Work) 
         if _kind_matches(current.st_mode, kind):
             return
         _remove_entry(target, name, work)
-    if kind == "fifo":
+    if kind == "fifo" and os.mkfifo in os.supports_dir_fd:  # not on macOS: it would take a path
         os.mkfifo(name, mode or 0o600, dir_fd=target)
         work.written += 1
     else:
