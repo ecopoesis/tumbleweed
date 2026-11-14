@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.broker.fsutil import remove_chain
 from tests.broker.rig import replace_config, running
 from tests.broker.test_daemon_snapshots import (
     COMMAND,
@@ -206,10 +207,13 @@ def test_a_chain_deeper_than_any_walk_does_not_block_the_users_undo(levels: int)
             (info,) = [i for i in (await client.list_snapshots()).snapshots if i.undoable]
             rig.prompts.allow("once")  # yes to "undo without being able to undo it"
 
-            await client.undo_snapshot(info.snapshot)
+            try:
+                await client.undo_snapshot(info.snapshot)
 
-            assert restored(directory)
-            assert not (directory / "deep").exists()
+                assert restored(directory)
+                assert not (directory / "deep").exists()
+            finally:
+                remove_chain(directory, "deep")  # only if the code under test left it
 
     run(scenario)
 
@@ -457,5 +461,33 @@ def test_the_chrome_undo_prompt_counts_against_the_owners_allowance() -> None:
 
             assert "not asked just now" in refused.value.message
             assert len(rig.prompts.asked) == asked
+
+    run(scenario)
+
+
+def test_a_later_run_on_other_places_neither_blocks_nor_is_overtaken() -> None:
+    async def scenario() -> None:
+        async with running() as rig:
+            client = await rig.client()
+            directory = project(rig)
+            documents = rig.home / "Documents"
+            first = await write_task(rig, client, directory)
+            rig.sandbox.on_run = edit(directory)
+            await client.run_in_sandbox(first, RunId.new(), COMMAND)
+            second = (await client.start_task()).task
+            rig.prompts.allow("task")
+            assert (await client.request_write(second, RunId.new(), str(documents), "x")).granted
+            rig.sandbox.on_run = write_to(documents / "n.txt", "n")
+            rig.clock.advance(timedelta(seconds=1))
+            await client.run_in_sandbox(second, RunId.new(), COMMAND)
+
+            done = await client.undo_last_change(first)
+
+            assert done.superseded == 0
+            assert restored(directory)
+            other = next(i for i in (await client.list_snapshots()).snapshots if i.task == second)
+            assert other.undoable
+            await client.undo_last_change(second)
+            assert not (documents / "n.txt").exists()
 
     run(scenario)

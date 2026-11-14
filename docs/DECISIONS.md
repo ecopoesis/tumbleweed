@@ -1503,7 +1503,8 @@ version cannot read still owns its copy); making room and the sweep take one loc
 of the subvolume the folder is in, in the dedicated subvolume `SnapshotSettings.btrfs_directory`,
 when the folder and that directory are both on btrfs (`f_type`, not `f_fsid`, which btrfs makes differ
 per subvolume), the target is a directory, it holds no nested subvolume (a snapshot would leave it out,
-and an undo would then delete its files: found by inode 256 while walking, fail closed) and `btrfs`
+and an undo would then delete its files: found by inode 256 while walking, fail closed: the walk goes 64 levels, so a deeper tree is never saved by
+btrfs either, and a restore walks at most 64 levels of saved tree) and `btrfs`
 works; run as an argv list on `/proc/self/fd/N` paths so nothing is looked up twice; the saved folder
 is found again by walking names with `O_NOFOLLOW` and by its inode number, which a snapshot keeps. A
 snapshot the tool cannot make (another btrfs, no permission) or a nested subvolume **falls through to
@@ -1543,24 +1544,32 @@ shows the newest 30 across tasks with an Undo button each, an undo of an undo in
 plain text of ours that undo puts the files back as they were before that change *including over
 edits made since*, and that the undo itself can be undone. **One undo at a time in the whole broker**:
 the user's waits (90 s) for another, the model's is refused `busy` (audited). An undo and a run on the
-same places do not overlap: a run whose write mounts overlap an undo in progress is refused (`busy`),
+same places do not overlap: a run whose write mounts overlap an undo in progress is refused (`busy`), and a write run on places
+another live write run (of any task) is writing waits for it, up to `write_run_wait` (20 s), then is
+refused `busy` (J7: two runs on one folder would each snapshot what the other is changing),
 and a live write run that overlaps the places of the **user's** undo is *stopped* (the broker's own stop
 path, its flow cancelled; its caller is told so) before the restore, while the **model's** undo is
 refused (`busy`), so the model can never hold the user's undo off. In order: refuse a no-undo,
 already-undone or superseded record; open every target by its stored identity with the deny rules (a
 target that is gone, replaced or now protected refuses the whole undo, nothing done: `unsafe`,
 `denied`); **snapshot what is there now** (kind `undo`, recorded and audited); restore through
-descriptors; mark the snapshot undone, and every later `run` snapshot of any task that overlaps its
-places **superseded** (H11: their changes were overtaken, so they are no longer undone one by one, are
-shown so in the list and are never what `undo_last_change` picks; there is no "undo the newer first"
-rule, so a later undo cannot bring the first run's changes back and a hostile task cannot bury a
-change under cheap runs; the undo of the undo brings everything back). "Most recent" is by a
-monotonic sequence (`seq`), not the clock. **If the safety snapshot cannot be taken** (a cap, depth,
+descriptors; mark the snapshot undone, and later runs inside the same places superseded. **What an
+undo overtakes (J5):** for each later `run` snapshot of any task that overlaps the places being
+undone, if every place of it lies inside or equals one of them it is *superseded* (its changes are
+inside what this undo puts back: it is no longer undone one by one, is shown so in the list and is never
+what `undo_last_change` picks, so a later undo cannot bring the first run's changes back and a hostile
+task cannot bury a change under cheap runs); if it goes wider, or is only partly inside, the undo is
+**refused** (`not_undoable`, "a later change to that folder must be undone first") before anything is
+done, because putting the narrow run back would take away what the wider one changed outside it; the
+user undoes the wider runs in order. The undo of an undo (the safety copy, `undoes` set) also gives the
+marks back (J4): the run it undid is undoable again and what it superseded no longer is superseded
+(`superseded_by`). "Most recent" is by a monotonic sequence (`seq`), not the clock. **If the safety snapshot cannot be taken** (a cap, depth,
 I/O, the store full), the model's undo is refused and points the user to the list; the *chrome's* undo
 asks the user, in a trusted prompt of the no-undo kind (purpose `undo`, once scope: "undo without being
 able to undo this undo?"); a no refuses it; a yes does it and says `safety: none`. A restore makes the
-folder **exactly** what it was: new files and folders are removed (iteratively, to 400 levels, one
-descriptor per level), deleted or changed ones are written back (content compared by reading, never by
+folder **exactly** what it was: new files and folders are removed (iteratively, however deep: two descriptors and a stack of
+(`st_dev`, `st_ino`), coming back up through `..` only after its identity matches the directory it
+came from, bounded by the deadline alone, so a run cannot nest a tree its own undo cannot remove), deleted or changed ones are written back (content compared by reading, never by
 size and times a program can set), links, FIFOs, modes and times restored. It never follows a link: a
 symlink where the copy has a directory is replaced, a file is written to a new name and renamed over
 the old one, directories are opened with `O_NOFOLLOW` and compared with `lstat`; a granted file is
@@ -1570,21 +1579,29 @@ tool's description, the system prompt (v5) and the panel say so, and the safety 
 restore that fails part way is rolled back from the safety snapshot and the answer says whether that
 worked (`failed`); the restore thread ends by its own deadline before the rollback runs. If the files
 were put back but the record of it cannot be written, the answer says the files were put back. (7)
-*Retention and making room* (the deliberate reading of PLAN's "7 days or 100 snapshots, whichever
-comes first"). A snapshot is deleted at the sweep when it is past 7 days. The count (100) and size
-(8 GiB of copies) caps are enforced when **room is needed** for a new snapshot of task T, and the
-victims are chosen so that no task can evict the undo that matters: (1) snapshots already undone or
-superseded, and any past retention, of any task; (2) T's *own* snapshots that are not **anchors**,
-oldest first (an anchor of T is, per place, its oldest not-undone snapshot, the state before T touched
-it, its newest not-undone run snapshot, which is what `undo_last_change` needs, and every not-undone
-safety snapshot, which holds the user's later edits); (3) otherwise `STORE_FULL`, which goes to the
-no-undo prompt so the user decides. Another task's not-undone, in-retention snapshot, an anchor, one
-being undone or one being taken is never deleted. So a busy task's handler runs stay quiet (step 2)
-while one damaging run followed by any number of cheap ones keeps its pre-damage snapshot; a snapshot
-in the middle may be gone, and undoing it is then refused (it is no longer listed). The sweep also
-enforces the size cap against undone and superseded snapshots (a lowered cap), and deletes copies no
-row names. Everything is configurable (`SnapshotSettings`) and every deletion audited
-(`snapshot_deleted`: `age`, `count`, `size`, `discarded`, `orphan`). (8) *Deny entries.* The copy store
+*Retention and making room.* A snapshot is deleted at the sweep when it is past 7 days. The count (100) and
+size (8 GiB of copies) caps are enforced when **room is needed** for a new snapshot of task T, and
+**each task has a share of the store** (J1; replaces the first round's tiers, which one busy task could
+fill for everybody): `max(10, max_snapshots // 4)` snapshots and a quarter of the store's bytes (at
+least one snapshot's cap), configurable; a safety snapshot counts against the task whose run it undoes.
+Room for T's new snapshot is made in this order: (1) snapshots already undone or superseded, and any past
+retention, of any task; (2) while T is at its share, T's *own* snapshots that are not anchors, oldest
+first, and if T is still at its share, `STORE_FULL` for T alone (the no-undo prompt for a run; the
+chrome prompt or the model's refusal for an undo's safety copy); (3) while the store is full, any task's
+non-anchors, oldest first, and only then `STORE_FULL`. An **anchor** is, per task and per place, its
+oldest not-undone snapshot (the state before the task first touched that place), its newest not-undone
+run (what `undo_last_change` needs) and every not-undone safety snapshot (the user's later edits);
+anchors, a snapshot being undone and one being taken are never deleted to make room, and only age
+(the sweep) removes an anchor. So a busy task's handler runs stay quiet (its own middle snapshots go
+first), one task cannot starve another of undo, a task's churn cannot evict the state before it first
+touched a place, and a snapshot in the middle may be gone (undoing it is then refused: it is no longer
+listed). A safety snapshot is protected only while its undo runs. The count cap is soft by up to the
+number of runs in flight (`max_concurrent_runs`). The sweep also enforces the size cap against undone
+and superseded snapshots (a lowered cap) and deletes copies no row names. Everything is configurable
+(`SnapshotSettings`) and every deletion audited (`snapshot_deleted`: `age`, `count`, `size`,
+`discarded`, `orphan`; a deletion that failed is audited `failed` and the record kept: a non-root
+broker needs the btrfs mount option `user_subvol_rm_allowed` to delete a subvolume, or the store stays
+full and says so). Names read back from a `.meta` file must be single path components. (8) *Deny entries.* The copy store
 is inside the broker's data directory (already denied) and is named on its own
 (`BrokerConfig.snapshots_directory`); the btrfs subvolume is a deny entry through `deny_context`; a
 grant request for either is refused (tests). (9) *The disk box (#74).* A task's workspace may hold

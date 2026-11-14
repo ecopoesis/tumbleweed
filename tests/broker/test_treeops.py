@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.broker.fsutil import make_fifo, make_socket
+from tests.broker.fsutil import make_fifo, make_socket, remove_chain
 from tumbleweed.broker.errors import SnapshotError, SnapshotFault
 from tumbleweed.broker.treeops import (
     TreeBudget,
@@ -618,6 +618,7 @@ def test_a_chain_of_thousands_of_directories_is_removed(tmp_path: Path) -> None:
         remove_entry(fd, "deep", soon())
     finally:
         os.close(fd)
+        remove_chain(parent, "deep")  # only if the code under test left it
 
     assert [p.name for p in parent.iterdir()] == ["keep"]
 
@@ -677,6 +678,8 @@ def test_a_file_swapped_while_it_is_unlocked_is_refused(
         os.close(dfd)
         (root / "moved.txt").chmod(0o600)
 
+    assert (root / "secret.txt").stat().st_mode & 0o777 == 0o644  # the swapped one: not unlocked
+
 
 @pytest.mark.linux
 def test_a_failed_in_place_restore_puts_the_mode_back_as_it_was(
@@ -727,11 +730,11 @@ def test_a_special_file_that_is_still_there_is_the_same_one_after_a_restore(tmp_
     root = tree(tmp_path)
     make_fifo(root / "pipe")
     saved = snap(root, tmp_path / "store")
-    before = (root / "pipe").stat().st_ino
+    (tmp_path / "held").hardlink_to(root / "pipe")  # keeps the inode, so it cannot be reused
 
     restore(saved, root)
 
-    assert (root / "pipe").stat().st_ino == before  # kept, not removed and made again
+    assert (root / "pipe").stat().st_ino == (tmp_path / "held").stat().st_ino  # kept, not remade
 
 
 def test_the_subvolume_root_inode_is_what_the_search_looks_for(

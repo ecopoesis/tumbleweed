@@ -394,7 +394,11 @@ def test_a_run_refused_after_its_copy_was_taken_has_the_copy_deleted() -> None:
                 await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
             async with asyncio.timeout(10):
-                while any(rig.config.snapshots_directory.iterdir()):  # noqa: ASYNC110  (bounded)
+                # The copy goes first, then its record of having gone is written.
+                while (  # noqa: ASYNC110  (bounded)
+                    any(rig.config.snapshots_directory.iterdir())
+                    or not rig.audit_of(SnapshotDeleted)
+                ):
                     await asyncio.sleep(0.02)
             assert service._inflight == set()  # noqa: SLF001
             assert [e.reason for e in rig.audit_of(SnapshotDeleted)] == ["discarded"]
