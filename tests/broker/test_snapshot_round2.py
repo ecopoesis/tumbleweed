@@ -188,7 +188,10 @@ def test_a_safety_snapshot_ages_out_like_any_other() -> None:
 # --- J3: a tree as deep as a run can make it ------------------------------------------------------
 
 
-@pytest.mark.parametrize("levels", [450, 3000])
+@pytest.mark.parametrize(
+    "levels",
+    [450, pytest.param(3000, marks=pytest.mark.linux)],  # macOS resolves deep paths too slowly
+)
 def test_a_chain_deeper_than_any_walk_does_not_block_the_users_undo(levels: int) -> None:
     async def scenario() -> None:
         async with running() as rig:

@@ -608,6 +608,7 @@ def chain(parent: Path, name: str, levels: int) -> None:
     os.close(here)
 
 
+@pytest.mark.linux  # macOS resolves a chain that deep in quadratic time
 def test_a_chain_of_thousands_of_directories_is_removed(tmp_path: Path) -> None:
     parent = tmp_path / "p"
     parent.mkdir()
