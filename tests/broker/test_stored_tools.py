@@ -6,6 +6,7 @@ that says so.
 """
 
 import json
+from datetime import timedelta
 
 import pytest
 
@@ -82,15 +83,36 @@ class TestSaving:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
+                first = await save(client, await net_task(rig, client))
+                files = await fs_task(rig, client)
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await save(client, files, tool=first.summary.tool)
+
+                assert caught.value.reason == "denied"  # ToolTaintConflictError: a net lineage
+                assert FRESH in caught.value.message
+                assert len(rig.audit_of(ToolSaved)) == 1  # nothing was saved
+
+    def test_a_net_task_asking_to_write_an_fs_only_tool_is_told_what_it_is_told_of_a_missing_one(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
                 first = await save(client, await fs_task(rig, client))
                 network = await net_task(rig, client)
 
-                with pytest.raises(BrokerRefused) as caught:
+                with pytest.raises(BrokerRefused) as hidden:
                     await save(client, network, tool=first.summary.tool)
+                with pytest.raises(BrokerRefused) as missing:
+                    await save(client, network, tool=ToolId.new())
 
-                assert caught.value.reason == "denied"
-                assert FRESH in caught.value.message
-                assert len(rig.audit_of(ToolSaved)) == 1  # nothing was saved
+                assert (hidden.value.reason, hidden.value.message) == (
+                    missing.value.reason,
+                    missing.value.message,
+                )
+                assert hidden.value.reason == "not_found"
+                assert FRESH in hidden.value.message
 
         run(scenario)
 
@@ -241,16 +263,16 @@ class TestRevert:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
-                first = await save(client, await fs_task(rig, client))
+                first = await save(client, await net_task(rig, client))
                 await client.save_tool(
-                    await fs_task(rig, client),
+                    await net_task(rig, client),
                     draft_text(draft(name="v2")),
                     tool=first.summary.tool,
                 )
-                network = await net_task(rig, client)
+                files = await fs_task(rig, client)
 
                 with pytest.raises(BrokerRefused) as caught:
-                    await client.revert_tool(network, first.summary.tool, ToolVersion(1))
+                    await client.revert_tool(files, first.summary.tool, ToolVersion(1))
 
                 assert caught.value.reason == "denied"
 
@@ -399,6 +421,8 @@ class TestOpeningTaintsTheTask:
 
                 assert second.summary.taint == ("fs",)
                 assert [e.tool for e in rig.audit_of(ToolWriteTainted)] == [first.summary.tool]
+                assert (str(clean), "fs") in rig.rows("select id, taint from tasks")  # on record
+                await client.end_task(clean)
                 heir = (await client.start_task(previous=clean)).task  # persisted
                 rig.prompts.allow("task")
                 assert not (await client.request_network(heir, RunId.new(), "x")).granted
@@ -615,6 +639,22 @@ class TestFindingNeverShowsWhatTheTaskMustNotSee:
 
                 assert opened.newest == 1  # version 2 is fs-tainted: not for this task to know of
                 assert newest.newest == 1  # nor for a clean one that did not ask for it
+
+        run(scenario)
+
+    def test_find_with_no_query_lists_the_newest_saved_first(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+                names = ["First", "Second", "Third"]
+                for name in names:
+                    rig.clock.advance(timedelta(seconds=1))
+                    await client.save_tool(task, draft_text(draft(name=name)))
+
+                found = await client.find_tools(task)
+
+                assert [t.name for t in found.tools] == ["Third", "Second", "First"]
 
         run(scenario)
 

@@ -52,7 +52,7 @@ def test_open_and_history_ask_the_port_for_that_row_only() -> None:
     panel.open()
 
     buttons(panel, "Open")[1].emit("clicked")
-    assert port.calls == [("open", (second.tool, None))]
+    assert port.calls == [("open", (second.tool, second.version))]  # the version the row shows
     port.pending.pop()()
     buttons(panel, "Versions")[0].emit("clicked")
     assert [b.get_label() for b in descendants(panel) if isinstance(b, Gtk.Button)].count(

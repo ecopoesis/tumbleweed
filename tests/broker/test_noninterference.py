@@ -14,6 +14,7 @@ takes the lineage's taint first, so it is fs-tainted after the call and the prop
 for it. The tests at the end pin both.
 """
 
+import contextlib
 import json
 import re
 from collections.abc import Awaitable, Callable
@@ -68,6 +69,11 @@ async def build(rig: Rig, client: BrokerClient, *, with_fs: bool) -> dict[str, T
         "Q": await saved(rig, client, clean, "Quartz tool", "a thing"),  # in its name
         "R": await saved(rig, client, clean, "Other thing", "quartz quartz"),  # only in the text
     }
+    # Net-tainted versions are in both stores: they are not fs versions, and a net task sees them.
+    network = await net_task(rig, client)
+    ids["W"] = await saved(rig, client, clean, "Epsilon tool", "epsilon things")
+    await saved(rig, client, network, "Epsilon tool", "epsilon net refined", ids["W"])
+    ids["V"] = await saved(rig, client, network, "Zeta net tool", "zeta things")
     ids["Y"] = ToolId.new()  # in the store without fs versions there is no such tool
     if with_fs:
         files = await fs_task(rig, client)
@@ -136,6 +142,12 @@ READS: tuple[tuple[str, Call], ...] = (
     ("find hunter", find("hunter2")),
     ("find no match", find("zzz")),
     ("find limit 2", find("tool", 2)),
+    ("find a limit where fs rows match and rank high", find("alpha", 1)),
+    ("find a limit of two", find("alpha", 2)),
+    ("find epsilon", find("epsilon")),
+    ("find a net tool", find("zeta")),
+    ("open a tool with a net refinement", open_("W")),
+    ("open a net tool", open_("V")),
     ("open the newest of a visible tool", open_("A")),
     ("open a tool with fs refinements", open_("X")),
     ("open its first version", open_("X", 1)),
@@ -151,6 +163,48 @@ NET_ONLY: tuple[tuple[str, Call], ...] = (
 )
 
 
+async def _nowhere(client: BrokerClient, task: TaskId, ids: dict[str, ToolId]) -> Response:
+    return await client.save_tool(task, draft_text(), tool=ToolId.new())
+
+
+async def _revert_nowhere(client: BrokerClient, task: TaskId, ids: dict[str, ToolId]) -> Response:
+    return await client.revert_tool(task, ToolId.new(), ToolVersion(1))
+
+
+def refine(name: str) -> Call:
+    async def call(client: BrokerClient, task: TaskId, ids: dict[str, ToolId]) -> Response:
+        return await client.save_tool(task, draft_text(), tool=ids[name])
+
+    return call
+
+
+def revert(name: str, version: int) -> Call:
+    async def call(client: BrokerClient, task: TaskId, ids: dict[str, ToolId]) -> Response:
+        return await client.revert_tool(task, ids[name], ToolVersion(version))
+
+    return call
+
+
+async def new_tool(client: BrokerClient, task: TaskId, ids: dict[str, ToolId]) -> Response:
+    return await client.save_tool(task, draft_text())
+
+
+# Writes into lineages the task sees whole: the same in both stores, from either kind of task.
+WRITES: tuple[tuple[str, Call], ...] = (
+    ("a new tool", new_tool),
+    ("refine a visible tool", refine("Z")),
+    ("revert a visible tool", revert("Z", 1)),
+    ("revert to the newest", revert("A", 1)),
+    ("revert a missing version", revert("A", 77)),
+)
+# A clean task that writes into an fs lineage is marked by it: the property is not for it.
+NET_WRITES: tuple[tuple[str, Call], ...] = (
+    ("refine an fs-only tool: it is nobody's to see", refine("Y")),
+    ("refine a tool with a net refinement it sees whole", refine("W")),
+    ("refine a net tool", refine("V")),
+)
+
+
 async def script(rig: Rig, *, with_fs: bool, kind: str) -> list[Answer]:
     client = await rig.client()
     ids = await build(rig, client, with_fs=with_fs)
@@ -160,7 +214,8 @@ async def script(rig: Rig, *, with_fs: bool, kind: str) -> list[Answer]:
         else (await client.start_task(fresh_context=True)).task
     )
     seen: dict[str, str] = {}
-    calls = READS + (NET_ONLY if kind == "net" else ())
+    calls = READS + (NET_ONLY if kind == "net" else ()) + WRITES
+    calls += NET_WRITES if kind == "net" else ()
     return [await attempt(call, client, task, ids, seen) for _, call in calls]
 
 
@@ -177,7 +232,13 @@ def test_every_answer_is_the_answer_of_the_store_without_the_fs_versions(kind: s
     async def scenario() -> None:
         with_fs, without = await both(kind)
 
-        names = [name for name, _ in READS + (NET_ONLY if kind == "net" else ())]
+        names = [
+            name
+            for name, _ in READS
+            + (NET_ONLY if kind == "net" else ())
+            + WRITES
+            + (NET_WRITES if kind == "net" else ())
+        ]
         for name, one, other in zip(names, with_fs, without, strict=True):
             assert one == other, name
 
@@ -273,6 +334,67 @@ class TestTheAcceptedBit:
 
         run(scenario)
 
+    def test_every_attempt_is_metered_as_much_as_a_write_whatever_the_answer(self) -> None:
+        """Zero answers cost what one answers do, or the budget would not bound the bits."""
+
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                ids = await build(rig, client, with_fs=True)
+                attempts: dict[str, Call] = {
+                    "refused (hidden lineage)": refine("X"),
+                    "not found (nobody's tool)": refine("Y"),
+                    "not found (no such tool)": _nowhere,
+                    "already the newest": revert("Z", 1),
+                    "revert refused (hidden lineage)": revert("X", 1),
+                    "revert not found (nobody's tool)": revert("Y", 1),
+                    "revert not found (no such tool)": _revert_nowhere,
+                    "written": refine("Z"),
+                }
+                for name, attempt_call in attempts.items():
+                    network = await net_task(rig, client)
+                    for _ in range(MAX_SAVES_PER_TASK):
+                        with contextlib.suppress(BrokerRefused):  # the answer is not the point
+                            await attempt_call(client, network, ids)
+                    with pytest.raises(BrokerRefused) as metered:
+                        await attempt_call(client, network, ids)
+                    assert metered.value.reason == "busy", name
+
+        run(scenario)
+
+    def test_the_meter_goes_with_the_context_and_only_fresh_context_starts_it_again(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                ids = await build(rig, client, with_fs=True)
+                network = await net_task(rig, client)
+                for _ in range(MAX_SAVES_PER_TASK - 5):
+                    with pytest.raises(BrokerRefused):
+                        await refine("X")(client, network, ids)
+                assert (str(network), MAX_SAVES_PER_TASK - 5) in rig.rows(
+                    "select id, tool_writes from tasks"
+                )
+
+                await client.end_task(network)
+                heir = (await client.start_task(previous=network)).task  # the context goes on
+                for _ in range(5):
+                    with pytest.raises(BrokerRefused) as hidden:
+                        await refine("X")(client, heir, ids)
+                    assert hidden.value.message == WRITE_HIDDEN_TEXT
+                with pytest.raises(BrokerRefused) as metered:
+                    await refine("X")(client, heir, ids)
+                assert metered.value.reason == "busy"
+
+                # A fresh context drops the turns, and the network needs the user's yes again.
+                fresh = (await client.start_task(previous=heir, fresh_context=True)).task
+                rig.prompts.allow("task")
+                assert (await client.request_network(fresh, RunId.new(), "x")).granted
+                with pytest.raises(BrokerRefused) as again:
+                    await refine("X")(client, fresh, ids)
+                assert again.value.message == WRITE_HIDDEN_TEXT  # not busy: it started at 0
+
+        run(scenario)
+
     def test_every_refused_attempt_counts_toward_the_tasks_saves(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
@@ -302,6 +424,8 @@ class TestTheAcceptedBit:
 
                 assert saved_version.summary.taint == ("fs",)
                 assert [e.tool for e in rig.audit_of(ToolWriteTainted)] == [ids["X"]]
+                assert (str(clean), "fs") in rig.rows("select id, taint from tasks")  # on record
+                await client.end_task(clean)
                 heir = (await client.start_task(previous=clean)).task
                 rig.prompts.allow("task")
                 assert not (await client.request_network(heir, RunId.new(), "x")).granted

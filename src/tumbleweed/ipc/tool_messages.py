@@ -171,6 +171,8 @@ class ToolStored(Response):
 
     kind: Literal["tool_stored"]
     summary: ToolSummary
+    raised: bool
+    """Whether the write first raised the task's taint to the lineage's (D30 (6))."""
 
 
 @final

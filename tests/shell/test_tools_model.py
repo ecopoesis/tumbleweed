@@ -266,6 +266,20 @@ def test_a_full_page_of_tools_says_that_only_the_newest_are_listed() -> None:
     assert "Only the newest 50 saved tools are listed." in str(view.shown[-1][3])
 
 
+def test_a_both_tainted_tool_in_the_list_says_why_it_does_not_open_without_asking_the_broker() -> (
+    None
+):
+    both = summary(taint=("fs", "net"))
+    port, view = FakePort(both), FakeView()
+    model = ToolsModel(port, view)
+    model.refresh()
+
+    assert model.open(both.tool)
+
+    assert port.calls == []
+    assert "claims both file and network use" in str(view.shown[-1][3])
+
+
 def test_the_chrome_says_refusals_in_its_own_words_not_the_models() -> None:
     from tumbleweed.broker.client import BrokerRefused
     from tumbleweed.broker.toolflow import OPEN_REFUSAL_TEXT
@@ -283,8 +297,11 @@ def test_the_chrome_says_refusals_in_its_own_words_not_the_models() -> None:
         == "Not done: that tool or version is not stored."
     )
 
-    from tumbleweed.broker.toolflow import LINEAGE_BOTH_TEXT
+    from tumbleweed.broker.toolflow import LINEAGE_BOTH_TEXT, NOT_VISIBLE_NET_TEXT
 
+    hidden = _refusal(BrokerRefused("not_found", NOT_VISIBLE_NET_TEXT)).text
+    assert "not stored" not in hidden  # the tool is in the user's own list
+    assert "used the network" in hidden
     both = _refusal(BrokerRefused("denied", LINEAGE_BOTH_TEXT)).text
     assert "cannot be changed" in both
     assert "new task" not in both  # a fresh task would not help

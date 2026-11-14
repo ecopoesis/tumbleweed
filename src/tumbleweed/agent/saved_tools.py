@@ -33,7 +33,7 @@ from tumbleweed.broker.client import BrokerClient, BrokerRefused
 from tumbleweed.core.canonical import content_hash
 from tumbleweed.core.ids import TaskId, ToolId, ToolInstanceId
 from tumbleweed.core.types import ToolVersion
-from tumbleweed.ipc.tool_messages import ToolMatches, ToolOpened, ToolSummary
+from tumbleweed.ipc.tool_messages import ToolMatches, ToolOpened, ToolStored, ToolSummary
 from tumbleweed.tools import ToolPackageError, parse_draft, parse_package
 from tumbleweed.tools.limits import (
     MAX_CAPABILITIES,
@@ -52,6 +52,9 @@ SOURCE_FRAME_BYTES: Final = 5 * 1024
 """Of the spec and of the code each, when `open_tool` shows the source: both fit one result."""
 LISTED_DESCRIPTION: Final = 160
 
+MARKED: Final = (
+    " Part of this tool was made in a task with a taint, so this task now counts as having it too."
+)
 CUT_SOURCE: Final = (
     "\nPart of the source above was cut: it is not the whole tool. Do not refine the tool from "
     "it, because what you build would lose what was cut. Tell the user, and rebuild the tool "
@@ -336,16 +339,17 @@ def register_saved_tool_tools(
         if len(document.encode("utf-8")) > MAX_PACKAGE_BYTES:
             raise ToolError("The tool is too large to save.")
 
-        async def work(client: BrokerClient) -> ToolSummary:
-            return (await client.save_tool(task, document, tool=arguments.refines)).summary
+        async def work(client: BrokerClient) -> ToolStored:
+            return await client.save_tool(task, document, tool=arguments.refines)
 
         try:
-            summary = await link.call(work, deadline=BROKER_SECONDS)
+            stored = await link.call(work, deadline=BROKER_SECONDS)
         except BrokerRefused as refusal:
             raise _refused(refusal) from None
         except BrokerUnavailableError as error:
             raise ToolError(str(error)) from None
-        note = ""
+        summary = stored.summary
+        note = MARKED if stored.raised else ""
         if source.stored is not None and arguments.refines is None:
             note = (
                 " This instance came from a saved tool, and you did not say it refines one, so "
@@ -428,18 +432,20 @@ def register_saved_tool_tools(
     async def revert_tool(arguments: RevertToolInput) -> str:
         task = await current_task()
 
-        async def work(client: BrokerClient) -> ToolSummary:
-            return (await client.revert_tool(task, arguments.tool, arguments.version)).summary
+        async def work(client: BrokerClient) -> ToolStored:
+            return await client.revert_tool(task, arguments.tool, arguments.version)
 
         try:
-            summary = await link.call(work, deadline=BROKER_SECONDS)
+            stored = await link.call(work, deadline=BROKER_SECONDS)
         except BrokerRefused as refusal:
             raise _refused(refusal) from None
         except BrokerUnavailableError as error:
             raise ToolError(str(error)) from None
+        summary = stored.summary
         return (
             f"Version {arguments.version} was saved again as version {summary.version}, now the "
             "newest. Earlier versions are unchanged. The user must allow its access again."
+            + (MARKED if stored.raised else "")
         )
 
     registry.register(

@@ -161,6 +161,14 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
 ) STRICT""",
         "CREATE INDEX snapshots_by_task ON snapshots (task_id, kind, seq)",
     ),
+    # S24 (D30 (6)): how many writes into stored tools a task's context has made, which a task
+    # that continues it inherits like its taint (`start_task` with `fresh_context` false).
+    (
+        (
+            "ALTER TABLE tasks ADD COLUMN tool_writes INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (tool_writes BETWEEN 0 AND 1000000)"
+        ),
+    ),
 )
 
 _GRANTS: Final[TypeAdapter[Grant]] = TypeAdapter(Grant)
@@ -430,6 +438,7 @@ class TaskRecord(PolicyModel):
     workspace_present: bool
     workspace: FsIdentity
     failures: int = 0  # failed attempts to delete the workspace
+    tool_writes: int = 0  # saves, refinements and reverts the task's context has attempted (S24)
 
     @property
     def ended(self) -> bool:
@@ -620,7 +629,7 @@ class BrokerStore:
         """Add a new task (inside `transaction()`)."""
         self._execute(
             "INSERT INTO tasks (id, state, taint, created_at, ended_at, workspace, "
-            "workspace_fsid, workspace_ino) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "workspace_fsid, workspace_ino, tool_writes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 str(record.task),
                 "ended" if record.ended else "live",
@@ -630,8 +639,14 @@ class BrokerStore:
                 "present" if record.workspace_present else "deleted",
                 str(record.workspace.fsid),
                 str(record.workspace.ino),
+                record.tool_writes,
             ),
         )
+
+    def record_tool_writes(self, task: TaskId, count: int) -> None:
+        """Record how many writes into stored tools the task's context has attempted (inside
+        `transaction()`); it only grows."""
+        self._execute("UPDATE tasks SET tool_writes = ? WHERE id = ?", (count, str(task)))
 
     def set_taint(self, task: TaskId, taint: frozenset[TaintKind]) -> None:
         """Replace a task's taint (inside `transaction()`); the caller only ever grows it."""
@@ -707,6 +722,7 @@ class BrokerStore:
                 workspace_present=_text(row[4]) == "present",
                 workspace=_identity(_text(row[5]), _text(row[6])),
                 failures=_failures(row[7]),
+                tool_writes=_failures(row[8]),
             )
         except (InvalidValueError, ValidationError):
             raise StoreCorruptError("the broker's database holds a malformed task") from None
@@ -1112,7 +1128,7 @@ _TOOL_COLUMNS: Final = (
 
 _TASK_COLUMNS: Final = (
     "SELECT id, taint, created_at, ended_at, workspace, workspace_fsid, workspace_ino, "
-    "delete_failures"
+    "delete_failures, tool_writes"
 )
 
 

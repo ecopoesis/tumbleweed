@@ -264,6 +264,15 @@ class ToolsModel:
         """Open a tool (the newest, or a version of the history) on the canvas."""
         if not self._known(tool, version):
             return False
+        listed = self._summaries.get(tool)
+        if listed is not None and len(listed.taint) > 1:
+            # An import whose claim had the network: it opens nowhere, and the broker says only
+            # "not found": the user is told why here.
+            self.refresh(
+                "Not opened: this tool came from a file that claims both file and network use, "
+                "so it cannot be opened."
+            )
+            return True
         if version is None:
             # The version the user is looking at: a task sees only what its taint allows of a
             # tool, and the list is the user's own (D30 (6)).

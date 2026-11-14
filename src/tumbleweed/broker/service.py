@@ -328,6 +328,7 @@ FIND_FILES_REFUSED: Final = (
     "This task has the network, so it cannot be shown tools made in tasks that read files. Call "
     "start_task with fresh_context=true and search again."
 )
+_SAVE_CAP: Final = "this task has made as many writes into saved tools as it may"
 _BAD_BINDING: Final = "the tool binding is not one this task opened"
 _LINEAGE_BOTH: Final = LINEAGE_BOTH_TEXT
 _TAINT_CONFLICT: Final = (
@@ -1148,21 +1149,25 @@ class BrokerService:
                 self._audit_open_refused(request, "hidden_tool")
                 raise self._not_found(taint)
             version = seen.version
+        # Whether the task may see the version is decided on the index, before the blob is read.
+        indexed = self._store.tool_record(request.tool, version)
+        if indexed is None:
+            raise self._not_found(taint)
+        if len(indexed.taint) > 1:  # fs and net: it opens nowhere, and is nobody's to see
+            self._audit_open_refused(request, "both_taints")
+            raise self._not_found(taint)
+        if TaintKind.NET in taint and TaintKind.FS in indexed.taint:
+            self._audit_open_refused(request, "hidden_version")
+            raise self._not_found(taint)
+        refusal = open_refusal(taint, indexed.taint)
+        if refusal is not None:  # a task that has read files, and a version that used the network
+            self._audit_open_refused(request, refusal)
+            raise _Refuse("denied", OPEN_REFUSAL_TEXT[refusal], f"open_{refusal}")
         try:
             opened = self._tools.open(request.tool, version)
         except ToolNotFoundError:
             raise self._not_found(taint) from None
         record = opened.record
-        if len(record.taint) > 1:  # fs and net: it opens nowhere, and is nobody's to see
-            self._audit_open_refused(request, "both_taints")
-            raise self._not_found(taint)
-        if TaintKind.NET in taint and TaintKind.FS in record.taint:
-            self._audit_open_refused(request, "hidden_version")
-            raise self._not_found(taint)
-        refusal = open_refusal(taint, record.taint)
-        if refusal is not None:  # a task that has read files, and a version that used the network
-            self._audit_open_refused(request, refusal)
-            raise _Refuse("denied", OPEN_REFUSAL_TEXT[refusal], f"open_{refusal}")
         merged = taint | record.taint
         raised = merged != taint
         instance = ToolInstanceId.new()
@@ -1250,7 +1255,18 @@ class BrokerService:
             return _Refuse("not_found", NOT_VISIBLE_NET_TEXT, "not_visible")
         return ToolNotFoundError("no such tool or version")
 
-    def _gate_lineage(self, live: _Live, tool: ToolId) -> None:
+    def _meter(self, live: _Live) -> None:
+        """Count one write into the stored tools against the task's context: `MAX_SAVES_PER_TASK`
+        of them, a refusal or a not-found counting as much as a save, so that what an attempt can
+        tell a net task about versions it may not see is metered (D30 (6)). The count is kept with
+        the task and inherited like its taint: only `fresh_context` starts it again."""
+        if live.saves >= MAX_SAVES_PER_TASK:
+            raise _Refuse("busy", _SAVE_CAP, "save_cap")
+        live.saves += 1
+        with self._store.transaction():
+            self._store.record_tool_writes(live.state.task, live.saves)
+
+    def _gate_lineage(self, live: _Live, tool: ToolId) -> bool:
         """Before a write into the lineage of `tool` (a refinement or a revert): what the answer
         and the new version's number and taint depend on must be within what the task sees.
 
@@ -1266,19 +1282,21 @@ class BrokerService:
             raise self._not_found(taint)
         hidden = [record for record in versions if not record.taint <= taint]
         if not hidden:
-            return
+            return False
         if any(len(record.taint) > 1 for record in versions):
             raise self._not_found(taint)
         if TaintKind.NET in taint and any(TaintKind.FS in record.taint for record in hidden):
-            live.saves += 1
+            if len(hidden) == len(versions):  # nothing of it is the task's to see: not found
+                raise self._not_found(taint)
             raise _Refuse("denied", WRITE_HIDDEN_TEXT, "hidden_lineage")
         if taint:
-            return  # a task that has read files, and a net version: the store's own conflict
+            return False  # a task that has read files, and a net version: the store's own conflict
         merged = frozenset().union(*(record.taint for record in hidden))
         with self._atomic() as entries:
             self._store.set_taint(live.state.task, merged)
             entries.append(ToolWriteTainted(at=self._now(), task=live.state.task, tool=tool))
         live.state = TaskState(task=live.state.task, taint=merged)
+        return True
 
     def _list_tool_versions(self, request: ListToolVersions) -> ResponseBody:
         records = self._tools.versions(request.tool)
@@ -1293,30 +1311,36 @@ class BrokerService:
         bundle, and takes the taint from its own record of the task."""
         live = self._owned(owner, request.task)
         if live.saves >= MAX_SAVES_PER_TASK:
-            raise _Refuse("busy", "this task has saved as many tools as it may", "save_cap")
+            raise _Refuse("busy", _SAVE_CAP, "save_cap")
         try:
             draft = parse_draft(request.draft.encode("utf-8"))
         except UnicodeEncodeError:  # a lone surrogate: not text, so not a draft
             raise _Refuse("invalid_request", "the tool draft is not acceptable") from None
         if request.tool is not None:
-            self._gate_lineage(live, request.tool)
+            self._meter(live)  # before the gate, whatever the answer
+            raised = self._gate_lineage(live, request.tool)
+        else:
+            raised = False
         stored = self.save_tool(owner, request.task, draft, tool=request.tool)
-        live.saves += 1
-        return ToolStored(kind="tool_stored", summary=_tool_summary(stored.record))
+        if request.tool is None:
+            self._meter(live)
+        return ToolStored(kind="tool_stored", summary=_tool_summary(stored.record), raised=raised)
 
     def _revert_tool(self, owner: Owner, request: RevertTool) -> ResponseBody:
         """Save a copy of an older version as the newest (D30 (5)): versions stay immutable and the
         lineage linear. The copy's taint is the task's together with the copied version's."""
         live = self._owned(owner, request.task)
-        if live.saves >= MAX_SAVES_PER_TASK:
-            raise _Refuse("busy", "this task has saved as many tools as it may", "save_cap")
-        self._gate_lineage(live, request.tool)
+        self._meter(live)  # every attempt counts, before the gate, whatever the answer
+        raised = self._gate_lineage(live, request.tool)
         newest = self._store.latest_version(request.tool)
         if newest is None:
-            raise ToolNotFoundError("no such tool")
+            raise self._not_found(live.state.taint)
         if request.version == newest:
             raise _Refuse("invalid_request", "that is already the newest version", "revert_newest")
-        source = self._tools.open(request.tool, request.version)
+        try:
+            source = self._tools.open(request.tool, request.version)
+        except ToolNotFoundError:
+            raise self._not_found(live.state.taint) from None
         claim = merged_taint(live.state.taint, source.record.taint)
         if claim is None:
             raise ToolTaintConflictError("the task's taint and the tool's cannot be combined")
@@ -1327,8 +1351,7 @@ class BrokerService:
             entries.append(
                 _saved_entry(stored, now, task=request.task, reverted_from=request.version)
             )
-        live.saves += 1
-        return ToolStored(kind="tool_stored", summary=_tool_summary(stored.record))
+        return ToolStored(kind="tool_stored", summary=_tool_summary(stored.record), raised=raised)
 
     def _list_tool_grants(self) -> ResponseBody:
         infos: list[ToolGrantInfo] = []
@@ -1523,6 +1546,7 @@ class BrokerService:
             else previous.successor(task, fresh_context=request.fresh_context)
         )
         now = self._now()
+        writes = self._inherited_writes(request, replaced)
         with self._atomic() as entries:
             if replaced is not None:
                 self._end_stored(replaced, TaskEndReason.REPLACED, now, entries)
@@ -1534,6 +1558,7 @@ class BrokerService:
                     ended_at=None,
                     workspace_present=True,
                     workspace=identity,
+                    tool_writes=writes,
                 )
             )
             entries.append(
@@ -1553,8 +1578,21 @@ class BrokerService:
             else self._ended_allowance(owner, request.previous)
             or self._new_budget(self._config.prompts_per_window)
         )
-        self._live[task] = _Live(owner=owner, state=state, workspace=identity, prompts=budget)
+        self._live[task] = _Live(
+            owner=owner, state=state, workspace=identity, prompts=budget, saves=writes
+        )
         return TaskStarted(kind="task_started", task=task, taint=_taint_names(state.taint))
+
+    def _inherited_writes(self, request: StartTask, replaced: "_Live | None") -> int:
+        """The writes into stored tools a new task starts with: those of the task it continues,
+        live or ended, unless `fresh_context` (which drops the turns, and for a task with the
+        network needs the user's approval again): the count is part of the context, like taint."""
+        if request.previous is None or request.fresh_context:
+            return 0
+        if replaced is not None:
+            return replaced.saves
+        record = self._store.task(request.previous)
+        return 0 if record is None else record.tool_writes
 
     async def _discard_workspace(self, task: TaskId) -> None:
         """Remove a workspace whose task could not be recorded. Best effort: a failure leaves an

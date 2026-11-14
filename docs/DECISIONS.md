@@ -1993,17 +1993,29 @@ fs versions, from a net task and from a clean task that stays clean, and demands
   version is refused with the `fresh_context=true` text. A both-tainted version is not found for
   everyone. (A both-tainted lineage is an import whose claim had `net`: its tool ID is known only to
   the user, so "this imported tool cannot be refined" is no longer something a model can reach; the
-  store still raises `ToolLineageBothError` with its own text, #99, and the chrome has its own sentence
-  for it.)
+  store still raises `ToolLineageBothError` with its own text, #99 (tested in `test_toolstore.py`),
+  and the chrome has its own sentence for it. The `ToolTaintConflictError` to `denied` mapping is
+  tested through the other conflict that remains reachable: a task that has read files refining a
+  net lineage.) The chrome says its own sentences, never the model's: a tool of the user's own list
+  that the conversation cannot open (it used the network) is not called "not stored", an import that
+  claims both is explained without asking the broker, and "Make this the newest" says when it marked
+  the conversation's task.
 - *Writes into a lineage* (`save_tool` with `refines`, `revert_tool`): the new version's number and
   taint depend on all its versions, so a write into a lineage that holds a version the task may not see
   is gated first. A clean task takes the lineage's taint first (audited as `tool_write_tainted`,
   persisted), then the answer is given: it is fs-tainted after the call, so the property does not
-  apply to it. A net task is **refused with one fixed sentence** and the attempt counts toward the
-  task's saves (`MAX_SAVES_PER_TASK`, so the channel is metered: at most 20 attempts a task).
-  **Accepted residual (a decision, not an oversight):** a net task learns one bit per refused write,
-  "this tool has a version made in a task that read files". The harness asserts that this bit is the
-  only difference. The lineage is not forked: that would amend D19.
+  apply to it. A net task is **refused with one fixed sentence** when the lineage has versions it
+  sees and versions it does not, and gets the not-found text when it sees none of it.
+  **The meter.** *Every* refine or revert attempt that names a tool counts against
+  `MAX_SAVES_PER_TASK` (20), before the gate and whatever the answer (written, refused, already the
+  newest, not found), so that a zero answer costs what a one answer does. The count belongs to the
+  context, like taint: it is kept with the task (`tasks.tool_writes`), `start_task(previous=...)`
+  without `fresh_context` carries it over (and so does ending and resuming), and only
+  `fresh_context` starts it at 0, which drops the turns and, for a net task, needs the user's approval
+  of the network again. **Accepted residual (a decision, not an oversight):** a net task learns at
+  most one bit per attempt, "this tool has a version made in a task that read files", so **at most 20
+  bits per context, that is per user approval of the network**. The harness asserts that this bit is
+  the only difference. The lineage is not forked: that would amend D19.
 - *Other store-wide state (S4).* Names are not unique, so there is no "name taken" answer. The caps are
   global: **the store is full** (500 tools, 256 MiB of packages) and the per-tool 100 versions (covered
   by the gate above). A task not fs-tainted can learn one bit, "the store is full", which depends on

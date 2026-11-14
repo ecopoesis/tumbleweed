@@ -18,7 +18,7 @@ from tumbleweed.agent.saved_tools import FetchedTool, open_with
 from tumbleweed.agent.tasks import TaskSession
 from tumbleweed.agent.tools import ToolError
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
-from tumbleweed.broker.toolflow import LINEAGE_BOTH_TEXT
+from tumbleweed.broker.toolflow import LINEAGE_BOTH_TEXT, NOT_VISIBLE_NET_TEXT
 from tumbleweed.core.ids import GrantId, ToolId
 from tumbleweed.core.types import ToolVersion
 from tumbleweed.ipc.tool_messages import ToolGrantInfo, ToolSummary
@@ -58,10 +58,19 @@ _LINEAGE_BOTH: Final = (
 )
 
 
+_NOT_VISIBLE: Final = (
+    "Not done: this conversation used the network, so it cannot use tools made in tasks that read "
+    "your files. Ask the assistant to start a new task, then try again."
+)
+_MARKED: Final = " This conversation's task now counts as having seen your files."
+
+
 def _refusal(refusal: BrokerRefused) -> ToolsOutcome:
     """Our own sentence for a refusal: the broker's text is written for the model."""
     if refusal.message == LINEAGE_BOTH_TEXT:
         return ToolsOutcome("refused", _LINEAGE_BOTH)
+    if refusal.message == NOT_VISIBLE_NET_TEXT:
+        return ToolsOutcome("refused", _NOT_VISIBLE)
     return ToolsOutcome("refused", _REFUSED.get(refusal.reason, _REFUSED_OTHERWISE))
 
 
@@ -152,7 +161,7 @@ class BrokerToolsPort:
             return ToolsOutcome(
                 "done",
                 f"Saved a copy of version {version} as version {saved.summary.version}. Access "
-                "for it is asked again.",
+                f"for it is asked again.{_MARKED if saved.raised else ''}",
             )
 
         self._act(work, done, done)

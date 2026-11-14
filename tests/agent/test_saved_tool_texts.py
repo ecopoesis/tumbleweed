@@ -193,6 +193,55 @@ class TestFindTexts:
 
 
 class TestOpenTexts:
+    def test_the_newest_the_model_is_told_is_the_one_its_task_sees(self) -> None:
+        with broker() as thread:
+            first = session(thread)
+            with first.reply(
+                [
+                    FakeTurn(tool_calls=(call("show_ui", spec=SPEC, code=CODE),)),
+                    FakeTurn(chunks=("o",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("go")
+            (instance,) = first.canvas.instances
+            reply_text(first, [save_calls(instance, name="Tool"), FakeTurn(chunks=("s",))])
+            tool = thread.rig.audit_of(ToolSaved)[0].tool
+            thread.rig.prompts.allow("task")
+            files = session(thread)
+            with files.reply(
+                [
+                    FakeTurn(
+                        tool_calls=(
+                            call(
+                                "request_access",
+                                kind="read",
+                                path=str(thread.rig.home / "Photos"),
+                                reason="r",
+                            ),
+                        )
+                    ),
+                    FakeTurn(tool_calls=(call("show_ui", spec=SPEC, code=CODE),)),
+                    FakeTurn(chunks=("o",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("go")
+            (shown,) = files.canvas.instances
+            reply_text(
+                files,
+                [save_calls(shown, name="Tool v2", refines=str(tool)), FakeTurn(chunks=("s",))],
+            )
+            clean = session(thread)
+
+            (opened,) = reply_text(
+                clean,
+                [
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(tool)),)),
+                    FakeTurn(chunks=("x",)),
+                ],
+            )
+
+            assert "Opened version 1 of the saved tool (the newest you can see is 1)" in opened
+
     def test_the_taint_note_is_said_only_when_the_open_changed_the_taint(self) -> None:
         with broker() as thread:
             first = session(thread)
@@ -229,6 +278,7 @@ class TestOpenTexts:
             )
 
             assert "This task now counts as having seen the user's files." in once
+            assert "the newest you can see is 1" in once
             assert "now counts" not in again  # it already did
 
     def test_a_cut_source_says_it_is_cut_and_must_not_be_refined_from(self) -> None:

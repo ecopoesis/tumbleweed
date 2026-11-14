@@ -2482,13 +2482,18 @@
           "title": "Kind",
           "type": "string"
         },
+        "raised": {
+          "title": "Raised",
+          "type": "boolean"
+        },
         "summary": {
           "$ref": "#/$defs/ToolSummary"
         }
       },
       "required": [
         "kind",
-        "summary"
+        "summary",
+        "raised"
       ],
       "title": "ToolStored",
       "type": "object"
