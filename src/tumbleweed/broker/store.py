@@ -161,13 +161,15 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
 ) STRICT""",
         "CREATE INDEX snapshots_by_task ON snapshots (task_id, kind, seq)",
     ),
-    # S24 (D30 (6)): how many writes into stored tools a task's context has made, which a task
-    # that continues it inherits like its taint (`start_task` with `fresh_context` false).
+    # S24 (D30 (6)): a task's context root (null: the task is its own root; a task that continues
+    # another, live or ended, shares its root) and, on the root's row, how many lineage writes
+    # the context has made while net-tainted: one budget for a context, whoever continues it.
     (
         (
             "ALTER TABLE tasks ADD COLUMN tool_writes INTEGER NOT NULL DEFAULT 0 "
             "CHECK (tool_writes BETWEEN 0 AND 1000000)"
         ),
+        "ALTER TABLE tasks ADD COLUMN context_root TEXT",
     ),
 )
 
@@ -438,7 +440,8 @@ class TaskRecord(PolicyModel):
     workspace_present: bool
     workspace: FsIdentity
     failures: int = 0  # failed attempts to delete the workspace
-    tool_writes: int = 0  # saves, refinements and reverts the task's context has attempted (S24)
+    tool_writes: int = 0  # on a context root: the lineage writes its context made on the network
+    context_root: TaskId | None = None  # None: the task is the root of its own context (S24)
 
     @property
     def ended(self) -> bool:
@@ -629,7 +632,8 @@ class BrokerStore:
         """Add a new task (inside `transaction()`)."""
         self._execute(
             "INSERT INTO tasks (id, state, taint, created_at, ended_at, workspace, "
-            "workspace_fsid, workspace_ino, tool_writes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "workspace_fsid, workspace_ino, tool_writes, context_root) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 str(record.task),
                 "ended" if record.ended else "live",
@@ -640,13 +644,18 @@ class BrokerStore:
                 str(record.workspace.fsid),
                 str(record.workspace.ino),
                 record.tool_writes,
+                None if record.context_root is None else str(record.context_root),
             ),
         )
 
-    def record_tool_writes(self, task: TaskId, count: int) -> None:
-        """Record how many writes into stored tools the task's context has attempted (inside
-        `transaction()`); it only grows."""
-        self._execute("UPDATE tasks SET tool_writes = ? WHERE id = ?", (count, str(task)))
+    def context_writes(self, root: TaskId) -> int:
+        """The lineage writes made on the network in the context whose root is `root`."""
+        rows = self._query("SELECT tool_writes FROM tasks WHERE id = ?", (str(root),))
+        return _failures(rows[0][0]) if rows else 0
+
+    def count_context_write(self, root: TaskId) -> None:
+        """Count one more (inside `transaction()`)."""
+        self._execute("UPDATE tasks SET tool_writes = tool_writes + 1 WHERE id = ?", (str(root),))
 
     def set_taint(self, task: TaskId, taint: frozenset[TaintKind]) -> None:
         """Replace a task's taint (inside `transaction()`); the caller only ever grows it."""
@@ -723,6 +732,7 @@ class BrokerStore:
                 workspace=_identity(_text(row[5]), _text(row[6])),
                 failures=_failures(row[7]),
                 tool_writes=_failures(row[8]),
+                context_root=None if row[9] is None else TaskId(_text(row[9])),
             )
         except (InvalidValueError, ValidationError):
             raise StoreCorruptError("the broker's database holds a malformed task") from None
@@ -1128,7 +1138,7 @@ _TOOL_COLUMNS: Final = (
 
 _TASK_COLUMNS: Final = (
     "SELECT id, taint, created_at, ended_at, workspace, workspace_fsid, workspace_ino, "
-    "delete_failures, tool_writes"
+    "delete_failures, tool_writes, context_root"
 )
 
 

@@ -280,6 +280,21 @@ def test_a_both_tainted_tool_in_the_list_says_why_it_does_not_open_without_askin
     assert "claims both file and network use" in str(view.shown[-1][3])
 
 
+def test_the_chrome_says_which_taint_a_write_took_and_has_its_own_busy_sentences() -> None:
+    from tumbleweed.broker.client import BrokerRefused
+    from tumbleweed.broker.toolflow import BIT_CAP_TEXT, SAVE_CAP_TEXT
+    from tumbleweed.shell.broker_tools import _marked, _refusal
+
+    assert "seen your files" in _marked(("fs",))
+    assert "used the network" in _marked(("net",))
+    saves = _refusal(BrokerRefused("busy", SAVE_CAP_TEXT)).text
+    bits = _refusal(BrokerRefused("busy", BIT_CAP_TEXT)).text
+    other = _refusal(BrokerRefused("busy", "full")).text
+    assert len({saves, bits, other}) == 3
+    assert "full or busy" not in saves + bits
+    assert "fresh_context" not in saves + bits  # the user has no such call
+
+
 def test_the_chrome_says_refusals_in_its_own_words_not_the_models() -> None:
     from tumbleweed.broker.client import BrokerRefused
     from tumbleweed.broker.toolflow import OPEN_REFUSAL_TEXT

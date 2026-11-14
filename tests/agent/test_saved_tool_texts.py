@@ -192,6 +192,57 @@ class TestFindTexts:
             assert "now counts" not in again  # it already did: nothing changed
 
 
+class TestWriteTexts:
+    def test_a_write_that_took_the_lineages_taint_says_which_one(self) -> None:
+        from tumbleweed.agent.saved_tools import marked
+
+        assert "saw the user's files" in marked(("fs",))
+        assert "used the network" in marked(("net",))
+        with broker() as thread:
+            first = session(thread)
+            thread.rig.prompts.allow("task")
+            with first.reply(
+                [
+                    FakeTurn(
+                        tool_calls=(
+                            call(
+                                "request_access",
+                                kind="read",
+                                path=str(thread.rig.home / "Photos"),
+                                reason="r",
+                            ),
+                        )
+                    ),
+                    FakeTurn(tool_calls=(call("show_ui", spec=SPEC, code=CODE),)),
+                    FakeTurn(chunks=("ok",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("go")
+            (instance,) = first.canvas.instances
+            reply_text(first, [save_calls(instance, name="Files tool"), FakeTurn(chunks=("s",))])
+            tool = thread.rig.audit_of(ToolSaved)[0].tool
+            clean = session(thread)
+            with clean.reply(
+                [
+                    FakeTurn(tool_calls=(call("show_ui", spec=SPEC, code=CODE),)),
+                    FakeTurn(chunks=("o",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("go")
+            (shown,) = clean.canvas.instances
+
+            (saved_text,) = reply_text(
+                clean,
+                [
+                    save_calls(shown, name="Files tool 2", refines=str(tool)),
+                    FakeTurn(chunks=("x",)),
+                ],
+            )
+
+            assert "Saved as tool" in saved_text
+            assert marked(("fs",)).strip() in saved_text
+
+
 class TestOpenTexts:
     def test_the_newest_the_model_is_told_is_the_one_its_task_sees(self) -> None:
         with broker() as thread:

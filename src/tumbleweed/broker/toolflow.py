@@ -47,6 +47,16 @@ NOT_VISIBLE_NET_TEXT: Final = (
 """The one not-found text a net task gets, for a tool or version that is missing, hidden or nobody's
 alike (D30 (6)): the answers stay identical, and PLAN's "told to start a fresh task" is in it."""
 
+SAVE_CAP_TEXT: Final = (
+    "This task has saved as many tools and versions as it may. Start a new task to save more."
+)
+BIT_CAP_TEXT: Final = (
+    "This conversation, while it had the network, has tried to change saved tools as many times as "
+    "it may. Call start_task with fresh_context=true to lift the limit."
+)
+"""The two busy texts of a write into saved tools, fixed: they say which limit it was and add no
+bit (D30 (6))."""
+
 WRITE_HIDDEN_TEXT: Final = (
     "That tool cannot be changed from this task: part of it was made in a task that saw the "
     "user's files, and this task has the network. Call start_task with fresh_context=true, then "

@@ -18,7 +18,12 @@ from tumbleweed.agent.saved_tools import FetchedTool, open_with
 from tumbleweed.agent.tasks import TaskSession
 from tumbleweed.agent.tools import ToolError
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
-from tumbleweed.broker.toolflow import LINEAGE_BOTH_TEXT, NOT_VISIBLE_NET_TEXT
+from tumbleweed.broker.toolflow import (
+    BIT_CAP_TEXT,
+    LINEAGE_BOTH_TEXT,
+    NOT_VISIBLE_NET_TEXT,
+    SAVE_CAP_TEXT,
+)
 from tumbleweed.core.ids import GrantId, ToolId
 from tumbleweed.core.types import ToolVersion
 from tumbleweed.ipc.tool_messages import ToolGrantInfo, ToolSummary
@@ -62,7 +67,23 @@ _NOT_VISIBLE: Final = (
     "Not done: this conversation used the network, so it cannot use tools made in tasks that read "
     "your files. Ask the assistant to start a new task, then try again."
 )
-_MARKED: Final = " This conversation's task now counts as having seen your files."
+_SAVE_CAP: Final = (
+    "Not done: this conversation's task has saved as many tools and versions as it may. Ask the "
+    "assistant to start a new task, then try again."
+)
+_BIT_CAP: Final = (
+    "Not done: this conversation, while it had the network, has tried to change saved tools as "
+    "many times as it may. Ask the assistant to start a fresh task (it will need the network "
+    "allowed again), then try again."
+)
+_MARKED: Final = {
+    "fs": " This conversation's task now counts as having seen your files.",
+    "net": " This conversation's task now counts as having used the network.",
+}
+
+
+def _marked(taint: tuple[str, ...]) -> str:
+    return _MARKED["net" if taint == ("net",) else "fs"]
 
 
 def _refusal(refusal: BrokerRefused) -> ToolsOutcome:
@@ -71,6 +92,10 @@ def _refusal(refusal: BrokerRefused) -> ToolsOutcome:
         return ToolsOutcome("refused", _LINEAGE_BOTH)
     if refusal.message == NOT_VISIBLE_NET_TEXT:
         return ToolsOutcome("refused", _NOT_VISIBLE)
+    if refusal.message == SAVE_CAP_TEXT:
+        return ToolsOutcome("refused", _SAVE_CAP)
+    if refusal.message == BIT_CAP_TEXT:
+        return ToolsOutcome("refused", _BIT_CAP)
     return ToolsOutcome("refused", _REFUSED.get(refusal.reason, _REFUSED_OTHERWISE))
 
 
@@ -161,7 +186,7 @@ class BrokerToolsPort:
             return ToolsOutcome(
                 "done",
                 f"Saved a copy of version {version} as version {saved.summary.version}. Access "
-                f"for it is asked again.{_MARKED if saved.raised else ''}",
+                f"for it is asked again.{_marked(saved.summary.taint) if saved.raised else ''}",
             )
 
         self._act(work, done, done)

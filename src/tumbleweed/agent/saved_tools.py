@@ -52,9 +52,20 @@ SOURCE_FRAME_BYTES: Final = 5 * 1024
 """Of the spec and of the code each, when `open_tool` shows the source: both fit one result."""
 LISTED_DESCRIPTION: Final = 160
 
-MARKED: Final = (
-    " Part of this tool was made in a task with a taint, so this task now counts as having it too."
-)
+
+def marked(taint: tuple[str, ...]) -> str:
+    """What the model is told when a write took the lineage's taint first: which."""
+    if taint == ("net",):
+        return (
+            " Part of this tool was made in a task that used the network, so this task now "
+            "counts as having used it."
+        )
+    return (
+        " Part of this tool was made in a task that saw the user's files, so this task now "
+        "counts as having seen them."
+    )
+
+
 CUT_SOURCE: Final = (
     "\nPart of the source above was cut: it is not the whole tool. Do not refine the tool from "
     "it, because what you build would lose what was cut. Tell the user, and rebuild the tool "
@@ -349,7 +360,7 @@ def register_saved_tool_tools(
         except BrokerUnavailableError as error:
             raise ToolError(str(error)) from None
         summary = stored.summary
-        note = MARKED if stored.raised else ""
+        note = marked(summary.taint) if stored.raised else ""
         if source.stored is not None and arguments.refines is None:
             note = (
                 " This instance came from a saved tool, and you did not say it refines one, so "
@@ -445,7 +456,7 @@ def register_saved_tool_tools(
         return (
             f"Version {arguments.version} was saved again as version {summary.version}, now the "
             "newest. Earlier versions are unchanged. The user must allow its access again."
-            + (MARKED if stored.raised else "")
+            + (marked(summary.taint) if stored.raised else "")
         )
 
     registry.register(

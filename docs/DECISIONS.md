@@ -2006,16 +2006,24 @@ fs versions, from a net task and from a clean task that stays clean, and demands
   persisted), then the answer is given: it is fs-tainted after the call, so the property does not
   apply to it. A net task is **refused with one fixed sentence** when the lineage has versions it
   sees and versions it does not, and gets the not-found text when it sees none of it.
-  **The meter.** *Every* refine or revert attempt that names a tool counts against
-  `MAX_SAVES_PER_TASK` (20), before the gate and whatever the answer (written, refused, already the
-  newest, not found), so that a zero answer costs what a one answer does. The count belongs to the
-  context, like taint: it is kept with the task (`tasks.tool_writes`), `start_task(previous=...)`
-  without `fresh_context` carries it over (and so does ending and resuming), and only
-  `fresh_context` starts it at 0, which drops the turns and, for a net task, needs the user's approval
-  of the network again. **Accepted residual (a decision, not an oversight):** a net task learns at
-  most one bit per attempt, "this tool has a version made in a task that read files", so **at most 20
-  bits per context, that is per user approval of the network**. The harness asserts that this bit is
-  the only difference. The lineage is not forked: that would amend D19.
+  **Two limits, kept apart (round 4).** (a) A task saves, refines and reverts at most
+  `MAX_SAVES_PER_TASK` (20) times, as always: a per-task cap (I9), counted on success, not inherited.
+  (b) **The bit budget**: every lineage write (`save_tool` with `refines`, `revert_tool`) made **while
+  the task is net-tainted** is counted before the gate, whatever the answer (written, refused, already
+  the newest, not found), so a zero answer costs what a one answer does; a context has
+  `MAX_CONTEXT_BITS` (20) of them. A clean task's writes never count (the gate fs-taints it first, so
+  it carries no bit), nor do new tools: ordinary use is never throttled by it. The budget lives **on a
+  context root** that the broker records: a task started with `fresh_context` or with no previous is a
+  new root, any other shares the root of the task it continues, live or ended, whatever the caller
+  says its current task is. So every heir of one task, and a branch from an older ended task, share one
+  count (`tasks.context_root`, the count on the root's row), persisted across end and resume. Only
+  `fresh_context` starts a new budget, which drops the turns and, for a net task, needs the user's
+  approval of the network again. Each limit has its own fixed busy text, which says which it was and,
+  for the context, that `start_task` with `fresh_context=true` lifts it (adding no bit).
+  **Accepted residual (a decision, not an oversight):** a net task learns at most one bit per counted
+  attempt, "this tool has a version made in a task that read files", so **at most 20 bits per
+  context, that is per user approval of the network**. The harness asserts that this bit is the only
+  difference. The lineage is not forked: that would amend D19.
 - *Other store-wide state (S4).* Names are not unique, so there is no "name taken" answer. The caps are
   global: **the store is full** (500 tools, 256 MiB of packages) and the per-tool 100 versions (covered
   by the gate above). A task not fs-tainted can learn one bit, "the store is full", which depends on

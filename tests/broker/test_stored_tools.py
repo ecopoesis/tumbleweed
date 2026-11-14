@@ -54,6 +54,7 @@ class TestSaving:
                 tainted = await save(client, await fs_task(rig, client))
 
                 assert clean.summary.taint == ()
+                assert not clean.raised
                 assert tainted.summary.taint == ("fs",)
                 assert clean.summary.version == 1
                 saved = rig.audit_of(ToolSaved)
@@ -419,6 +420,7 @@ class TestOpeningTaintsTheTask:
 
                 second = await save(client, clean, tool=first.summary.tool)
 
+                assert second.raised  # the write took the lineage's taint first
                 assert second.summary.taint == ("fs",)
                 assert [e.tool for e in rig.audit_of(ToolWriteTainted)] == [first.summary.tool]
                 assert (str(clean), "fs") in rig.rows("select id, taint from tasks")  # on record

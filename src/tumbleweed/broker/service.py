@@ -182,9 +182,11 @@ from tumbleweed.broker.store import (
 )
 from tumbleweed.broker.task import TaintKind, TaskState, merged_taint
 from tumbleweed.broker.toolflow import (
+    BIT_CAP_TEXT,
     LINEAGE_BOTH_TEXT,
     NOT_VISIBLE_NET_TEXT,
     OPEN_REFUSAL_TEXT,
+    SAVE_CAP_TEXT,
     WRITE_HIDDEN_TEXT,
     BoundRunError,
     bound_payload,
@@ -328,7 +330,9 @@ FIND_FILES_REFUSED: Final = (
     "This task has the network, so it cannot be shown tools made in tasks that read files. Call "
     "start_task with fresh_context=true and search again."
 )
-_SAVE_CAP: Final = "this task has made as many writes into saved tools as it may"
+MAX_CONTEXT_BITS: Final = 20
+"""Lineage writes a context may make while net-tainted (D30 (6)): the bound on what a net task can
+learn about versions it may not see, per user approval of the network."""
 _BAD_BINDING: Final = "the tool binding is not one this task opened"
 _LINEAGE_BOTH: Final = LINEAGE_BOTH_TEXT
 _TAINT_CONFLICT: Final = (
@@ -408,7 +412,8 @@ class _Live:
     pending_runs: set[RunId] = field(default_factory=set)  # reserved, not yet authorised
     running: set["asyncio.Future[ResponseBody]"] = field(default_factory=set)
     instances: dict[ToolInstanceId, "_OpenedTool"] = field(default_factory=dict)
-    saves: int = 0
+    saves: int = 0  # saves, refinements and reverts this task has made (not inherited)
+    root: TaskId | None = None  # the root of its context (None: itself), which holds the bit budget
 
 
 @dataclass(frozen=True, slots=True)
@@ -1255,16 +1260,25 @@ class BrokerService:
             return _Refuse("not_found", NOT_VISIBLE_NET_TEXT, "not_visible")
         return ToolNotFoundError("no such tool or version")
 
-    def _meter(self, live: _Live) -> None:
-        """Count one write into the stored tools against the task's context: `MAX_SAVES_PER_TASK`
-        of them, a refusal or a not-found counting as much as a save, so that what an attempt can
-        tell a net task about versions it may not see is metered (D30 (6)). The count is kept with
-        the task and inherited like its taint: only `fresh_context` starts it again."""
+    def _check_saves(self, live: _Live) -> None:
+        """A task saves, refines and reverts at most `MAX_SAVES_PER_TASK` times (I9)."""
         if live.saves >= MAX_SAVES_PER_TASK:
-            raise _Refuse("busy", _SAVE_CAP, "save_cap")
-        live.saves += 1
+            raise _Refuse("busy", SAVE_CAP_TEXT, "save_cap")
+
+    def _spend_bit(self, live: _Live) -> None:
+        """Count a write into a lineage made while the task has the network, before the gate and
+        whatever the answer: what such an attempt can tell it about versions it may not see is at
+        most a bit (D30 (6)), and a context has `MAX_CONTEXT_BITS` of them. The budget is kept on
+        the context's root, shared by every task that continues it, live or ended, and only
+        `fresh_context` starts a new one. A task without the network spends nothing: a write
+        into a lineage it does not see whole marks it first, and then it carries no bit."""
+        if TaintKind.NET not in live.state.taint:
+            return
+        root = live.root or live.state.task
+        if self._store.context_writes(root) >= MAX_CONTEXT_BITS:
+            raise _Refuse("busy", BIT_CAP_TEXT, "bit_cap")
         with self._store.transaction():
-            self._store.record_tool_writes(live.state.task, live.saves)
+            self._store.count_context_write(root)
 
     def _gate_lineage(self, live: _Live, tool: ToolId) -> bool:
         """Before a write into the lineage of `tool` (a refinement or a revert): what the answer
@@ -1310,27 +1324,26 @@ class BrokerService:
         """Save the model's draft from the task: the broker parses it again, as strictly as a
         bundle, and takes the taint from its own record of the task."""
         live = self._owned(owner, request.task)
-        if live.saves >= MAX_SAVES_PER_TASK:
-            raise _Refuse("busy", _SAVE_CAP, "save_cap")
+        self._check_saves(live)
         try:
             draft = parse_draft(request.draft.encode("utf-8"))
         except UnicodeEncodeError:  # a lone surrogate: not text, so not a draft
             raise _Refuse("invalid_request", "the tool draft is not acceptable") from None
         if request.tool is not None:
-            self._meter(live)  # before the gate, whatever the answer
+            self._spend_bit(live)  # before the gate, whatever the answer
             raised = self._gate_lineage(live, request.tool)
         else:
             raised = False
         stored = self.save_tool(owner, request.task, draft, tool=request.tool)
-        if request.tool is None:
-            self._meter(live)
+        live.saves += 1
         return ToolStored(kind="tool_stored", summary=_tool_summary(stored.record), raised=raised)
 
     def _revert_tool(self, owner: Owner, request: RevertTool) -> ResponseBody:
         """Save a copy of an older version as the newest (D30 (5)): versions stay immutable and the
         lineage linear. The copy's taint is the task's together with the copied version's."""
         live = self._owned(owner, request.task)
-        self._meter(live)  # every attempt counts, before the gate, whatever the answer
+        self._check_saves(live)
+        self._spend_bit(live)  # every attempt, before the gate, whatever the answer
         raised = self._gate_lineage(live, request.tool)
         newest = self._store.latest_version(request.tool)
         if newest is None:
@@ -1351,6 +1364,7 @@ class BrokerService:
             entries.append(
                 _saved_entry(stored, now, task=request.task, reverted_from=request.version)
             )
+        live.saves += 1
         return ToolStored(kind="tool_stored", summary=_tool_summary(stored.record), raised=raised)
 
     def _list_tool_grants(self) -> ResponseBody:
@@ -1546,7 +1560,7 @@ class BrokerService:
             else previous.successor(task, fresh_context=request.fresh_context)
         )
         now = self._now()
-        writes = self._inherited_writes(request, replaced)
+        root = self._context_root(request, replaced)
         with self._atomic() as entries:
             if replaced is not None:
                 self._end_stored(replaced, TaskEndReason.REPLACED, now, entries)
@@ -1558,7 +1572,7 @@ class BrokerService:
                     ended_at=None,
                     workspace_present=True,
                     workspace=identity,
-                    tool_writes=writes,
+                    context_root=root,
                 )
             )
             entries.append(
@@ -1579,20 +1593,21 @@ class BrokerService:
             or self._new_budget(self._config.prompts_per_window)
         )
         self._live[task] = _Live(
-            owner=owner, state=state, workspace=identity, prompts=budget, saves=writes
+            owner=owner, state=state, workspace=identity, prompts=budget, root=root
         )
         return TaskStarted(kind="task_started", task=task, taint=_taint_names(state.taint))
 
-    def _inherited_writes(self, request: StartTask, replaced: "_Live | None") -> int:
-        """The writes into stored tools a new task starts with: those of the task it continues,
-        live or ended, unless `fresh_context` (which drops the turns, and for a task with the
-        network needs the user's approval again): the count is part of the context, like taint."""
+    def _context_root(self, request: StartTask, replaced: "_Live | None") -> TaskId | None:
+        """The root of the context a new task is in: the task itself (None) for one started
+        with `fresh_context` or with no previous, else the root of the task it continues, live or
+        ended, so that every task that continues one context shares its budget (D30 (6)). It is the
+        broker's own record, never what the caller says about its current task."""
         if request.previous is None or request.fresh_context:
-            return 0
+            return None
         if replaced is not None:
-            return replaced.saves
+            return replaced.root or replaced.state.task
         record = self._store.task(request.previous)
-        return 0 if record is None else record.tool_writes
+        return None if record is None else record.context_root or record.task
 
     async def _discard_workspace(self, task: TaskId) -> None:
         """Remove a workspace whose task could not be recorded. Best effort: a failure leaves an

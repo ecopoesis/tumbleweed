@@ -29,8 +29,12 @@ from tests.ipc.bounded import run
 from tests.tools.support import draft
 from tumbleweed.broker.audit import ToolWriteTainted
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
-from tumbleweed.broker.service import MAX_SAVES_PER_TASK
-from tumbleweed.broker.toolflow import WRITE_HIDDEN_TEXT
+from tumbleweed.broker.service import MAX_CONTEXT_BITS, MAX_SAVES_PER_TASK
+from tumbleweed.broker.toolflow import (
+    BIT_CAP_TEXT,
+    SAVE_CAP_TEXT,
+    WRITE_HIDDEN_TEXT,
+)
 from tumbleweed.core.ids import RunId, TaskId, ToolId
 from tumbleweed.core.types import ToolVersion
 from tumbleweed.ipc.base import Response
@@ -394,6 +398,111 @@ class TestTheAcceptedBit:
                 assert again.value.message == WRITE_HIDDEN_TEXT  # not busy: it started at 0
 
         run(scenario)
+
+    def test_a_clean_conversation_is_never_throttled_however_long_it_goes_on(self) -> None:
+        """The budget is for lineage writes made on the network: ordinary use costs none of it."""
+
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                ids = await build(rig, client, with_fs=False)
+                task = (await client.start_task()).task
+                for _ in range(6):  # six tasks of one conversation, none with the network
+                    for _ in range(5):
+                        await new_tool(client, task, ids)
+                    for _ in range(4):
+                        await refine("Z")(client, task, ids)
+                    task = (await client.start_task(previous=task)).task
+                await refine("Z")(client, task, ids)
+
+        run(scenario)
+
+    def test_the_budget_is_one_for_the_context_across_live_and_ended_heirs(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                ids = await build(rig, client, with_fs=True)
+                network = await net_task(rig, client)
+                for _ in range(8):
+                    with pytest.raises(BrokerRefused):
+                        await refine("X")(client, network, ids)
+                live_heir = (await client.start_task(previous=network)).task  # network was live
+                for _ in range(7):
+                    with pytest.raises(BrokerRefused):
+                        await refine("X")(client, live_heir, ids)
+                await client.end_task(live_heir)
+                ended_heir = (await client.start_task(previous=live_heir)).task  # it was ended
+                for _ in range(5):
+                    with pytest.raises(BrokerRefused) as hidden:
+                        await refine("X")(client, ended_heir, ids)
+                    assert hidden.value.message == WRITE_HIDDEN_TEXT
+
+                with pytest.raises(BrokerRefused) as metered:
+                    await refine("X")(client, ended_heir, ids)
+
+                assert metered.value.reason == "busy"
+                assert metered.value.message == BIT_CAP_TEXT
+
+        run(scenario)
+
+    def test_heirs_of_one_task_and_a_branch_from_an_older_one_share_one_budget(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                ids = await build(rig, client, with_fs=True)
+                root = await net_task(rig, client)
+                await client.end_task(root)
+                first = (await client.start_task(previous=root)).task
+                for _ in range(10):
+                    with pytest.raises(BrokerRefused):
+                        await refine("X")(client, first, ids)
+                await client.end_task(first)
+                # Two heirs of the one ended task, and a branch from the older ended root itself.
+                second = (await client.start_task(previous=root)).task
+                third = (await client.start_task(previous=first)).task
+                for task, count in ((second, 5), (third, 5)):
+                    for _ in range(count):
+                        with pytest.raises(BrokerRefused) as hidden:
+                            await refine("X")(client, task, ids)
+                        assert hidden.value.message == WRITE_HIDDEN_TEXT
+                for task in (second, third):
+                    with pytest.raises(BrokerRefused) as metered:
+                        await refine("X")(client, task, ids)
+                    assert metered.value.message == BIT_CAP_TEXT
+
+        run(scenario)
+
+    def test_new_tools_saved_on_the_network_cost_no_bit_but_count_toward_the_tasks_saves(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                ids = await build(rig, client, with_fs=True)
+                network = await net_task(rig, client)
+                for _ in range(MAX_SAVES_PER_TASK):
+                    await new_tool(client, network, ids)
+                with pytest.raises(BrokerRefused) as per_task:
+                    await new_tool(client, network, ids)
+                assert per_task.value.message == SAVE_CAP_TEXT
+                heir = (await client.start_task(previous=network)).task
+
+                for _ in range(MAX_CONTEXT_BITS):  # the context's bits are all still there
+                    with pytest.raises(BrokerRefused) as hidden:
+                        await refine("X")(client, heir, ids)
+                    assert hidden.value.message == WRITE_HIDDEN_TEXT
+
+        run(scenario)
+
+    def test_the_two_busy_texts_are_fixed_and_say_which_limit_it_was(self) -> None:
+        assert SAVE_CAP_TEXT == (
+            "This task has saved as many tools and versions as it may. "
+            "Start a new task to save more."
+        )
+        assert BIT_CAP_TEXT == (
+            "This conversation, while it had the network, has tried to change saved tools as many "
+            "times as it may. Call start_task with fresh_context=true to lift the limit."
+        )
 
     def test_every_refused_attempt_counts_toward_the_tasks_saves(self) -> None:
         async def scenario() -> None:
