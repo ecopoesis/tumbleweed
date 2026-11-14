@@ -167,7 +167,7 @@ class NetworkLink:
         try:
             async with asyncio.timeout(SETUP_SECONDS):
                 info = await self._read_info(bwrap)
-                self._pidfd = os.pidfd_open(info.child_pid)
+                self._pidfd = os.pidfd_open(info.child_pid)  # type: ignore[attr-defined,unused-ignore]  # Linux only: sandboxes never run elsewhere
                 net = os.open(f"/proc/{info.child_pid}/ns/net", os.O_RDONLY | os.O_CLOEXEC)
                 refuse_unless_own_namespace(
                     info.net_namespace, os.fstat(net).st_ino, _own_network_namespace()
@@ -207,7 +207,9 @@ class NetworkLink:
         self._close_gates()
         if self._pidfd is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                signal.pidfd_send_signal(self._pidfd, signal.SIGKILL)
+                signal.pidfd_send_signal(  # type: ignore[attr-defined,unused-ignore]  # Linux only
+                    self._pidfd, signal.SIGKILL
+                )
 
     async def _read_info(self, bwrap: asyncio.subprocess.Process) -> _Info:
         loop = asyncio.get_running_loop()
