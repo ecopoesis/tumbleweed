@@ -262,8 +262,10 @@ shell, voice or `gi` (section 10).
   `tumbleweed.sandbox.network.NetworkLink` reads the child's PID and namespace ids, **refuses if the
   network namespace is the launcher's own or is not reported**, starts `slirp4netns --configure
   --disable-host-loopback --enable-sandbox --enable-seccomp --ready-fd --exit-fd <pid> tap0` with an
-  empty environment, waits for its ready byte and only then writes to the block pipe, so the payload
-  runs with the network up and never before. 10 s bounds the whole setup. Any failure (no
+  empty environment (joining the user namespace that owns the network namespace, found with
+  `NS_GET_USERNS`: `--disable-userns` nests the init in a second one, which has no right over it),
+  waits for its ready byte and only then writes to the block pipe, on which bwrap holds the init after
+  its setup and before it execs the program, so the payload runs with the network up and never before. 10 s bounds the whole setup. Any failure (no
   slirp4netns, a tap that does not come up, a bwrap that ends, a timeout) raises
   `SandboxNetworkError`, kills bwrap's process group and the sandbox's init (held on the block pipe,
   which does not yet die with its parent) before the pipe closes, and the broker refuses the run with

@@ -1732,9 +1732,7 @@ task ending and the taint rule all apply). The launcher then starts bwrap with `
 network namespace is the launcher's own** (a mutant with `--share-net` ends here), starts
 `slirp4netns --configure --disable-host-loopback --enable-sandbox --enable-seccomp --ready-fd
 --exit-fd <pid> tap0` with an empty environment, waits for its ready byte, and only then writes the
-byte that releases bwrap's `--block-fd`. bwrap does not set the sandbox up, and the payload cannot
-run, before that: there is no sleep and no race, and a program whose first action is a connect
-succeeds. (3) *Fail closed.* A missing `slirp4netns`, a tap that does not come up, a ready byte that
+byte that releases bwrap's `--block-fd`. bwrap holds the sandbox's init on the block pipe after its setup and privilege drop and before it execs the program, so the payload cannot run before that: there is no sleep and no race with the program, and a program whose first action is a connect succeeds. **Two user namespaces (found in the container, not on a host):** `--disable-userns` moves the init into a second user namespace nested in the first, which owns the network namespace. slirp4netns's default (join the init's user namespace, then its netns) therefore gets EPERM for good once the init has moved, and `setegid(0)` fails before the second one is mapped. The launcher waits (bounded) until the init is in its own mapped namespace, takes the owner with `NS_GET_USERNS` on the init's network namespace and hands that descriptor to slirp4netns as `--userns-path`. `--disable-userns` stays (3) *Fail closed.* A missing `slirp4netns`, a tap that does not come up, a ready byte that
 does not arrive, a namespace that is the launcher's, a bwrap that ends meanwhile or any timeout
 raises `SandboxNetworkError` (a `SandboxLaunchError`); the broker answers with one fixed refusal ("the
 sandbox's network could not be set up; the program did not run") and audits `network_unavailable`. A

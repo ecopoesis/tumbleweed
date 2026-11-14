@@ -4,12 +4,14 @@ Every sandbox has a network namespace of its own (`--unshare-net`, never `--shar
 whose policy has `network` set gets a user-mode network in it, and the program is held back until
 the network is up:
 
-1. bwrap starts with `--info-fd` and `--block-fd`. It makes its namespaces and then waits for a
-   byte on the block pipe before it sets the sandbox up, so the program cannot have started.
+1. bwrap starts with `--info-fd` and `--block-fd`. It makes its namespaces, sets the sandbox up
+   and then waits for a byte on the block pipe before it execs the program, so the program cannot
+   have started.
 2. The launcher reads the child's PID and namespace ids from the info pipe, and **refuses if the
    child's network namespace is its own**: a sandbox that shared the host's network would be
    attached to by nothing and reached by everything.
-3. `slirp4netns --configure --disable-host-loopback` joins the child's namespaces, makes `tap0`,
+3. `slirp4netns --configure --disable-host-loopback` joins the owner of the child's network
+   namespace (see `_owning_user_namespace`) and that namespace, makes `tap0`,
    brings the interface up and writes a byte to its ready pipe.
 4. The launcher writes the byte that releases bwrap. No sleep, no race.
 
@@ -24,6 +26,7 @@ by `tumbleweed.sandbox.bwrap` from `NetworkFds`.
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -72,11 +75,15 @@ class _Info(BaseModel):
     """Absent when bwrap did not unshare the network: then it is refused."""
 
 
-def slirp_argv(program: str, pid: int, *, ready: int, exit_: int) -> list[str]:
-    """slirp4netns's command line: attached to `pid`'s namespaces, host loopback unreachable, its
-    own mount namespace and seccomp filter, ready and exit pipes by number."""
+def slirp_argv(
+    program: str, pid: int, *, ready: int, exit_: int, userns_fd: int | None = None
+) -> list[str]:
+    """slirp4netns's command line: attached to `pid`'s network namespace (joining the user
+    namespace open as `userns_fd`, the one that owns it), host loopback unreachable, its own
+    mount namespace and seccomp filter, ready and exit pipes by number."""
     return [
         program,
+        *([] if userns_fd is None else [f"--userns-path=/proc/self/fd/{userns_fd}"]),
         "--configure",
         "--disable-host-loopback",
         "--enable-sandbox",
@@ -180,18 +187,21 @@ class NetworkLink:
         raise SandboxNetworkError(_FAILED)
 
     async def _start_slirp(self, pid: int) -> None:
+        owner = await _owning_user_namespace(pid)
         ready_read, ready_write = os.pipe()
         exit_read, exit_write = os.pipe()
         self._exit_write = exit_write
         try:
             self._process = await asyncio.create_subprocess_exec(
-                *slirp_argv(self._program, pid, ready=ready_write, exit_=exit_read),
+                *slirp_argv(
+                    self._program, pid, ready=ready_write, exit_=exit_read, userns_fd=owner
+                ),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
                 env={},
                 cwd="/",
-                pass_fds=[ready_write, exit_read],
+                pass_fds=[ready_write, exit_read, owner],
             )
         except BaseException:
             os.close(ready_read)
@@ -199,6 +209,7 @@ class NetworkLink:
         finally:
             os.close(ready_write)
             os.close(exit_read)
+            os.close(owner)
         assert self._process.stderr is not None  # noqa: S101  (PIPE was asked for)
         self._drain = asyncio.ensure_future(_capped(self._process.stderr, self.stderr))
         with os.fdopen(ready_read, "rb", buffering=0) as ready:
@@ -212,7 +223,9 @@ class NetworkLink:
             finally:
                 transport.close()
         if answer != b"1":
-            raise SandboxNetworkError(_FAILED)  # slirp4netns ended without saying it was ready
+            await asyncio.sleep(0.05)  # let the drain see what it said as it ended
+            log.warning("slirp4netns did not become ready: %s", _printable(self.stderr))
+            raise SandboxNetworkError(_FAILED)  # it ended without saying it was ready
 
     def _release(self) -> None:
         if not self._block_write_open:
@@ -252,3 +265,45 @@ async def _capped(stream: asyncio.StreamReader, into: bytearray) -> None:
     slirp4netns)."""
     while chunk := await stream.read(4096):
         into += chunk[: max(0, STDERR_LIMIT - len(into))]
+
+
+def _printable(data: bytearray) -> str:
+    return bytes(data).decode("utf-8", errors="replace").encode("unicode_escape").decode("ascii")
+
+
+async def _owning_user_namespace(pid: int) -> int:
+    """An open descriptor of the user namespace that owns `pid`'s network namespace.
+
+    `--disable-userns` gives the sandbox's init a second user namespace of its own, nested in the
+    one bwrap made (which owns the network namespace). A process that joins the init's, as
+    slirp4netns does by default, has no right over the network namespace (`setns` says EPERM,
+    for good). Joining the owner has. The init is waited for until it has moved into its own,
+    mapped namespace: before that, slirp4netns's own sandbox fails in `setegid(0)`. Bounded by the
+    setup's timeout."""
+    net = os.open(f"/proc/{pid}/ns/net", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        owner = fcntl.ioctl(net, _NS_GET_USERNS)
+        try:
+            while True:
+                if _settled(pid, owner):
+                    return owner
+                await asyncio.sleep(0.002)
+        except BaseException:
+            os.close(owner)
+            raise
+    finally:
+        os.close(net)
+
+
+_NS_GET_USERNS: Final = 0xB701
+
+
+def _settled(pid: int, owner: int) -> bool:
+    """Whether `pid` is in a user namespace other than `owner` and its maps are written."""
+    try:
+        own = Path(f"/proc/self/fd/{owner}").readlink()
+        theirs = Path(f"/proc/{pid}/ns/user").readlink()
+        maps = [Path(f"/proc/{pid}/{name}").read_text() for name in ("uid_map", "gid_map")]
+    except OSError:
+        return False
+    return own != theirs and all(text.strip() for text in maps)
