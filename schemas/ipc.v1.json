@@ -2356,6 +2356,10 @@
           "title": "Kind",
           "type": "string"
         },
+        "raised": {
+          "title": "Raised",
+          "type": "boolean"
+        },
         "task_taint": {
           "items": {
             "enum": [
@@ -2380,7 +2384,8 @@
       "required": [
         "kind",
         "tools",
-        "task_taint"
+        "task_taint",
+        "raised"
       ],
       "title": "ToolMatches",
       "type": "object"
@@ -2405,17 +2410,10 @@
           "type": "string"
         },
         "newest": {
-          "anyOf": [
-            {
-              "maximum": 9007199254740992,
-              "minimum": 1,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "title": "Newest"
+          "maximum": 9007199254740992,
+          "minimum": 1,
+          "title": "Newest",
+          "type": "integer"
         },
         "raised": {
           "title": "Raised",

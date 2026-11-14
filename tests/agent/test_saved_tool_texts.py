@@ -113,12 +113,26 @@ class TestFindTexts:
         assert "\u202e" not in line
         assert "\n" not in line
 
-    def test_what_is_said_about_the_rest_depends_on_the_task_only(self) -> None:
-        assert not_shown(()) == NOT_SHOWN_CLEAN
-        assert not_shown(("fs",)) == NOT_SHOWN_FILES
-        assert not_shown(("net",)) == NOT_SHOWN_NET
-        assert "include_file_tools=true" in NOT_SHOWN_CLEAN
-        assert "fresh_context=true" in NOT_SHOWN_NET
+    def test_what_is_said_about_the_rest_depends_on_the_task_only_and_is_pinned_word_for_word(
+        self,
+    ) -> None:
+        clean = (
+            "Tools, and newer versions of tools, made in tasks that saw the user's files or used "
+            "the network are not shown. To also see the ones made in tasks that saw files, call "
+            "find_tools again with include_file_tools=true: that makes this task count as having "
+            "seen the user's files, so it can no longer be given the network."
+        )
+        files = (
+            "Tools, and newer versions of tools, made in tasks that used the network are not shown."
+        )
+        net = (
+            "Tools, and newer versions of tools, made in tasks that saw the user's files are "
+            "never shown to a task that has the network. To search for them, call start_task "
+            "with fresh_context=true first."
+        )
+        assert not_shown(()) == clean == NOT_SHOWN_CLEAN
+        assert not_shown(("fs",)) == files == NOT_SHOWN_FILES
+        assert not_shown(("net",)) == net == NOT_SHOWN_NET
 
     def test_a_search_that_finds_nothing_still_says_the_one_fixed_sentence(self) -> None:
         with broker() as thread:
@@ -156,10 +170,13 @@ class TestFindTexts:
             reply_text(first, [save_calls(instance, name="Photo csv"), FakeTurn(chunks=("saved",))])
             second = session(thread)
 
-            plain, opted = reply_text(
+            plain, opted, again = reply_text(
                 second,
                 [
                     FakeTurn(tool_calls=(call("find_tools", query="photo"),)),
+                    FakeTurn(
+                        tool_calls=(call("find_tools", query="photo", include_file_tools=True),)
+                    ),
                     FakeTurn(
                         tool_calls=(call("find_tools", query="photo", include_file_tools=True),)
                     ),
@@ -172,6 +189,7 @@ class TestFindTexts:
             assert "made in a task that saw the user's files" in opted
             assert "This task now counts as having seen the user's files." in opted
             assert opted.rstrip().endswith(NOT_SHOWN_FILES)
+            assert "now counts" not in again  # it already did: nothing changed
 
 
 class TestOpenTexts:

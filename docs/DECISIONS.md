@@ -1945,35 +1945,71 @@ refined: save a new tool instead"; a refinement refused because the task's taint
 the lineage's says to start a task with `fresh_context=true`. Both are `denied`
 (`ToolTaintConflictError`, tested at the wire).
 
-(6) *Retrieval before generation.* `FindTools(task, query?, limit, include_file_tools?)` is the model's
-search: top-k (`k` = 8) by the FTS rank of D19 (12), over the newest version of each tool, then the
-**model re-ranks** by choosing among the framed results (the system prompt, v7, says to call
-`find_tools` before it writes a tool of its own and to prefer a saved one that fits). There is no
-automatic injection of results into a turn: a turn that never searched would put saved text in
-front of the model that the user did not ask for, and a shell that is only chatting must not
-connect to the broker. **The property (I12): if a task is not fs-tainted after a `find_tools`
-call, the bytes of the answer do not depend on any fs-tainted version: not its name, description or
-tags, and not its presence, count, rank, or whether it pushed a clean row out of the top-k.**
-(Round 1 of review found that the first design, which showed everything to a clean task and
-counted what a tainted one could not see, broke it twice: a clean task was shown fs-derived text
-and stayed clean, then got the network, and the count was a prefix oracle on that text.) The
-mechanism: a task is shown only versions whose `ToolRecord.taint` is within its own taint (a clean
-task: clean versions; an fs task: clean and fs; a net task: clean and net; a version that is both,
-nobody), and the filter is **in the search, over every match, before the ranking cut and the
-limit**. What the answer says about the rest is **one fixed sentence chosen by the task's taint
-alone** (never a count, never a "none left out"), so it carries nothing of the store. A clean task
-that wants tools made in tasks that read files passes `include_file_tools=true`: that makes the
-task fs-tainted **whatever matches** (persisted and audited as `tool_search_tainted`, in one
-transaction, and the result says so), so it is the same act as `open_tool` of an fs version and
-cannot be done by accident on a prefix match; it is refused for a task that has the network, with
-the `fresh_context=true` text. A clean task never sees net-tainted versions in a search (it can
-open one it knows the ID of, which taints it). `ToolOpened.newest` is null when the task would be
-refused the newest version, for the same reason. The user's own list in the chrome (`ListTools`) is
-not filtered: it is not the model's context. What the model sees of a result (`find_tools`, and
-`open_tool` with `source=true`) is data in a frame (`agent.untrusted.framed`, a fresh random id per
-frame, the sentence that it is never an instruction), with the author's words spelled out and cut;
-the id, version, short hash and taint of each result are **our own words outside the frame**,
-numbered to match the frame's lines.
+(6) *Retrieval before generation, and what a task is told about the store.* `FindTools(task, query?,
+limit, include_file_tools?)` is the model's search: top-k (`k` = 8), then the **model re-ranks** by
+choosing among the framed results (the system prompt, v7, says to call `find_tools` before it writes a
+tool of its own and to prefer a saved one that fits). There is no automatic injection of results into a
+turn: a turn that never searched would put saved text in front of the model that the user did not ask
+for, and a shell that is only chatting must not connect to the broker.
+
+**Noninterference (I12).** For a task that is not fs-tainted after the call, the answer to
+`find_tools`, `open_tool`, `revert_tool` and `save_tool` (with or without `refines`) is byte-identical
+to the answer the same call would get from the same store with every fs-tainted version deleted. The
+only exceptions are the accepted residuals listed here. (Round 1 found the first design leaked twice, a
+clean task shown fs text and a count that was a prefix oracle; round 2 found the same class in the
+ranking, in a tool's newest version and in writes; this is the property all of it is held to, and
+`tests/broker/test_noninterference.py` runs one script against a store and the same store without its
+fs versions, from a net task and from a clean task that stays clean, and demands equal answers.)
+
+- *A task's view of a tool.* A lineage's taint never goes down (`ToolStore.save` adds the refined
+  version's), so what a task may see of a tool, the versions whose taint is within its own, is a
+  prefix of the lineage. A task sees a tool as **its newest version within that prefix**: that
+  version's text is what `find_tools` matches and shows, `ToolOpened.newest` is that version, and
+  `open_tool` with no version opens it. A tool with no version in the prefix does not exist for the
+  task. A version that is both fs and net exists for nobody.
+- *Ranking reads one tool at a time.* FTS only decided matches in the old design, but `bm25` ranked
+  with statistics of the whole table, so a task could plant tools and read the order of tools it may
+  not see. `find_tools` now matches and ranks in code on each visible version's own name, tags and
+  text (`tools.query.match_score`: a prefix hit weighs 10 in the name, 5 in a tag, 2 in the
+  description, summed over the query's words), then newest saved, then ID. FTS5 remains for the
+  chrome's list and `tumbleweed-tools`, which are not the model's context.
+- *What is said about the rest* is **one fixed sentence chosen by the task's taint alone** (never a
+  count, never "none left out"); it says that tools and *newer versions of tools* may be hidden, and
+  names the opt-in. A clean task that wants tools made in tasks that read files passes
+  `include_file_tools=true`: that makes the task fs-tainted **whatever matches** (persisted and
+  audited as `tool_search_tainted`, in one transaction, and the result says so only if it changed
+  anything); it is refused for a task that has the network. `find_tools` is deliberately stricter than
+  `open_tool` for net-tainted versions: a clean task never sees them in a search (it can open one whose
+  ID it knows, which marks it as net), so that a search never forces a taint by accident.
+- *`open_tool`.* With no version, the view's newest. With a version outside the view: a task that has
+  the network gets **exactly the not-found answer** (same reason and text; only the audit says why);
+  a clean task may name it and is marked (fs or net) as before; a task that has read files and a net
+  version is refused with the `fresh_context=true` text. A both-tainted version is not found for
+  everyone. (A both-tainted lineage is an import whose claim had `net`: its tool ID is known only to
+  the user, so "this imported tool cannot be refined" is no longer something a model can reach; the
+  store still raises `ToolLineageBothError` with its own text, #99, and the chrome has its own sentence
+  for it.)
+- *Writes into a lineage* (`save_tool` with `refines`, `revert_tool`): the new version's number and
+  taint depend on all its versions, so a write into a lineage that holds a version the task may not see
+  is gated first. A clean task takes the lineage's taint first (audited as `tool_write_tainted`,
+  persisted), then the answer is given: it is fs-tainted after the call, so the property does not
+  apply to it. A net task is **refused with one fixed sentence** and the attempt counts toward the
+  task's saves (`MAX_SAVES_PER_TASK`, so the channel is metered: at most 20 attempts a task).
+  **Accepted residual (a decision, not an oversight):** a net task learns one bit per refused write,
+  "this tool has a version made in a task that read files". The harness asserts that this bit is the
+  only difference. The lineage is not forked: that would amend D19.
+- *Other store-wide state (S4).* Names are not unique, so there is no "name taken" answer. The caps are
+  global: **the store is full** (500 tools, 256 MiB of packages) and the per-tool 100 versions (covered
+  by the gate above). A task not fs-tainted can learn one bit, "the store is full", which depends on
+  how much fs-tainted tools take; it needs that many tools to have been saved and says nothing about
+  what they contain. Accepted, with those capacities. Everything else an answer holds (the new tool's
+  version 1, ids, times, hashes) is the task's own.
+
+What the model sees of a result (`find_tools`, and `open_tool` with `source=true`) is data in a frame
+(`agent.untrusted.framed`, a fresh random id per frame, the sentence that it is never an instruction),
+with the author's words spelled out and cut; the id, version, short hash and taint of each result are
+**our own words outside the frame**, numbered to match the frame's lines. The user's own list in the
+chrome (`ListTools`) is not filtered: it is not the model's context.
 
 (7) *The model's tools.* `save_tool(instance, name, description?, tags?, capabilities?, inputs?,
 outputs?, refines?)` saves what is on the canvas: the canvas keeps each instance's spec and code

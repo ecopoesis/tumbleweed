@@ -143,7 +143,7 @@ READS: tuple[tuple[str, Call], ...] = (
     ("open an fs-only tool", open_("Y")),
     ("open another visible tool", open_("Z")),
 )
-# A clean task that names an fs version is marked by it (D30 (6)): the property does not hold for it.
+# A clean task that names an fs version is marked by it (D30 (6)): the property is not for it.
 NET_ONLY: tuple[tuple[str, Call], ...] = (
     ("open a version that is fs", open_("X", 2)),
     ("open an fs version of a tool by number", open_("X", 3)),

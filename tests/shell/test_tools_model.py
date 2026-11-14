@@ -281,3 +281,9 @@ def test_the_chrome_says_refusals_in_its_own_words_not_the_models() -> None:
         _refusal(BrokerRefused("not_found", "x")).text
         == "Not done: that tool or version is not stored."
     )
+
+    from tumbleweed.broker.toolflow import LINEAGE_BOTH_TEXT
+
+    both = _refusal(BrokerRefused("denied", LINEAGE_BOTH_TEXT)).text
+    assert "cannot be changed" in both
+    assert "new task" not in both  # a fresh task would not help

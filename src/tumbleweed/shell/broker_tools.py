@@ -18,6 +18,7 @@ from tumbleweed.agent.saved_tools import FetchedTool, open_with
 from tumbleweed.agent.tasks import TaskSession
 from tumbleweed.agent.tools import ToolError
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
+from tumbleweed.broker.toolflow import LINEAGE_BOTH_TEXT
 from tumbleweed.core.ids import GrantId, ToolId
 from tumbleweed.core.types import ToolVersion
 from tumbleweed.ipc.tool_messages import ToolGrantInfo, ToolSummary
@@ -51,8 +52,16 @@ _REFUSED: Final[dict[str, str]] = {
 _REFUSED_OTHERWISE: Final = "Not done: the broker would not."
 
 
+_LINEAGE_BOTH: Final = (
+    "Not done: this tool came from a file that claims both file and network use, so it cannot be "
+    "changed. Save a new tool instead."
+)
+
+
 def _refusal(refusal: BrokerRefused) -> ToolsOutcome:
     """Our own sentence for a refusal: the broker's text is written for the model."""
+    if refusal.message == LINEAGE_BOTH_TEXT:
+        return ToolsOutcome("refused", _LINEAGE_BOTH)
     return ToolsOutcome("refused", _REFUSED.get(refusal.reason, _REFUSED_OTHERWISE))
 
 

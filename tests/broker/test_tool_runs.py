@@ -615,6 +615,44 @@ class TestToolGrants:
 
         run(scenario)
 
+    def test_expired_tool_grants_do_not_count_toward_the_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("tumbleweed.broker.service.MAX_TOOL_GRANTS", 1)
+
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task, opened = await opened_tool(client)
+                rig.prompts.answers.append(
+                    Allowed(
+                        scope=GrantScope.TOOL,
+                        picked=str(rig.home / "Photos"),
+                        expires_at=rig.clock.now + timedelta(minutes=5),
+                    )
+                )
+                await client.request_grant(
+                    task,
+                    RunId.new(),
+                    PickAccess(kind="fs.pick", choose="folder"),
+                    "x",
+                    origin_of(opened),
+                )
+                rig.clock.advance(timedelta(minutes=6))
+                rig.prompts.answers.append(Allowed(scope=GrantScope.TASK, picked=str(rig.home)))
+
+                await client.request_grant(
+                    task,
+                    RunId.new(),
+                    PickAccess(kind="fs.pick", choose="folder"),
+                    "x",
+                    origin_of(opened),
+                )
+
+                assert GrantScope.TOOL in rig.prompts.asked[-1].scopes  # the dead one took no room
+
+        run(scenario)
+
     def test_a_binding_for_an_instance_the_task_no_longer_remembers_is_refused(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
