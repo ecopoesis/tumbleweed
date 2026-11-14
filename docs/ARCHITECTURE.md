@@ -252,9 +252,27 @@ shell, voice or `gi` (section 10).
   grants where one is the other or inside it, only the outer is mounted
   (`tumbleweed.broker.compose.disjoint_mounts`).
 - **Flags.** `--unshare-all --unshare-user --disable-userns --die-with-parent --new-session
-  --clearenv --cap-drop ALL`, plus a hostname of its own. There is no network option until S22:
-  the sandbox's `lo` is its own, and no host interface, host loopback or host abstract socket is
-  there.
+  --clearenv --cap-drop ALL`, plus a hostname of its own and an explicit `--unshare-net`
+  (`--share-net` is nowhere). Without `net.full` the sandbox's `lo` is its own, and no host
+  interface, host loopback or host abstract socket is there, and no `/etc/resolv.conf`.
+- **The network (S22, D29).** A run whose policy has `network` (the broker sets it when a `net.full`
+  grant applies to the run, and then mounts no file grant and no input: `SandboxPolicy` refuses the
+  combination, I12) starts bwrap with `--info-fd` and `--block-fd`, `--uid 0 --gid 0` (slirp4netns's
+  own sandbox needs `setegid(0)` in the target's user namespace; the caps are dropped all the same).
+  `tumbleweed.sandbox.network.NetworkLink` reads the child's PID and namespace ids, **refuses if the
+  network namespace is the launcher's own or is not reported**, starts `slirp4netns --configure
+  --disable-host-loopback --enable-sandbox --enable-seccomp --ready-fd --exit-fd <pid> tap0` with an
+  empty environment, waits for its ready byte and only then writes to the block pipe, so the payload
+  runs with the network up and never before. 10 s bounds the whole setup. Any failure (no
+  slirp4netns, a tap that does not come up, a bwrap that ends, a timeout) raises
+  `SandboxNetworkError`, kills bwrap's process group and the sandbox's init (held on the block pipe,
+  which does not yet die with its parent) before the pipe closes, and the broker refuses the run with
+  fixed text; nothing falls back. slirp4netns is killed and reaped on every path out of the run, and
+  ends by itself if the broker dies (its exit pipe). DNS is slirp4netns's resolver at 10.0.2.3 and the
+  run's `/etc/resolv.conf` (a memfd, read-only, readable by Landlock) says so. The host's loopback is
+  unreachable (`--disable-host-loopback`: 10.0.2.2 fails) and so are its abstract unix sockets
+  (the namespace); everything else the host can reach, including its LAN, is reachable, because that
+  is what `net.full` is (#31 is the narrower grant, post-v1).
 - **Environment.** Empty, plus the variables the policy lists, each of which must be on the
   policy's allowlist (otherwise the policy is refused, not trimmed). A name that looks like a
   secret (`key`, `token`, `secret`, `passw`, `credential`, `auth`, `anthropic`) is refused even on
