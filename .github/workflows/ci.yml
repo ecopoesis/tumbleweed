@@ -23,7 +23,10 @@ jobs:
   linux:
     name: Linux (full suite in the container)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The image build plus the full suite took 28-29 minutes on main by S22 and grows with every
+    # step, so 30 cancelled runs that were passing (#161). Hangs are still caught per test by
+    # pytest-timeout (120 s).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
