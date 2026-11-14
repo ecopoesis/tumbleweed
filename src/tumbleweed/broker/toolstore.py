@@ -28,11 +28,12 @@ bundle cannot appear as a newer version of a tool the user has. It carries no gr
 tool that was imported is granted again like any other version, since a grant binds to its hash.
 
 **Taint (I12).** `ToolRecord.taint` is what open and grant decisions must read (S24): for a saved
-version the taint of its task; for an imported one **the package's claim plus `fs`**
-(`effective_taint`), because a bundle is file input that a task which could read files and write
-one may have made, with their content in it, claiming none. The package keeps its claim (so the
-hash is the bundle's, and export and import are hash-stable) and `claimed_taint` records it for
-display. `open` refuses a version whose index taint is not what its origin and package give.
+version the taint of its task together with that of the version it refines; for an imported one
+**the package's claim plus `fs`** (`effective_taint`), because a bundle is file input that a task
+which could read files and write one may have made, with their content in it, claiming none. The
+package keeps its claim (so the hash is the bundle's, and export and import are hash-stable) and
+`claimed_taint` records it for display. `open` refuses a version whose index taint is not what its
+origin, package and lineage give.
 
 **Bounds (I9).** At most `MAX_TOOLS` tools, `MAX_VERSIONS_PER_TOOL` versions of one and
 `MAX_STORE_BYTES` of packages; beyond that a save or import is refused (`ToolStoreFullError`), not
@@ -51,6 +52,7 @@ from typing import Final, Literal, assert_never, final
 from tumbleweed.broker.errors import (
     ToolBlobError,
     ToolConflictError,
+    ToolLineageBothError,
     ToolNotFoundError,
     ToolStoreFullError,
     ToolTaintConflictError,
@@ -202,6 +204,8 @@ class ToolStore:
             identifier = tool
             previous = self._store.tool_record(tool, latest)
             refines = frozenset() if previous is None else previous.taint
+            if len(refines) > 1:
+                raise ToolLineageBothError("the tool carries both file and network taint")
             if len(taint | refines) > 1:
                 raise ToolTaintConflictError("the task's taint and the tool's cannot be combined")
             try:
@@ -265,6 +269,10 @@ class ToolStore:
         return record
 
     # --- reads -----------------------------------------------------------------------------
+
+    def versions(self, tool: ToolId) -> list[ToolRecord]:
+        """Every stored version of `tool`, newest first (at most `MAX_VERSIONS_PER_TOOL`)."""
+        return self._store.tool_versions(tool, MAX_VERSIONS_PER_TOOL)
 
     def find(self, query: str | None, limit: int = MAX_RESULTS) -> list[ToolRecord]:
         """The newest version of the tools that match `query` (name, description and tags), best

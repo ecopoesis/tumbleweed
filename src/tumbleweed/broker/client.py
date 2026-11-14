@@ -29,6 +29,7 @@ from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId
 from tumbleweed.core.types import ToolVersion, WorkspaceRelPath
 from tumbleweed.ipc.broker_messages import (
+    MODEL_ORIGIN,
     DirListing,
     EndTask,
     EnvPair,
@@ -49,6 +50,7 @@ from tumbleweed.ipc.broker_messages import (
     Revoked,
     RevokeGrant,
     RunInSandbox,
+    RunOrigin,
     RunResult,
     SnapshotList,
     StartTask,
@@ -73,13 +75,25 @@ from tumbleweed.ipc.peercred import PeerCredentialsProvider
 from tumbleweed.ipc.sockdir import SocketPath
 from tumbleweed.ipc.tool_messages import (
     ExportTool,
+    FindTools,
     ImportTool,
+    ListToolGrants,
     ListTools,
+    ListToolVersions,
+    OpenTool,
+    RevertTool,
+    RevokeToolGrant,
+    SaveTool,
     ShowTool,
     ToolBundle,
+    ToolGrantList,
     ToolImported,
     ToolList,
+    ToolMatches,
+    ToolOpened,
     ToolShown,
+    ToolStored,
+    ToolVersions,
 )
 
 _log = logging.getLogger(__name__)
@@ -204,11 +218,22 @@ class BrokerClient:
         return await self._ask(EndTask(kind="end_task", task=task), TaskEnded)
 
     async def request_grant(
-        self, task: TaskId, run: RunId, access: RequestedAccess, reason: str
+        self,
+        task: TaskId,
+        run: RunId,
+        access: RequestedAccess,
+        reason: str,
+        origin: RunOrigin = MODEL_ORIGIN,
     ) -> GrantOutcome:
-        """Ask for `access` for `run`; the user decides. A denial is an outcome, not an error."""
+        """Ask for `access` for `run`; the user decides. A denial is an outcome, not an error.
+        `origin` is what started the run: the model's tools never pass one (D30 (2))."""
         request = RequestGrant(
-            kind="request_grant", task=task, run=run, access=access, reason=reason
+            kind="request_grant",
+            task=task,
+            run=run,
+            access=access,
+            reason=reason,
+            origin=origin,
         )
         return await self._ask(request, GrantOutcome, wait=PROMPT_WAIT)
 
@@ -273,6 +298,7 @@ class BrokerClient:
         cpu_seconds: int = 30,
         max_output_bytes: int = 64 * 1024,
         payload: str | None = None,
+        origin: RunOrigin = MODEL_ORIGIN,
     ) -> RunResult:
         request = RunInSandbox(
             kind="run_in_sandbox",
@@ -284,6 +310,7 @@ class BrokerClient:
             cpu_seconds=cpu_seconds,
             max_output_bytes=max_output_bytes,
             payload=payload,
+            origin=origin,
         )
         wait = timedelta(seconds=wall_seconds) + _RUN_SETUP
         return await self._ask(request, RunResult, wait=wait)
@@ -322,6 +349,51 @@ class BrokerClient:
     async def import_tool(self, bundle: str) -> ToolImported:
         """Add the tool in `bundle` (the text of a bundle file) to the store."""
         return await self._ask(ImportTool(kind="import_tool", bundle=bundle), ToolImported)
+
+    async def save_tool(
+        self, task: TaskId, draft: str, *, tool: ToolId | None = None
+    ) -> ToolStored:
+        """Save `draft` (the JSON text of a `ToolDraft`) from `task`: a new tool, or the next
+        version of `tool`. The taint is the broker's record of the task (S24)."""
+        return await self._ask(
+            SaveTool(kind="save_tool", task=task, draft=draft, tool=tool), ToolStored
+        )
+
+    async def revert_tool(self, task: TaskId, tool: ToolId, version: ToolVersion) -> ToolStored:
+        """Save a copy of `version` of `tool` as its newest version."""
+        return await self._ask(
+            RevertTool(kind="revert_tool", task=task, tool=tool, version=version), ToolStored
+        )
+
+    async def open_tool(
+        self, task: TaskId, tool: ToolId, version: ToolVersion | None = None
+    ) -> ToolOpened:
+        """Open a stored version into `task` (its taint is checked and raised by the broker)."""
+        return await self._ask(
+            OpenTool(kind="open_tool", task=task, tool=tool, version=version), ToolOpened
+        )
+
+    async def find_tools(
+        self, task: TaskId, query: str | None = None, *, limit: int | None = None
+    ) -> ToolMatches:
+        """The model's search: what `task` may see of the stored tools matching `query`."""
+        if limit is None:
+            return await self._ask(
+                FindTools(kind="find_tools", task=task, query=query), ToolMatches
+            )
+        return await self._ask(
+            FindTools(kind="find_tools", task=task, query=query, limit=limit), ToolMatches
+        )
+
+    async def list_tool_versions(self, tool: ToolId) -> ToolVersions:
+        return await self._ask(ListToolVersions(kind="list_tool_versions", tool=tool), ToolVersions)
+
+    async def list_tool_grants(self) -> ToolGrantList:
+        return await self._ask(ListToolGrants(kind="list_tool_grants"), ToolGrantList)
+
+    async def revoke_tool_grant(self, grant: GrantId) -> Revoked:
+        """Revoke a tool grant: the user's chrome action, never a model tool."""
+        return await self._ask(RevokeToolGrant(kind="revoke_tool_grant", grant=grant), Revoked)
 
 
 type Spawn = Callable[[], Awaitable[object]]

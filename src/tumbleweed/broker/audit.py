@@ -36,7 +36,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, V
 
 from tumbleweed.broker.errors import AuditError
 from tumbleweed.broker.privatefs import open_private_directory, open_private_file
-from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId
+from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId, ToolInstanceId
 from tumbleweed.core.types import ContentHash, ToolVersion
 
 _log = logging.getLogger(__name__)
@@ -118,7 +118,7 @@ class GrantDecision(_AuditModel):
     path: PathText | None
     outcome: Literal["covered", "granted", "denied"]
     grant: GrantId | None
-    scope: Literal["once", "task"] | None
+    scope: Literal["once", "task", "tool"] | None
     reason: Text | None
     model_reason: Text | None = None
     expires_at: AwareDatetime | None = None
@@ -143,7 +143,7 @@ class GrantRevoked(_AuditModel):
     kind: Literal["grant_revoked"] = "grant_revoked"
     task: TaskId | None
     grant: GrantId
-    reason: Literal["requested", "task_ended"]
+    reason: Literal["requested", "task_ended", "revoked_by_user"]
 
 
 class SandboxRun(_AuditModel):
@@ -227,6 +227,32 @@ class ToolSaved(_AuditModel):
     origin: Literal["saved", "imported"]
     task: TaskId | None
     claimed_taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=1)] = ()
+    reverted_from: ToolVersion | None = None  # S24: this version is a copy of that one
+
+
+class ToolOpened(_AuditModel):
+    """A stored version was opened into a task (S24, D30 (4)): the task's taint was checked against
+    the version's and raised to `task_taint` (what it became). `instance` is the ID the broker gave
+    the shown tool, which a later run's binding must name. Written before the task's taint is."""
+
+    kind: Literal["tool_opened"] = "tool_opened"
+    task: TaskId
+    tool: ToolId
+    version: ToolVersion
+    hash: ContentHash
+    instance: ToolInstanceId
+    taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=2)]  # of the version
+    task_taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=1)]
+
+
+class ToolOpenRefused(_AuditModel):
+    """An `open_tool` the taint rule refused (I12): `reason` is closed, nothing else is kept."""
+
+    kind: Literal["tool_open_refused"] = "tool_open_refused"
+    task: TaskId
+    tool: ToolId
+    version: ToolVersion
+    reason: Literal["both_taints", "fs_in_net_task", "net_in_fs_task"]
 
 
 class ToolExported(_AuditModel):
@@ -340,6 +366,8 @@ type AuditEntry = Annotated[
     | SandboxRunResult
     | WorkspaceDeleted
     | ToolSaved
+    | ToolOpened
+    | ToolOpenRefused
     | ToolExported
     | ToolImportRefused
     | SnapshotTaken

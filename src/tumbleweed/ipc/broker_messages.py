@@ -16,12 +16,12 @@ broker cannot make sense of at all (a body the schema refuses) is the connection
 `Refused`.
 """
 
-from typing import Annotated, Final, Literal, final
+from typing import Annotated, Final, Literal, Self, final
 
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, model_validator
 
-from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId
-from tumbleweed.core.types import WorkspaceRelPath
+from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId, ToolInstanceId
+from tumbleweed.core.types import ContentHash, WorkspaceRelPath
 from tumbleweed.ipc.base import IpcMessage, Request, Response
 
 MAX_REASON_CHARS: Final = 500
@@ -46,7 +46,7 @@ def _base64_chars(raw_bytes: int) -> int:
 
 
 Taint = Literal["fs", "net"]
-Scope = Literal["once", "task"]
+Scope = Literal["once", "task", "tool"]
 
 RefusalReason = Literal[
     "unknown_task",  # not a live task of this connection
@@ -67,6 +67,44 @@ RefusalReason = Literal[
     "not_undoable",  # S21: nothing to undo that can be: ran with no undo, already undone
     "unknown_prompt",  # not a prompt this connection was sent, or one already answered or closed
 ]
+
+
+# --- what started a run (S24, D30 (1)) --------------------------------------------------------
+
+
+@final
+class WireBinding(IpcMessage):
+    """The saved tool a run executes, as the shell says it: the instance the broker made when it
+    opened the tool into the task (`OpenTool`), the tool and the hash of the version. The broker
+    checks every part against what it recorded and against its store (I8); none is believed."""
+
+    instance: ToolInstanceId
+    tool: ToolId
+    content_hash: ContentHash
+
+
+@final
+class RunOrigin(IpcMessage):
+    """What started a run, and the saved tool it runs (D30 (1), (2)).
+
+    `model` (the default, with no binding) is `run_code` and the model's own broker calls, and
+    also the handler runs of a tool that was not opened from the store. `user_event` is the
+    shell's claim that a direct input event on a widget of a stored tool's instance started it: it
+    needs a binding, and the broker accepts it only for a run whose code it built itself
+    (`RunInSandbox`) or for the user's own chrome (`RequestGrant`). Only the tool grants look at it.
+    """
+
+    trigger: Literal["model", "user_event"] = "model"
+    binding: WireBinding | None = None
+
+    @model_validator(mode="after")
+    def _a_user_event_names_a_tool(self) -> Self:
+        if self.trigger == "user_event" and self.binding is None:
+            raise ValueError("a user-triggered run names the saved tool it belongs to")
+        return self
+
+
+MODEL_ORIGIN: Final = RunOrigin()
 
 
 # --- tasks -----------------------------------------------------------------------------------
@@ -191,6 +229,7 @@ class RequestGrant(Request):
     run: RunId
     access: RequestedAccess
     reason: Annotated[str, Field(max_length=MAX_REASON_CHARS)]
+    origin: RunOrigin = MODEL_ORIGIN
 
 
 @final
@@ -245,6 +284,7 @@ class ReadFile(Request):
     run: RunId
     path: Annotated[str, Field(min_length=1, max_length=MAX_PATH_CHARS)]
     max_bytes: Annotated[int, Field(ge=1, le=MAX_FILE_BYTES)] = MAX_FILE_BYTES
+    origin: RunOrigin = MODEL_ORIGIN
 
 
 @final
@@ -273,6 +313,7 @@ class ListDir(Request):
     task: TaskId
     run: RunId
     path: Annotated[str, Field(min_length=1, max_length=MAX_PATH_CHARS)]
+    origin: RunOrigin = MODEL_ORIGIN
 
 
 @final
@@ -324,6 +365,9 @@ class RunInSandbox(Request):
     payload: Annotated[str, Field(max_length=MAX_PAYLOAD_CHARS)] | None = None
     """Text the program reads as the file `/tw-payload` (S20): its code and inputs. Never an
     argument, so it is not on the host's process list."""
+    origin: RunOrigin = MODEL_ORIGIN
+    """With a binding (S24, D30 (3)) the run is a stored tool's handler: `command` is the shim's
+    and `payload` the handler document with an empty `code`; the broker puts the stored code in."""
 
 
 @final

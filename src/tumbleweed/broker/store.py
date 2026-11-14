@@ -112,7 +112,8 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     # S23: the tool store's index. A package is a file (`toolblobs`); these rows say which exist,
     # and the name, description and tags are copies of the package's own, for listing and search
     # (a read that opens a package checks them against it). `taint` is what a decision must use: for
-    # a saved version it is the package's own, for an imported one the package's claim plus `fs`
+    # a saved version it is its task's plus that of the version it refines (its lineage), for an
+    # imported one the package's claim plus `fs`
     # (an imported package is user-filesystem input of unknown provenance, I12); `claimed_taint` is
     # the package's own, for display. `tool_search` indexes the newest
     # version of each tool, under the rowid of its `tools` row.
@@ -963,6 +964,14 @@ class BrokerStore:
                 (str(tool), int(version)),
             )
         return self._tool_row(rows[0]) if rows else None
+
+    def tool_versions(self, tool: ToolId, limit: int) -> list[ToolRecord]:
+        """The stored versions of `tool`, newest first, at most `limit` (S24's history)."""
+        return self._tools(
+            f"{_TOOL_COLUMNS} FROM tools t JOIN tool_versions v ON v.tool = t.seq "
+            "WHERE t.id = ? ORDER BY v.version DESC LIMIT ?",
+            (str(tool), _limit(limit)),
+        )
 
     def insert_tool_version(self, record: ToolRecord) -> None:
         """Add a version (inside `transaction()`). A new tool gets a row of its own; the next

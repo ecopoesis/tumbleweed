@@ -1,4 +1,5 @@
-"""The messages of the tool store (S23): list and search, show, export and import.
+"""The messages of the tool store: list and search, show, export and import (S23); save, revert,
+open, find, version history and tool grants (S24, D30).
 
 Registered in `tumbleweed.ipc.messages`, and like the rest of the broker's messages (see
 `broker_messages`) wire types that name IDs, bounded text and closed `Literal`s, never the
@@ -14,14 +15,15 @@ A bundle is validated by the broker, not by this schema: a request whose bundle 
 schema ends the connection as any malformed frame does, and one that is within it but not an
 acceptable bundle is answered `Refused`.
 
-There is no `save_tool` here: saving is the model's tool and the task's taint, S24's.
+A save, a revert and an open name a task: the taint of a stored version is the broker's to decide
+against the task's, never the shell's (I12).
 """
 
 from typing import Annotated, Final, Literal, final
 
 from pydantic import AwareDatetime, Field
 
-from tumbleweed.core.ids import ToolId
+from tumbleweed.core.ids import GrantId, TaskId, ToolId, ToolInstanceId
 from tumbleweed.core.types import ContentHash, ToolVersion
 from tumbleweed.ipc.base import IpcMessage, Request, Response
 from tumbleweed.tools.limits import (
@@ -38,14 +40,20 @@ from tumbleweed.tools.limits import (
 Taint = Literal["fs", "net"]
 
 MAX_LISTED: Final = MAX_RESULTS
+MAX_FOUND: Final = 8
+"""How many matches the model is shown (top-k before it re-ranks, D30 (6))."""
+MAX_VERSIONS_LISTED: Final = 100
+MAX_TOOL_GRANTS_LISTED: Final = 100
+MAX_GRANT_PATH_CHARS: Final = 4096
 
 
 @final
 class ToolSummary(IpcMessage):
     """One stored version of a tool, as the index lists it. `name`, `description` and `tags` are
     the author's text (the model's, usually): bounded, and not to be shown as the broker's own.
-    `taint` is the taint a decision must use (I12): for a saved version the task's, for an imported
-    one its claim plus `fs`; `claimed_taint` is what the package itself records."""
+    `taint` is the taint a decision must use (I12): for a saved version the task's together with
+    that of the version it refines (a lineage never gets cleaner), for an imported one its claim
+    plus `fs`; `claimed_taint` is what the package itself records."""
 
     tool: ToolId
     version: ToolVersion
@@ -130,3 +138,136 @@ class ToolImported(Response):
     kind: Literal["tool_imported"]
     summary: ToolSummary
     created: bool
+
+
+# --- saving, opening, finding (S24, D30) -----------------------------------------------------
+
+
+@final
+class SaveTool(Request):
+    """Store `draft` (the canonical JSON text of a `ToolDraft`) as a new tool, or, with `tool`, as
+    the next version of that tool, saved from `task`. The taint is the broker's record of the task,
+    never the request's. `draft` is hostile input: the broker parses it as strictly as a bundle."""
+
+    kind: Literal["save_tool"]
+    task: TaskId
+    draft: Annotated[str, Field(max_length=MAX_PACKAGE_BYTES)]
+    tool: ToolId | None = None
+
+
+@final
+class RevertTool(Request):
+    """Store a copy of `version` of `tool` as its next version, saved from `task` (D30 (5))."""
+
+    kind: Literal["revert_tool"]
+    task: TaskId
+    tool: ToolId
+    version: ToolVersion
+
+
+@final
+class ToolStored(Response):
+    """A version was stored: `summary` is the new one."""
+
+    kind: Literal["tool_stored"]
+    summary: ToolSummary
+
+
+@final
+class OpenTool(Request):
+    """Open one stored version (the newest if `version` is null) into `task`, to be shown. The
+    broker checks the version's taint against the task's, raises the task's taint, and names the
+    instance that must be shown (D30 (4))."""
+
+    kind: Literal["open_tool"]
+    task: TaskId
+    tool: ToolId
+    version: ToolVersion | None = None
+
+
+@final
+class ToolOpened(Response):
+    """What to show: `instance` is the broker's own ID for it (a binding is accepted only for it),
+    `document` the package's canonical JSON, untrusted data like `ToolShown.document`. `taint` is
+    the task's taint after the open."""
+
+    kind: Literal["tool_opened"]
+    instance: ToolInstanceId
+    summary: ToolSummary
+    document: Annotated[str, Field(max_length=MAX_PACKAGE_BYTES)]
+    taint: Annotated[tuple[Taint, ...], Field(max_length=1)]
+    newest: ToolVersion
+
+
+@final
+class FindTools(Request):
+    """The model's search (D30 (6)): the best matches for `query` (newest version of each tool),
+    or, with none, the newest saved. Summaries the task must not see (I12) are left out."""
+
+    kind: Literal["find_tools"]
+    task: TaskId
+    query: Annotated[str, Field(max_length=MAX_QUERY_CHARS)] | None = None
+    limit: Annotated[int, Field(ge=1, le=MAX_FOUND)] = MAX_FOUND
+
+
+@final
+class ToolMatches(Response):
+    """`withheld` counts matches left out because of the task's taint."""
+
+    kind: Literal["tool_matches"]
+    tools: Annotated[tuple[ToolSummary, ...], Field(max_length=MAX_FOUND)]
+    withheld: Annotated[int, Field(ge=0, le=MAX_FOUND)]
+
+
+@final
+class ListToolVersions(Request):
+    """The versions of one tool, newest first (the chrome's history)."""
+
+    kind: Literal["list_tool_versions"]
+    tool: ToolId
+
+
+@final
+class ToolVersions(Response):
+    kind: Literal["tool_versions"]
+    versions: Annotated[tuple[ToolSummary, ...], Field(max_length=MAX_VERSIONS_LISTED)]
+
+
+# --- tool grants (S24, D30 (8)) --------------------------------------------------------------
+
+
+@final
+class ToolGrantInfo(IpcMessage):
+    """One stored tool grant, for the chrome's list. `access` is what it allows (`path` is the
+    canonical text of the place, for a file or folder: data to show, never to believe);
+    `tool_name` and `version` come from the index (None if the version is no longer found);
+    `newest` says the grant is for the newest version."""
+
+    grant: GrantId
+    tool: ToolId
+    tool_name: Annotated[str, Field(min_length=1, max_length=MAX_NAME_LENGTH)] | None
+    version: ToolVersion | None
+    newest: bool
+    access: Literal["fs.read", "net.full"]
+    path: Annotated[str, Field(min_length=1, max_length=MAX_GRANT_PATH_CHARS)] | None
+    issued_at: AwareDatetime
+    expires_at: AwareDatetime | None
+
+
+@final
+class ListToolGrants(Request):
+    kind: Literal["list_tool_grants"]
+
+
+@final
+class ToolGrantList(Response):
+    kind: Literal["tool_grant_list"]
+    grants: Annotated[tuple[ToolGrantInfo, ...], Field(max_length=MAX_TOOL_GRANTS_LISTED)]
+
+
+@final
+class RevokeToolGrant(Request):
+    """Revoke a tool grant. The user's own action from the chrome: no model tool sends it."""
+
+    kind: Literal["revoke_tool_grant"]
+    grant: GrantId

@@ -1065,10 +1065,10 @@ as its claim. `open` checks a refinement's taint against its predecessor's.
 that could read files and write one could have made it, with their content in it, under any claim.
 So **an imported package is `fs`-tainted whatever it claims**. The index keeps two fields:
 `taint`, what open and grant decisions **must read** (S24's `open_tool`, tool grants): for a saved
-version the task's taint, for an imported one the claim plus `fs` (so a claim of `net` makes `fs`
+version the task's taint together with that of the version it refines, for an imported one the claim plus `fs` (so a claim of `net` makes `fs`
 and `net`, which no task can hold and which opens nowhere); and `claimed_taint`, what the package
 says, for display (`tumbleweed-tools` shows both). The package itself is not rewritten, so the
-hash is the bundle's. `open` refuses a version whose `taint` is not what its origin and package
+hash is the bundle's. `open` refuses a version whose `taint` is not what its origin, package and lineage
 give. The origin lives in the index (a package cannot record how it came without changing the hash
 it is exported with), so rewriting both fields of an index row is not detected: editing the broker's
 database is out of scope (section 8), as for the grants beside it. Editing a bundle's claim and its
