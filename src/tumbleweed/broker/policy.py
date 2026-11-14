@@ -499,7 +499,8 @@ def _cover(grant: Grant, request: AccessRequest) -> _Cover | None:
 def _scopes_for(run: RunContext, capability: CapabilityKind) -> frozenset[GrantScope]:
     if capability is CapabilityKind.FS_WRITE:
         # A write is bound to the snapshots of the runs that use it, so it is the task's (D28): a
-        # `once` grant is spent by one read and never reaches code, and a tool's write is S24's.
+        # `once` grant is spent by one read and never reaches code, and a tool's write stays the
+        # task's too (D30 (8)).
         return frozenset({GrantScope.TASK})
     scopes = {GrantScope.ONCE, GrantScope.TASK}
     if run.tool is not None and run.trigger is RunTrigger.USER_EVENT:

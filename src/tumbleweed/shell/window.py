@@ -26,10 +26,13 @@ from tumbleweed.agent.canvas import CanvasLink
 from tumbleweed.agent.canvas_events import EventGate, Scheduler
 from tumbleweed.agent.code import BrokerHandlerExecutor
 from tumbleweed.agent.responder import Responder
+from tumbleweed.agent.saved_tools import FetchedTool
 from tumbleweed.agent.tasks import TaskSession
+from tumbleweed.agent.tool_access import BrokerToolAccess
 from tumbleweed.core.ids import TaskId
 from tumbleweed.shell._gi import Adw, Gio, Gtk
 from tumbleweed.shell.broker_prompts import BrokerPrompts
+from tumbleweed.shell.broker_tools import BrokerToolsPort
 from tumbleweed.shell.broker_undo import BrokerUndoPort
 from tumbleweed.shell.canvas import CanvasView
 from tumbleweed.shell.canvas_tools import CanvasTools
@@ -41,6 +44,7 @@ from tumbleweed.shell.prompt_guard import PromptGuard
 from tumbleweed.shell.speech_feed import SpeechFeed
 from tumbleweed.shell.status_strip import StatusStrip
 from tumbleweed.shell.terminal_pane import TerminalPane, default_settings
+from tumbleweed.shell.tools_panel import ToolsPanel
 from tumbleweed.shell.undo_chrome import UndoPanel
 from tumbleweed.shell.viewmodel.chat import ChatController
 from tumbleweed.shell.viewmodel.session import ChatSession, HistoryOpener
@@ -138,6 +142,9 @@ class ShellWindow(Adw.ApplicationWindow):
             if broker_link is None
             else BrokerHandlerExecutor(broker_link, GlibDispatcher()),
             scheduler=None if broker_link is None else GlibScheduler(),
+            tool_access=None
+            if broker_link is None
+            else BrokerToolAccess(broker_link, GlibDispatcher()),
         )
         if canvas_link is not None:
             canvas_link.attach(self.canvas_tools)
@@ -170,10 +177,22 @@ class ShellWindow(Adw.ApplicationWindow):
                 self.transcript.subscribe(self._speech_feed)
 
         # The separator and the panel hide together.
+        # The saved tools (S24) sit above the chat in the side column: a fallback for when the
+        # model is not at hand, hidden until the strip's button opens it. Only with a broker.
+        self.tools_panel: ToolsPanel | None = None
+        side_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        if broker_link is not None and tasks is not None:
+            self.tools_panel = ToolsPanel(
+                BrokerToolsPort(broker_link, GlibDispatcher(), tasks, self._show_stored)
+            )
+            side_column.append(self.tools_panel)
+            self.status_strip.tools_button.set_visible(True)
+            self.status_strip.tools_button.connect("clicked", self._on_tools_clicked)
+        side_column.append(self.chat_panel)
         self._side = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         self._side.set_hexpand(False)
         self._side.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
-        self._side.append(self.chat_panel)
+        self._side.append(side_column)
 
         body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         body.set_vexpand(True)
@@ -266,6 +285,18 @@ class ShellWindow(Adw.ApplicationWindow):
     @property
     def side_panel_visible(self) -> bool:
         return self._side.get_visible()
+
+    def _show_stored(self, fetched: FetchedTool) -> None:
+        """Show a tool the broker opened for the chrome's list, under its instance and task."""
+        package = fetched.package
+        self.canvas_tools.show(
+            package.ui, "stack", fetched.task, tuple(package.modules), fetched.stored
+        )
+
+    def _on_tools_clicked(self, _button: Gtk.Button) -> None:
+        if self.tools_panel is not None and not self.prompt_guard.engaged:
+            self._side.set_visible(True)
+            self.tools_panel.toggle()
 
     def _add_action(self, name: str, handler: Callable[[], None]) -> Gio.SimpleAction:
         action = Gio.SimpleAction.new(name, None)

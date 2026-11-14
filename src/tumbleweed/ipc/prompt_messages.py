@@ -55,7 +55,10 @@ class ShowPrompt(Request):
     task: TaskId
     tool: ToolId | None
     access: PromptedAccess
-    scopes: Annotated[tuple[Scope, ...], Field(min_length=1, max_length=2)]
+    tool_name: Annotated[str, Field(min_length=1, max_length=64)] | None = None
+    """The name of `tool` from the broker's index: the tool's own text, to be shown plain, capped
+    and as the tool's, never as ours (I5)."""
+    scopes: Annotated[tuple[Scope, ...], Field(min_length=1, max_length=3)]
     reason: Annotated[str, Field(max_length=MAX_REASON_CHARS)]
     expires_in_ms: Annotated[int, Field(ge=1, le=MAX_PROMPT_SECONDS * 1000)]
 

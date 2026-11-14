@@ -25,7 +25,8 @@
         "scope": {
           "enum": [
             "once",
-            "task"
+            "task",
+            "tool"
           ],
           "title": "Scope",
           "type": "string"
@@ -411,6 +412,53 @@
       "title": "FileContent",
       "type": "object"
     },
+    "FindTools": {
+      "additionalProperties": false,
+      "description": "The model's search (D30 (6)): the best matches for `query` (newest version of each tool),\nor, with none, the newest saved. Summaries the task must not see (I12) are left out.",
+      "properties": {
+        "include_file_tools": {
+          "default": false,
+          "title": "Include File Tools",
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "find_tools",
+          "title": "Kind",
+          "type": "string"
+        },
+        "limit": {
+          "default": 8,
+          "maximum": 8,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "query": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Query"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task"
+      ],
+      "title": "FindTools",
+      "type": "object"
+    },
     "GrantOutcome": {
       "additionalProperties": false,
       "description": "The answer to `RequestGrant`: granted (`grant`, `scope`), already covered, or denied.\n\n`message` is fixed text that names the rule, never the path. `picked` is the canonical path of\nwhat the user chose in the picker, for a picker grant only (D26 (6), amending D25 (7)): the\nuser chose it to give it to the assistant, and without it a granted folder has no name to\nlist. It is the broker's resolved text, and the receiver frames it as data.",
@@ -460,7 +508,8 @@
             {
               "enum": [
                 "once",
-                "task"
+                "task",
+                "tool"
               ],
               "type": "string"
             },
@@ -535,6 +584,13 @@
           "title": "Kind",
           "type": "string"
         },
+        "origin": {
+          "$ref": "#/$defs/RunOrigin",
+          "default": {
+            "binding": null,
+            "trigger": "model"
+          }
+        },
         "path": {
           "maxLength": 4096,
           "minLength": 1,
@@ -582,6 +638,43 @@
         "kind"
       ],
       "title": "ListSnapshots",
+      "type": "object"
+    },
+    "ListToolGrants": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "list_tool_grants",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "ListToolGrants",
+      "type": "object"
+    },
+    "ListToolVersions": {
+      "additionalProperties": false,
+      "description": "The versions of one tool, newest first (the chrome's history).",
+      "properties": {
+        "kind": {
+          "const": "list_tool_versions",
+          "title": "Kind",
+          "type": "string"
+        },
+        "tool": {
+          "pattern": "^tool_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "tool"
+      ],
+      "title": "ListToolVersions",
       "type": "object"
     },
     "ListTools": {
@@ -723,6 +816,48 @@
         "cause"
       ],
       "title": "NoUndoAccess",
+      "type": "object"
+    },
+    "OpenTool": {
+      "additionalProperties": false,
+      "description": "Open one stored version (the newest if `version` is null) into `task`, to be shown. The\nbroker checks the version's taint against the task's, raises the task's taint, and names the\ninstance that must be shown (D30 (4)).",
+      "properties": {
+        "kind": {
+          "const": "open_tool",
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        },
+        "tool": {
+          "pattern": "^tool_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Tool",
+          "type": "string"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740992,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "tool"
+      ],
+      "title": "OpenTool",
       "type": "object"
     },
     "PickAccess": {
@@ -868,6 +1003,13 @@
           "title": "Max Bytes",
           "type": "integer"
         },
+        "origin": {
+          "$ref": "#/$defs/RunOrigin",
+          "default": {
+            "binding": null,
+            "trigger": "model"
+          }
+        },
         "path": {
           "maxLength": 4096,
           "minLength": 1,
@@ -988,17 +1130,24 @@
               "echo": "#/$defs/Echo",
               "end_task": "#/$defs/EndTask",
               "export_tool": "#/$defs/ExportTool",
+              "find_tools": "#/$defs/FindTools",
               "import_tool": "#/$defs/ImportTool",
               "list_dir": "#/$defs/ListDir",
               "list_snapshots": "#/$defs/ListSnapshots",
+              "list_tool_grants": "#/$defs/ListToolGrants",
+              "list_tool_versions": "#/$defs/ListToolVersions",
               "list_tools": "#/$defs/ListTools",
               "list_workspace": "#/$defs/ListWorkspace",
+              "open_tool": "#/$defs/OpenTool",
               "ping": "#/$defs/Ping",
               "read_file": "#/$defs/ReadFile",
               "read_workspace_file": "#/$defs/ReadWorkspaceFile",
               "request_grant": "#/$defs/RequestGrant",
+              "revert_tool": "#/$defs/RevertTool",
               "revoke_grant": "#/$defs/RevokeGrant",
+              "revoke_tool_grant": "#/$defs/RevokeToolGrant",
               "run_in_sandbox": "#/$defs/RunInSandbox",
+              "save_tool": "#/$defs/SaveTool",
               "show_prompt": "#/$defs/ShowPrompt",
               "show_tool": "#/$defs/ShowTool",
               "start_task": "#/$defs/StartTask",
@@ -1061,6 +1210,27 @@
             },
             {
               "$ref": "#/$defs/ImportTool"
+            },
+            {
+              "$ref": "#/$defs/SaveTool"
+            },
+            {
+              "$ref": "#/$defs/RevertTool"
+            },
+            {
+              "$ref": "#/$defs/OpenTool"
+            },
+            {
+              "$ref": "#/$defs/FindTools"
+            },
+            {
+              "$ref": "#/$defs/ListToolVersions"
+            },
+            {
+              "$ref": "#/$defs/ListToolGrants"
+            },
+            {
+              "$ref": "#/$defs/RevokeToolGrant"
             },
             {
               "$ref": "#/$defs/AnswerPrompt"
@@ -1128,6 +1298,13 @@
           "title": "Kind",
           "type": "string"
         },
+        "origin": {
+          "$ref": "#/$defs/RunOrigin",
+          "default": {
+            "binding": null,
+            "trigger": "model"
+          }
+        },
         "reason": {
           "maxLength": 500,
           "title": "Reason",
@@ -1176,9 +1353,14 @@
               "task_ended": "#/$defs/TaskEnded",
               "task_started": "#/$defs/TaskStarted",
               "tool_bundle": "#/$defs/ToolBundle",
+              "tool_grant_list": "#/$defs/ToolGrantList",
               "tool_imported": "#/$defs/ToolImported",
               "tool_list": "#/$defs/ToolList",
+              "tool_matches": "#/$defs/ToolMatches",
+              "tool_opened": "#/$defs/ToolOpened",
               "tool_shown": "#/$defs/ToolShown",
+              "tool_stored": "#/$defs/ToolStored",
+              "tool_versions": "#/$defs/ToolVersions",
               "undo_result": "#/$defs/UndoResult"
             },
             "propertyName": "kind"
@@ -1230,6 +1412,21 @@
               "$ref": "#/$defs/ToolImported"
             },
             {
+              "$ref": "#/$defs/ToolStored"
+            },
+            {
+              "$ref": "#/$defs/ToolOpened"
+            },
+            {
+              "$ref": "#/$defs/ToolMatches"
+            },
+            {
+              "$ref": "#/$defs/ToolVersions"
+            },
+            {
+              "$ref": "#/$defs/ToolGrantList"
+            },
+            {
               "$ref": "#/$defs/PromptShown"
             },
             {
@@ -1263,6 +1460,41 @@
       "title": "ResponseFrame",
       "type": "object"
     },
+    "RevertTool": {
+      "additionalProperties": false,
+      "description": "Store a copy of `version` of `tool` as its next version, saved from `task` (D30 (5)).",
+      "properties": {
+        "kind": {
+          "const": "revert_tool",
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        },
+        "tool": {
+          "pattern": "^tool_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Tool",
+          "type": "string"
+        },
+        "version": {
+          "maximum": 9007199254740992,
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "tool",
+        "version"
+      ],
+      "title": "RevertTool",
+      "type": "object"
+    },
     "RevokeGrant": {
       "additionalProperties": false,
       "properties": {
@@ -1288,6 +1520,28 @@
         "grant"
       ],
       "title": "RevokeGrant",
+      "type": "object"
+    },
+    "RevokeToolGrant": {
+      "additionalProperties": false,
+      "description": "Revoke a tool grant. The user's own action from the chrome: no model tool sends it.",
+      "properties": {
+        "grant": {
+          "pattern": "^grt_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Grant",
+          "type": "string"
+        },
+        "kind": {
+          "const": "revoke_tool_grant",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "grant"
+      ],
+      "title": "RevokeToolGrant",
       "type": "object"
     },
     "Revoked": {
@@ -1347,6 +1601,13 @@
           "title": "Max Output Bytes",
           "type": "integer"
         },
+        "origin": {
+          "$ref": "#/$defs/RunOrigin",
+          "default": {
+            "binding": null,
+            "trigger": "model"
+          }
+        },
         "payload": {
           "anyOf": [
             {
@@ -1385,6 +1646,34 @@
         "command"
       ],
       "title": "RunInSandbox",
+      "type": "object"
+    },
+    "RunOrigin": {
+      "additionalProperties": false,
+      "description": "What started a run, and the saved tool it runs (D30 (1), (2)).\n\n`model` (the default, with no binding) is `run_code` and the model's own broker calls, and\nalso the handler runs of a tool that was not opened from the store. `user_event` is the\nshell's claim that a direct input event on a widget of a stored tool's instance started it: it\nneeds a binding, and the broker accepts it only for a run whose code it built itself\n(`RunInSandbox`) or for the user's own chrome (`RequestGrant`). Only the tool grants look at it.",
+      "properties": {
+        "binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WireBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "trigger": {
+          "default": "model",
+          "enum": [
+            "model",
+            "user_event"
+          ],
+          "title": "Trigger",
+          "type": "string"
+        }
+      },
+      "title": "RunOrigin",
       "type": "object"
     },
     "RunResult": {
@@ -1489,6 +1778,47 @@
       "title": "RunResult",
       "type": "object"
     },
+    "SaveTool": {
+      "additionalProperties": false,
+      "description": "Store `draft` (the canonical JSON text of a `ToolDraft`) as a new tool, or, with `tool`, as\nthe next version of that tool, saved from `task`. The taint is the broker's record of the task,\nnever the request's. `draft` is hostile input: the broker parses it as strictly as a bundle.",
+      "properties": {
+        "draft": {
+          "maxLength": 409600,
+          "title": "Draft",
+          "type": "string"
+        },
+        "kind": {
+          "const": "save_tool",
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "pattern": "^tool_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "draft"
+      ],
+      "title": "SaveTool",
+      "type": "object"
+    },
     "ShowPrompt": {
       "additionalProperties": false,
       "description": "Ask the user. `scopes` are the grant scopes the user may choose from, `expires_in_ms` how\nlong the broker will wait, from now: the shell denies when it has passed.",
@@ -1548,11 +1878,12 @@
           "items": {
             "enum": [
               "once",
-              "task"
+              "task",
+              "tool"
             ],
             "type": "string"
           },
-          "maxItems": 2,
+          "maxItems": 3,
           "minItems": 1,
           "title": "Scopes",
           "type": "array"
@@ -1573,6 +1904,20 @@
             }
           ],
           "title": "Tool"
+        },
+        "tool_name": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool Name"
         }
       },
       "required": [
@@ -1832,6 +2177,127 @@
       "title": "ToolBundle",
       "type": "object"
     },
+    "ToolGrantInfo": {
+      "additionalProperties": false,
+      "description": "One stored tool grant, for the chrome's list. `access` is what it allows (`path` is the\ncanonical text of the place, for a file or folder: data to show, never to believe);\n`tool_name` and `version` come from the index (None if the version is no longer found);\n`newest` says the grant is for the newest version.",
+      "properties": {
+        "access": {
+          "enum": [
+            "fs.read",
+            "net.full"
+          ],
+          "title": "Access",
+          "type": "string"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Expires At"
+        },
+        "grant": {
+          "pattern": "^grt_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Grant",
+          "type": "string"
+        },
+        "issued_at": {
+          "format": "date-time",
+          "title": "Issued At",
+          "type": "string"
+        },
+        "newest": {
+          "title": "Newest",
+          "type": "boolean"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Path"
+        },
+        "tool": {
+          "pattern": "^tool_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Tool",
+          "type": "string"
+        },
+        "tool_name": {
+          "anyOf": [
+            {
+              "maxLength": 64,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Name"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740992,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Version"
+        }
+      },
+      "required": [
+        "grant",
+        "tool",
+        "tool_name",
+        "version",
+        "newest",
+        "access",
+        "path",
+        "issued_at",
+        "expires_at"
+      ],
+      "title": "ToolGrantInfo",
+      "type": "object"
+    },
+    "ToolGrantList": {
+      "additionalProperties": false,
+      "properties": {
+        "grants": {
+          "items": {
+            "$ref": "#/$defs/ToolGrantInfo"
+          },
+          "maxItems": 100,
+          "title": "Grants",
+          "type": "array"
+        },
+        "kind": {
+          "const": "tool_grant_list",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "grants"
+      ],
+      "title": "ToolGrantList",
+      "type": "object"
+    },
     "ToolImported": {
       "additionalProperties": false,
       "description": "`created` is false if the store already held this very version (nothing changed).",
@@ -1881,6 +2347,108 @@
       "title": "ToolList",
       "type": "object"
     },
+    "ToolMatches": {
+      "additionalProperties": false,
+      "description": "What the task may see. `task_taint` is the task's taint after the call: the one fact the\nanswer says about what was left out, so that nothing in it depends on tools the task must not\nsee (not their text, their number or their rank).",
+      "properties": {
+        "kind": {
+          "const": "tool_matches",
+          "title": "Kind",
+          "type": "string"
+        },
+        "task_taint": {
+          "items": {
+            "enum": [
+              "fs",
+              "net"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Task Taint",
+          "type": "array"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ToolSummary"
+          },
+          "maxItems": 8,
+          "title": "Tools",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "tools",
+        "task_taint"
+      ],
+      "title": "ToolMatches",
+      "type": "object"
+    },
+    "ToolOpened": {
+      "additionalProperties": false,
+      "description": "What to show: `instance` is the broker's own ID for it (a binding is accepted only for it),\n`document` the package's canonical JSON, untrusted data like `ToolShown.document`. `taint` is\nthe task's taint after the open.",
+      "properties": {
+        "document": {
+          "maxLength": 409600,
+          "title": "Document",
+          "type": "string"
+        },
+        "instance": {
+          "pattern": "^inst_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Instance",
+          "type": "string"
+        },
+        "kind": {
+          "const": "tool_opened",
+          "title": "Kind",
+          "type": "string"
+        },
+        "newest": {
+          "anyOf": [
+            {
+              "maximum": 9007199254740992,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Newest"
+        },
+        "raised": {
+          "title": "Raised",
+          "type": "boolean"
+        },
+        "summary": {
+          "$ref": "#/$defs/ToolSummary"
+        },
+        "taint": {
+          "items": {
+            "enum": [
+              "fs",
+              "net"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Taint",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "instance",
+        "summary",
+        "document",
+        "taint",
+        "raised",
+        "newest"
+      ],
+      "title": "ToolOpened",
+      "type": "object"
+    },
     "ToolShown": {
       "additionalProperties": false,
       "description": "The version and its package as canonical JSON text: untrusted data, parsed by whoever\nreads it with `tumbleweed.tools.parse_package`.",
@@ -1907,9 +2475,29 @@
       "title": "ToolShown",
       "type": "object"
     },
+    "ToolStored": {
+      "additionalProperties": false,
+      "description": "A version was stored: `summary` is the new one.",
+      "properties": {
+        "kind": {
+          "const": "tool_stored",
+          "title": "Kind",
+          "type": "string"
+        },
+        "summary": {
+          "$ref": "#/$defs/ToolSummary"
+        }
+      },
+      "required": [
+        "kind",
+        "summary"
+      ],
+      "title": "ToolStored",
+      "type": "object"
+    },
     "ToolSummary": {
       "additionalProperties": false,
-      "description": "One stored version of a tool, as the index lists it. `name`, `description` and `tags` are\nthe author's text (the model's, usually): bounded, and not to be shown as the broker's own.\n`taint` is the taint a decision must use (I12): for a saved version the task's, for an imported\none its claim plus `fs`; `claimed_taint` is what the package itself records.",
+      "description": "One stored version of a tool, as the index lists it. `name`, `description` and `tags` are\nthe author's text (the model's, usually): bounded, and not to be shown as the broker's own.\n`taint` is the taint a decision must use (I12): for a saved version the task's together with\nthat of the version it refines (a lineage never gets cleaner), for an imported one its claim\nplus `fs`; `claimed_taint` is what the package itself records.",
       "properties": {
         "claimed_taint": {
           "items": {
@@ -1999,6 +2587,30 @@
         "saved_at"
       ],
       "title": "ToolSummary",
+      "type": "object"
+    },
+    "ToolVersions": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "tool_versions",
+          "title": "Kind",
+          "type": "string"
+        },
+        "versions": {
+          "items": {
+            "$ref": "#/$defs/ToolSummary"
+          },
+          "maxItems": 100,
+          "title": "Versions",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "versions"
+      ],
+      "title": "ToolVersions",
       "type": "object"
     },
     "UndoLastChange": {
@@ -2109,6 +2721,34 @@
         "snapshot"
       ],
       "title": "UndoSnapshot",
+      "type": "object"
+    },
+    "WireBinding": {
+      "additionalProperties": false,
+      "description": "The saved tool a run executes, as the shell says it: the instance the broker made when it\nopened the tool into the task (`OpenTool`), the tool and the hash of the version. The broker\nchecks every part against what it recorded and against its store (I8); none is believed.",
+      "properties": {
+        "content_hash": {
+          "pattern": "^(?:[0-9a-f]{64})$",
+          "title": "Content Hash",
+          "type": "string"
+        },
+        "instance": {
+          "pattern": "^inst_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Instance",
+          "type": "string"
+        },
+        "tool": {
+          "pattern": "^tool_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Tool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instance",
+        "tool",
+        "content_hash"
+      ],
+      "title": "WireBinding",
       "type": "object"
     },
     "WriteAccess": {

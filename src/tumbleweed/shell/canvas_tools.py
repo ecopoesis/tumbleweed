@@ -22,10 +22,17 @@ from typing import Final, final
 
 from pydantic import JsonValue
 
-from tumbleweed.agent.canvas import Placement, ShownTool, UnknownInstanceError
+from tumbleweed.agent.canvas import (
+    InstanceSource,
+    Placement,
+    ShownTool,
+    StoredBinding,
+    UnknownInstanceError,
+)
 from tumbleweed.agent.canvas_events import AgentEventSink, EventGate, Scheduler
 from tumbleweed.agent.code import HandlerExecutor
 from tumbleweed.agent.handler_runs import HandlerRuns
+from tumbleweed.agent.tool_access import ToolAccess, ToolAccessKind
 from tumbleweed.core.ids import TaskId, ToolInstanceId
 from tumbleweed.shell._gi import Gtk
 from tumbleweed.shell.canvas import CanvasView
@@ -76,6 +83,7 @@ class _Shown:
     task: TaskId | None
     sink: _TaskSink
     runs: HandlerRuns | None
+    source: InstanceSource
 
 
 @final
@@ -94,7 +102,47 @@ class _Notice:
         self._label.set_visible(bool(text))
 
 
-def _card(tool: RenderedTool, notice: Gtk.Label) -> Gtk.Box:
+_ACCESS_BUTTONS: Final[dict[str, tuple[tuple[str, ToolAccessKind], ...]]] = {
+    "fs.read": (
+        ("Choose a file for this tool...", "file"),
+        ("Choose a folder for this tool...", "folder"),
+    ),
+    "net.full": (("Allow the network for this tool...", "network"),),
+}
+"""What the card of a stored tool offers, by what its manifest declares, in our words. `fs.write`
+has none: a write grant is the task's only (D30 (8))."""
+
+
+def _access_row(
+    task: TaskId,
+    stored: StoredBinding,
+    access: ToolAccess,
+    notice: "_Notice",
+) -> Gtk.Box | None:
+    buttons: list[Gtk.Button] = []
+    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+    def clicked(kind: ToolAccessKind) -> None:
+        for each in buttons:
+            each.set_sensitive(False)  # one request at a time; the broker's prompt is the answer
+
+        def done(text: str) -> None:
+            for each in buttons:
+                each.set_sensitive(True)
+            notice.notice(text)
+
+        access.request(task, stored, kind, done)
+
+    for capability in stored.capabilities:
+        for label, kind in _ACCESS_BUTTONS.get(capability, ()):
+            button = Gtk.Button(label=label)
+            button.connect("clicked", lambda _button, kind=kind: clicked(kind))
+            buttons.append(button)
+            row.append(button)
+    return row if buttons else None
+
+
+def _card(tool: RenderedTool, notice: Gtk.Label, access: Gtk.Widget | None = None) -> Gtk.Box:
     card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     card.add_css_class("card")
     card.set_margin_top(12)
@@ -103,6 +151,8 @@ def _card(tool: RenderedTool, notice: Gtk.Label) -> Gtk.Box:
     card.set_margin_end(12)
     card.append(line_label(tool.title, css_classes=["title-3"]))
     card.append(tool.widget)
+    if access is not None:
+        card.append(access)
     card.append(notice)
     return card
 
@@ -119,7 +169,9 @@ class CanvasTools:
         images_for: Callable[[TaskId], ImageResolver] | None = None,
         executor: HandlerExecutor | None = None,
         scheduler: Scheduler | None = None,
+        tool_access: ToolAccess | None = None,
     ) -> None:
+        self._tool_access = tool_access
         self._executor = executor
         self._scheduler = scheduler
         self._canvas = canvas
@@ -145,12 +197,14 @@ class CanvasTools:
         placement: Placement,
         task: TaskId | None = None,
         code: tuple[CodeModule, ...] = (),
+        stored: StoredBinding | None = None,
     ) -> ShownTool:
-        instance = ToolInstanceId.new()
+        instance = ToolInstanceId.new() if stored is None else stored.instance
         sink = _TaskSink(AgentEventSink(instance, self._gate))
         label = line_label("", css_classes=["caption", "dim-label"])
         label.set_visible(False)
         holder: list[UiRuntime] = []
+        notice = _Notice(lambda: holder[0], label)
         runs = (
             None
             if self._executor is None or self._scheduler is None
@@ -159,7 +213,8 @@ class CanvasTools:
                 code=code,
                 executor=self._executor,
                 scheduler=self._scheduler,
-                target=_Notice(lambda: holder[0], label),
+                target=notice,
+                stored=stored,
             )
         )
         runtime = UiRuntime(spec, sandbox=runs, agent=sink)
@@ -170,7 +225,20 @@ class CanvasTools:
             else self._images_for(task)  # the broker's, for the workspace of the instance's task
         )
         tool = RenderedTool(spec, runtime=runtime, images=images)
-        shown = _Shown(instance, tool, _card(tool, label), task, sink, runs)
+        access = (
+            None
+            if stored is None or task is None or self._tool_access is None or runs is None
+            else _access_row(task, stored, self._tool_access, notice)
+        )
+        shown = _Shown(
+            instance,
+            tool,
+            _card(tool, label, access),
+            task,
+            sink,
+            runs,
+            InstanceSource(spec, code, stored, task),
+        )
         keep = 0 if placement == "replace" else MAX_STACKED - 1
         while len(self._shown) > keep:
             self._close(self._shown[0])
@@ -179,6 +247,12 @@ class CanvasTools:
         if self._canvas.content is not self._column:
             self._canvas.set_content(self._column)
         return ShownTool(instance=instance, on_canvas=len(self._shown))
+
+    def source(self, instance: ToolInstanceId) -> InstanceSource:
+        found = next((shown.source for shown in self._shown if shown.instance == instance), None)
+        if found is None:
+            raise UnknownInstanceError(f"no tool {instance} is on the canvas")
+        return found
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
         tool = self.tool(instance)

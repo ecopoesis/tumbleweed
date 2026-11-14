@@ -259,6 +259,25 @@ def build_package(
         raise ToolPackageError(problems_of(error)) from None
 
 
+def draft_of(package: ToolPackage) -> ToolDraft:
+    """The draft a stored package was made from: the same name, text, tags, ports, spec and code,
+    without the ID, version and taint that a save gives (a revert saves a copy, D30 (5))."""
+    manifest = package.manifest
+    try:
+        return ToolDraft(
+            name=manifest.name,
+            description=manifest.description,
+            tags=manifest.tags,
+            capabilities=manifest.capabilities,
+            inputs=manifest.inputs,
+            outputs=manifest.outputs,
+            ui=package.ui,
+            modules=package.modules,
+        )
+    except ValidationError as error:
+        raise ToolPackageError(problems_of(error)) from None
+
+
 def _no_repeated_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     """The `object_pairs_hook` of every parse here: an object that repeats a key, or is wider
     than any model or value allows, is refused (parsers otherwise keep the last value of a
