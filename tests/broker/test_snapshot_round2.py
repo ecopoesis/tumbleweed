@@ -20,6 +20,7 @@ from tests.broker.test_daemon_snapshots import (
     project,
     restored,
     settings,
+    user_undo,
     write_task,
 )
 from tests.broker.test_snapshot_hardening import BLOCKS, stamp, until_set
@@ -90,7 +91,7 @@ def test_a_task_that_runs_and_undoes_in_a_loop_neither_stops_nor_starves_the_oth
             for _ in range(60):
                 rig.clock.advance(timedelta(seconds=1))
                 await client.run_in_sandbox(hostile, RunId.new(), COMMAND)
-                await client.undo_last_change(hostile)
+                await user_undo(client, hostile)
 
             victim = await write_task(rig, client, victim_dir)
             await client.run_in_sandbox(victim, RunId.new(), COMMAND)  # not asked, not refused
@@ -133,7 +134,7 @@ def test_four_tasks_cycling_leave_a_fifth_unaffected() -> None:
                 for task in tasks:
                     rig.clock.advance(timedelta(seconds=1))
                     await client.run_in_sandbox(task, RunId.new(), COMMAND)
-                    await client.undo_last_change(task)
+                    await user_undo(client, task)
             fifth = await write_task(rig, client, places[4])
 
             await client.run_in_sandbox(fifth, RunId.new(), COMMAND)
@@ -201,7 +202,7 @@ def test_the_safety_snapshot_of_an_undo_is_an_anchor_and_is_not_evicted() -> Non
             task = await write_task(rig, client, directory)
             rig.sandbox.on_run = edit(directory)
             await client.run_in_sandbox(task, RunId.new(), COMMAND)
-            await client.undo_last_change(task)
+            await user_undo(client, task)
             (safety,) = [
                 str(r[0]) for r in rig.rows("SELECT id FROM snapshots WHERE kind = 'undo'")
             ]
@@ -306,7 +307,14 @@ def test_undoing_an_undo_makes_the_undone_run_undoable_again() -> None:
             }
             assert all(i.undoable for key, i in infos.items() if key[0] == "run")
             assert (directory / "a.txt").read_text() == "second"
-            await client.undo_last_change(task)  # the newest run again
+            with pytest.raises(BrokerRefused) as refused:  # the user undid since: not the model's
+                await client.undo_last_change(task)
+            assert refused.value.reason == "not_undoable"
+            newest = max(
+                (i for i in (await client.list_snapshots()).snapshots if i.kind == "run"),
+                key=lambda i: i.taken_at,
+            )
+            await client.undo_snapshot(newest.snapshot)  # the user can: the run is live again
             assert (directory / "a.txt").read_text() == "CHANGED"
 
     run(scenario)

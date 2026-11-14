@@ -19,6 +19,7 @@ from tests.broker.test_daemon_snapshots import (
     project,
     restored,
     settings,
+    user_undo,
     write_task,
 )
 from tests.ipc.bounded import run
@@ -259,7 +260,7 @@ def test_undone_snapshots_and_those_past_retention_go_first() -> None:
             rig.sandbox.on_run = edit(directory)
             await client.run_in_sandbox(task, RunId.new(), COMMAND)
             (undone,) = [str(r[0]) for r in rig.rows("SELECT id FROM snapshots")]
-            await client.undo_last_change(task)  # S1 is undone, the safety copy is kept
+            await user_undo(client, task)  # S1 is undone, the safety copy is kept
             rig.sandbox.on_run = None
             rig.clock.advance(timedelta(seconds=1))
             await client.run_in_sandbox(task, RunId.new(), COMMAND)

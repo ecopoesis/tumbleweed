@@ -150,3 +150,10 @@ def test_the_undo_without_a_way_back_card_carries_its_purpose() -> None:
     )
 
     assert (card.kind, card.purpose, card.cause) == ("no_undo", "undo", "too_deep")
+
+
+def test_a_snapshot_a_later_wider_change_blocks_is_shown_as_not_undoable_for_now() -> None:
+    row = row_of(info(undoable=False, blocked=True))
+
+    assert row.status == "undo the later changes to that folder first"
+    assert not row.undoable

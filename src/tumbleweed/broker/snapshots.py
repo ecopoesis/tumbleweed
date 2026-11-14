@@ -122,9 +122,14 @@ class SnapshotRecord(PolicyModel):
     targets: Annotated[tuple[SnapshotTarget, ...], Field(min_length=1, max_length=MAX_TARGETS)]
     no_undo: bool = False
     undoes: SnapshotId | None = None
+    by_model: bool = False
+    """For an `undo` snapshot: the model asked for the undo it was taken for. Such a copy may hold
+    the user's later edits and the user may have no other way to them, so it is pinned (D28, L1)."""
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
+        if self.by_model and self.kind is not SnapshotKind.UNDO:
+            raise ValueError("only a safety snapshot is made for the model's undo")
         if self.no_undo != all(target.backend is BackendKind.NOOP for target in self.targets):
             raise ValueError("a snapshot is a no-undo record exactly when nothing was saved")
         if (self.kind is SnapshotKind.RUN) != (self.run is not None):

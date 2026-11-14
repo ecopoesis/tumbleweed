@@ -1566,11 +1566,23 @@ marks back (J4): the run it undid is undoable again and what it superseded no lo
 (`superseded_by`). **A later run done with no undo never blocks an older undo (K1):** nothing could put
 its changes back, and what the undo overwrites of it is gone either way; if it lies inside the places it
 is superseded as above, otherwise the undo goes ahead. The list shows a snapshot whose undo would be
-refused because of a wider later run as *not undoable for now* (`blocked`, with our reason text). **The
-marks follow the files (K3):** each undo keeps, with its safety snapshot, the exact list of marks it
-changed (what it undid, what it superseded, and the inverse of what the undo it undid had changed);
-undoing that safety snapshot applies the inverse, so undo, redo, undo leaves the first run undone and
-the later one superseded, and the model's undo cannot bring the first change back. "Most recent" is by
+refused because of a wider later run as *not undoable for now* (`blocked`, with our reason text). **What
+holds about the marks (K3, L2; narrowed to what is true):** each undo keeps, with its safety snapshot, the
+*net* list of marks it changed (what it undid, what it superseded, and the inverse of what the undo it
+undid had changed, a mark set and cleared being no change), so undo, redo, undo of the same places
+leaves the first run undone and the later one superseded, and a chain of redo/undo cycles does not grow
+the list (a test runs 300). More than 200 net changes, or more than 100 runs to supersede, refuses the
+undo before any file is touched. **What does not hold in general:** a redo over later undos, or
+interleaved chains over overlapping places, can leave the *list* showing a run live or undone that the
+files say otherwise; no data is lost (the safety copies hold every state and each is reachable from the
+list within retention) and every refusal can be lifted by user undos from the list (undo copies never
+block an undo, only a later live wider run with a snapshot does). The invariant that matters for
+safety is held by a rule, not by the marks: **the model's undo never restores a change the user
+undid** because `undo_last_change` is refused (`not_undoable`, "the user undid a change to those
+places since") while any safety copy made for a *user's* undo is newer than the run's snapshot and
+overlaps its places (the model's own undos do not block each other: it may step back run by run). A
+full "the marks equal the files after every step" for arbitrary user chains is filed for the polish
+issue (each safety copy would store the whole mark state of the places it covers). "Most recent" is by
 a monotonic sequence (`seq`), not the clock. **If the safety snapshot cannot be taken** (a cap, depth,
 I/O, the store full), the model's undo is refused and points the user to the list; the *chrome's* undo
 asks the user, in a trusted prompt of the no-undo kind (purpose `undo`, once scope: "undo without being
@@ -1613,12 +1625,31 @@ three anchors (its oldest run, its newest safety copy and the run being made), s
 newest safety copy of those places for an undo) is left out of the share check but is **not deleted
 before the new record lands** (a failed snapshot followed by "no undo" must not lose the previous run's
 undo), so the share is overshot by at most one snapshot; what the new snapshot will take is estimated
-from the task's last snapshot of the same places, never more than `max_bytes`. Several big places per
+from the task's last snapshot of the same places, never more than `max_bytes` (the estimate feeds the
+share check only; the store-wide check counts the incoming copy as `max_bytes`, L3, so the store cap is
+soft only by the copies in flight, `max_concurrent_runs`, never by a bad estimate); the record being
+undone is left out of the share like the anchor being replaced (L4), so the user's undo of a middle run
+of a place near the cap is not asked about. The share is overshot by at most one snapshot, never
+cumulatively Several big places per
 task, or several big tasks together, can still reach `STORE_FULL`: that goes to the trusted prompt. The
-bound: a task holds at most its share (3 GiB by default of the 8 GiB store, so two big tasks and a part
-of a third), and a task's own middle snapshots go first, so a busy task's handler runs stay quiet, one
+bound: a task holds at most one snapshot over its share (3 GiB by default of the 8 GiB store, so two big
+tasks and a part of a third), and a task's own middle snapshots go first, so a busy task's handler runs stay quiet, one
 task cannot starve another of undo, a task's churn cannot evict the state before it first touched a
-place, and a snapshot in the middle may be gone (undoing it is then refused: it is no longer listed). A safety snapshot is protected only while its undo runs. The count cap is soft by up to the
+place, and a snapshot in the middle may be gone (undoing it is then refused: it is no longer listed). **The model cannot make the user lose edits (L1).** A safety copy made for the *model's* undo may hold
+edits the user made after the run and has no other way to, so it is **pinned**: every not-undone one is
+an anchor (a new one replaces nothing, and the user's own newest safety copy is judged apart from them),
+only age removes it, and the model's undo is **refused**, with the "ask the user to undo it from the undo
+list" text, when keeping another one safe would leave the task unable to run. The reservation covers the
+worst case, not the next run: the task's pinned copies, the new one and three snapshots of a place that
+size (the oldest run, the user's newest safety copy and the run being made) must fit its byte share, and
+the pinned copies plus four its count share; the size is the biggest of the run's snapshot, the task's
+biggest snapshot and the copy actually taken (checked again after it is taken, before any file is
+touched; a copy that does not fit is deleted). So a task's runs never get `STORE_FULL` because of the
+model's copies, and a model run/undo loop ends in the model's own refusal. **How many model undos fit,
+by place size s at the defaults (cap m, share 3m):** `(3m / s) - 3`: none at s = m (every model undo on
+a place near the cap is refused, the user's list works), 3 at m/2, 6 at m/3, 9 at m/4, and at most
+`task_share_snapshots - 4` (21) by count. The user's undo never pins and never refuses for this.
+A safety snapshot is protected only while its undo runs. The count cap is soft by up to the
 number of runs in flight (`max_concurrent_runs`). The sweep also enforces the size cap against undone
 and superseded snapshots (a lowered cap) and deletes copies no row names. Everything is configurable
 (`SnapshotSettings`) and every deletion audited (`snapshot_deleted`: `age`, `count`, `size`,

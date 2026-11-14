@@ -32,7 +32,7 @@ The connection belongs to the thread that opened it (the broker's event loop).
 import logging
 import os
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -165,26 +165,82 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
 _GRANTS: Final[TypeAdapter[Grant]] = TypeAdapter(Grant)
 _SNAPSHOTS: Final[TypeAdapter[SnapshotRecord]] = TypeAdapter(SnapshotRecord)
 MAX_MARK_CHANGES: Final = 100
-"""The most marks one undo may change (`marks` is a column of at most 64 KiB)."""
+"""The most runs one undo may supersede."""
+MAX_NET_MARKS: Final = 200
+"""The most marks one undo may change in all (`marks` is a column of at most 64 KiB)."""
 
 
 @final
 class MarkChange(PolicyModel):
-    """One change an undo made to the marks of a snapshot: `undone` or `superseded` set (`on`) or
-    cleared. `by` is the snapshot whose undo superseded it. The undo's safety snapshot keeps the
-    list; undoing that safety snapshot applies the inverse, so the marks follow the files (D28, K3).
-    """
+    """The net change an undo made to one mark of one snapshot: `undone` or `superseded`, from
+    `was_on` (by `was_by`) to `on` (by `by`). The undo's safety snapshot keeps the list; undoing
+    that
+    safety snapshot applies the inverse. Only net changes are kept, so a chain of undos and redos
+    does not grow the list (D28, K3, L2)."""
 
     what: Literal["undone", "superseded"]
     snapshot: SnapshotId
     on: bool
     by: SnapshotId | None = None
+    was_on: bool = False
+    was_by: SnapshotId | None = None
 
     def inverse(self) -> "MarkChange":
-        return MarkChange(what=self.what, snapshot=self.snapshot, on=not self.on, by=self.by)
+        return MarkChange(
+            what=self.what,
+            snapshot=self.snapshot,
+            on=self.was_on,
+            by=self.was_by,
+            was_on=self.on,
+            was_by=self.by,
+        )
 
 
 _MARKS: Final[TypeAdapter[list[MarkChange]]] = TypeAdapter(list[MarkChange])
+
+
+def net_marks(
+    undone: SnapshotId,
+    overtaken: Sequence[SnapshotId],
+    reverting: Sequence[MarkChange],
+    state: Callable[[SnapshotId], tuple[bool, bool, SnapshotId | None]],
+) -> list[MarkChange]:
+    """The net change to the marks when `undone` is undone, `overtaken` runs are superseded by it
+    and, if it is a safety snapshot, the changes `reverting` (what the undo it was made for changed)
+    are reverted (D28, L2). `state` gives (undone, superseded, by) of a snapshot now. A mark set and
+    then cleared is not a change, so a chain of undos and redos of the same places does not grow the
+    list: it holds each mark that differs at most once."""
+    order: list[tuple[str, SnapshotId]] = []
+    final: dict[tuple[str, SnapshotId], tuple[bool, SnapshotId | None]] = {}
+
+    def put(what: str, snapshot: SnapshotId, on: bool, by: SnapshotId | None) -> None:
+        key = (what, snapshot)
+        if key not in final:
+            order.append(key)
+        final[key] = (on, by)
+
+    for change in reversed(reverting):
+        put(change.what, change.snapshot, change.was_on, change.was_by)
+    put("undone", undone, True, None)
+    for each in overtaken:
+        put("superseded", each, True, undone)
+    net: list[MarkChange] = []
+    for what, snapshot in order:
+        was_undone, was_superseded, was_by_now = state(snapshot)
+        was_on, was_by = (was_undone, None) if what == "undone" else (was_superseded, was_by_now)
+        on, by = final[(what, snapshot)]
+        if (on, by if on else None) != (was_on, was_by if was_on else None):
+            net.append(
+                MarkChange(
+                    what="undone" if what == "undone" else "superseded",
+                    snapshot=snapshot,
+                    on=on,
+                    by=by,
+                    was_on=was_on,
+                    was_by=was_by,
+                )
+            )
+    return net
 
 
 @final
@@ -771,6 +827,27 @@ class BrokerStore:
                         str(change.snapshot),
                     ),
                 )
+
+    def mark_state(self, snapshot: SnapshotId) -> tuple[bool, bool, SnapshotId | None]:
+        """(undone, superseded, by) of a snapshot now; all false for one that is not there."""
+        rows = self._query(
+            "SELECT undone_at, superseded_at, superseded_by FROM snapshots WHERE id = ?",
+            (str(snapshot),),
+        )
+        if not rows:
+            return False, False, None
+        undone, superseded, by = rows[0]
+        return (
+            undone is not None,
+            superseded is not None,
+            None if by is None else SnapshotId(_text(by)),
+        )
+
+    def newer_safety_snapshots(self, seq: int) -> list[StoredSnapshot]:
+        """The `undo` snapshots taken after `seq`, oldest first."""
+        return self._snapshots(
+            "WHERE seq > ? AND kind = 'undo' ORDER BY seq LIMIT ?", (seq, MAX_LIST)
+        )
 
     def set_marks(self, snapshot: SnapshotId, changes: Sequence[MarkChange]) -> None:
         """Keep, with the safety snapshot of an undo, the marks that undo changed (inside

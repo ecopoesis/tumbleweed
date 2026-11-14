@@ -164,11 +164,13 @@ from tumbleweed.broker.snapshots import (
 from tumbleweed.broker.store import (
     MAX_LIST,
     MAX_MARK_CHANGES,
+    MAX_NET_MARKS,
     BrokerStore,
     MarkChange,
     StoredSnapshot,
     TaskRecord,
     ToolRecord,
+    net_marks,
 )
 from tumbleweed.broker.task import TaintKind, TaskState
 from tumbleweed.broker.toolstore import StoredTool, ToolStore, taint_names
@@ -2395,14 +2397,44 @@ class BrokerService:
             return False
         return outcome == "deleted"
 
+    def _model_undo_fits(self, task: TaskId, size: int, *, taken_now: int = 0) -> bool:
+        """Whether the task can keep one more safety copy pinned for a model undo of a place of
+        `size` bytes and still do runs (D28, L1): its pinned copies, this one, and the worst case of
+        everything else a run needs on a place that size (the oldest run, the user's newest safety
+        copy and the run being made: three snapshots) must fit its share, bytes and count. When it
+        does not, the model's undo is refused and the user's list, which never pins, still works.
+        `taken_now` is the copy that was just taken, counted once (it is not in the store yet)."""
+        settings = self._config.snapshots
+        stored = self._store.oldest_snapshots(MAX_LIST)
+        pinned = [
+            each.record
+            for each in stored
+            if each.record.task == task
+            and each.record.kind is SnapshotKind.UNDO
+            and each.record.by_model
+            and not each.undone
+        ]
+        biggest = max(
+            [size, taken_now, *(r.saved_bytes for r in pinned)]
+            + [each.record.saved_bytes for each in stored if each.record.task == task]
+        )
+        unit = min(settings.max_bytes, max(biggest, 1))
+        held = sum(r.saved_bytes for r in pinned)
+        incoming = taken_now or unit
+        return (
+            held + incoming + 3 * unit <= settings.task_share_bytes
+            and len(pinned) + 1 + 4 <= settings.task_share_snapshots
+        )
+
     @staticmethod
     def _anchors(stored: Sequence[StoredSnapshot]) -> set[SnapshotId]:
         """The snapshots that make a task's undo possible and are never evicted to make room (D28,
         J1, K2): for each task, per place, its oldest not-undone run (the state before the task
         first touched it), its newest not-undone run (what `undo_last_change` needs), and, per
-        place, its newest not-undone safety snapshot (the user's latest edits from before an undo).
-        An older safety snapshot is not an anchor: under pressure it may go. Only the age sweep
-        removes an anchor."""
+        place, its newest not-undone safety snapshot of the user's undos (the user's latest edits
+        from before an undo; an older one may go under pressure), and **every** not-undone safety
+        snapshot made for the model's undo (pinned, D28 L1: the model cannot make the user lose
+        edits by churning). Only the age sweep removes an anchor."""
         anchors: set[SnapshotId] = set()
         seen: set[tuple[TaskId, str]] = set()
         newest: dict[TaskId, SnapshotId] = {}
@@ -2412,6 +2444,9 @@ class BrokerService:
             if each.undone:
                 continue
             if record.kind is SnapshotKind.UNDO:
+                if record.by_model:
+                    anchors.add(record.id)  # pinned: the user may have no other way to its edits
+                    continue
                 for target in record.targets:
                     newest_safety[(record.task, target.path.path)] = record.id
                 continue
@@ -2427,7 +2462,12 @@ class BrokerService:
         return anchors
 
     async def _make_room(
-        self, task: TaskId, kind: SnapshotKind, paths: Sequence[StoredPath]
+        self,
+        task: TaskId,
+        kind: SnapshotKind,
+        paths: Sequence[StoredPath],
+        *,
+        pinned: bool = False,
     ) -> None:
         """Before a new snapshot of `kind` of `paths` for `task`: make room under the caps (D28, J1,
         K2). Each task has a share of the store (`SnapshotSettings.task_share_*`) so that one task
@@ -2451,7 +2491,10 @@ class BrokerService:
             keep = self._inflight | self._protected
             anchors = self._anchors(stored)
             where = {path.path for path in paths}
-            replaced = self._replaced_by(task, kind, where, stored, anchors)
+            replaced = self._replaced_by(task, kind, where, stored, anchors, pinned=pinned)
+            # What is being undone is not the share's to count either (L4): it is one more anchor
+            # only because it is held for the undo.
+            held_out = replaced | self._protected
             incoming = settings.max_bytes
             for each in reversed(stored):
                 record = each.record
@@ -2468,7 +2511,7 @@ class BrokerService:
                 mine = [
                     each.record
                     for each in left()
-                    if each.record.task == task and each.record.id not in replaced
+                    if each.record.task == task and each.record.id not in held_out
                 ]
                 return (
                     len(mine) >= settings.task_share_snapshots
@@ -2479,7 +2522,8 @@ class BrokerService:
                 every = [each.record for each in left()]
                 return (
                     len(every) >= settings.max_snapshots
-                    or sum(r.saved_bytes for r in every) + incoming > settings.store_max_bytes
+                    or sum(r.saved_bytes for r in every) + settings.max_bytes
+                    > settings.store_max_bytes
                 )
 
             async def evict(candidates: list[StoredSnapshot], while_: Callable[[], bool]) -> None:
@@ -2526,6 +2570,8 @@ class BrokerService:
         where: set[str],
         stored: Sequence[StoredSnapshot],
         anchors: set[SnapshotId],
+        *,
+        pinned: bool,
     ) -> set[SnapshotId]:
         """The anchors a new snapshot of `kind` of the places `where` is about to take the place of:
         the task's newest run (for a run), the newest safety copy of each of the places (for an
@@ -2538,11 +2584,13 @@ class BrokerService:
                 continue
             if record.kind is SnapshotKind.RUN:
                 newest_run = record.id
-            else:
+            elif not record.by_model:
                 for target in record.targets:
                     newest_safety[target.path.path] = record.id
         if kind is SnapshotKind.RUN:
             return set() if newest_run is None else {newest_run}
+        if pinned:  # the model's copies replace nothing: they are pinned
+            return set()
         return {newest_safety[path] for path in where if path in newest_safety}
 
     async def _sweep_snapshots(self, now: datetime) -> int:
@@ -2605,10 +2653,14 @@ class BrokerService:
 
     def _list_snapshots(self, request: ListSnapshots) -> ResponseBody:
         infos: list[SnapshotInfo] = []
+        live_runs = self._store.newer_run_snapshots(0)  # once, not for each row
         for each in self._store.recent_snapshots(request.limit):
             record = each.record
             blocked = each.undoable and (
-                self._overtaken_by(each, tuple(target.path for target in record.targets)) is None
+                self._overtaken_by(
+                    each, tuple(target.path for target in record.targets), newer=live_runs
+                )
+                is None
             )
             infos.append(
                 SnapshotInfo(
@@ -2648,6 +2700,20 @@ class BrokerService:
                 "undo it from the undo list",
                 "write_access_gone",
             )
+        theirs = tuple(target.path for target in found.record.targets)
+        for later in self._store.newer_safety_snapshots(found.seq):
+            if not later.record.by_model and _overlaps(
+                tuple(target.path for target in later.record.targets), theirs
+            ):
+                # The user undid something there since: this run's pre-state may hold what they
+                # undid (D28, L2: the model's undo never restores a change the user undid).
+                self._audit_undo(found.record, None, "model", "refused", "user_undid_since", theirs)
+                raise _Refuse(
+                    "not_undoable",
+                    "the user undid a change to those places since that run: ask them to undo "
+                    "it from the undo list, or start again with a new run",
+                    "user_undid_since",
+                )
         return await self._undo(owner, found, asked_by="model")
 
     async def _model_may_undo(self, live: _Live, record: SnapshotRecord) -> bool:
@@ -2730,6 +2796,13 @@ class BrokerService:
                     "not_undoable",
                     "a later change to that folder must be undone first",
                 )
+            plan = self._plan_marks(record, overtaken)
+            if plan is None:
+                raise refused(
+                    "too_many_marks",
+                    "not_undoable",
+                    "too many later changes overlap that folder: undo the later ones first",
+                )
             in_the_way = [run for run in self._write_runs.values() if _overlaps(run.paths, paths)]
             if in_the_way and asked_by == "model":
                 raise refused("run_in_progress", "busy", "a run is writing those files right now")
@@ -2755,7 +2828,7 @@ class BrokerService:
                     else "the broker may not open what was changed: nothing was undone",
                 ) from None
             try:
-                return await self._undo_opened(owner, stored, opened, asked_by, paths, overtaken)
+                return await self._undo_opened(owner, stored, opened, asked_by, paths, plan)
             finally:
                 for each in opened:
                     each.close()
@@ -2804,7 +2877,7 @@ class BrokerService:
         opened: list[OpenedPath],
         asked_by: Literal["model", "user"],
         paths: tuple[StoredPath, ...],
-        overtaken: list[SnapshotId],
+        plan: list[MarkChange],
     ) -> ResponseBody:
         record = stored.record
         task = record.task
@@ -2822,7 +2895,15 @@ class BrokerService:
         before: SnapshotRecord | None = None
         try:
             try:
-                await self._make_room(task, SnapshotKind.UNDO, paths)
+                if asked_by == "model" and not self._model_undo_fits(task, record.saved_bytes):
+                    self._audit_undo(record, None, asked_by, "refused", "pin_reserve", paths)
+                    raise _Refuse(
+                        "unavailable",
+                        "the user's later edits could not be kept safe for another undo of "
+                        "this size: ask the user to undo it from the undo list",
+                        "pin_reserve",
+                    )
+                await self._make_room(task, SnapshotKind.UNDO, paths, pinned=asked_by == "model")
                 taken = await self._fs.call(
                     partial(
                         self._snapshots.take,
@@ -2870,7 +2951,20 @@ class BrokerService:
                     taken_at=self._now(),
                     targets=taken.targets,
                     undoes=record.id,
+                    by_model=asked_by == "model",
                 )
+                if asked_by == "model" and not self._model_undo_fits(
+                    task, before.saved_bytes, taken_now=before.saved_bytes
+                ):
+                    # It grew past what was estimated: not kept, nothing was changed yet.
+                    await self._delete_saved(before, "discarded")
+                    self._audit_undo(record, None, asked_by, "refused", "pin_reserve", paths)
+                    raise _Refuse(
+                        "unavailable",
+                        "the user's later edits could not be kept safe for another undo of "
+                        "this size: ask the user to undo it from the undo list",
+                        "pin_reserve",
+                    )
                 with self._atomic() as entries:
                     self._store.insert_snapshot(before)
                     entries.append(_snapshot_entry(before, before.taken_at))
@@ -2907,7 +3001,7 @@ class BrokerService:
         removed = sum(item.removed for item in restored)
         skipped = sum(item.skipped for item in restored)
         try:
-            self._record_undone(stored, before, asked_by, paths, written, removed, overtaken)
+            self._record_undone(stored, before, asked_by, paths, written, removed, plan)
         except (AuditError, StoreError):
             _log.error("an undo was done but could not be recorded")
             raise _Refuse(
@@ -2923,7 +3017,7 @@ class BrokerService:
             written=written,
             removed=removed,
             skipped=skipped,
-            superseded=len(overtaken),
+            superseded=sum(1 for c in plan if c.what == "superseded" and c.on and not c.was_on),
         )
 
     async def _restore(
@@ -2934,8 +3028,24 @@ class BrokerService:
             deadline=self._config.snapshots.timeout + SNAPSHOT_SLACK,
         )
 
+    def _plan_marks(
+        self, record: SnapshotRecord, overtaken: list[SnapshotId]
+    ) -> list[MarkChange] | None:
+        """The net change to the marks an undo of `record` will make, worked out before any file is
+        touched (D28, L2, L5): `record` undone, `overtaken` superseded by it, and, if `record` is
+        itself a safety snapshot, the inverse of what the undo it was made for changed. Only net
+        changes are kept (a mark set and then cleared is not a change), so redo/undo cycles do not
+        grow the list. `None` if there would be more than `MAX_NET_MARKS`: the undo is then refused
+        rather than ending in a record that cannot be written."""
+        undone_marks = self._store.marks_of(record.id) if record.kind is SnapshotKind.UNDO else []
+        net = net_marks(record.id, overtaken, undone_marks, self._store.mark_state)
+        return net if len(net) <= MAX_NET_MARKS else None
+
     def _overtaken_by(
-        self, stored: StoredSnapshot, paths: tuple[StoredPath, ...]
+        self,
+        stored: StoredSnapshot,
+        paths: tuple[StoredPath, ...],
+        newer: Sequence[StoredSnapshot] | None = None,
     ) -> list[SnapshotId] | None:
         """What the undo of `stored` would overtake (D28, J5, K1): each later `run` snapshot, of any
         task, on the same places. A run whose every place lies inside or equals one of these is
@@ -2946,7 +3056,12 @@ class BrokerService:
         what this undo overwrites of it is gone either way. More than `MAX_MARK_CHANGES` runs to
         overtake is also `None`: undo the later ones first."""
         found: list[SnapshotId] = []
-        for each in self._store.newer_run_snapshots(stored.seq):
+        later = (
+            self._store.newer_run_snapshots(stored.seq)
+            if newer is None
+            else [each for each in newer if each.seq > stored.seq]
+        )
+        for each in later:
             theirs = tuple(target.path for target in each.record.targets)
             if each.record.id == stored.record.id or not _overlaps(theirs, paths):
                 continue
@@ -2964,31 +3079,21 @@ class BrokerService:
         paths: tuple[StoredPath, ...],
         written: int,
         removed: int,
-        overtaken: list[SnapshotId],
+        plan: list[MarkChange],
     ) -> None:
-        """Record a finished undo, in one transaction: the snapshot is undone, later runs inside the
-        same places are superseded, and, if what was undone is itself an undo, the marks that undo
-        changed are reverted exactly (K3: the undo of an undo puts the marks back as they were
-        before it, whatever sequence of undos and redos led here). The marks changed are kept with
-        the safety snapshot, so undoing *that* reverts them in turn."""
+        """Record a finished undo, in one transaction: the snapshot is undone and the marks `plan`
+        (worked out before any file was touched) are applied. They are kept with the safety
+        snapshot, so undoing *that* reverts them in turn."""
         record = stored.record
-        changes: list[MarkChange] = []
-        if record.kind is SnapshotKind.UNDO:
-            changes.extend(change.inverse() for change in reversed(self._store.marks_of(record.id)))
-        changes.append(MarkChange(what="undone", snapshot=record.id, on=True))
-        changes.extend(
-            MarkChange(what="superseded", snapshot=each, on=True, by=record.id)
-            for each in overtaken
-        )
         with self._atomic() as entries:
             if not self._store.mark_undone(record.id, self._now()):
                 raise _Refuse("not_undoable", "that change was already undone", "already_undone")
             self._store.apply_marks(  # (the snapshot itself is marked by the guarded call above)
-                [c for c in changes if not (c.what == "undone" and c.snapshot == record.id)],
+                [c for c in plan if not (c.what == "undone" and c.snapshot == record.id)],
                 self._now(),
             )
             if before is not None:
-                self._store.set_marks(before.id, changes)
+                self._store.set_marks(before.id, plan)
             entries.append(
                 UndoDone(
                     at=self._now(),

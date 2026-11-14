@@ -23,6 +23,7 @@ from tumbleweed.broker.errors import SnapshotError, SnapshotFault
 from tumbleweed.broker.grants import GrantScope
 from tumbleweed.broker.prompts import Allowed, Denied
 from tumbleweed.core.ids import RunId, TaskId
+from tumbleweed.ipc.broker_messages import UndoResult
 from tumbleweed.sandbox.policy import GrantAccess, SandboxPolicy
 
 COMMAND = ("/usr/bin/python3", "-c", "pass")
@@ -66,6 +67,13 @@ def stamp_text(path: Path, text: str) -> Callable[[SandboxPolicy], None]:
         path.write_text(text)
 
     return change
+
+
+async def user_undo(client: BrokerClient, task: TaskId) -> UndoResult:
+    """The user's undo of the task's newest undoable run, from the chrome's list."""
+    infos = (await client.list_snapshots()).snapshots
+    newest = next(i for i in infos if i.task == task and i.kind == "run" and i.undoable)
+    return await client.undo_snapshot(newest.snapshot)
 
 
 def restored(directory: Path) -> bool:
