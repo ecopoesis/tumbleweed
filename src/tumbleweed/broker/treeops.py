@@ -60,8 +60,6 @@ _FICLONE: Final = 0x40049409  # linux/fs.h: share the blocks of one file with an
 CHUNK: Final = 1024 * 1024
 MAX_DEPTH: Final = 64
 """How deep a tree to be copied may be (the walk recurses once per level)."""
-REMOVE_DEPTH: Final = 400
-"""How deep a tree to be removed may be: the removal holds one descriptor per level, not a frame."""
 META_SUFFIX: Final = ".meta"
 MAX_META_BYTES: Final = 8 * 1024 * 1024
 _TEMP_PREFIX: Final = ".tw-restore-"
@@ -126,9 +124,17 @@ class TreeMeta:
 
     specials: dict[Components, tuple[str, int]] = field(default_factory=dict)
     modes: dict[Components, int] = field(default_factory=dict)
+    _index: dict[Components, dict[str, tuple[str, int]]] | None = field(default=None, repr=False)
 
     def children_of(self, path: Components) -> dict[str, tuple[str, int]]:
-        return {where[-1]: value for where, value in self.specials.items() if where[:-1] == path}
+        """The special files directly in the directory `path`. The specials are indexed by parent
+        once: a restore asks once per directory, and a scan each time was quadratic (D28, J6)."""
+        if self._index is None:
+            index: dict[Components, dict[str, tuple[str, int]]] = {}
+            for where, value in self.specials.items():
+                index.setdefault(where[:-1], {})[where[-1]] = value
+            self._index = index
+        return self._index.get(path, {})
 
     def dumps(self) -> bytes:
         document = {
@@ -150,7 +156,10 @@ class TreeMeta:
             for where, kind, mode in document["specials"]:
                 if kind not in _SPECIAL_KINDS or not isinstance(mode, int):
                     raise TypeError
-                meta.specials[_components(where)] = (kind, mode & 0o7777)
+                here = _components(where)
+                if not here:
+                    raise TypeError  # a special file has a name
+                meta.specials[here] = (kind, mode & 0o7777)
             for where, mode in document["modes"]:
                 if not isinstance(mode, int):
                     raise TypeError
@@ -161,8 +170,13 @@ class TreeMeta:
 
 
 def _components(value: object) -> Components:
+    """The names of a path read from a `.meta` file: each a single path component, so that a
+    damaged or planted file cannot name `..`, a nested path or a name with a NUL (D28)."""
     if not isinstance(value, list) or not all(isinstance(each, str) for each in value):
         raise TypeError
+    for each in value:
+        if each in {"", ".", ".."} or "/" in each or "\0" in each:
+            raise TypeError
     return tuple(value)
 
 
@@ -206,7 +220,7 @@ class _Work:
 
 
 def _unbounded() -> TreeBudget:
-    return TreeBudget(TreeLimits(max_bytes=2**62, max_files=2**62, max_depth=REMOVE_DEPTH))
+    return TreeBudget(TreeLimits(max_bytes=2**62, max_files=2**62))
 
 
 def _fault_of(error: OSError) -> SnapshotError:
@@ -807,38 +821,63 @@ def _names(directory: int) -> list[str]:
 
 def _remove_entry(parent: int, name: str, work: _Work) -> None:
     """Remove `name` of `parent`: a link or file is unlinked, a directory is emptied and removed,
-    nothing followed. Iterative, one descriptor per level (at most `REMOVE_DEPTH`), so that a tree
-    a program nested thousands of levels deep cannot exhaust the stack."""
+    nothing followed. However deep the tree is (D28 J3: what a run nests is the run's to nest,
+    and must not be able to stop its own undo): it keeps two descriptors, the directory it is in
+    and nothing else, and a stack of the identities (`st_dev`, `st_ino`) and names of the
+    directories above. Going down it opens the child with `O_NOFOLLOW` and compares it with
+    `lstat`; coming back up it opens `..` and compares it with the identity it came from, so a
+    directory moved away meanwhile is refused (`TARGET_CHANGED`) and nothing outside is touched.
+    Bounded by the deadline only."""
     info = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if not stat.S_ISDIR(info.st_mode):
         os.unlink(name, dir_fd=parent)
         work.removed += 1
         return
-    stack: list[tuple[int, int, str]] = []  # (the directory, its parent, its name)
+    current = _open_removal(parent, name, info)
+    above: list[tuple[tuple[int, int], str]] = []  # (identity, name) of each directory we are in
+    here = (info.st_dev, info.st_ino)
     try:
-        stack.append((_open_removal(parent, name, info), parent, name))
-        while stack:
-            directory, above, current = stack[-1]
+        while True:
             work.tick()
-            names = _names(directory)
-            if not names:
-                os.close(directory)
-                stack.pop()
-                os.rmdir(current, dir_fd=above)
-                work.removed += 1
-                continue
+            names = _names(current)
+            descended = False
             for each in names:
-                inner = os.stat(each, dir_fd=directory, follow_symlinks=False)
+                inner = os.stat(each, dir_fd=current, follow_symlinks=False)
                 if stat.S_ISDIR(inner.st_mode):
-                    if len(stack) >= REMOVE_DEPTH:
-                        raise SnapshotError(SnapshotFault.TOO_DEEP)
-                    stack.append((_open_removal(directory, each, inner), directory, each))
+                    child = _open_removal(current, each, inner)
+                    os.close(current)
+                    current = child
+                    above.append((here, each))
+                    here = (inner.st_dev, inner.st_ino)
+                    descended = True
                     break  # empty the new one first
-                os.unlink(each, dir_fd=directory)
+                os.unlink(each, dir_fd=current)
                 work.removed += 1
+            if descended or names:
+                continue
+            if not above:  # `current` is the one we were asked to remove, and it is empty
+                os.close(current)
+                current = -1
+                os.rmdir(name, dir_fd=parent)
+                work.removed += 1
+                return
+            expected, last = above.pop()
+            up = os.open("..", _DIRECTORY, dir_fd=current)
+            try:
+                reached = os.fstat(up)
+                if (reached.st_dev, reached.st_ino) != expected:
+                    raise SnapshotError(SnapshotFault.TARGET_CHANGED)
+            except BaseException:
+                os.close(up)
+                raise
+            os.close(current)
+            current = up
+            here = expected
+            os.rmdir(last, dir_fd=current)  # an empty directory only: a swapped one is refused
+            work.removed += 1
     finally:
-        for directory, _, _ in stack:
-            os.close(directory)
+        if current >= 0:
+            os.close(current)
 
 
 def _open_removal(parent: int, name: str, info: os.stat_result) -> int:

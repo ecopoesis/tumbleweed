@@ -406,9 +406,9 @@ the broker imports the agent or an LLM (I2).
 - **Requests and answers.** `start_task`, `end_task`, `request_grant`, `revoke_grant`,
   `read_workspace_file`, `list_workspace`, `read_file`, `list_dir` and `run_in_sandbox`
   (`tumbleweed.ipc.broker_messages`), the undo requests `undo_last_change` (the model's, of its own
-  task), `undo_snapshot` and `list_snapshots` (the user's, from the chrome's undo list: no model tool
-  sends them, and like the tool store's they are served to any connection of the user), and the tool store's `list_tools`, `show_tool`, `export_tool`
-  and `import_tool` (`tumbleweed.ipc.tool_messages`, section 5). Every body is a strict model with
+  task), `undo_snapshot` and `list_snapshots` (the user's, from the chrome's undo list: no model
+  tool sends them, and like the tool store's they are served to any connection of the user), and
+  the tool store's `list_tools`, `show_tool`, `export_tool` and `import_tool` (`tumbleweed.ipc.tool_messages`, section 5). Every body is a strict model with
   bounded fields before the service sees it, so a request the schema refuses ends the connection
   like any malformed frame. A request the broker declines is *answered* with `Refused`: a closed
   reason (`unknown_task`, `invalid_request`, `denied`, `not_granted`, `not_found`, `unsafe`,

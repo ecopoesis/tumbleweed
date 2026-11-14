@@ -277,8 +277,8 @@ UNDO_LOCK_WAIT: Final = timedelta(seconds=90)
 UNDO_STOP_WAIT: Final = timedelta(seconds=30)
 """How long the user's undo waits for the runs it stopped to be gone."""
 _NESTING_MESSAGE: Final = (
-    "refused: a write grant may not lie inside a read grant of the same task, or the other way "
-    "round: ask for one wider place, or revoke the other first"
+    "refused: a write grant may not lie inside a read grant of the same task, and a read grant "
+    "may not lie around a write grant: ask for one wider place, or revoke the other first"
 )
 _UNAVAILABLE_AUDIT: Final = "the audit log is unavailable, so nothing is done"
 
@@ -1755,7 +1755,6 @@ class BrokerService:
             if current is not None and current.cancelling() > 0:
                 raise  # this request itself is being cancelled: the connection is closing
             if request.run in self._stopped_for_undo:
-                self._stopped_for_undo.discard(request.run)
                 return Refused(
                     kind="refused",
                     reason="busy",
@@ -1764,6 +1763,8 @@ class BrokerService:
             return Refused(
                 kind="refused", reason="unknown_task", message="the task ended during the run"
             )
+        finally:
+            self._stopped_for_undo.discard(request.run)  # whether or not the stop got there
 
     async def _run_flow(self, owner: Owner, request: RunInSandbox) -> ResponseBody:
         """A run, from the checks to the result. Once the task is known every refusal before the
@@ -1835,11 +1836,21 @@ class BrokerService:
                 raise InvalidRunError(
                     f"a run may write at most {MAX_TARGETS} places: revoke some write access"
                 )
+            if write_paths:
+                await self._wait_for_runs_on(write_paths)
             if write_paths and _overlaps(write_paths, self._undo_active):
                 raise _Refuse(
                     "busy",
                     "an undo of those files is in progress: try again in a moment",
                     "undo_in_progress",
+                )
+            if write_paths and any(
+                _overlaps(write_paths, other.paths) for other in self._write_runs.values()
+            ):  # one came in while this waited: no more waiting, this one is refused
+                raise _Refuse(
+                    "busy",
+                    "another run is writing those files right now: try again in a moment",
+                    "write_run_in_progress",
                 )
             if write_paths:  # seen by an undo of the same places, which stops this run (H10)
                 current = asyncio.current_task()
@@ -2239,7 +2250,13 @@ class BrokerService:
                 fault = error.fault if isinstance(error, SnapshotError) else SnapshotFault.TIMEOUT
                 self._audit_snapshot_refused(request, [path for path, _ in writable], fault.value)
                 answer = await self._ask_no_undo(
-                    owner, live, request.run, [path for path, _ in writable], fault, "run"
+                    owner,
+                    live,
+                    request.run,
+                    [path for path, _ in writable],
+                    fault,
+                    "run",
+                    live.state.task,
                 )
                 if answer is not True:
                     raise _Refuse(
@@ -2306,7 +2323,7 @@ class BrokerService:
         paths: Sequence[StoredPath],
         fault: SnapshotFault,
         purpose: Literal["run", "undo"],
-        task: TaskId | None = None,
+        task: TaskId,
     ) -> bool | Literal["rate_limited"]:
         """Ask the user whether this run (or this undo) may go ahead with no undo. Per run: the
         answer is not kept, and the same limits as any prompt apply (I5): `"rate_limited"` says the
@@ -2320,7 +2337,7 @@ class BrokerService:
         else:
             budget.count(now)
         prompt = GrantPrompt(
-            task=live.state.task if live is not None else task,  # type: ignore[arg-type]  # given when there is no live task
+            task=task,
             run=run,
             no_undo=NoUndoSubject(paths=tuple(paths), cause=fault, purpose=purpose),
             scopes=frozenset({GrantScope.ONCE}),
@@ -2369,87 +2386,103 @@ class BrokerService:
         return outcome == "deleted"
 
     @staticmethod
-    def _anchors(task: TaskId, stored: Sequence[StoredSnapshot]) -> set[SnapshotId]:
-        """The snapshots of `task` that make its undo possible and may not be evicted to make room
-        for its own new ones (D28, H2): per place, the oldest not-undone one (the state before
-        the task touched it), the newest not-undone run (what `undo_last_change` needs), and every
-        not-undone safety snapshot (they hold the user's later edits)."""
+    def _anchors(stored: Sequence[StoredSnapshot]) -> set[SnapshotId]:
+        """The snapshots that make a task's undo possible and are never evicted to make room (D28,
+        J1): for each task, per place, its oldest not-undone snapshot (the state before the task
+        first touched it), its newest not-undone run (what `undo_last_change` needs), and every
+        not-undone safety snapshot (they hold the user's later edits). Only the age sweep removes
+        an anchor."""
         anchors: set[SnapshotId] = set()
-        seen: set[str] = set()
-        newest: SnapshotId | None = None
+        seen: set[tuple[TaskId, str]] = set()
+        newest: dict[TaskId, SnapshotId] = {}
         for each in stored:  # oldest first
             record = each.record
-            if record.task != task or each.undone:
+            if each.undone:
                 continue
             if record.kind is SnapshotKind.UNDO:
                 anchors.add(record.id)
                 continue
             if each.superseded or record.no_undo:
                 continue
-            newest = record.id
+            newest[record.task] = record.id
             for target in record.targets:
-                if target.path.path not in seen:
-                    seen.add(target.path.path)
+                if (record.task, target.path.path) not in seen:
+                    seen.add((record.task, target.path.path))
                     anchors.add(record.id)
-        if newest is not None:
-            anchors.add(newest)
+        anchors.update(newest.values())
         return anchors
 
     async def _make_room(self, task: TaskId) -> None:
-        """Before a new snapshot of `task`: make room under the count and size caps by deleting, in
-        this order, (1) snapshots already undone or superseded, and any past retention (of any
-        task), then (2) `task`'s own that are not anchors, oldest first. Another task's snapshot
-        that is not undone and is within retention is never deleted, nor is an anchor, nor one being
-        undone or taken. If that is not enough `SnapshotError(STORE_FULL)`: the run then asks the
-        user (D28, H2: the reading of "7 days or 100 snapshots, whichever comes first" under which
-        a task's own churn cannot evict the undo of what it damaged)."""
+        """Before a new snapshot of `task`: make room under the caps (D28, J1). Each task has a
+        share of the store (`SnapshotSettings.task_share_*`) so that one task cannot fill it for the
+        others. In this order: (1) snapshots already undone or superseded, and any past retention,
+        of any task; (2) while `task` is at its share, its own snapshots that are not anchors,
+        oldest first, and if it is still at its share `STORE_FULL` for it alone; (3) while the store
+        is full, any task's non-anchors, oldest first. An anchor, a snapshot being undone or taken
+        is never deleted. If that is not enough `SnapshotError(STORE_FULL)`: the run then asks the
+        user (the undo's safety copy: the chrome asks, the model is refused)."""
         settings = self._config.snapshots
         async with self._sweep_lock:
             stored = self._store.oldest_snapshots(MAX_LIST)
-            count = len(stored)
-            total = sum(each.record.saved_bytes for each in stored)
-
-            def short() -> bool:
-                return (
-                    count >= settings.max_snapshots
-                    or total + settings.max_bytes > settings.store_max_bytes
-                )
-
-            if not short():
-                return
             now = self._now()
             keep = self._inflight | self._protected
-            anchors = self._anchors(task, stored)
-            tiers: list[list[StoredSnapshot]] = [
-                [
-                    each
-                    for each in stored
-                    if each.undone
-                    or each.superseded
-                    or now - each.record.taken_at >= settings.retention
-                ],
-                [
-                    each
-                    for each in stored
-                    if each.record.task == task and each.record.id not in anchors
-                ],
-            ]
+            anchors = self._anchors(stored)
             gone: set[SnapshotId] = set()
-            for tier in tiers:
-                for each in tier:
-                    if not short():
+
+            def left() -> list[StoredSnapshot]:
+                return [each for each in stored if each.record.id not in gone]
+
+            def at_share() -> bool:
+                mine = [each.record for each in left() if each.record.task == task]
+                return (
+                    len(mine) >= settings.task_share_snapshots
+                    or sum(r.saved_bytes for r in mine) + settings.max_bytes
+                    > settings.task_share_bytes
+                )
+
+            def full() -> bool:
+                every = [each.record for each in left()]
+                return (
+                    len(every) >= settings.max_snapshots
+                    or sum(r.saved_bytes for r in every) + settings.max_bytes
+                    > settings.store_max_bytes
+                )
+
+            async def evict(candidates: list[StoredSnapshot], while_: Callable[[], bool]) -> None:
+                for each in candidates:
+                    if not while_():
                         return
                     record = each.record
                     if record.id in keep or record.id in gone:
                         continue
                     reason: Literal["count", "size"] = (
-                        "count" if count >= settings.max_snapshots else "size"
+                        "count" if len(left()) >= settings.max_snapshots else "size"
                     )
                     if await self._delete_saved(record, reason):
                         gone.add(record.id)
-                        count -= 1
-                        total -= record.saved_bytes
-            if short():
+
+            if not (at_share() or full()):
+                return
+            spent = [
+                each
+                for each in stored
+                if each.undone
+                or each.superseded
+                or now - each.record.taken_at >= settings.retention
+            ]
+            await evict(spent, lambda: at_share() or full())
+            await evict(
+                [
+                    each
+                    for each in left()
+                    if each.record.task == task and each.record.id not in anchors
+                ],
+                at_share,
+            )
+            if at_share():
+                raise SnapshotError(SnapshotFault.STORE_FULL)  # this task's, and only its
+            await evict([each for each in left() if each.record.id not in anchors], full)
+            if full():
                 raise SnapshotError(SnapshotFault.STORE_FULL)
 
     async def _sweep_snapshots(self, now: datetime) -> int:
@@ -2626,6 +2659,13 @@ class BrokerService:
                     "not_undoable",
                     "a later undo already put back those places: undo that one instead",
                 )
+            overtaken = self._overtaken_by(stored, paths)
+            if overtaken is None:
+                raise refused(
+                    "later_change_first",
+                    "not_undoable",
+                    "a later change to that folder must be undone first",
+                )
             in_the_way = [run for run in self._write_runs.values() if _overlaps(run.paths, paths)]
             if in_the_way and asked_by == "model":
                 raise refused("run_in_progress", "busy", "a run is writing those files right now")
@@ -2651,7 +2691,7 @@ class BrokerService:
                     else "the broker may not open what was changed: nothing was undone",
                 ) from None
             try:
-                return await self._undo_opened(owner, stored, opened, asked_by, paths)
+                return await self._undo_opened(owner, stored, opened, asked_by, paths, overtaken)
             finally:
                 for each in opened:
                     each.close()
@@ -2674,6 +2714,14 @@ class BrokerService:
         if any(not flow.done() for flow in flows):
             raise _Refuse("busy", "a run writing those files would not stop", "run_would_not_stop")
 
+    async def _wait_for_runs_on(self, paths: tuple[StoredPath, ...]) -> None:
+        """A run that writes places another live run writes waits for it (D28, J7): two runs on the
+        same folder would each snapshot what the other is changing. At most `write_run_wait`;
+        the caller refuses the run if one is still there."""
+        flows = [run.flow for run in self._write_runs.values() if _overlaps(paths, run.paths)]
+        if flows:
+            await asyncio.wait(flows, timeout=self._config.write_run_wait.total_seconds())
+
     def _open_undo_targets(self, record: SnapshotRecord, rules: DenyRules) -> list[OpenedPath]:
         opened: list[OpenedPath] = []
         try:
@@ -2692,6 +2740,7 @@ class BrokerService:
         opened: list[OpenedPath],
         asked_by: Literal["model", "user"],
         paths: tuple[StoredPath, ...],
+        overtaken: list[SnapshotId],
     ) -> ResponseBody:
         record = stored.record
         task = record.task
@@ -2733,7 +2782,7 @@ class BrokerService:
                         "safety_" + fault.value,
                     ) from None
                 answer = await self._ask_no_undo(
-                    owner, None, RunId.new(), paths, fault, "undo", task=task
+                    owner, None, RunId.new(), paths, fault, "undo", task
                 )
                 if answer is not True:
                     raise _Refuse(
@@ -2763,6 +2812,7 @@ class BrokerService:
                     entries.append(_snapshot_entry(before, before.taken_at))
         finally:
             self._inflight.discard(safety)
+            self._protected.discard(safety)  # only while the undo runs: after it, anchor or age
         try:
             restored = await self._restore(record, opened)
         except (SnapshotError, FsTimeoutError) as error:
@@ -2793,7 +2843,7 @@ class BrokerService:
         removed = sum(item.removed for item in restored)
         skipped = sum(item.skipped for item in restored)
         try:
-            overtaken = self._record_undone(stored, before, asked_by, paths, written, removed)
+            self._record_undone(stored, before, asked_by, paths, written, removed, overtaken)
         except (AuditError, StoreError):
             _log.error("an undo was done but could not be recorded")
             raise _Refuse(
@@ -2809,7 +2859,7 @@ class BrokerService:
             written=written,
             removed=removed,
             skipped=skipped,
-            superseded=overtaken,
+            superseded=len(overtaken),
         )
 
     async def _restore(
@@ -2820,6 +2870,24 @@ class BrokerService:
             deadline=self._config.snapshots.timeout + SNAPSHOT_SLACK,
         )
 
+    def _overtaken_by(
+        self, stored: StoredSnapshot, paths: tuple[StoredPath, ...]
+    ) -> list[SnapshotId] | None:
+        """What the undo of `stored` would overtake (D28, J5): each later run, of any task, on the
+        same places. A run whose every place lies inside or equals one of these is superseded (its
+        changes are inside what this undo puts back). A run that goes wider, or only partly inside,
+        cannot be overtaken without losing what it changed outside: then `None`, and the undo is
+        refused until that run is undone first."""
+        found: list[SnapshotId] = []
+        for each in self._store.newer_run_snapshots(stored.seq):
+            theirs = tuple(target.path for target in each.record.targets)
+            if each.record.id == stored.record.id or not _overlaps(theirs, paths):
+                continue
+            if not all(any(_nested(mine, outer) for outer in paths) for mine in theirs):
+                return None
+            found.append(each.record.id)
+        return found
+
     def _record_undone(
         self,
         stored: StoredSnapshot,
@@ -2828,21 +2896,18 @@ class BrokerService:
         paths: tuple[StoredPath, ...],
         written: int,
         removed: int,
-    ) -> int:
-        """Record a finished undo: it is undone, later runs on the same places are superseded (their
-        changes were overtaken: undoing them alone would bring this one's back), and the audit
-        entry says so, in one transaction. Returns how many were superseded."""
+        overtaken: list[SnapshotId],
+    ) -> None:
+        """Record a finished undo: it is undone, later runs inside the same places are superseded,
+        and, if what was undone is itself an undo, the change it had undone is undoable again and
+        what that overtook is no longer overtaken; the audit entry says so, in one transaction."""
         record = stored.record
-        overtaken = [
-            each.record.id
-            for each in self._store.newer_run_snapshots(stored.seq)
-            if each.record.id != record.id
-            and _overlaps(tuple(t.path for t in each.record.targets), paths)
-        ]
         with self._atomic() as entries:
             if not self._store.mark_undone(record.id, self._now()):
                 raise _Refuse("not_undoable", "that change was already undone", "already_undone")
-            self._store.mark_superseded(overtaken, self._now())
+            self._store.mark_superseded(overtaken, self._now(), record.id)
+            if record.kind is SnapshotKind.UNDO and record.undoes is not None:
+                self._store.reinstate(record.undoes)
             entries.append(
                 UndoDone(
                     at=self._now(),
@@ -2857,7 +2922,6 @@ class BrokerService:
                     removed=removed,
                 )
             )
-        return len(overtaken)
 
     async def _roll_back(self, before: SnapshotRecord, opened: Sequence[OpenedPath]) -> bool:
         try:

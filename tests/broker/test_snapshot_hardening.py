@@ -430,7 +430,9 @@ def test_one_failed_audit_does_not_end_the_orphan_sweep() -> None:
 
 def test_the_size_cap_is_enforced_at_the_sweep_on_undone_snapshots() -> None:
     async def scenario() -> None:
-        async with running(config=settings(max_bytes=BLOCKS, store_max_bytes=4 * BLOCKS)) as rig:
+        async with running(
+            config=settings(max_bytes=BLOCKS, store_max_bytes=4 * BLOCKS, task_bytes=4 * BLOCKS)
+        ) as rig:
             client = await rig.client()
             directory = project(rig)
             task = await write_task(rig, client, directory)
@@ -881,7 +883,12 @@ def test_room_is_made_only_when_one_more_would_pass_the_caps() -> None:
     async def scenario() -> None:
         # Exactly enough room for three snapshots: the fourth needs one gone, the third does not.
         async with running(
-            config=settings(max_bytes=BLOCKS, store_max_bytes=3 * BLOCKS, max_snapshots=100)
+            config=settings(
+                max_bytes=BLOCKS,
+                store_max_bytes=3 * BLOCKS,
+                max_snapshots=100,
+                task_bytes=3 * BLOCKS,
+            )
         ) as rig:
             client = await rig.client()
             directory = project(rig)

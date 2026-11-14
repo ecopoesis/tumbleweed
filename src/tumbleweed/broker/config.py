@@ -68,8 +68,11 @@ MAX_SNAPSHOT_TIMEOUT: Final = timedelta(minutes=5)
 SNAPSHOT_SLACK: Final = timedelta(seconds=5)
 """What the file system worker's deadline allows beyond the snapshot's own (the tree walks check
 their own deadline, so the thread ends by itself)."""
+MAX_WRITE_RUN_WAIT: Final = timedelta(seconds=60)
+"""The longest a write run may wait for another that writes the same places (D28, J7)."""
 RUN_SETUP_WAIT: Final = (
-    timedelta(seconds=20)  # opening the grants and measuring the workspace
+    MAX_WRITE_RUN_WAIT  # another run on the same places
+    + timedelta(seconds=20)  # opening the grants and measuring the workspace
     + timedelta(seconds=60)  # making room: deleting the oldest snapshots
     + MAX_SNAPSHOT_TIMEOUT
     + SNAPSHOT_SLACK  # the snapshot of what the run may write
@@ -103,6 +106,11 @@ class SnapshotSettings:
       tree over either is refused before the run (the user may accept "no undo" instead).
     - `store_max_bytes`: all the copies together; over it the oldest are deleted (audited).
     - `retention`, `max_snapshots`: a snapshot is kept 7 days or until 100 newer ones exist.
+    - `task_snapshots`, `task_bytes`: one task's share of the store (D28, J1): by default a quarter
+      of `max_snapshots` (at least 10) and of `store_max_bytes` (at least `max_bytes`). A task at
+      its share makes room from its own snapshots or is refused alone; it cannot fill the store
+      for the others. The count cap is soft by up to `max_concurrent_runs`: runs that are in the
+      same step together each see the room the others are about to take.
     - `timeout`: how long taking or restoring one may take.
     - `btrfs_directory`: the dedicated btrfs subvolume snapshots are made in, if the host has
       one; it is on the deny list. Only a target on the same file system uses the btrfs backend.
@@ -115,9 +123,19 @@ class SnapshotSettings:
     store_max_bytes: int = 8 * GIB
     retention: timedelta = timedelta(days=7)
     max_snapshots: int = 100
+    task_snapshots: int | None = None
+    task_bytes: int | None = None
     timeout: timedelta = timedelta(seconds=60)
     btrfs_directory: Path | None = None
     btrfs_program: str = "btrfs"
+
+    @property
+    def task_share_snapshots(self) -> int:
+        return self.task_snapshots or max(10, self.max_snapshots // 4)
+
+    @property
+    def task_share_bytes(self) -> int:
+        return self.task_bytes or max(self.max_bytes, self.store_max_bytes // 4)
 
     def __post_init__(self) -> None:
         if type(self.mode) is not SnapshotMode:
@@ -130,6 +148,10 @@ class SnapshotSettings:
         ):
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= high:
+                raise InvalidValueError(f"{name} must be an int from 1 to {high}")
+        for name, high in (("task_snapshots", 1000), ("task_bytes", 1024 * GIB)):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or not 1 <= value <= high):
                 raise InvalidValueError(f"{name} must be an int from 1 to {high}")
         if self.store_max_bytes < self.max_bytes:
             raise InvalidValueError("store_max_bytes must hold at least one snapshot")
@@ -166,6 +188,8 @@ class BrokerConfig:
     - `run_grace`: how long past its wall-clock limit a run may take to set up and be reaped.
     - `sandbox_path`: the `PATH` inside a sandbox (the runtime decides where its programs are).
     - `limits`: the sandbox limits of a run, except what a request may lower.
+    - `write_run_wait`: how long a run that writes places another live run writes waits for it,
+      before it is refused `busy` (D28, J7).
     - `snapshots`: undo (D28). `workspace_max_bytes`, `workspace_max_files`: what a task's
       workspace may hold; a run is refused while it holds more (#74's disk box, D28).
     """
@@ -190,6 +214,7 @@ class BrokerConfig:
     prompt_window: timedelta = timedelta(minutes=10)
     run_grace: timedelta = timedelta(seconds=20)
     sandbox_path: str = "/usr/bin:/bin"
+    write_run_wait: timedelta = timedelta(seconds=20)
     snapshots: SnapshotSettings = field(default_factory=SnapshotSettings)
     workspace_max_bytes: int = 512 * 1024 * 1024
     workspace_max_files: int = 50_000
@@ -206,6 +231,7 @@ class BrokerConfig:
         _require_duration("prompt_timeout", self.prompt_timeout, maximum=MAX_PROMPT_TIMEOUT)
         _require_duration("prompt_window", self.prompt_window, maximum=timedelta(days=1))
         _require_duration("run_grace", self.run_grace, maximum=timedelta(minutes=5))
+        _require_duration("write_run_wait", self.write_run_wait, maximum=MAX_WRITE_RUN_WAIT)
         if self.prompt_timeout + FS_CALLS_PER_PROMPT * self.fs_timeout + PROMPT_SLACK > PROMPT_WAIT:
             raise InvalidValueError(
                 "prompt_timeout and the file system calls around a prompt "

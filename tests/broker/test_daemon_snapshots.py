@@ -646,7 +646,9 @@ class TestRetention:
             directory_blocks = 2 * 4096
             async with running(
                 config=settings(
-                    max_bytes=directory_blocks, store_max_bytes=3 * directory_blocks + 100
+                    max_bytes=directory_blocks,
+                    store_max_bytes=3 * directory_blocks + 100,
+                    task_bytes=3 * directory_blocks + 100,
                 )
             ) as rig:
                 client = await rig.client()

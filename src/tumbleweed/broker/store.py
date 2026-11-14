@@ -154,6 +154,7 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     taken_at INTEGER NOT NULL CHECK (taken_at {_MILLIS}),
     undone_at INTEGER CHECK (undone_at IS NULL OR undone_at {_MILLIS}),
     superseded_at INTEGER CHECK (superseded_at IS NULL OR superseded_at {_MILLIS}),
+    superseded_by TEXT,
     record TEXT NOT NULL CHECK (length(CAST(record AS BLOB)) <= 65536)
 ) STRICT""",
         "CREATE INDEX snapshots_by_task ON snapshots (task_id, kind, seq)",
@@ -731,15 +732,27 @@ class BrokerStore:
             == 1
         )
 
-    def mark_superseded(self, snapshots: Sequence[SnapshotId], at: datetime) -> None:
-        """Record that these snapshots' changes were overtaken by an undo (inside
-        `transaction()`)."""
+    def mark_superseded(
+        self, snapshots: Sequence[SnapshotId], at: datetime, by: SnapshotId
+    ) -> None:
+        """Record that these snapshots' changes were overtaken by the undo of `by` (inside
+        `transaction()`): `reinstate(by)` undoes that."""
         for snapshot in snapshots:
             self._execute(
-                "UPDATE snapshots SET superseded_at = ? "
+                "UPDATE snapshots SET superseded_at = ?, superseded_by = ? "
                 "WHERE id = ? AND superseded_at IS NULL AND undone_at IS NULL",
-                (_millis(at), str(snapshot)),
+                (_millis(at), str(by), str(snapshot)),
             )
+
+    def reinstate(self, snapshot: SnapshotId) -> None:
+        """The undo of `snapshot` was itself undone (inside `transaction()`): it can be undone
+        again, and the snapshots its undo overtook are no longer overtaken."""
+        self._execute("UPDATE snapshots SET undone_at = NULL WHERE id = ?", (str(snapshot),))
+        self._execute(
+            "UPDATE snapshots SET superseded_at = NULL, superseded_by = NULL "
+            "WHERE superseded_by = ?",
+            (str(snapshot),),
+        )
 
     def snapshot(self, snapshot: SnapshotId) -> StoredSnapshot | None:
         """A snapshot with its state; None if there is none (or it cannot be read)."""

@@ -460,3 +460,22 @@ def test_a_fifo_in_a_tree_does_not_stop_the_snapshot(tmp_path: Path) -> None:
 
     assert stat.S_ISFIFO((root / "pipe").lstat().st_mode)
     snapshots.close()
+
+
+def test_the_subvolume_root_is_found_by_its_inode_number(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tumbleweed.broker.snapshots import BtrfsCli
+
+    volume = tmp_path / "volume"
+    root = make_tree(volume)
+    monkeypatch.setattr("tumbleweed.broker.snapshots._BTRFS_ROOT_INODE", volume.stat().st_ino)
+    with opened(root) as target:
+        found = BtrfsCli("btrfs").subvolume_root(target, len(stored(root).components))
+        elsewhere = BtrfsCli("btrfs").subvolume_root(target, 0)  # one level only: not reached
+
+    assert found is not None
+    fd, depth = found
+    os.close(fd)
+    assert depth == 1
+    assert elsewhere is None

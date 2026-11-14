@@ -401,6 +401,8 @@ class BtrfsCli:
         buffer = ctypes.create_string_buffer(256)
         if _libc().fstatfs(fd, buffer) != 0:
             return False
+        # `f_type` is the first field of `struct statfs`, a native `long` (so `@l`: 32 bits on a
+        # 32-bit host, 64 on x86_64 and aarch64, and it is masked below either way).
         (kind,) = struct.unpack_from("@l", buffer.raw)
         return (int(kind) & 0xFFFFFFFF) == _BTRFS_SUPER_MAGIC
 

@@ -590,3 +590,196 @@ def test_a_subvolume_search_that_cannot_finish_says_there_is_one(tmp_path: Path)
         assert contains_subvolume(fd, max_files=2, deadline=soon()) is True  # a limit
     finally:
         os.close(fd)
+
+
+# --- round 2: guards a mutant showed untested --------------------------------------------------
+
+
+def chain(parent: Path, name: str, levels: int) -> None:
+    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    os.mkdir(name, dir_fd=fd)
+    here = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+    os.close(fd)
+    for _ in range(levels):
+        os.mkdir("x", dir_fd=here)
+        nxt = os.open("x", os.O_RDONLY | os.O_DIRECTORY, dir_fd=here)
+        os.close(here)
+        here = nxt
+    os.close(here)
+
+
+def test_a_chain_of_thousands_of_directories_is_removed(tmp_path: Path) -> None:
+    parent = tmp_path / "p"
+    parent.mkdir()
+    chain(parent, "deep", 5000)
+    (parent / "keep").write_text("keep")
+    fd = open_dir(parent)
+    try:
+        remove_entry(fd, "deep", soon())
+    finally:
+        os.close(fd)
+
+    assert [p.name for p in parent.iterdir()] == ["keep"]
+
+
+def test_a_directory_that_is_not_the_one_climbed_from_is_refused_on_the_way_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "p"
+    (parent / "victim" / "inner").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "keep").mkdir(parents=True)
+    real = os.open
+
+    def lying(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if path == ".." and kwargs.get("dir_fd") is not None:
+            return real(elsewhere, os.O_RDONLY | os.O_DIRECTORY)  # `..` leads somewhere else
+        return real(path, flags, *args, **kwargs)  # type: ignore[arg-type]  # delegating
+
+    monkeypatch.setattr(os, "open", lying)
+    fd = open_dir(parent)
+    try:
+        with pytest.raises(SnapshotError) as caught:
+            remove_entry(fd, "victim", soon())
+    finally:
+        os.close(fd)
+
+    assert caught.value.fault is SnapshotFault.TARGET_CHANGED
+    assert (elsewhere / "keep").is_dir()  # nothing outside was touched
+
+
+@pytest.mark.linux
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
+def test_a_file_swapped_while_it_is_unlocked_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tree(tmp_path)
+    (root / "secret.txt").write_text("s")
+    (root / "secret.txt").chmod(0)
+    real = os.open
+    swapped: list[bool] = []
+
+    def swap(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if path == "secret.txt" and flags & getattr(os, "O_PATH", 0) and not swapped:
+            swapped.append(True)
+            (root / "secret.txt").rename(root / "moved.txt")
+            (root / "secret.txt").write_text("another")
+        return real(path, flags, *args, **kwargs)  # type: ignore[arg-type]  # delegating
+
+    monkeypatch.setattr(os, "open", swap)
+    (tmp_path / "s").mkdir()
+    sfd, dfd = open_dir(root), open_dir(tmp_path / "s")
+    try:
+        with pytest.raises(SnapshotError):
+            copy_object(sfd, dfd, "c", TreeBudget(LIMITS), soon())
+    finally:
+        os.close(sfd)
+        os.close(dfd)
+        (root / "moved.txt").chmod(0o600)
+
+
+@pytest.mark.linux
+def test_a_failed_in_place_restore_puts_the_mode_back_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "f.txt"
+    target.write_text("before")
+    target.chmod(0o444)
+    store = tmp_path / "store"
+    store.mkdir()
+    tfd = os.open(target, os.O_RDONLY)
+    dfd = open_dir(store)
+    copy_object(tfd, dfd, "copy", TreeBudget(LIMITS), soon())
+    target.chmod(0o600)
+    target.write_text("after")
+    target.chmod(0o444)
+    real = os.open
+
+    def fail(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if isinstance(path, str) and path.startswith("/proc/self/fd/"):
+            raise PermissionError
+        return real(path, flags, *args, **kwargs)  # type: ignore[arg-type]  # delegating
+
+    monkeypatch.setattr(os, "open", fail)
+    stored = real(store / "copy", os.O_RDONLY)
+    try:
+        with pytest.raises(SnapshotError):
+            restore_object(stored, tfd, TreeMeta(), soon())
+    finally:
+        for fd in (tfd, dfd, stored):
+            os.close(fd)
+
+    assert target.stat().st_mode & 0o777 == 0o444  # not left writable
+
+
+def test_the_mode_of_the_restored_folder_itself_is_put_back(tmp_path: Path) -> None:
+    root = tree(tmp_path)
+    root.chmod(0o750)
+    saved = snap(root, tmp_path / "store")
+    root.chmod(0o700)
+
+    restore(saved, root)
+
+    assert root.stat().st_mode & 0o777 == 0o750
+
+
+def test_a_special_file_that_is_still_there_is_the_same_one_after_a_restore(tmp_path: Path) -> None:
+    root = tree(tmp_path)
+    make_fifo(root / "pipe")
+    saved = snap(root, tmp_path / "store")
+    before = (root / "pipe").stat().st_ino
+
+    restore(saved, root)
+
+    assert (root / "pipe").stat().st_ino == before  # kept, not removed and made again
+
+
+def test_the_subvolume_root_inode_is_what_the_search_looks_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tree(tmp_path)
+    fd = open_dir(root)
+    try:
+        assert contains_subvolume(fd, max_files=1000, deadline=soon()) is False
+        monkeypatch.setattr(
+            "tumbleweed.broker.treeops._SUBVOLUME_ROOT_INODE", (root / "d").stat().st_ino
+        )
+        assert contains_subvolume(fd, max_files=1000, deadline=soon()) is True
+    finally:
+        os.close(fd)
+
+
+def test_a_file_that_grows_while_it_is_copied_is_stopped_at_the_cap_chunk_by_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fcntl
+
+    from tumbleweed.broker import treeops
+
+    big = tmp_path / "big"
+    big.write_bytes(b"x" * (12 * treeops.CHUNK))
+    monkeypatch.setattr(fcntl, "ioctl", lambda *a, **k: (_ for _ in ()).throw(OSError()))
+    reads: list[int] = []
+    real = os.read
+
+    def counting(fd: int, count: int) -> bytes:
+        data = real(fd, count)
+        reads.append(len(data))
+        return data
+
+    monkeypatch.setattr(os, "read", counting)
+    source = os.open(big, os.O_RDONLY)
+    (tmp_path / "out").write_bytes(b"")
+    out = os.open(tmp_path / "out", os.O_WRONLY)
+    work = treeops._Work(  # noqa: SLF001
+        TreeBudget(TreeLimits(max_bytes=2 * treeops.CHUNK, max_files=10)), soon()
+    )
+    try:
+        with pytest.raises(SnapshotError) as caught:
+            treeops._copy_content(source, out, work, allowed=0)  # noqa: SLF001
+    finally:
+        os.close(source)
+        os.close(out)
+
+    assert caught.value.fault is SnapshotFault.TOO_MANY_BYTES
+    assert len([n for n in reads if n]) <= 4  # stopped near the cap, not at the end of the file
