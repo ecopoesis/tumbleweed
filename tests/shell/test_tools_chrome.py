@@ -212,3 +212,82 @@ def test_the_source_of_an_instance_is_what_was_shown_and_it_is_gone_when_closed(
     tools.close()
     with pytest.raises(UnknownInstanceError):
         tools.source(shown.instance)
+
+
+class _WindowPort(FakePort):
+    made: "list[_WindowPort]" = []  # noqa: RUF012  (reset by the test)
+
+    def __init__(self, *args: object) -> None:
+        super().__init__()
+        self.args = args
+        _WindowPort.made.append(self)
+        self.listed = 0
+
+    def list(self, done: Callable[[tuple[object, ...] | None], None]) -> None:  # type: ignore[override]  # a fake
+        self.listed += 1
+        done(())
+
+
+def _window_with_a_broker(monkeypatch: pytest.MonkeyPatch) -> Shell:
+    from tumbleweed.agent.broker_link import BrokerLink
+    from tumbleweed.agent.echo import EchoResponder
+    from tumbleweed.agent.tasks import TaskSession
+    from tumbleweed.shell._gi import Gio
+    from tumbleweed.shell.app import ShellApplication
+    from tumbleweed.shell.dispatch import GlibDispatcher
+    from tumbleweed.shell.window import ShellWindow
+
+    _WindowPort.made = []
+    monkeypatch.setattr("tumbleweed.shell.window.BrokerToolsPort", _WindowPort)
+    link = BrokerLink(lambda relay: (_ for _ in ()).throw(AssertionError("never connects")))
+    responder = EchoResponder()
+    app = ShellApplication(responder, flags=Gio.ApplicationFlags.NON_UNIQUE)
+    app.register(None)
+    window = ShellWindow(
+        app, responder, broker_link=link, tasks=TaskSession(link, GlibDispatcher())
+    )
+    return Shell(app, window)
+
+
+def test_the_tools_button_opens_the_panel_in_the_side_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shell = _window_with_a_broker(monkeypatch)
+    try:
+        window = shell.window
+        assert window.tools_panel is not None
+        assert window.status_strip.tools_button.get_visible()
+        assert not window.tools_panel.get_visible()
+        assert window.tools_panel.is_ancestor(window._side)  # noqa: SLF001  (the side column)
+
+        window.status_strip.tools_button.emit("clicked")
+
+        assert window.tools_panel.get_visible()
+        assert _WindowPort.made[0].listed == 1
+    finally:
+        shell.window.shutdown()
+        shell.window.destroy()
+
+
+def test_a_pending_prompt_locks_the_tools_panel_and_its_button(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.shell.prompt_support import Answers, Clock, Timers, read_card
+    from tumbleweed.shell.viewmodel.prompts import PromptController
+
+    shell = _window_with_a_broker(monkeypatch)
+    try:
+        window = shell.window
+        assert window.tools_panel is not None
+        clock = Clock()
+        controller = PromptController(window.prompt_banner, Answers(), Timers(clock), clock)
+        window.prompt_banner.bind(controller)
+        assert controller.offer(read_card(), 600.0)
+
+        window.status_strip.tools_button.emit("clicked")
+
+        assert not window.tools_panel.get_visible()  # the click did nothing
+        assert not window.tools_panel.get_sensitive() or not window._side.get_sensitive()  # noqa: SLF001
+    finally:
+        shell.window.shutdown()
+        shell.window.destroy()

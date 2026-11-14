@@ -325,6 +325,20 @@ class TestGenerateSaveFindOpen:
             assert payload["code"] == {"csv_view": SOURCE}
             assert second.canvas.runtimes[instance].store.value(StateKey("status")) == "loaded"
 
+    def test_patching_the_state_of_a_stored_instance_starts_no_run(self) -> None:
+        """Who gets tool grants rests on this: a patch is not a user's event (D24, D30 (2))."""
+        with broker() as thread:
+            tool = generate_and_save(session(thread))
+            second, _ = open_in_new_session(thread, tool)
+            (instance,) = second.canvas.instances
+            runs = len(thread.rig.audit_of(SandboxRun))
+
+            second.canvas.runtimes[instance].patch_state({"csv_path": "/other.csv"})
+            second.dispatcher.drain(settle=0.2)
+
+            assert len(thread.rig.audit_of(SandboxRun)) == runs
+            assert second.canvas.targets[instance].notices == []
+
     def test_find_tools_says_when_nothing_matches_and_open_tool_names_a_missing_tool(self) -> None:
         with broker() as thread:
             first = session(thread)
@@ -337,7 +351,7 @@ class TestGenerateSaveFindOpen:
                 rig.send_and_wait("open my spreadsheet tool")
 
                 none, missing = results(rig, 1)[0], results(rig, 2)[0]
-                assert none.content == "No saved tool matches."
+                assert none.content.startswith("No saved tool matches.\n")
                 assert missing.is_error
                 assert "not_found" in missing.content
 
