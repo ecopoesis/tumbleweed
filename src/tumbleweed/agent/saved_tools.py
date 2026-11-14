@@ -167,7 +167,8 @@ class RevertToolInput(BaseModel):
 
 
 def _refused(refusal: BrokerRefused) -> ToolError:
-    return ToolError(f"The broker said no ({refusal.reason}): {refusal.message}.")
+    """The broker's fixed text, with one full stop (several of its texts end with one already)."""
+    return ToolError(f"The broker said no ({refusal.reason}): {refusal.message.rstrip('.')}.")
 
 
 def _label(taint: tuple[str, ...]) -> str:

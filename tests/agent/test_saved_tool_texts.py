@@ -193,6 +193,17 @@ class TestFindTexts:
 
 
 class TestWriteTexts:
+    def test_a_broker_text_that_ends_with_a_full_stop_is_not_given_a_second(self) -> None:
+        from tumbleweed.agent.saved_tools import _refused
+        from tumbleweed.broker.client import BrokerRefused
+        from tumbleweed.broker.toolflow import BIT_CAP_TEXT, NOT_VISIBLE_NET_TEXT
+
+        for text in (BIT_CAP_TEXT, NOT_VISIBLE_NET_TEXT):
+            said = str(_refused(BrokerRefused("busy", text)))
+            assert said == f"The broker said no (busy): {text}"
+            assert ".." not in said
+        assert str(_refused(BrokerRefused("denied", "no stop"))).endswith("no stop.")
+
     def test_a_write_that_took_the_lineages_taint_says_which_one(self) -> None:
         from tumbleweed.agent.saved_tools import marked
 

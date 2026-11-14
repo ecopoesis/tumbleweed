@@ -445,6 +445,27 @@ class TestTheAcceptedBit:
 
         run(scenario)
 
+    def test_the_budget_is_shared_down_a_chain_of_live_heirs(self) -> None:
+        """The agent's normal path: each task continues the live one before it (A, B, C, D)."""
+
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                ids = await build(rig, client, with_fs=True)
+                task = await net_task(rig, client)
+                for generation in range(4):
+                    for _ in range(5):
+                        with pytest.raises(BrokerRefused) as hidden:
+                            await refine("X")(client, task, ids)
+                        assert hidden.value.message == WRITE_HIDDEN_TEXT, generation
+                    if generation < 3:
+                        task = (await client.start_task(previous=task)).task  # task is live
+                with pytest.raises(BrokerRefused) as metered:
+                    await refine("X")(client, task, ids)  # 21st, in the fourth generation
+                assert metered.value.message == BIT_CAP_TEXT
+
+        run(scenario)
+
     def test_heirs_of_one_task_and_a_branch_from_an_older_one_share_one_budget(self) -> None:
         async def scenario() -> None:
             async with running() as rig:

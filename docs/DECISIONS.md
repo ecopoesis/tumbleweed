@@ -2021,9 +2021,14 @@ fs versions, from a net task and from a clean task that stays clean, and demands
   approval of the network again. Each limit has its own fixed busy text, which says which it was and,
   for the context, that `start_task` with `fresh_context=true` lifts it (adding no bit).
   **Accepted residual (a decision, not an oversight):** a net task learns at most one bit per counted
-  attempt, "this tool has a version made in a task that read files", so **at most 20 bits per
-  context, that is per user approval of the network**. The harness asserts that this bit is the only
-  difference. The lineage is not forked: that would amend D19.
+  attempt, "this tool has a version made in a task that read files", so **at most
+  `MAX_CONTEXT_BITS` (20) bits per context root**. (Not strictly "per user approval of the network": a
+  fresh root can become net-tainted by opening a net-tainted saved tool, which needs no prompt, and then
+  has a budget of its own. The reach is small: a fresh clean task's search hides net tools, so the
+  model must already know the tool's ID, and what it can then learn is the same one bit per attempt
+  about a lineage it can already name.) The harness asserts that this bit is the only
+  difference. `start_task(previous=E)` accepts an ended task of any owner (as it does for taint,
+  #157), so a heir shares E's root and spends its budget: the same class as taint inheritance. The lineage is not forked: that would amend D19.
 - *Other store-wide state (S4).* Names are not unique, so there is no "name taken" answer. The caps are
   global: **the store is full** (500 tools, 256 MiB of packages) and the per-tool 100 versions (covered
   by the gate above). A task not fs-tainted can learn one bit, "the store is full", which depends on
