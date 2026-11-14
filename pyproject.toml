@@ -181,7 +181,7 @@ filterwarnings = ["error"]
 xfail_strict = true
 # No test may hang a run. The slowest tests (a cold mypy over a fixture, a Docker build of a
 # scratch context) take 5 to 25 seconds, so 120 leaves a wide margin while a hang costs two
-# minutes instead of the job's 30-minute limit. A test with a legitimate reason to take longer
+# minutes instead of the whole job's limit. A test with a legitimate reason to take longer
 # says so with @pytest.mark.timeout(n).
 timeout = 120
 markers = [
