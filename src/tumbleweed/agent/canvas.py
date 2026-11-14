@@ -36,7 +36,8 @@ from tumbleweed.agent.runtime import MainThreadDispatcher
 from tumbleweed.agent.tasks import TaskError
 from tumbleweed.agent.tools import ToolError, ToolName, ToolRegistry
 from tumbleweed.core.errors import TumbleweedError
-from tumbleweed.core.ids import TaskId, ToolInstanceId
+from tumbleweed.core.ids import TaskId, ToolId, ToolInstanceId
+from tumbleweed.core.types import ContentHash, ToolVersion
 from tumbleweed.tools.limits import MAX_MODULES, MAX_MODULES_BYTES
 from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.spec import SpecError, UiSpec, validate_ui_spec
@@ -65,6 +66,34 @@ class UnknownInstanceError(TumbleweedError):
 
 @final
 @dataclass(frozen=True)
+class StoredBinding:
+    """A tool shown from the broker's store (S24, D30 (2)): the instance the **broker** named when
+    it opened the version into the task, the tool, the version and its content hash, and what the
+    manifest declares it may ask for (`fs.read`, `net.full`: what the card offers to grant).
+
+    Only `open_tool` and the chrome's tools list make one, from the broker's own answer. A tool
+    the model shows with `show_ui` has none, so no tool grant ever applies to it."""
+
+    instance: ToolInstanceId
+    tool: ToolId
+    version: ToolVersion
+    content_hash: ContentHash
+    capabilities: tuple[str, ...]
+
+
+@final
+@dataclass(frozen=True)
+class InstanceSource:
+    """What is on the canvas as one instance: its spec, its code and, for a stored tool, where it
+    came from. What `save_tool` saves, so the model never resends it."""
+
+    spec: UiSpec
+    code: tuple[CodeModule, ...]
+    stored: StoredBinding | None
+
+
+@final
+@dataclass(frozen=True)
 class ShownTool:
     """What the canvas did with a spec: the instance it made, and how many are on the canvas."""
 
@@ -81,10 +110,16 @@ class CanvasHost(Protocol):
         placement: Placement,
         task: TaskId | None,
         code: tuple[CodeModule, ...] = (),
+        stored: StoredBinding | None = None,
     ) -> ShownTool:
         """Show `spec` as an instance that belongs to `task` (None: to no task, S12's case).
         `code` is the source of the modules its `sandbox` handlers call (S20): text, never run
-        here."""
+        here. With `stored` the instance has the ID the broker named, and its handler runs go
+        through the broker's store (S24)."""
+        ...
+
+    def source(self, instance: ToolInstanceId) -> InstanceSource:
+        """The spec, code and origin of an instance on the canvas. Raises `UnknownInstanceError`."""
         ...
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
@@ -116,8 +151,12 @@ class CanvasLink:
         placement: Placement,
         task: TaskId | None = None,
         code: tuple[CodeModule, ...] = (),
+        stored: StoredBinding | None = None,
     ) -> ShownTool:
-        return await self._on_main(lambda host: host.show(spec, placement, task, code))
+        return await self._on_main(lambda host: host.show(spec, placement, task, code, stored))
+
+    async def source(self, instance: ToolInstanceId) -> InstanceSource:
+        return await self._on_main(lambda host: host.source(instance))
 
     async def patch(
         self, instance: ToolInstanceId, patch: Mapping[str, object]
@@ -219,7 +258,7 @@ def _code_problems(spec: UiSpec, code: tuple[CodeModule, ...]) -> list[str]:
     return problems
 
 
-def _describe_entries(spec: UiSpec) -> str:
+def describe_entries(spec: UiSpec) -> str:
     entries = []
     for key, decl in spec.declarations().items():
         computed = isinstance(decl, BoolState | IntState | FloatState | StringState) and (
@@ -256,7 +295,7 @@ def register_canvas_tools(
         where = f"on the canvas{count}"
         return (
             f"Showed the tool {where} as instance {shown.instance}. "
-            f"State entries: {_describe_entries(spec) or 'none'}. "
+            f"State entries: {describe_entries(spec) or 'none'}. "
             "Use patch_state with this instance id to change them."
         )
 

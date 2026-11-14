@@ -27,6 +27,7 @@ from tumbleweed.agent.canvas_events import EventGate, Scheduler
 from tumbleweed.agent.code import BrokerHandlerExecutor
 from tumbleweed.agent.responder import Responder
 from tumbleweed.agent.tasks import TaskSession
+from tumbleweed.agent.tool_access import BrokerToolAccess
 from tumbleweed.core.ids import TaskId
 from tumbleweed.shell._gi import Adw, Gio, Gtk
 from tumbleweed.shell.broker_prompts import BrokerPrompts
@@ -138,6 +139,9 @@ class ShellWindow(Adw.ApplicationWindow):
             if broker_link is None
             else BrokerHandlerExecutor(broker_link, GlibDispatcher()),
             scheduler=None if broker_link is None else GlibScheduler(),
+            tool_access=None
+            if broker_link is None
+            else BrokerToolAccess(broker_link, GlibDispatcher()),
         )
         if canvas_link is not None:
             canvas_link.attach(self.canvas_tools)

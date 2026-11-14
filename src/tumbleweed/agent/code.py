@@ -20,6 +20,7 @@ from typing import Final, Literal, Protocol, assert_never, final
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from tumbleweed.agent.broker_link import BrokerLink, BrokerUnavailableError
+from tumbleweed.agent.canvas import StoredBinding
 from tumbleweed.agent.canvas_events import json_of
 from tumbleweed.agent.runtime import MainThreadDispatcher
 from tumbleweed.agent.tasks import TaskError, TaskSession
@@ -28,7 +29,7 @@ from tumbleweed.agent.untrusted import PROGRAM_INTRO, framed
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
 from tumbleweed.broker.config import RUN_SETUP_WAIT
 from tumbleweed.core.ids import RunId, TaskId
-from tumbleweed.ipc.broker_messages import RunResult
+from tumbleweed.ipc.broker_messages import RunOrigin, RunResult, WireBinding
 from tumbleweed.sandbox.handler_protocol import (
     handler_command,
     handler_payload,
@@ -147,6 +148,9 @@ class HandlerCall:
     function: str
     inputs: Mapping[StateKey, StateValue]
     code: Sequence[CodeModule]
+    stored: StoredBinding | None = None
+    """For a tool opened from the broker's store (S24): the run carries no code, the broker puts in
+    the stored code, and the run is a user's (a handler runs only on a direct input event)."""
 
 
 def handler_run(call: HandlerCall) -> tuple[tuple[str, ...], str] | None:
@@ -155,7 +159,9 @@ def handler_run(call: HandlerCall) -> tuple[tuple[str, ...], str] | None:
         call.module,
         call.function,
         {str(key): json_of(value) for key, value in call.inputs.items()},
-        {str(module.name): module.source for module in call.code},
+        {}
+        if call.stored is not None
+        else {str(module.name): module.source for module in call.code},
     )
     return None if payload is None else (handler_command(), payload)
 
@@ -253,6 +259,7 @@ class BrokerHandlerExecutor:
             return _nothing
         command, payload = prepared
         run = RunId.new()
+        origin = _origin_of(call.stored)
 
         async def work(client: BrokerClient) -> HandlerOutcome:
             try:
@@ -264,6 +271,7 @@ class BrokerHandlerExecutor:
                     cpu_seconds=self._wall_seconds,
                     max_output_bytes=HANDLER_OUTPUT_BYTES,
                     payload=payload,
+                    origin=origin,
                 )
             except BrokerRefused as refusal:
                 return refusal_outcome(refusal)
@@ -295,6 +303,21 @@ class BrokerHandlerExecutor:
 
 def _nothing() -> None:
     return
+
+
+def _origin_of(stored: StoredBinding | None) -> RunOrigin:
+    """What started a handler run. A sandbox handler runs only on a direct input event of the
+    user (a patch fires none, D24), so the run of a stored tool is the user's, and the broker
+    checks the binding (D30 (2)). A tool that was not opened from the store has none: its run is
+    the model's code and gets no tool grant."""
+    if stored is None:
+        return RunOrigin()
+    return RunOrigin(
+        trigger="user_event",
+        binding=WireBinding(
+            instance=stored.instance, tool=stored.tool, content_hash=stored.content_hash
+        ),
+    )
 
 
 # --- run_code --------------------------------------------------------------------------------

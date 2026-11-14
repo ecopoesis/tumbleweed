@@ -15,8 +15,10 @@ from tests.agent.support import ManualDispatcher, Rig, make_rig
 from tests.ui.spec.support import golden_text
 from tumbleweed.agent.canvas import (
     CanvasLink,
+    InstanceSource,
     Placement,
     ShownTool,
+    StoredBinding,
     UnknownInstanceError,
     register_canvas_tools,
 )
@@ -42,6 +44,13 @@ class FakeCanvas:
         self.runtimes: dict[ToolInstanceId, UiRuntime] = {}
         self.threads: set[int] = set()
         self.code: list[tuple[CodeModule, ...]] = []
+        self.sources: dict[ToolInstanceId, InstanceSource] = {}
+
+    def source(self, instance: ToolInstanceId) -> InstanceSource:
+        found = self.sources.get(instance)
+        if found is None or instance not in self.runtimes:
+            raise UnknownInstanceError("gone")
+        return found
 
     def show(
         self,
@@ -49,10 +58,18 @@ class FakeCanvas:
         placement: Placement,
         task: TaskId | None,
         code: tuple[CodeModule, ...] = (),
+        stored: StoredBinding | None = None,
     ) -> ShownTool:
         self.threads.add(threading.get_ident())
         self.code.append(code)
-        instance = self._ids.pop(0) if self._ids else ToolInstanceId.new()
+        instance = (
+            stored.instance
+            if stored is not None
+            else self._ids.pop(0)
+            if self._ids
+            else ToolInstanceId.new()
+        )
+        self.sources[instance] = InstanceSource(spec, code, stored)
         if placement == "replace":
             self.runtimes.clear()
         self.runtimes[instance] = UiRuntime(spec)
