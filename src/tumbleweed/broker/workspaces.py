@@ -183,7 +183,7 @@ class Workspaces:
 
     def delete_named(self, name: str) -> Literal["deleted", "missing"]:
         try:
-            fd = _open_directory(self._root_fd, name)
+            fd = open_directory(self._root_fd, name)
         except FileNotFoundError:
             return "missing"
         except OSError as exc:
@@ -238,7 +238,7 @@ def _remove(parent: int, name: str, depth: int) -> None:
     if not stat.S_ISDIR(info.st_mode):
         os.unlink(name, dir_fd=parent)  # a file, or a link (removed, never followed)
         return
-    child = _open_directory(parent, name)
+    child = open_directory(parent, name)
     try:
         opened = os.fstat(child)
         if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
@@ -249,7 +249,7 @@ def _remove(parent: int, name: str, depth: int) -> None:
     os.rmdir(name, dir_fd=parent)
 
 
-def _open_directory(parent: int, name: str) -> int:
+def open_directory(parent: int, name: str) -> int:
     """Open the directory `name` of `parent` without following a link. A directory the program
     made unreadable (mode 0) is given the mode to be opened first; it is ours."""
     try:

@@ -5,7 +5,12 @@ Pure functions; `service` opens the descriptors and builds the `SandboxPolicy`.
 - `disjoint_mounts`: the sandbox policy refuses grants that overlap, because bwrap makes the
   mount point of an inner one by walking the live directory of the outer one (S14, #74). The
   broker therefore keeps the grants it mounts apart: of two grants where one is the other or
-  inside it, only the outer is mounted, which gives the program exactly the access it had.
+  inside it, only the outer is mounted. Writing makes the two kinds differ (S21, D28): a read
+  grant that is the same as, or inside, a write grant is merged into it (the program has the
+  access the write grant gave it there, which includes reading, and no more than the user
+  allowed); a **write grant inside a read grant is refused** (`InvalidRunError`), because
+  mounting the outer one writable would give more than was granted and mounting it read-only
+  would take away the inner one's write: the user narrows or revokes one of the two.
 - `sandbox_environment`: the broker, not the launcher, owns the environment (I6, #74). A run
   gets a fixed set (`PATH`, `HOME`, `TMPDIR`, `LANG`, `PYTHONDONTWRITEBYTECODE`) and a request
   may set only `LANG`, `LC_ALL` and `TZ`; any other name is refused rather than dropped, so the
@@ -38,20 +43,38 @@ class Mount:
 
     grant: GrantId
     path: StoredPath
+    writable: bool = False
 
 
 def disjoint_mounts(mounts: Sequence[Mount]) -> list[Mount]:
     """`mounts` without any that is the same as, or inside, another, in a stable order.
 
-    Compared by the components of the stored text, as the sandbox policy compares targets.
-    The outermost come first, so a mount is kept only if nothing kept before it covers it.
+    Compared by the components of the stored text, as the sandbox policy compares targets. The
+    outermost come first (a write before a read of the same path), so a mount is kept only if
+    nothing kept before it covers it. `InvalidRunError` if a writable mount is inside a read-only
+    one (see the module docstring).
     """
-    ordered = sorted(mounts, key=lambda mount: (len(mount.path.components), mount.path.path))
+    ordered = sorted(
+        mounts,
+        key=lambda mount: (len(mount.path.components), mount.path.path, not mount.writable),
+    )
     kept: list[Mount] = []
     for mount in ordered:
         parts = mount.path.components
-        if not any(parts[: len(other.path.components)] == other.path.components for other in kept):
+        covering = next(
+            (
+                other
+                for other in kept
+                if parts[: len(other.path.components)] == other.path.components
+            ),
+            None,
+        )
+        if covering is None:
             kept.append(mount)
+        elif mount.writable and not covering.writable:
+            raise InvalidRunError(
+                "a write grant lies inside a read grant of this run: narrow or revoke one of them"
+            )
     return kept
 
 

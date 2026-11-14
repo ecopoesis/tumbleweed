@@ -13,9 +13,9 @@ anything itself (see `Allow`).
 2. the static deny rules (`StaticDeny`): the path equals, is inside or is an ancestor of a
    protected location. Nothing beats this: it comes before every grant, and a stored grant
    that now overlaps the list is not used either (`SkipReason.STATIC_DENY`);
-3. the write gate (`WriteGateClosed`): every `fs.write` request is refused until S21 ships
-   snapshots and replaces `_write_gate`. A stored `fs.write` grant is not used for anything,
-   not even for reading;
+3. (the write gate of S16 is lifted by S21, D28: an `fs.write` grant is an ordinary grant of
+   the task scope only, and what makes a write safe is the broker's snapshot before the run, I13;
+   the deny rules apply to it like to any other);
 4. the grants in force (`select_grants`): one that covers the request is an `Allow`. A grant
    covers a path request by identity (`ResolvedPath.below`), not by text;
 5. otherwise a prompt could still end in a grant only if the task's taint allows it
@@ -112,13 +112,6 @@ class StaticDeny(PolicyModel):
 
 
 @final
-class WriteGateClosed(PolicyModel):
-    """Writes are not available until snapshots exist (S21)."""
-
-    kind: Literal["write_gate"] = "write_gate"
-
-
-@final
 class TaintConflict(PolicyModel):
     """The task holds one kind of taint, and the grant would add the one that cannot be held
     with it (I12). The model is told to start a task with `fresh_context=true`."""
@@ -166,7 +159,6 @@ class BadExpiry(PolicyModel):
 
 type Refusal = Annotated[
     StaticDeny
-    | WriteGateClosed
     | TaintConflict
     | TaskEnded
     | TaskMismatch
@@ -184,11 +176,6 @@ def describe(reason: Refusal) -> str:
         case StaticDeny(entry=entry, relation=relation):
             return (
                 f"refused: {_relation_phrase(relation)} ({entry}), and those can never be granted"
-            )
-        case WriteGateClosed():
-            return (
-                "refused: writing to files is not available yet (it needs undo first); "
-                "a sandbox can write only to its own workspace"
             )
         case TaintConflict(held=held, wanted=wanted):
             return (
@@ -296,7 +283,6 @@ class SkipReason(StrEnum):
     OTHER_RUN = "other_run"
     OTHER_TOOL = "other_tool"  # a different tool, a different version, or no saved tool at all
     NOT_USER_TRIGGERED = "not_user_triggered"  # a tool grant, for a run a user event did not start
-    WRITE_GATE = "write_gate"
     STATIC_DENY = "static_deny"
     TAINT_CONFLICT = "taint_conflict"  # I12: withheld from the run
 
@@ -361,9 +347,7 @@ def _skip_reason(
     if binding is not None:
         return binding
     match grant.capability:
-        case FsWrite():
-            return SkipReason.WRITE_GATE
-        case FsRead(path=stored):
+        case FsRead(path=stored) | FsWrite(path=stored):
             # Deny beats grant even for a grant made before the list grew or before it was
             # forged into a store; by text only, as a stored path has no identities to compare.
             if rules.check_text(stored) is not None:
@@ -392,8 +376,8 @@ def select_grants(
 
     A grant applies if it has not expired, belongs here (a once grant: to this task and this run
     and is not consumed; a task grant: to this task; a tool grant: the run is a user-triggered
-    run of exactly that tool and content hash), is not an `fs.write` grant (the write gate),
-    does not overlap the deny list, and does not conflict with the task's taint.
+    run of exactly that tool and content hash), does not overlap the deny list, and does not
+    conflict with the task's taint.
 
     **Applying a tool grant counts as issuing it** (I12): the tool grants that apply are taken
     in order of issue (`issued_at`, then ID) and each adds its taint to the running taint, so
@@ -439,17 +423,6 @@ def select_grants(
 # --- the gates -------------------------------------------------------------------------------
 
 
-def _write_gate(capability: CapabilityKind) -> WriteGateClosed | None:
-    """Refuse every write. S21 replaces this with the snapshot-backed gate (I13)."""
-    match capability:
-        case CapabilityKind.FS_WRITE:
-            return WriteGateClosed()
-        case CapabilityKind.FS_READ | CapabilityKind.NET_FULL:
-            return None
-        case _ as unreachable:
-            assert_never(unreachable)
-
-
 def _common_refusal(task: TaskState, request: AccessRequest, rules: DenyRules) -> Refusal | None:
     """The refusals `decide` and `issue_grant` share, in order."""
     if request.task != task.task:
@@ -458,7 +431,7 @@ def _common_refusal(task: TaskState, request: AccessRequest, rules: DenyRules) -
         return TaskEnded()
     if request.path is not None and (match := rules.check(request.path)) is not None:
         return StaticDeny(entry=match.entry, relation=match.relation)
-    return _write_gate(request.capability)
+    return None
 
 
 def _capability_of(request: AccessRequest) -> Capability | None:
@@ -469,7 +442,9 @@ def _capability_of(request: AccessRequest) -> Capability | None:
                 return None
             return FsRead(path=StoredPath.record(request.path))
         case CapabilityKind.FS_WRITE:
-            return None  # the write gate refuses it first; until S21 nothing records a write
+            if request.path is None or request.path.identity is None:
+                return None
+            return FsWrite(path=StoredPath.record(request.path))
         case CapabilityKind.NET_FULL:
             return NetFull()
         case _ as unreachable:
@@ -505,19 +480,27 @@ def _cover(grant: Grant, request: AccessRequest) -> _Cover | None:
     capability = grant.capability
     match request.capability:
         case CapabilityKind.FS_READ:
-            if not isinstance(capability, FsRead) or request.path is None:
+            # A write grant implies reading (capabilities): it covers reads below it.
+            if not isinstance(capability, FsRead | FsWrite) or request.path is None:
                 return None
             below = request.path.below(capability.path)
             return None if below is None else _Cover(grant, below)
         case CapabilityKind.NET_FULL:
             return _Cover(grant, ()) if isinstance(capability, NetFull) else None
         case CapabilityKind.FS_WRITE:
-            return None
+            if not isinstance(capability, FsWrite) or request.path is None:
+                return None
+            below = request.path.below(capability.path)
+            return None if below is None else _Cover(grant, below)
         case _ as unreachable:
             assert_never(unreachable)
 
 
-def _scopes_for(run: RunContext) -> frozenset[GrantScope]:
+def _scopes_for(run: RunContext, capability: CapabilityKind) -> frozenset[GrantScope]:
+    if capability is CapabilityKind.FS_WRITE:
+        # A write is bound to the snapshots of the runs that use it, so it is the task's (D28): a
+        # `once` grant is spent by one read and never reaches code, and a tool's write is S24's.
+        return frozenset({GrantScope.TASK})
     scopes = {GrantScope.ONCE, GrantScope.TASK}
     if run.tool is not None and run.trigger is RunTrigger.USER_EVENT:
         scopes.add(GrantScope.TOOL)
@@ -563,7 +546,7 @@ def decide(
     capability = _capability_of(request)
     if capability is None:
         return Deny(reason=Ungrantable())
-    return NeedsPrompt(capability=capability, scopes=_scopes_for(request.run))
+    return NeedsPrompt(capability=capability, scopes=_scopes_for(request.run, request.capability))
 
 
 # --- issuing a grant -------------------------------------------------------------------------
@@ -587,7 +570,7 @@ def issue_grant(
     folder picked for a file asked for): its `path` is the path to grant, from
     `ResolvedPath.resolve` taken **before** the user was asked, so that what the user saw is what
     gets recorded. The refusals come in this order: the checks of `decide` (task, static deny
-    with the ancestor rule, write gate), a target that cannot be recorded (it must exist),
+    with the ancestor rule), a target that cannot be recorded (it must exist),
     an `expires_at` that is not in the future, a scope that is not available (`tool` needs a
     user-triggered run of a saved tool) and, last, a taint that conflicts. On success the
     returned task has the new grant's taint, whether or not the grant is ever used (I12), and
@@ -609,7 +592,11 @@ def issue_grant(
         return Deny(reason=Ungrantable())
     if expires_at is not None and expires_at <= now:
         return Deny(reason=BadExpiry())
-    grant = _new_grant(task, request, capability, scope, origin, grant_id, now, expires_at)
+    grant = (
+        None
+        if request.capability is CapabilityKind.FS_WRITE and scope is not GrantScope.TASK
+        else _new_grant(task, request, capability, scope, origin, grant_id, now, expires_at)
+    )
     if grant is None:
         return Deny(reason=ScopeUnavailable(scope=scope))
     wanted = taint_of(request.capability)

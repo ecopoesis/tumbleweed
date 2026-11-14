@@ -266,10 +266,12 @@ source_modules = [
     "tumbleweed.broker.prompts",
     "tumbleweed.broker.service",
     "tumbleweed.broker.shellprompts",
+    "tumbleweed.broker.snapshots",
     "tumbleweed.broker.store",
     "tumbleweed.broker.task",
     "tumbleweed.broker.toolblobs",
     "tumbleweed.broker.toolstore",
+    "tumbleweed.broker.treeops",
     "tumbleweed.broker.workspace",
     "tumbleweed.broker.workspaces",
 ]

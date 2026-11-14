@@ -405,12 +405,15 @@ the broker imports the agent or an LLM (I2).
 
 - **Requests and answers.** `start_task`, `end_task`, `request_grant`, `revoke_grant`,
   `read_workspace_file`, `list_workspace`, `read_file`, `list_dir` and `run_in_sandbox`
-  (`tumbleweed.ipc.broker_messages`), and the tool store's `list_tools`, `show_tool`, `export_tool`
-  and `import_tool` (`tumbleweed.ipc.tool_messages`, section 5). Every body is a strict model with
+  (`tumbleweed.ipc.broker_messages`), the undo requests `undo_last_change` (the model's, of its own
+  task), `undo_snapshot` and `list_snapshots` (the user's, from the chrome's undo list: no model
+  tool sends them, and like the tool store's they are served to any connection of the user), and
+  the tool store's `list_tools`, `show_tool`, `export_tool` and `import_tool` (`tumbleweed.ipc.tool_messages`, section 5). Every body is a strict model with
   bounded fields before the service sees it, so a request the schema refuses ends the connection
   like any malformed frame. A request the broker declines is *answered* with `Refused`: a closed
   reason (`unknown_task`, `invalid_request`, `denied`, `not_granted`, `not_found`, `unsafe`,
-  `too_large`, `busy`, `exhausted`, `unavailable`, `timeout`, `failed`, `conflict`) and fixed text that never
+  `too_large`, `busy`, `exhausted`, `unavailable`, `timeout`, `failed`, `conflict`, `no_undo`,
+  `workspace_full`, `not_undoable`, `unknown_prompt`) and fixed text that never
   repeats a path, a command, a name from a tool or the model's reason. A denied grant is an ordinary answer (`GrantOutcome(granted=false)`).
 - **Tasks.** `start_task(previous, fresh_context)` ends `previous` and makes the new task, with a
   private workspace (`<workspaces>/<TaskId>`, mode 0700), copying `previous`'s taint unless
@@ -452,9 +455,14 @@ the broker imports the agent or an LLM (I2).
   vanished one, a hung mount) gets a second `file_access` entry, `refused`, with the reason.
 - **Runs.** `run_in_sandbox(task, run, command, env, wall/cpu seconds, output limit)` is composed
   from the task's grants as `select_grants` selects them for that run: every applicable `fs.read`
-  grant is opened by `open_granted` (any failure, a swapped or vanished path, refuses the whole
-  run), kept disjoint, and bound read-only at its host path by descriptor, with the task's
-  workspace read-write at `/workspace`. Writes are not offered (S16's gate), and a `net.full`
+  and `fs.write` grant is opened by `open_granted` (any failure, a swapped or vanished path,
+  refuses the whole run), kept disjoint (`compose.disjoint_mounts`, D28: a read inside a write is
+  merged into it, a write inside a read refuses the run, and at most 16 places may be written), and
+  bound at its host path by descriptor, read-only or, for a write grant, read-write, with the task's
+  workspace read-write at `/workspace`. A run that mounts a write grant starts only after the
+  snapshot of those places is recorded, in the transaction that authorises it, or after the user
+  accepted "no undo" for that run (I13, section 7); it is refused while the task's workspace holds
+  more than its budget, and while an undo of the same places is in progress. A `net.full`
   grant is held but gives no network until S22. The once grants the run uses are consumed, the
   task's taint raised and a `sandbox_run` audit entry written in one transaction *before* the
   program starts; `sandbox_run_result` follows when it ends. A `RunId` can be used once, and
@@ -841,10 +849,10 @@ the user's own, and `edit_before_send` (and its forcing over plain http) applies
 | `show_ui(spec, placement?, code?)` | Validate and render a tool draft on the canvas; `placement` is `replace` (default) or `stack`; `code` is the list of `{name, source}` modules its `sandbox` handlers call | S12, S20 |
 | `patch_state(instance, patch)` | Update a rendered tool's state (never fires handlers) | S12 |
 | `start_task(title, fresh_context?)` | End the current task; new workspace, no grants; optionally no prior turns | S19 |
-| `request_access(kind, path?, reason)` | Ask for a grant (`read`, `network`), or ask the user to pick a file/folder (`pick_file`, `pick_folder`); a picked path comes back in the result | S19 |
+| `request_access(kind, path?, reason)` | Ask for a grant (`read`, `write` (task scope only; runs that can change it are snapshotted first), `network`), or ask the user to pick a file/folder to read (`pick_file`, `pick_folder`); a picked path comes back in the result | S19, S21 |
 | `list_workspace()` / `list_dir(path)` / `read_file(path)` | Grant-checked, size-capped listings and reads via the broker | S19 |
 | `run_code(source, timeout_seconds)` | One-off sandboxed Python in the task workspace; stdout and stderr come back framed as data | S20 |
-| `undo_last_change()` | Restore the paths written by the task's last write-enabled run | S21 |
+| `undo_last_change()` | Restore the paths written by the task's latest write-enabled run that is not undone or overtaken, while the task still holds write access to them; snapshots what is there first, so the user can undo the undo | S21 |
 | `find_tools(query)` / `open_tool(id, version?)` | Retrieve and reopen saved tools | S24 |
 | `save_tool(name, description)` / `revert_tool(id, version)` | Persist and version tools | S24 |
 | `connect_tools(from, to)` | Wire a typed output port to an input port | S25 |
@@ -1162,8 +1170,16 @@ audited.
   whatever it says, and a refinement keeps the taint of what it refines. Data reaches a net-tainted task from an fs-tainted one only
   through a cross-task connection the user approved in a trusted prompt; the model context
   of a net-tainted task excludes every turn of fs-tainted tasks (§2).
-- **Writes are off until undo exists.** Until snapshots ship (S21), policy refuses every
-  `fs.write` grant; the sandbox writes only to its own workspace.
+- **Writes need undo (I13, S21, D28).** An `fs.write` grant is made only in a trusted prompt, for
+  the task only, and is covered and denied by the same rules as a read (it implies reading). A run
+  that mounts one starts only after the broker has snapshotted the outermost write grants of the
+  run (the same descriptors it mounts), recorded the snapshot in the transaction that authorises
+  the run, or after the user accepted "no undo" for that one run in a trusted prompt. A write grant
+  is kept disjoint from the read grants of the run: a read inside a write is merged into it, a write
+  inside a read refuses the run (and is refused when asked for). Undo restores through descriptors
+  only, after a snapshot of what is there, so it can be undone; a run cannot disable its own undo
+  (what it leaves behind is recorded, not refused), one undo runs at a time, and the model's undo
+  needs write access the user has not taken back.
 - **Decisions** come from static policy, existing grants, or a **trusted permission prompt**.
   A prompt may instead be a **trusted file/folder picker** (`Gtk.FileDialog` in chrome, S18):
   picking is itself the user's grant decision, and it doubles as the handoff's fallback
@@ -1463,7 +1479,9 @@ Each invariant names where it is enforced. Reviews check every change against th
   through a user-approved cross-task connection (§6, §7).
 - **I13 — No write without undo.** A run with write grants starts only after a snapshot of
   its writable paths has been taken, unless the user accepted "no undo" for that run in a
-  trusted prompt.
+  trusted prompt. The snapshot's record and the run's authorisation are one transaction, and the
+  acceptance is for that run only (a `once` answer, never kept). Implemented in
+  `BrokerService._snapshot_for_run` and `_authorise_run` (D28).
 
 **Residual risks accepted for v1** (tracked as issues): image decoding of sandbox-produced
 files happens in the shell (mitigated by format allowlist, sniffing and dimension/size
@@ -1490,8 +1508,9 @@ only, so it can only refuse more; and case folding is not every file system's ow
 | Piper and its voice models (installed by the user, named by absolute path in `[voice.tts]`) | Wherever the user put them | Never |
 | Synthesised speech | Nowhere: held in memory from Piper's pipe to the player, never written (S07) | n/a |
 | Broker data: grants, tasks and the tool store's index (`broker.sqlite3`), tool packages (`tool-blobs/`), audit log (`audit.jsonl`) | `$XDG_DATA_HOME/tumbleweed/broker/` | Never |
-| Copy/reflink snapshots | `$XDG_DATA_HOME/tumbleweed/broker/snapshots/` | Never |
-| btrfs snapshots | dedicated subvolume on the same filesystem, on the deny list | Never |
+| Copy/reflink snapshots (`<SnapshotId>/<n>` and `<n>.meta`; kept 7 days; 100 snapshots and 8 GiB in all, made room for by the new snapshot's own task, never another's, D28) | `$XDG_DATA_HOME/tumbleweed/broker/snapshots/` | Never |
+| btrfs snapshots (read-only, `<SnapshotId>-<n>`) | dedicated subvolume on the same filesystem (`SnapshotSettings.btrfs_directory`), on the deny list | Never |
+| Snapshot records (task, run, paths with identities, backend, size) | `broker.sqlite3`, table `snapshots` | Never |
 | Workspaces (kept 7 days after their task ends) | `$XDG_DATA_HOME/tumbleweed/workspaces/<TaskId>/` | Only their own, at `/workspace` |
 | Sockets | `$XDG_RUNTIME_DIR/tumbleweed/` (mode 0700) | Never |
 

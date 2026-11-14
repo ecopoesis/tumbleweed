@@ -79,6 +79,19 @@ _ACTIVATING: Final = frozenset(
 )
 _FIRST_TOUCH: Final = 1000  # (a touch has no button: its ids start above any)
 _PICK_TITLE: Final = {"file": "Choose a file to share", "folder": "Choose a folder to share"}
+_NO_UNDO_CAUSE: Final[dict[str, str]] = {
+    "too_many_bytes": "they hold more than a copy may",
+    "too_many_files": "they hold more files than a copy may",
+    "too_deep": "they are nested too deeply",
+    "special_file": "they hold a socket, pipe or device",
+    "unreadable": "something in them cannot be read",
+    "unsupported": "undo is switched off here",
+    "timeout": "saving took too long",
+    "store_full": "the space for copies is full",
+    "io": "saving failed",
+}
+_NO_UNDO_LABEL: Final = "Run without undo"
+_UNDO_UNDO_LABEL: Final = "Undo without a way back"
 _SCOPE_LABEL: Final[dict[Scope, str]] = {"once": "Allow once", "task": "Allow for this task"}
 _PICK_LABEL: Final[dict[Scope, str]] = {
     "once": "Choose, allow once…",
@@ -432,6 +445,25 @@ class PromptBanner(Gtk.Box):
                 return [("The assistant asks you to choose a file it may read.", None)]
             case "pick_folder":
                 return [("The assistant asks you to choose a folder it may read.", None)]
+            case "no_undo":
+                why = _NO_UNDO_CAUSE.get(card.cause or "", "it failed")
+                if card.purpose == "undo":
+                    sentence = (
+                        "You asked to undo a change. What is in the places below now could not "
+                        f"be saved first: {why}. If you allow it, the undo goes ahead and cannot "
+                        "itself be undone. Only this undo."
+                    )
+                    return [(sentence, None), *[("Place:", each) for each in card.paths]]
+                sentence = (
+                    "A program the assistant is running may change the places below, and "
+                    f"a copy for undo could not be saved: {why}. If you allow it, this "
+                    "run goes ahead and its changes cannot be undone. Only this run: the "
+                    "next one asks again."
+                )
+                return [
+                    (sentence, None),
+                    *[("Place:", each) for each in card.paths],
+                ]
             case _:
                 assert_never(card.kind)
 
@@ -444,7 +476,13 @@ class PromptBanner(Gtk.Box):
         self._deny = deny
         self._buttons.append(deny)
         for scope in card.scopes:
-            label = _PICK_LABEL[scope] if card.picks else _SCOPE_LABEL[scope]
+            label = (
+                (_UNDO_UNDO_LABEL if card.purpose == "undo" else _NO_UNDO_LABEL)
+                if card.kind == "no_undo"
+                else _PICK_LABEL[scope]
+                if card.picks
+                else _SCOPE_LABEL[scope]
+            )
             button = Gtk.Button(label=label)
             button.connect("clicked", lambda _button, scope=scope: self._allow_clicked(card, scope))
             self._watch_release(button, scope)

@@ -381,7 +381,7 @@ class TestEveryWaitHasATimeout:
                 assert limits.handler_timeout >= (
                     timedelta(seconds=MAX_WALL_SECONDS) + rig.config.run_grace
                 )
-                assert limits.handler_timeout < timedelta(minutes=10)
+                assert limits.handler_timeout < timedelta(minutes=30)  # an undo may take 20
                 assert limits.idle_timeout == IDLE_TIMEOUT
                 assert IDLE_TIMEOUT == 3 * HEARTBEAT  # a client that pings is never idle
 

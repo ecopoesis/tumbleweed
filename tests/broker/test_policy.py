@@ -61,7 +61,6 @@ from tumbleweed.broker.policy import (
     TaskEnded,
     TaskMismatch,
     Ungrantable,
-    WriteGateClosed,
 )
 from tumbleweed.core.errors import InvalidValueError
 from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId
@@ -314,57 +313,27 @@ class TestTheAncestorRuleWhenIssuing:
         assert tainted.taint == FS
 
 
-class TestTheWriteGate:
-    @pytest.mark.parametrize("trigger", list(RunTrigger))
-    def test_every_write_request_is_refused_with_a_clear_reason(
-        self, world: World, task: TaskState, trigger: RunTrigger
+class TestWriteGrants:
+    """The write gate of S16 is lifted (S21, D28): a write is asked about, granted for the task
+    only, covered like a read, and still refused where the deny rules say so."""
+
+    def test_a_write_request_with_no_grant_needs_the_user_and_offers_only_the_task_scope(
+        self, world: World, task: TaskState
     ) -> None:
         decision = decide(
             task,
             [],
-            request(
-                task.task, world.home / "Documents", capability=WRITE, run=run_context(trigger)
-            ),
+            request(task.task, world.home / "Documents", capability=WRITE),
             rules=world.rules,
             now=NOW,
         )
 
-        assert refusal_of(decision) == WriteGateClosed()
-        assert "not available yet" in describe(WriteGateClosed())
-
-    def test_a_write_grant_in_the_store_does_not_open_writing(
-        self, world: World, task: TaskState
-    ) -> None:
-        grant = forged(world.home / "Documents", FsWrite, task)
-
-        decision = decide(
-            task,
-            [grant],
-            request(task.task, world.home / "Documents" / "notes.txt", capability=WRITE),
-            rules=world.rules,
-            now=NOW,
-        )
-
-        assert refusal_of(decision) == WriteGateClosed()
-
-    def test_nor_does_it_open_reading(self, world: World, task: TaskState) -> None:
-        """`fs.write` implies read, but there can be no write grant: one found is inert."""
-        grant = forged(world.home / "Documents", FsWrite, task)
-
-        selection = select_grants(task, run_context(), [grant], rules=world.rules, now=NOW)
-        decision = decide(
-            task,
-            [grant],
-            request(task.task, world.home / "Documents" / "notes.txt"),
-            rules=world.rules,
-            now=NOW,
-        )
-
-        assert [s.reason for s in selection.skipped] == [SkipReason.WRITE_GATE]
         assert isinstance(decision, NeedsPrompt)
+        assert isinstance(decision.capability, FsWrite)
+        assert decision.scopes == frozenset({GrantScope.TASK})
 
-    @pytest.mark.parametrize("scope", list(GrantScope))
-    def test_no_write_grant_can_be_issued_in_any_scope(
+    @pytest.mark.parametrize("scope", [GrantScope.ONCE, GrantScope.TOOL])
+    def test_a_write_grant_of_any_other_scope_is_refused(
         self, world: World, task: TaskState, scope: GrantScope
     ) -> None:
         result = issue_grant(
@@ -383,24 +352,67 @@ class TestTheWriteGate:
             grants=(),
         )
 
-        assert refusal_of(result) == WriteGateClosed()
+        assert refusal_of(result) == ScopeUnavailable(scope=scope)
 
-    def test_a_write_request_is_never_asked_about(self, world: World, task: TaskState) -> None:
-        """A prompt would be a promise the gate cannot keep: the answer is a plain denial."""
+    def test_the_task_scope_is_issued_and_taints_the_task(
+        self, world: World, task: TaskState
+    ) -> None:
+        result = issue_grant(
+            task,
+            request(task.task, world.home / "Documents", capability=WRITE),
+            scope=GrantScope.TASK,
+            origin=GrantOrigin.PROMPT,
+            grant_id=GrantId.new(),
+            rules=world.rules,
+            now=NOW,
+            grants=(),
+        )
+
+        assert isinstance(result, Issued)
+        assert isinstance(result.grant.capability, FsWrite)
+        assert result.task.taint == FS
+
+    def test_a_write_grant_covers_writes_and_reads_below_it_and_nothing_else(
+        self, world: World, task: TaskState
+    ) -> None:
+        grant = forged(world.home / "Documents", FsWrite, task)
+        inside = world.home / "Documents" / "notes.txt"
+
+        for capability in (WRITE, READ):
+            decision = decide(
+                task,
+                [grant],
+                request(task.task, inside, capability=capability),
+                rules=world.rules,
+                now=NOW,
+            )
+            assert isinstance(decision, Allow)
+            assert decision.grant == grant.id
+        elsewhere = decide(
+            task,
+            [grant],
+            request(task.task, world.home / "Photos", capability=WRITE),
+            rules=world.rules,
+            now=NOW,
+        )
+        assert isinstance(elsewhere, NeedsPrompt)
+
+    def test_a_read_grant_does_not_cover_a_write(self, world: World, task: TaskState) -> None:
+        grant = forged(world.home / "Documents", FsRead, task)
+
         decision = decide(
             task,
-            [],
-            request(task.task, world.home / "Photos" / "a.jpg", capability=WRITE),
+            [grant],
+            request(task.task, world.home / "Documents" / "notes.txt", capability=WRITE),
             rules=world.rules,
             now=NOW,
         )
 
-        assert isinstance(decision, Deny)
+        assert isinstance(decision, NeedsPrompt)
 
-    def test_the_protected_place_is_named_before_the_gate(
+    def test_the_protected_place_is_refused_for_a_write(
         self, world: World, task: TaskState
     ) -> None:
-        """Where both refuse, the reason that will still hold when writes are enabled."""
         decision = decide(
             task,
             [],
@@ -411,7 +423,14 @@ class TestTheWriteGate:
 
         assert isinstance(refusal_of(decision), StaticDeny)
 
-    def test_an_ended_task_is_named_before_the_gate(self, world: World, task: TaskState) -> None:
+    def test_deny_beats_a_stored_write_grant(self, world: World, task: TaskState) -> None:
+        grant = forged(world.home / ".ssh", FsWrite, task)
+
+        selection = select_grants(task, run_context(), [grant], rules=world.rules, now=NOW)
+
+        assert [s.reason for s in selection.skipped] == [SkipReason.STATIC_DENY]
+
+    def test_an_ended_task_is_named_first(self, world: World, task: TaskState) -> None:
         decision = decide(
             task.end(),
             [],
@@ -422,26 +441,15 @@ class TestTheWriteGate:
 
         assert refusal_of(decision) == TaskEnded()
 
-    def test_nothing_is_ever_allowed_to_write(self, world: World, task: TaskState) -> None:
-        """Whatever the grants, the scope or the trigger: no `Allow` for a write."""
-        grants: list[Grant] = [
-            forged(world.home / "Documents", FsWrite, task),
-            forged(world.home / "Documents", FsRead, task),
-        ]
-        for trigger in RunTrigger:
-            decision = decide(
-                task,
-                grants,
-                request(
-                    task.task,
-                    world.home / "Documents" / "notes.txt",
-                    capability=WRITE,
-                    run=run_context(trigger),
-                ),
-                rules=world.rules,
-                now=NOW,
-            )
-            assert not isinstance(decision, Allow | NeedsPrompt)
+    def test_a_write_grant_taints_a_task_that_already_holds_net(
+        self, world: World, task: TaskState
+    ) -> None:
+        grant = forged(world.home / "Documents", FsWrite, task)
+        net = TaskState(task=task.task, taint=frozenset({TaintKind.NET}))
+
+        selection = select_grants(net, run_context(), [grant], rules=world.rules, now=NOW)
+
+        assert [s.reason for s in selection.skipped] == [SkipReason.TAINT_CONFLICT]
 
 
 class TestOnce:
@@ -1482,7 +1490,6 @@ class TestDescribe:
         StaticDeny(entry="~/.ssh", relation=DenyRelation.EQUAL),
         StaticDeny(entry="~/.ssh", relation=DenyRelation.INSIDE),
         StaticDeny(entry="~/.ssh", relation=DenyRelation.ANCESTOR),
-        WriteGateClosed(),
         TaintConflict(held=TaintKind.FS, wanted=TaintKind.NET),
         TaintConflict(held=TaintKind.NET, wanted=TaintKind.FS),
         TaskEnded(),
@@ -1517,7 +1524,6 @@ class TestDescribe:
 
         assert kinds == {
             "static_deny",
-            "write_gate",
             "taint_conflict",
             "task_ended",
             "task_mismatch",

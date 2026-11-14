@@ -177,6 +177,8 @@ class FakeSandbox:
         self.plans_asked = 0
         self.closed = False
         self.fail_with: Exception | None = None
+        # What the program does while it runs (a test writes files the way code would).
+        self.on_run: Callable[[SandboxPolicy], None] | None = None
 
     async def run(self, policy: SandboxPolicy) -> SandboxResult:
         self.policies.append(policy)
@@ -188,6 +190,8 @@ class FakeSandbox:
             )
         )
         self.started.set()
+        if self.on_run is not None:
+            self.on_run(policy)
         if self.fail_with is not None:
             raise self.fail_with
         if self.hang:

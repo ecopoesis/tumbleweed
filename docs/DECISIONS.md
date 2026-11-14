@@ -1469,3 +1469,245 @@ holds one of its run slots for at most its wall time. *S24.* The command, the pa
 reading of the shim's line are `tumbleweed.sandbox.handler_protocol`, which the broker may import:
 a run of a stored tool's code (I8) is built there, from the broker's own store. *Inputs of a
 waiting run* are those of the event, not of the moment it starts.
+
+## D28 — Snapshots and undo: a snapshot per write-enabled run, recorded with the run's authorisation, copy/btrfs/noop backends, undo that snapshots first and that a run cannot disable (2026-11-13, accepted)
+
+**Context.** S20 let model-written code run. The write gate (D17/S16) kept it from writing the user's
+files. S21 lifts it, under I13: nothing writes without a way back. **Decision.** (1) *Write grants.*
+`fs.write` is requested by the model (`request_access kind=write`, a path) and decided by the user in
+the ordinary trusted prompt; it is offered for the **task scope only** (`once` is spent by a read and
+never reaches code; `tool` is S24's), it implies reading (it covers reads below it), the deny rules
+apply to it as to a read (including a stored grant that now overlaps them), and it taints the task
+`fs`. There is no way to a write grant that does not go through the user's decision: the picker stays
+read-only. `WriteGateClosed` and `SkipReason.WRITE_GATE` are gone. (2) *Disjoint mounts (#74).* A run
+mounts the outermost grants: a read grant at or inside a write grant is merged into it (the program
+gets what the write grant gave there, which includes reading); a write grant inside a read grant
+**refuses the run** (`invalid_request`): mounting the outer one writable would exceed what was granted,
+mounting it read-only would take away the inner write. Such a pair is also **refused when the grant is
+asked for** (before anyone is prompted, and again after a picker), in either order, so the user is never
+asked for a grant that would make every later run refuse; the same place twice is fine. A run may write
+at most 16 places (`MAX_TARGETS`): more refuses it before anything is saved. (3) *What is snapshotted,
+and when.* The writable paths of one run: the outer write mounts, taken from the very descriptors the
+run will mount (opened by identity, no symlink followed). The snapshot is taken after the grants are
+opened and before the policy is built; its record (`SnapshotRecord`: `SnapshotId`, kind, task, run,
+time, per path the `StoredPath` identity, backend, files, bytes) is inserted in the **same
+transaction** as the run's `sandbox_run` authorisation and the audit entry `snapshot_taken` (written
+first). So a run that can write starts only after its snapshot is recorded. A snapshot taken for a run
+that then does not start (a grant changed, the user's answer, a cancellation, any error) has no record;
+its id is held in `_inflight` from before its copy exists until the record is, and its copy is deleted
+at once in the background (`snapshot_deleted`, `discarded`) and, if that fails, as an orphan at the next
+sweep. The sweep decides per name, synchronously, with no `await` between the check and the delete
+being submitted, that the id is not in flight and has **no row at all** (a raw `SELECT`: a record this
+version cannot read still owns its copy); making room and the sweep take one lock. (4) *Backends*
+(`SnapshotBackend` Protocol, tried per path in order). `BtrfsBackend`: a read-only subvolume snapshot
+of the subvolume the folder is in, in the dedicated subvolume `SnapshotSettings.btrfs_directory`,
+when the folder and that directory are both on btrfs (`f_type`, not `f_fsid`, which btrfs makes differ
+per subvolume), the target is a directory, it holds no nested subvolume (a snapshot would leave it out,
+and an undo would then delete its files: found by inode 256 while walking, fail closed: the walk goes 64 levels, so a deeper tree is never saved by
+btrfs either, and a restore walks at most 64 levels of saved tree) and `btrfs`
+works; run as an argv list on `/proc/self/fd/N` paths so nothing is looked up twice; the saved folder
+is found again by walking names with `O_NOFOLLOW` and by its inode number, which a snapshot keeps. A
+snapshot the tool cannot make (another btrfs, no permission) or a nested subvolume **falls through to
+the copy and is audited** (`snapshot_fallback`); a timeout does not. Deleting a subvolume that is gone
+succeeds, and `<id>-<n>` subvolumes with no record are swept like copies. **Accepted v1 risk:** a btrfs
+snapshot is of the *whole enclosing subvolume* (all of `/home`, say), so for the retention period the
+store holds files outside the granted folder and files the user deletes meanwhile; the store is on the
+deny list and unreadable to sandboxes, and the S27 layout decides whether the user's data should be
+split into subvolumes to narrow this. `CopyBackend`: a copy (a reflink via `FICLONE` where there is
+one) in `broker/snapshots/<id>/<n>` with a `<n>.meta` file. **One budget for the whole run** (1 GiB of
+*allocated* bytes (`st_blocks`), 100,000 entries, depth 64; each configurable): a file is counted before
+it is copied and again chunk by chunk if it grows, so a sparse file costs what it holds and is copied
+sparse-aware (`SEEK_DATA`/`SEEK_HOLE`), and a tree over a cap fails closed before the run. **What a run
+leaves behind cannot stop its own undo:** a FIFO, socket or device is *recorded, never opened* (place,
+kind, mode, in `.meta`): a restore removes one the saved state lacked, keeps one of the saved kind,
+recreates a FIFO and reports a socket or device it cannot recreate as skipped; a directory or file of
+ours with mode 000 is made readable through an `O_PATH` descriptor checked against what `lstat` saw
+for the copy and its mode put back at once, the true mode kept in `.meta`. Hard links are saved as
+separate files; owners and xattrs are not saved. `NoopBackend` takes nothing and says `unsupported`
+(the only backend with `mode = noop`). Every walk checks a monotonic deadline itself, so a thread the
+broker gave up on ends by itself. (5) *No undo (I13's other branch).* If no backend can save a path (or
+the store is full of what must be kept, (7)), the broker audits `snapshot_refused` and asks, in a
+**trusted prompt of the same kind** (`GrantPrompt.no_undo`, wire `NoUndoAccess`, a card that names the
+places and the cause in our words and has no model text), whether this run may go ahead with no undo.
+The only scope offered is `once`; any other answer, a denial, a timeout or a failing prompt refuses the
+run (`no_undo`). The acceptance is of that run only and is never kept: the next run asks again; it is
+recorded (`no_undo` snapshot record with the paths, audit `no_undo_accepted`) so that
+`undo_last_change` can say that run cannot be undone. It counts against the prompt rate limit like any
+prompt (I5), and a run refused for that says the user was not asked. Tests use a fake user at the
+`PromptInterface` Protocol, never a hook in `src/`. (6) *Undo.* `undo_last_change(task)` (model tool)
+undoes the current task's newest `run` snapshot that is neither undone nor superseded **and only while
+the task still holds an applicable `fs.write` grant that covers every place it changed**: after the user
+revokes or lets it expire the model cannot touch those files, and is told to ask the user. The chrome's
+list (`list_snapshots`, `undo_snapshot`; **no model tool reaches them**, and like the tool store's
+requests they are served to any connection of the user: a same-uid process is outside the threat model)
+shows the newest 30 across tasks with an Undo button each, an undo of an undo included, and says in
+plain text of ours that undo puts the files back as they were before that change *including over
+edits made since*, and that the undo itself can be undone. **One undo at a time in the whole broker**:
+the user's waits (90 s) for another, the model's is refused `busy` (audited). An undo and a run on the
+same places do not overlap: a run whose write mounts overlap an undo in progress is refused (`busy`), and a write run on places
+another live write run (of any task) is writing waits for it, up to `write_run_wait` (20 s), then is
+refused `busy` (J7: two runs on one folder would each snapshot what the other is changing),
+and a live write run that overlaps the places of the **user's** undo is *stopped* (the broker's own stop
+path, its flow cancelled; its caller is told so) before the restore, while the **model's** undo is
+refused (`busy`), so the model can never hold the user's undo off. In order: refuse a no-undo,
+already-undone or superseded record; open every target by its stored identity with the deny rules (a
+target that is gone, replaced or now protected refuses the whole undo, nothing done: `unsafe`,
+`denied`); **snapshot what is there now** (kind `undo`, recorded and audited); restore through
+descriptors; mark the snapshot undone, and later runs inside the same places superseded. **What an
+undo overtakes (J5):** for each later `run` snapshot of any task that overlaps the places being
+undone, if every place of it lies inside or equals one of them it is *superseded* (its changes are
+inside what this undo puts back: it is no longer undone one by one, is shown so in the list and is never
+what `undo_last_change` picks, so a later undo cannot bring the first run's changes back and a hostile
+task cannot bury a change under cheap runs); if it goes wider, or is only partly inside, the undo is
+**refused** (`not_undoable`, "a later change to that folder must be undone first") before anything is
+done, because putting the narrow run back would take away what the wider one changed outside it; the
+user undoes the wider runs in order. The undo of an undo (the safety copy, `undoes` set) also gives the
+marks back (J4): the run it undid is undoable again and what it superseded no longer is superseded
+(`superseded_by`). **A later run done with no undo never blocks an older undo (K1):** nothing could put
+its changes back, and what the undo overwrites of it is gone either way; if it lies inside the places it
+is superseded as above, otherwise the undo goes ahead. The list shows a snapshot whose undo would be
+refused because of a wider later run as *not undoable for now* (`blocked`, with our reason text). **What
+holds about the marks (K3, L2; narrowed to what is true):** each undo keeps, with its safety snapshot, the
+*net* list of marks it changed (what it undid, what it superseded, and the inverse of what the undo it
+undid had changed, a mark set and cleared being no change), so undo, redo, undo of the same places
+leaves the first run undone and the later one superseded, and a chain of redo/undo cycles *does* grow
+the list by one mark for each safety copy it made (M3: measured through the service, 112 bytes a cycle,
+until the share's count cap evicts the oldest; with a large count cap it would reach 200). So a plan
+over 200 net changes first drops the marks of copies that are gone, then those of older *safety*
+copies (they decide only what the list shows for them; the files come from the copies themselves),
+never the marks of runs, so a chain never ends in a refusal no undo lifts (a service test runs 24
+cycles with the cap at 6). More than 100 runs to supersede, or more than 200 run marks, refuses the
+undo before any file is touched. **What does not hold in general:** a redo over later undos, or
+interleaved chains over overlapping places, can leave the *list* showing a run live or undone that the
+files say otherwise; no data is lost (the safety copies hold every state and each is reachable from the
+list within retention) and every refusal can be lifted by user undos from the list (undo copies never
+block an undo, only a later live wider run with a snapshot does). The invariant that matters for
+safety is held by a rule, not by the marks: **the model's undo never restores a change the user
+undid** because `undo_last_change` is refused (`not_undoable`, audit `user_undid_since`; the fixed,
+model-facing text is "the user has undone a change to those places since that run; the user can undo
+it from the undo list") while any safety copy made for a *user's* undo, **including one the user has
+since undone (a redo)**, is newer than the run's snapshot and overlaps its places (the model's own
+undos do not block each other: it may step back run by run). The check is deliberately blunt: a redo
+does not lift it, only a newer run does (its snapshot is newer than the copy), because telling "the pre-
+state holds what the user undid" from "it does not" needs the whole mark state per copy (the polish
+issue); relaxing it for redone copies was not argued safe, so it stays. A
+full "the marks equal the files after every step" for arbitrary user chains is filed for the polish
+issue (each safety copy would store the whole mark state of the places it covers). "Most recent" is by
+a monotonic sequence (`seq`), not the clock. **If the safety snapshot cannot be taken** (a cap, depth,
+I/O, the store full), the model's undo is refused and points the user to the list; the *chrome's* undo
+asks the user, in a trusted prompt of the no-undo kind (purpose `undo`, once scope: "undo without being
+able to undo this undo?"); a no refuses it; a yes does it and says `safety: none`. A restore makes the
+folder **exactly** what it was: new files and folders are removed (iteratively, however deep: two descriptors and a stack of
+(`st_dev`, `st_ino`), coming back up through `..` only after its identity matches the directory it
+came from, bounded by the deadline alone, so a run cannot nest a tree its own undo cannot remove), deleted or changed ones are written back (content compared by reading, never by
+size and times a program can set), links, FIFOs, modes and times restored. It never follows a link: a
+symlink where the copy has a directory is replaced, a file is written to a new name and renamed over
+the old one, directories are opened with `O_NOFOLLOW` and compared with `lstat`; a granted file is
+rewritten in place through the verified descriptor (Linux; elsewhere the undo is refused before
+anything is done). Edits made by the user in those places **after** the run are reverted too: the
+tool's description, the system prompt (v5) and the panel say so, and the safety snapshot keeps them. A
+restore that fails part way is rolled back from the safety snapshot and the answer says whether that
+worked (`failed`); the restore thread ends by its own deadline before the rollback runs. If the files
+were put back but the record of it cannot be written, the answer says the files were put back. (7)
+*Retention and making room.* A snapshot is deleted at the sweep when it is past 7 days. The count (100) and
+size (8 GiB of copies) caps are enforced when **room is needed** for a new snapshot of task T, and
+**each task has a share of the store** (J1; replaces the first round's tiers, which one busy task could
+fill for everybody): `max(10, max_snapshots // 4)` snapshots (never more than the cap) and a quarter of
+the store's bytes, **but at least three snapshots' worth** (`3 * max_bytes`, K2), configurable (a
+smaller explicit byte share is clamped up to one snapshot); a safety snapshot counts against the task
+whose run it undoes.
+Room for T's new snapshot is made in this order: (1) snapshots already undone or superseded, and any past
+retention, of any task; (2) while T is at its share, T's *own* snapshots that are not anchors, oldest
+first, and if T is still at its share, `STORE_FULL` for T alone (the no-undo prompt for a run; the
+chrome prompt or the model's refusal for an undo's safety copy); (3) while the store is full, any task's
+non-anchors, oldest first, and only then `STORE_FULL`. An **anchor** is, per task and per place, its
+oldest not-undone run (the state before the task first touched that place), its newest not-undone
+run (what `undo_last_change` needs) and, per place, its **newest** not-undone safety snapshot (the
+user's latest edits from before an undo; **trade-off (K2):** an *older* safety copy is not an anchor,
+so under pressure the edits the user had made before an earlier undo can now be evicted, which reverses
+round 1's stated reason for anchoring every safety copy and is what lets run/undo loops go on);
+anchors, a snapshot being undone and one being taken are never deleted to make room, and only age
+(the sweep) removes an anchor. **The invariant (K2), tested at the default ratios:** one task doing
+repeated runs, or run/undo cycles, on *one* place of any size up to `max_bytes` never gets `STORE_FULL`
+from its own share, the safety copy of its undo included. The arithmetic: such a task keeps at most
+three anchors (its oldest run, its newest safety copy and the run being made), so the share is
+`3 * max_bytes`; the anchor the new snapshot is about to replace (the task's newest run for a run, the
+newest safety copy of those places for an undo) is left out of the share check but is **not deleted
+before the new record lands** (a failed snapshot followed by "no undo" must not lose the previous run's
+undo), so the share is overshot by at most one snapshot; what the new snapshot will take is estimated
+from the task's last snapshot of the same places, never more than `max_bytes` (the estimate feeds the
+share check only; the store-wide check counts the incoming copy as `max_bytes`, L3, so the store cap is
+soft only by the copies in flight, `max_concurrent_runs`, never by a bad estimate); the record being
+undone is left out of the share like the anchor being replaced (L4), so the user's undo of a middle run
+of a place near the cap is not asked about. The share is overshot by at most one snapshot, never
+cumulatively Several big places per
+task, or several big tasks together, can still reach `STORE_FULL`: that goes to the trusted prompt. The
+bound: a task holds at most one snapshot over its share (3 GiB by default of the 8 GiB store, so two big
+tasks and a part of a third), and a task's own middle snapshots go first, so a busy task's handler runs stay quiet, one
+task cannot starve another of undo, a task's churn cannot evict the state before it first touched a
+place, and a snapshot in the middle may be gone (undoing it is then refused: it is no longer listed). **The model cannot make the user lose edits (L1), and this costs no run its room (M1).** A safety copy
+made for the *model's* undo may hold edits the user made after the run and has no other way to, so it is
+**pinned**: every not-undone one is an anchor, only age or the user's own undo of it removes it, and no
+run, churn or other undo evicts, spends or supersedes it. Pinned copies live in a **broker-wide pin
+pool outside every task's share**: the share check (bytes and count) ignores them, so no later change
+of place sizes, and no number of tasks the model starts itself, can make a run `STORE_FULL` because of
+a pin; the store-wide check counts them (they are on disk). The pool is `store_max_bytes // 8` bytes
+and `max_snapshots // 10` copies (1 GiB and 10 by default). Arithmetic: a task's run needs at most 3
+units of `max_bytes` (the oldest run, the user's newest safety copy, the run being made), so the share
+is 3m; two such tasks (6m), the pool (m) and one snapshot in flight (m) are the 8m of the default store.
+A third big task meets the documented cross-task bound as before (3 GiB shares of an 8 GiB store); pins
+add nothing to what a *task* can hold, they take the store's last eighth, so the bound moves from "two
+tasks and a part of a third" to "two tasks, the pool and a part of the third". The model's undo is
+**refused** ("ask the user to undo it from the undo list", audit reason `pin_pool`) when its copy does
+not fit the pool, checked before the copy from the run's snapshot and again with the copy's actual size,
+before any file is touched (a copy that does not fit is deleted). The pool is shared: one task's model
+can use all of it, which only limits other tasks' *model* undos; the user's list never pins and never
+refuses for this. A user's undo of a pinned copy spends it and gives its place back. **How many model
+undos fit in all, by place size s at the defaults (cap m):** `min(10, floor(m / s))`: 1 at s = m, 2 at
+m/2, 4 at m/4, 10 from m/10 down. (Round 4's per-task reservation, `(3m/s) - 3`, is gone: it was sized
+from the place at undo time and could not know how it would grow.) A model run/undo loop ends in the
+model's own refusal, never in a `STORE_FULL` prompt (tests: the place grows after pins; three tasks pin
+and a fourth runs; pins outside a two-snapshot share; the pool counted store-wide; churn of other tasks
+cannot evict a pin). A safety snapshot is protected only while its undo runs. The count cap is soft by up to the
+number of runs in flight (`max_concurrent_runs`). The sweep also enforces the size cap against undone
+and superseded snapshots (a lowered cap) and deletes copies no row names. Everything is configurable
+(`SnapshotSettings`) and every deletion audited (`snapshot_deleted`: `age`, `count`, `size`,
+`discarded`, `orphan`; a deletion that failed is audited `failed` and the record kept: a non-root
+broker needs the btrfs mount option `user_subvol_rm_allowed` to delete a subvolume, or the store stays
+full and says so). Names read back from a `.meta` file must be single path components. (8) *Deny entries.* The copy store
+is inside the broker's data directory (already denied) and is named on its own
+(`BrokerConfig.snapshots_directory`); the btrfs subvolume is a deny entry through `deny_context`; a
+grant request for either is refused (tests). (9) *The disk box (#74).* A task's workspace may hold
+`workspace_max_bytes` (512 MiB of disk use, `st_blocks`) and `workspace_max_files` (50,000 entries):
+before each run the broker walks the workspace through descriptors (no link followed, bounded, with
+a deadline) and refuses a run while it holds more or is nested deeper than 64 (`workspace_full`: the
+task's own code made it, and a new task starts clean). One run can pass the budget by what it writes in
+its wall time; the next is refused; a quota would stop it in the middle but needs a subvolume per
+workspace, which S27 may add. The `..` climb of a removal has one residual case: a process outside the sandbox (same uid, outside the
+threat model) that moves the directory being emptied to outside the target gets its contents deleted at
+the new place before the identity check on the way up notices; overlapping runs are stopped or refused
+during an undo, so a sandbox cannot do it. A write run waiting for another holds a run slot for up to
+`write_run_wait` (20 s): the slots are 4 and the wait is short, so it is documented, not avoided.
+(10) *Audit (#82).* S21 adds `snapshot_taken`, `snapshot_fallback`,
+`snapshot_refused`, `no_undo_accepted`, `undo` (a `busy` refusal included) and `snapshot_deleted`. The
+log is still append-only, not fsynced and not tamper evident; the snapshot entry precedes the run it
+protects, so a crash can leave a copy without a record (swept as an orphan) but never a write run
+without an entry. Rotation and tamper evidence are not needed by S21 and stay open on #82. (11) *The
+model.* The `undo_last_change` result is our fixed text with counts, nothing a file contained, so it
+carries nothing untrusted to frame; a refusal is the broker's fixed text. The system prompt becomes v5.
+`request_access` gains `kind=write`. **Waits:** a write run's caller waits for the broker's setup, its
+snapshot and, if none can be saved, the user's answer (`RUN_SETUP_WAIT`), an undo's caller for the
+lock, the stop, two snapshots and a prompt (`UNDO_WAIT`); the agent, the client and the IPC handler
+timeout derive from those constants, and a test checks the relation. (12) *#157.* S21 reads no stored
+task id (the chrome list shows no task), so `HIDDEN_TASK` does not apply. **Tests.** A real daemon with
+a fake sandbox that writes files (every acceptance item over IPC), the real sandbox under `linux` (a
+write run and its undo), the btrfs backend with a fake tool everywhere (nested subvolumes, fallbacks,
+missing subvolumes, orphans) and against a loopback btrfs under `btrfs` (S27's VM covers it end to end),
+each reviewer probe as a regression test, swap-between-`lstat`-and-`open` hooks for every I11 guard, and
+mutants for each check listed in the PR. **Consequences.** Every run of a task that holds a write grant
+takes a snapshot, a handler run included: a copy of up to 1 GiB per slider event is slow where there
+is no btrfs or reflink (the retention and size caps bound the disk, and step 2 of (7) keeps one task's
+churn from costing another's undo); a later step may skip a snapshot when nothing changed since the
+last. A write grant is not the same as the user having looked at what the code will do: the prompt
+names the place, and undo is the net. Not done and listed for the polish issue: `sandbox_run.mounted`
+does not list read grants merged into a write mount.

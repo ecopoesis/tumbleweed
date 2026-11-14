@@ -13,8 +13,10 @@ from tumbleweed.ipc.broker_messages import (
     DirEntry,
     EnvPair,
     NetworkAccess,
+    NoUndoAccess,
     PickAccess,
     ReadAccess,
+    SnapshotInfo,
     WriteAccess,
 )
 from tumbleweed.ipc.messages import IpcMessage, Request, RequestBody, Response, ResponseBody
@@ -64,6 +66,8 @@ PARTS: tuple[type[IpcMessage], ...] = (
     DenyDecision,
     DirEntry,
     EnvPair,
+    NoUndoAccess,
+    SnapshotInfo,
     ToolSummary,
 )
 

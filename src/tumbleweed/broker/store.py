@@ -32,8 +32,9 @@ The connection belongs to the thread that opened it (the broker's event loop).
 import logging
 import os
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Final, Literal, Self, final
@@ -51,9 +52,10 @@ from tumbleweed.broker.privatefs import (
     open_private_file,
     same_file,
 )
+from tumbleweed.broker.snapshots import SnapshotRecord
 from tumbleweed.broker.task import TaintKind
 from tumbleweed.core.errors import InvalidValueError
-from tumbleweed.core.ids import GrantId, TaskId, ToolId
+from tumbleweed.core.ids import GrantId, SnapshotId, TaskId, ToolId
 from tumbleweed.core.types import ByteCount, ContentHash, ToolVersion
 from tumbleweed.tools.limits import MAX_PACKAGE_BYTES
 from tumbleweed.tools.package import Description, Name, ToolTag
@@ -139,9 +141,122 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
             "name, description, tags, tokenize = 'unicode61 remove_diacritics 2')"
         ),
     ),
+    # S21: snapshots. The record is the JSON of a `SnapshotRecord`; the columns are what is
+    # queried. `seq` is the order they were taken in (the clock can step back): "the most recent"
+    # is the highest. `superseded_at` is set when a later undo of an overlapping, older snapshot
+    # made this one's changes no longer a thing to undo on its own (D28, H11).
+    (
+        f"""CREATE TABLE snapshots (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('run', 'undo')),
+    taken_at INTEGER NOT NULL CHECK (taken_at {_MILLIS}),
+    undone_at INTEGER CHECK (undone_at IS NULL OR undone_at {_MILLIS}),
+    superseded_at INTEGER CHECK (superseded_at IS NULL OR superseded_at {_MILLIS}),
+    superseded_by TEXT,
+    marks TEXT CHECK (marks IS NULL OR length(CAST(marks AS BLOB)) <= 65536),
+    record TEXT NOT NULL CHECK (length(CAST(record AS BLOB)) <= 65536)
+) STRICT""",
+        "CREATE INDEX snapshots_by_task ON snapshots (task_id, kind, seq)",
+    ),
 )
 
 _GRANTS: Final[TypeAdapter[Grant]] = TypeAdapter(Grant)
+_SNAPSHOTS: Final[TypeAdapter[SnapshotRecord]] = TypeAdapter(SnapshotRecord)
+MAX_MARK_CHANGES: Final = 100
+"""The most runs one undo may supersede."""
+MAX_NET_MARKS: Final = 200
+"""The most marks one undo may change in all (`marks` is a column of at most 64 KiB)."""
+
+
+@final
+class MarkChange(PolicyModel):
+    """The net change an undo made to one mark of one snapshot: `undone` or `superseded`, from
+    `was_on` (by `was_by`) to `on` (by `by`). The undo's safety snapshot keeps the list; undoing
+    that
+    safety snapshot applies the inverse. Only net changes are kept, so a chain of undos and redos
+    does not grow the list (D28, K3, L2)."""
+
+    what: Literal["undone", "superseded"]
+    snapshot: SnapshotId
+    on: bool
+    by: SnapshotId | None = None
+    was_on: bool = False
+    was_by: SnapshotId | None = None
+
+    def inverse(self) -> "MarkChange":
+        return MarkChange(
+            what=self.what,
+            snapshot=self.snapshot,
+            on=self.was_on,
+            by=self.was_by,
+            was_on=self.on,
+            was_by=self.by,
+        )
+
+
+_MARKS: Final[TypeAdapter[list[MarkChange]]] = TypeAdapter(list[MarkChange])
+
+
+def net_marks(
+    undone: SnapshotId,
+    overtaken: Sequence[SnapshotId],
+    reverting: Sequence[MarkChange],
+    state: Callable[[SnapshotId], tuple[bool, bool, SnapshotId | None]],
+) -> list[MarkChange]:
+    """The net change to the marks when `undone` is undone, `overtaken` runs are superseded by it
+    and, if it is a safety snapshot, the changes `reverting` (what the undo it was made for changed)
+    are reverted (D28, L2). `state` gives (undone, superseded, by) of a snapshot now. A mark set and
+    then cleared is not a change, so a chain of undos and redos of the same places does not grow the
+    list: it holds each mark that differs at most once."""
+    order: list[tuple[str, SnapshotId]] = []
+    final: dict[tuple[str, SnapshotId], tuple[bool, SnapshotId | None]] = {}
+
+    def put(what: str, snapshot: SnapshotId, on: bool, by: SnapshotId | None) -> None:
+        key = (what, snapshot)
+        if key not in final:
+            order.append(key)
+        final[key] = (on, by)
+
+    for change in reversed(reverting):
+        put(change.what, change.snapshot, change.was_on, change.was_by)
+    put("undone", undone, True, None)
+    for each in overtaken:
+        put("superseded", each, True, undone)
+    net: list[MarkChange] = []
+    for what, snapshot in order:
+        was_undone, was_superseded, was_by_now = state(snapshot)
+        was_on, was_by = (was_undone, None) if what == "undone" else (was_superseded, was_by_now)
+        on, by = final[(what, snapshot)]
+        if (on, by if on else None) != (was_on, was_by if was_on else None):
+            net.append(
+                MarkChange(
+                    what="undone" if what == "undone" else "superseded",
+                    snapshot=snapshot,
+                    on=on,
+                    by=by,
+                    was_on=was_on,
+                    was_by=was_by,
+                )
+            )
+    return net
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class StoredSnapshot:
+    """A snapshot with what the database knows of it besides the record: whether it was undone or
+    superseded, and its place in the order they were taken (`seq`)."""
+
+    record: SnapshotRecord
+    undone: bool
+    superseded: bool
+    seq: int
+
+    @property
+    def undoable(self) -> bool:
+        return not (self.record.no_undo or self.undone or self.superseded)
 
 
 def _millis(moment: datetime) -> int:
@@ -659,6 +774,155 @@ class BrokerStore:
                 # A grant that cannot be read grants nothing. Only its ID is logged.
                 _log.warning("a grant record of the broker's database cannot be read; skipped")
         return grants
+
+    # --- snapshots (S21) -----------------------------------------------------------------
+
+    def insert_snapshot(self, record: SnapshotRecord) -> None:
+        """Add a snapshot (inside `transaction()`)."""
+        self._execute(
+            "INSERT INTO snapshots (id, task_id, kind, taken_at, record) VALUES (?, ?, ?, ?, ?)",
+            (
+                str(record.id),
+                str(record.task),
+                record.kind.value,
+                _millis(record.taken_at),
+                _SNAPSHOTS.dump_json(record).decode("utf-8"),
+            ),
+        )
+
+    def delete_snapshot(self, snapshot: SnapshotId) -> bool:
+        """Forget a snapshot (inside `transaction()`); whether there was one."""
+        return self._execute("DELETE FROM snapshots WHERE id = ?", (str(snapshot),)) == 1
+
+    def has_snapshot_row(self, snapshot: SnapshotId) -> bool:
+        """Whether the database has a row for `snapshot`, readable or not: what an orphan check
+        must ask (a record this version cannot read still owns its copy)."""
+        return bool(self._query("SELECT 1 FROM snapshots WHERE id = ?", (str(snapshot),)))
+
+    def mark_undone(self, snapshot: SnapshotId, at: datetime) -> bool:
+        """Record that a snapshot was undone (inside `transaction()`); False if it already was
+        or is not there, so that two undos of one snapshot cannot both go ahead."""
+        return (
+            self._execute(
+                "UPDATE snapshots SET undone_at = ? WHERE id = ? AND undone_at IS NULL",
+                (_millis(at), str(snapshot)),
+            )
+            == 1
+        )
+
+    def apply_marks(self, changes: Sequence[MarkChange], at: datetime) -> None:
+        """Apply `changes` in order (inside `transaction()`)."""
+        for change in changes:
+            if change.what == "undone":
+                self._execute(
+                    "UPDATE snapshots SET undone_at = ? WHERE id = ?",
+                    (_millis(at) if change.on else None, str(change.snapshot)),
+                )
+            else:
+                self._execute(
+                    "UPDATE snapshots SET superseded_at = ?, superseded_by = ? WHERE id = ?",
+                    (
+                        _millis(at) if change.on else None,
+                        None if not change.on or change.by is None else str(change.by),
+                        str(change.snapshot),
+                    ),
+                )
+
+    def mark_state(self, snapshot: SnapshotId) -> tuple[bool, bool, SnapshotId | None]:
+        """(undone, superseded, by) of a snapshot now; all false for one that is not there."""
+        rows = self._query(
+            "SELECT undone_at, superseded_at, superseded_by FROM snapshots WHERE id = ?",
+            (str(snapshot),),
+        )
+        if not rows:
+            return False, False, None
+        undone, superseded, by = rows[0]
+        return (
+            undone is not None,
+            superseded is not None,
+            None if by is None else SnapshotId(_text(by)),
+        )
+
+    def newer_safety_snapshots(self, seq: int) -> list[StoredSnapshot]:
+        """The `undo` snapshots taken after `seq`, oldest first."""
+        return self._snapshots(
+            "WHERE seq > ? AND kind = 'undo' ORDER BY seq LIMIT ?", (seq, MAX_LIST)
+        )
+
+    def set_marks(self, snapshot: SnapshotId, changes: Sequence[MarkChange]) -> None:
+        """Keep, with the safety snapshot of an undo, the marks that undo changed (inside
+        `transaction()`)."""
+        self._execute(
+            "UPDATE snapshots SET marks = ? WHERE id = ?",
+            (_MARKS.dump_json(list(changes)).decode("utf-8"), str(snapshot)),
+        )
+
+    def marks_of(self, snapshot: SnapshotId) -> list[MarkChange]:
+        """What the undo that made `snapshot` (its safety snapshot) changed; empty if nothing was
+        kept or it cannot be read."""
+        rows = self._query("SELECT marks FROM snapshots WHERE id = ?", (str(snapshot),))
+        if not rows or rows[0][0] is None:
+            return []
+        try:
+            return _MARKS.validate_json(_text(rows[0][0]), strict=True)
+        except ValidationError:
+            _log.warning("the marks of a snapshot cannot be read; skipped")
+            return []
+
+    def snapshot(self, snapshot: SnapshotId) -> StoredSnapshot | None:
+        """A snapshot with its state; None if there is none (or it cannot be read)."""
+        found = self._snapshots("WHERE id = ?", (str(snapshot),))
+        return found[0] if found else None
+
+    def latest_run_snapshot(self, task: TaskId) -> StoredSnapshot | None:
+        """The newest `run` snapshot of `task` that has been neither undone nor superseded."""
+        found = self._snapshots(
+            "WHERE task_id = ? AND kind = 'run' AND undone_at IS NULL AND superseded_at IS NULL "
+            "ORDER BY seq DESC LIMIT 1",
+            (str(task),),
+        )
+        return found[0] if found else None
+
+    def recent_snapshots(self, limit: int) -> list[StoredSnapshot]:
+        """The newest snapshots of every task, newest first."""
+        return self._snapshots("ORDER BY seq DESC LIMIT ?", (_limit(limit),))
+
+    def oldest_snapshots(self, limit: int) -> list[StoredSnapshot]:
+        """The oldest snapshots first (for retention)."""
+        return self._snapshots("ORDER BY seq LIMIT ?", (_limit(limit),))
+
+    def newer_run_snapshots(self, seq: int) -> list[StoredSnapshot]:
+        """The `run` snapshots taken after `seq` that are still to be undone, oldest first."""
+        return self._snapshots(
+            "WHERE seq > ? AND kind = 'run' AND undone_at IS NULL AND superseded_at IS NULL "
+            "ORDER BY seq LIMIT ?",
+            (seq, MAX_LIST),
+        )
+
+    def snapshot_count(self) -> int:
+        return _integer(self._query("SELECT count(*) FROM snapshots")[0][0])
+
+    def _snapshots(self, tail: str, parameters: Sequence[object] = ()) -> list[StoredSnapshot]:
+        found: list[StoredSnapshot] = []
+        for row in self._query(
+            f"SELECT id, record, undone_at, superseded_at, seq FROM snapshots {tail}",  # noqa: S608  (our own constants)
+            parameters,
+        ):
+            try:
+                record = _SNAPSHOTS.validate_json(_text(row[1]), strict=True)
+                if str(record.id) != _text(row[0]):
+                    raise StoreCorruptError("a snapshot record disagrees with its row")
+                found.append(
+                    StoredSnapshot(
+                        record=record,
+                        undone=row[2] is not None,
+                        superseded=row[3] is not None,
+                        seq=_integer(row[4]),
+                    )
+                )
+            except (StoreCorruptError, ValidationError):
+                _log.warning("a snapshot record of the broker's database cannot be read; skipped")
+        return found
 
     # --- tools (S23) ---------------------------------------------------------------------
 

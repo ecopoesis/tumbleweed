@@ -14,8 +14,43 @@ from tumbleweed.broker.paths import StoredPath
 from tumbleweed.core.ids import GrantId
 
 
-def mount(path: str, ino: int = 1) -> Mount:
-    return Mount(GrantId.new(), StoredPath(path=path, identity=FsIdentity(fsid=1, ino=ino)))
+def mount(path: str, ino: int = 1, *, writable: bool = False) -> Mount:
+    return Mount(
+        GrantId.new(),
+        StoredPath(path=path, identity=FsIdentity(fsid=1, ino=ino)),
+        writable=writable,
+    )
+
+
+class TestWriteAndReadMounts:
+    """A write grant is kept disjoint from the read grants of the run (#74, S21, D28)."""
+
+    def test_a_read_inside_a_write_is_merged_into_it(self) -> None:
+        outer, inner = mount("/h/p", writable=True), mount("/h/p/sub")
+
+        assert disjoint_mounts([inner, outer]) == [outer]
+
+    def test_the_same_path_read_and_write_is_one_writable_mount_whatever_the_order(self) -> None:
+        read, write = mount("/h/p"), mount("/h/p", writable=True)
+
+        assert disjoint_mounts([read, write]) == [write]
+        assert disjoint_mounts([write, read]) == [write]
+
+    def test_a_write_inside_a_read_refuses_the_run(self) -> None:
+        outer, inner = mount("/h/p"), mount("/h/p/sub", writable=True)
+
+        with pytest.raises(InvalidRunError, match="write grant lies inside a read grant"):
+            disjoint_mounts([outer, inner])
+
+    def test_a_write_inside_a_write_is_the_outer_one(self) -> None:
+        outer, inner = mount("/h/p", writable=True), mount("/h/p/sub", writable=True)
+
+        assert disjoint_mounts([inner, outer]) == [outer]
+
+    def test_a_write_beside_a_read_keeps_both_and_their_access(self) -> None:
+        read, write = mount("/h/photos"), mount("/h/photos-out", writable=True)
+
+        assert disjoint_mounts([write, read]) == [read, write]
 
 
 class TestDisjointMounts:

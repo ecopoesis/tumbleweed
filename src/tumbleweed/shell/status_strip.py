@@ -137,4 +137,12 @@ class StatusStrip(Gtk.Box):
         self.terminal_button.set_focus_on_click(False)
         self.terminal_button.add_css_class("caption")
         # No tooltip: a tooltip is a surface of its own, and none is allowed in the window (#53).
+        # The undo list (S21): the same kind of widget, for the same reasons.
+        self.undo_button = Gtk.Button(label="Undo…")
+        self.undo_button.set_has_frame(False)
+        self.undo_button.set_focusable(False)
+        self.undo_button.set_focus_on_click(False)
+        self.undo_button.add_css_class("caption")
+        self.undo_button.set_visible(False)  # shown when there is a broker to ask
+        self.append(self.undo_button)
         self.append(self.terminal_button)

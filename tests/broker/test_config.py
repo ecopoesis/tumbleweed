@@ -12,11 +12,14 @@ from tests.broker.support import World, make_world, resolve
 from tumbleweed.broker import DenyRelation, DenyRules
 from tumbleweed.broker.config import (
     FS_CALLS_PER_PROMPT,
+    GIB,
     MAX_PROMPT_TIMEOUT,
     PROMPT_MARGIN,
     PROMPT_SLACK,
     PROMPT_WAIT,
     BrokerConfig,
+    SnapshotMode,
+    SnapshotSettings,
 )
 from tumbleweed.broker.daemon import ipc_limits
 from tumbleweed.broker.deny import DenyMatch
@@ -200,14 +203,13 @@ class TestTheSettings:
     def test_the_handlers_cover_a_prompt_and_its_file_system_calls_even_with_a_short_grace(
         self, home_world: World
     ) -> None:
-        """The run bound alone (the longest run, its grace and 30 s) is shorter than what a
-        prompt can take with a slow file system, once the run grace is small."""
+        """A grant request (a prompt and its file system calls) is always inside the bound, whatever
+        the run grace: the bound is the longest of a request, a write run (its setup and snapshot
+        and a prompt, S21) and an undo."""
         config = config_for(home_world, run_grace=timedelta(milliseconds=1))
-        run_bound = timedelta(seconds=120) + config.run_grace + timedelta(seconds=30)
         asking = config.prompt_timeout + FS_CALLS_PER_PROMPT * config.fs_timeout + PROMPT_MARGIN
 
-        assert asking > run_bound
-        assert ipc_limits(config).handler_timeout == asking
+        assert ipc_limits(config).handler_timeout >= asking
 
     def test_the_file_system_calls_around_a_prompt_are_inside_the_wait_too(
         self, home_world: World
@@ -262,3 +264,27 @@ class TestTheSettings:
     ) -> None:
         with pytest.raises(InvalidValueError):
             config_for(home_world, **changes)
+
+
+class TestSnapshotSettings:
+    def test_the_defaults_are_the_plan(self) -> None:
+        settings = SnapshotSettings()
+
+        assert settings.mode is SnapshotMode.AUTO
+        assert settings.max_bytes == GIB
+        assert settings.retention == timedelta(days=7)
+        assert settings.max_snapshots == 100
+
+    def test_the_snapshot_places_are_on_the_deny_list(self, home_world: World) -> None:
+        snapshots = home_world.base / "vol" / "snaps"
+        config = config_for(home_world, snapshots=SnapshotSettings(btrfs_directory=snapshots))
+
+        paths = {entry.path for entry in config.deny_context({}).extra}
+
+        assert str(config.snapshots_directory) in paths
+        assert str(snapshots) in paths
+        assert str(config.broker_directory) in paths
+
+    def test_a_workspace_budget_is_validated(self, home_world: World) -> None:
+        with pytest.raises(InvalidValueError):
+            config_for(home_world, workspace_max_bytes=0)

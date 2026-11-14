@@ -27,12 +27,17 @@ from tumbleweed.ipc.base import IpcMessage, Request, Response
 from tumbleweed.ipc.broker_messages import (
     MAX_PATH_CHARS,
     MAX_REASON_CHARS,
+    NoUndoAccess,
     RequestedAccess,
     Scope,
 )
 
 MAX_PROMPT_SECONDS: Final = 3600
 """The longest a prompt may be asked to wait (the broker's own ceiling for `prompt_timeout`)."""
+
+PromptedAccess = Annotated[RequestedAccess | NoUndoAccess, Field(discriminator="kind")]
+"""What a prompt may ask: an access (what a model may request) or, from the broker only, "no undo"
+(S21). `RequestedAccess` is itself a union, so this is a plain union of the two."""
 
 DenyReason = Literal[
     "user_denied",  # the user pressed Deny
@@ -49,7 +54,7 @@ class ShowPrompt(Request):
     prompt: PromptId
     task: TaskId
     tool: ToolId | None
-    access: RequestedAccess
+    access: PromptedAccess
     scopes: Annotated[tuple[Scope, ...], Field(min_length=1, max_length=2)]
     reason: Annotated[str, Field(max_length=MAX_REASON_CHARS)]
     expires_in_ms: Annotated[int, Field(ge=1, le=MAX_PROMPT_SECONDS * 1000)]

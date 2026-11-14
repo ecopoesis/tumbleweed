@@ -182,23 +182,26 @@ class TestAGrant:
             assert not shell.window.prompt_banner.get_visible()
             assert shell.window.canvas.is_sensitive()
 
-    def test_write_access_never_reaches_the_user(self, build_prompt_shell: Builder) -> None:
+    def test_write_access_is_asked_for_the_task_only_and_the_users_click_grants_it(
+        self, build_prompt_shell: Builder
+    ) -> None:
         shell = build_prompt_shell()
-        counting = Counting(shell.window.broker_prompts)
-        shell.window.present()
-        broker = LiveBroker(counting)
-        try:
-            outcome = broker.wait(
-                broker.submit(
-                    broker.client.request_write(broker.task, RunId.new(), home_path(broker), "x")
-                )
+        with live(shell) as broker:
+            pending = broker.submit(
+                broker.client.request_write(broker.task, RunId.new(), home_path(broker), "x")
             )
+            assert pump_until(lambda: shown(shell))
+            shell.wait_armed()
+            card = shell.window.broker_prompts.controller.current
+            assert card is not None
+            assert card.kind == "write"
+            assert card.scopes == ("task",)
+            user_click(shell.window.prompt_banner, clickable(shell, "Allow for this task"))
 
-            assert not outcome.granted
-            assert counting.shown == 0
-            assert not shown(shell)
-        finally:
-            broker.stop()
+            outcome = broker.wait(pending)
+
+            assert outcome.granted
+            assert outcome.scope == "task"
 
 
 class TestTheRateLimit:
