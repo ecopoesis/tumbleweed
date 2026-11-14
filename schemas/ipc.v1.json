@@ -416,6 +416,11 @@
       "additionalProperties": false,
       "description": "The model's search (D30 (6)): the best matches for `query` (newest version of each tool),\nor, with none, the newest saved. Summaries the task must not see (I12) are left out.",
       "properties": {
+        "include_file_tools": {
+          "default": false,
+          "title": "Include File Tools",
+          "type": "boolean"
+        },
         "kind": {
           "const": "find_tools",
           "title": "Kind",
@@ -2344,12 +2349,24 @@
     },
     "ToolMatches": {
       "additionalProperties": false,
-      "description": "`withheld` counts matches left out because of the task's taint.",
+      "description": "What the task may see. `task_taint` is the task's taint after the call: the one fact the\nanswer says about what was left out, so that nothing in it depends on tools the task must not\nsee (not their text, their number or their rank).",
       "properties": {
         "kind": {
           "const": "tool_matches",
           "title": "Kind",
           "type": "string"
+        },
+        "task_taint": {
+          "items": {
+            "enum": [
+              "fs",
+              "net"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Task Taint",
+          "type": "array"
         },
         "tools": {
           "items": {
@@ -2358,18 +2375,12 @@
           "maxItems": 8,
           "title": "Tools",
           "type": "array"
-        },
-        "withheld": {
-          "maximum": 8,
-          "minimum": 0,
-          "title": "Withheld",
-          "type": "integer"
         }
       },
       "required": [
         "kind",
         "tools",
-        "withheld"
+        "task_taint"
       ],
       "title": "ToolMatches",
       "type": "object"
@@ -2394,10 +2405,21 @@
           "type": "string"
         },
         "newest": {
-          "maximum": 9007199254740992,
-          "minimum": 1,
-          "title": "Newest",
-          "type": "integer"
+          "anyOf": [
+            {
+              "maximum": 9007199254740992,
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Newest"
+        },
+        "raised": {
+          "title": "Raised",
+          "type": "boolean"
         },
         "summary": {
           "$ref": "#/$defs/ToolSummary"
@@ -2421,6 +2443,7 @@
         "summary",
         "document",
         "taint",
+        "raised",
         "newest"
       ],
       "title": "ToolOpened",
