@@ -127,7 +127,7 @@ def effective_taint(
     An imported package is input from the user's file system or from elsewhere: it may have been
     written by a task that read files and could write one, with those files' content in it, under
     any claim, so it is `fs`-tainted whatever it says, and what it says is kept beside it
-    (`claimed_taint`). Lowering it later is a user's decision in a trusted prompt (S18, S24), never
+    (`claimed_taint`). Lowering it later is a user's decision in a trusted prompt (#98), never
     something a bundle can state, and editing the package or its hash gains nothing: the taint of
     an import is made here, from the origin.
 

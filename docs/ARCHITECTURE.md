@@ -416,7 +416,7 @@ shell, voice or `gi` (section 10).
   import or evaluate that text. A handler's result is one JSON line that the trusted side parses
   again with a closed model and applies only to the declared outputs
   (`UiRuntime.apply_sandbox_result`). `tumbleweed.sandbox.handler_protocol` builds the command and
-  payload and reads the line (the broker may use it for stored code, S24); `agent.handler_runs`
+  payload and reads the line (the broker builds a stored tool's run from it, S24, D30 (3)); `agent.handler_runs`
   decides when runs start (debounce, one in flight per instance) and `agent.code` starts them.
 
 ### Broker daemon
@@ -457,7 +457,8 @@ the broker imports the agent or an LLM (I2).
   `PromptInterface`: `ShellPrompts` (S18), which asks the shell that made the task over its
   connection, or `AutoDeny` for a broker with nobody to ask, so nothing can be granted without a
   user. A prompt gets the structured capability (or, for a request for the picker, `fs.pick` and
-  no path), the scopes it may offer (`once`, `task`: `tool` needs S24's saved tools) and the
+  no path), the scopes it may offer (`once`, `task`, and `tool` for a user-triggered run of a tool opened
+  from the store, S24) and the
   model's reason as text to be quoted. Its answer is checked against what was offered; a timeout
   (120 s), an exception, a scope not offered, an answer that is not one of the two kinds and a
   picker answered without a choice (or any other prompt answered with one) are all a denial. The
@@ -593,8 +594,8 @@ the broker imports the agent or an LLM (I2).
   settings where those and 5 s are more than `PROMPT_WAIT` (150 s), which is what
   `BrokerClient.request_grant` waits, and the daemon's handlers get at least that and a margin. So a
   transport timeout can never come before the broker has stopped asking (an Allow after one would
-  make a grant the caller never hears about, #60). The prompt's `tool` is null until S24 binds a run
-  to a tool. A request may ask for the **picker** (`fs.pick`, file or folder): the shell opens a
+  make a grant the caller never hears about, #60). The prompt's `tool` (and its name from the index) is set when the request
+  carries a verified binding to a stored tool (S24, D30 (2)), and null otherwise. A request may ask for the **picker** (`fs.pick`, file or folder): the shell opens a
   `Gtk.FileDialog` when the user presses "Choose", and the path the user picks (received text, so
   not a decision already made) is resolved and issued like any other: deny rules, taint rule and
   grant cap apply, the grant records `origin = picker`, and the audit entry has the picked path (a
@@ -879,8 +880,8 @@ the user's own, and `edit_before_send` (and its forcing over plain http) applies
 | `list_workspace()` / `list_dir(path)` / `read_file(path)` | Grant-checked, size-capped listings and reads via the broker | S19 |
 | `run_code(source, timeout_seconds)` | One-off sandboxed Python in the task workspace; stdout and stderr come back framed as data | S20 |
 | `undo_last_change()` | Restore the paths written by the task's latest write-enabled run that is not undone or overtaken, while the task still holds write access to them; snapshots what is there first, so the user can undo the undo | S21 |
-| `find_tools(query)` / `open_tool(id, version?)` | Retrieve and reopen saved tools | S24 |
-| `save_tool(name, description)` / `revert_tool(id, version)` | Persist and version tools | S24 |
+| `find_tools(query?)` / `open_tool(tool, version?, placement?, source?)` | Retrieve saved tools (framed data, taint-filtered) and show one under the broker's instance | S24 |
+| `save_tool(instance, name, description?, tags?, capabilities?, inputs?, outputs?, refines?)` / `revert_tool(tool, version)` | Save what is on the canvas as a tool or a new version; save a copy of an older version as the newest | S24 |
 | `connect_tools(from, to)` | Wire a typed output port to an input port | S25 |
 
 ## 4. Generated UI
@@ -957,8 +958,9 @@ stored bytes are the normalised bytes and the hash covers exactly what the sandb
 Packages are immutable; refining a tool creates a new version. The broker owns the tool store so
 it can verify that the code it runs for a saved tool is exactly the stored version (I8).
 Retrieval in v1 is SQLite FTS5 plus model re-ranking; embeddings arrive with file search,
-post-v1. S23 (D19) built the store; the model's `save_tool`, `find_tools` and `open_tool` and the
-tool grants are S24's.
+post-v1. S23 (D19) built the store; S24 (D30) added the model's `save_tool`, `find_tools`,
+`open_tool` and `revert_tool`, the broker's checks that go with them, the tool grants and the
+chrome's list ("Saved tools in a task", below).
 
 **The package** (`tumbleweed.tools.package`, pure, no I/O; the broker and the shell both use it).
 Every model is closed (`extra="forbid"`, strict, frozen), so a grant, a task or a current state
@@ -1020,7 +1022,7 @@ change to any of them is a new hash and, for a tool grant, a new grant.
   as it is and the write refused. Nothing deletes a blob, and a blob left by a transaction that
   failed is harmless and found again by the next save of the same bytes.
 
-`open` (what S24's `open_tool` and the sandbox run will use) reads the blob, parses it with the
+`open` (what `open_tool` and the run of a stored tool use) reads the blob, parses it with the
 strict models, and checks that the index row is a faithful copy of it (id, version, name,
 description, tags, the package's taint, the taint its origin gives, size): a package whose blob or
 row was edited is refused, so the taint of a saved version cannot be lowered by editing the
@@ -1033,7 +1035,7 @@ characters, and quotes each as a prefix term; the string is a bound parameter, n
 SQL, and a query without a word finds nothing. At most 50 results.
 
 **Versions are immutable.** The store has no operation that changes or removes a version. `save`
-(S24's `save_tool` calls it through `BrokerService.save_tool`, which has no IPC request yet) adds
+(the `save_tool` and `revert_tool` requests call it through `BrokerService`) adds
 the first version of a new tool or the next of one that exists, assigning the version where it is
 stored and taking the taint from the task, read in the same synchronous block (I12). `import_`
 adds a tool the store does not have.
@@ -1073,16 +1075,43 @@ give. The origin lives in the index (a package cannot record how it came without
 it is exported with), so rewriting both fields of an index row is not detected: editing the broker's
 database is out of scope (section 8), as for the grants beside it. Editing a bundle's claim and its
 hash gains nothing: it is another package, and an import is `fs`-tainted anyway. Lowering the taint
-of an import later is a user's decision in a trusted prompt (S18, S24; #98).
+of an import later is a user's decision in a trusted prompt (#98).
 
 **Audit.** A saved or imported version (`tool_saved`: tool, version, hash, size, the effective
-taint and the package's claim, origin, and the task for a save), an export (`tool_exported`: written before the bundle is returned, the
+taint and the package's claim, origin, the task for a save and `reverted_from` for a revert), an
+open into a task (`tool_opened`, with the instance the broker named and the task's taint after) or
+one the taint rule refused (`tool_open_refused`), a revoked tool grant (`grant_revoked`, reason
+`revoked_by_user`), an export (`tool_exported`: written before the bundle is returned, the
 effective taint included, because a bundle is content that leaves the broker's custody) and a
 refused import (`tool_import_refused`: `invalid`, `too_large`, `conflict`, `full`, `integrity` for a
 stored package that failed its check while the import looked at it, `error` for any other failure
 of the store or the disk; nothing of the bundle) are written before the act, in its transaction (a
 refusal that is itself a failure of the store is recorded if the log can take it). Listing, showing and searching are reads of the broker's own store and are not
 decisions; an import that finds the very same version stored changes nothing and has no entry.
+
+**Saved tools in a task (S24, D30).** The requests that name a task:
+
+- `save_tool(task, draft, tool?)`: the draft is the canonical JSON of a `ToolDraft`, parsed again by
+  the broker as strictly as a bundle; the taint is the broker's record of the task; at most 20
+  saves per task. `revert_tool(task, tool, version)` saves a *copy* of an older version as the
+  newest (versions stay immutable and the lineage linear; a tool grant on the old version does not
+  carry to the copy; the copy's taint never gets cleaner than the lineage's).
+- `open_tool(task, tool, version?)`: reads `ToolStore.open`, checks `ToolRecord.taint` against the
+  task's (a version both fs and net: refused everywhere; fs in a net task and net in an fs task:
+  refused with the text that says `start_task` with `fresh_context=true`; otherwise the task's taint
+  becomes the merge, in the transaction that audits it), and **names the instance** (`inst_...`)
+  that the canvas must show the tool under. At most 32 instances per task are remembered.
+- `find_tools(task, query?)`: top 8 by FTS rank over the newest versions, minus what the task's
+  taint must not see (names and descriptions are text the saving task wrote); the answer counts
+  the ones withheld. The model re-ranks by choosing; results reach it as framed data.
+- A run, a grant request, a read or a listing may carry an `origin`: a trigger (`model`, the
+  default, or `user_event`) and a binding (instance, tool, hash). The broker accepts a binding only
+  if the task opened that instance for exactly that tool and hash and the store still has the
+  version. A run with a binding brings **no code**: its command must be the handler shim's and its
+  payload the handler document with an empty `code`; the broker checks the handler is declared by
+  the stored spec and builds the payload from the stored modules (I8). Only a verified binding
+  with `user_event` gets `tool` scope grants and the prompt's "allow for this tool".
+- `list_tool_versions(tool)`, `list_tool_grants`, `revoke_tool_grant(grant)`: the chrome's.
 
 **`tumbleweed-tools`** (`tumbleweed.broker.toolscli`: `list [QUERY]`, `show TOOL [--version N]
 [--json]`, `export TOOL FILE [--version N]`, `import FILE`; `-` is standard output or input) is a
@@ -1126,7 +1155,7 @@ audited.
     version must be granted again. Tool grants apply **only** to sandbox handler runs
     triggered by a direct user input event on an instance of that tool; runs triggered by
     the model, by `patch_state` or by connections get only task grants. Users can list and
-    revoke tool grants in chrome (S24).
+    revoke tool grants in chrome (S24: the Tools panel, `ListToolGrants` and `RevokeToolGrant`).
 - **Static deny rules** cannot be overridden: `~/.ssh`, `~/.gnupg`, cloud and package-manager
   credential dirs (`~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.netrc`, …),
   keyrings, browser profiles, Tumbleweed's own config/data/state dirs (including workspaces
@@ -1187,8 +1216,7 @@ audited.
   taint purposes; a tool grant that would conflict with the task's taint is withheld from
   that run. Tool grants are applied oldest first, so of two conflicting ones the older applies
   and the newer is withheld: the older is the one the user made first, and the result then does
-  not depend on which request happens to arrive first (S24 shows the user which tool grants a
-  run withheld). A task inheriting turns from an fs-tainted task starts fs-tainted (§2):
+  not depend on which request happens to arrive first. A task inheriting turns from an fs-tainted task starts fs-tainted (§2):
   `start_task` passes `fresh_context` to the broker, which copies the ended task's taint to
   the new task unless it is true. The broker's taint state is authoritative. A tool
   package records the taint of the task it was saved from, because its code and defaults
@@ -1307,7 +1335,7 @@ Each invariant names where it is enforced. Reviews check every change against th
   from the connection it sent the prompt to.
   **The prompt (S18, D25).** `tumbleweed.shell.viewmodel.prompts.PromptController` (no GTK) holds
   the rules and `tumbleweed.shell.prompt_chrome.PromptBanner` draws them in the chrome region. *What
-  is shown*: our heading, "From task ..." (and the tool, once a run can name one: S24), one sentence
+  is shown*: our heading, "From task ..." (and the tool's own name, when a verified binding names a stored tool: S24), one sentence
   per kind of access ("The assistant asks to read this file or folder and all in it:", full network
   access, choose a file or a folder) and the path on a line of its own, spelled out where it has a
   control, format, line-separator or paragraph-separator character; then "The assistant says (its

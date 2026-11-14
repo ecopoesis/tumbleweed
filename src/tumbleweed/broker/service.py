@@ -33,8 +33,10 @@ that is opened is the one that is audited and returned, and a store that changes
 make the two differ. An export is audited before the bundle is returned and an import before it
 commits (inside `_atomic`, like every act that changes state); listing, showing and searching are
 reads of the broker's own store and are not decisions. `save_tool` is the same block for a tool
-saved from a task, whose taint is the broker's own record of it (I12); it has no IPC request until
-S24 gives the model a `save_tool`.
+saved from a task, whose taint is the broker's own record of it (I12); `save_tool`, `revert_tool`,
+`open_tool`, `find_tools` and the tool-grant requests (S24, D30) are the same kind of synchronous
+block, and a request that names a stored tool's binding has it **verified** against what this
+module recorded when it opened the tool and against the store (`_context`) before anything else.
 
 **Refusals never carry input.** A `Refused` message is fixed text: paths, commands and the
 model's reason are never repeated in a response, a log line or an exception message, and no
@@ -1010,7 +1012,7 @@ class BrokerService:
         stores the version (I12), so a grant that arrived a moment ago is in it. Raises
         `UnknownTaskError` if `task` is not a live task of `owner`, `ToolNotFoundError`,
         `ToolStoreFullError`, `ToolPackageError`, `AuditError` and `StoreError` as the store and
-        the audit log do. There is no IPC request for it yet: S24's `save_tool` is the caller.
+        the audit log do. The `SaveTool` request calls it.
         """
         try:
             live = self._owned(owner, task)

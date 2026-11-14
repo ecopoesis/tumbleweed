@@ -2001,8 +2001,9 @@ model `shell/viewmodel/tools.py`): the saved tools, newest first, each with name
 taint badge ("saw your files" / "used the network") and **Open**; a row expands to the version
 history (**Open this version**, **Make this the newest**); and the grants list with **Revoke**. It
 is a fallback for when the model is not at hand, not app switching: opening shows the tool on the
-canvas under the current task, through the same code as `open_tool` (so the same taint rules and
-the same refusal text). Every name and description is `plain_label` text, capped, spelled
+canvas under the current task, through the same broker request as `open_tool` (so the same taint
+rules and the same refusal text); it starts no task, so with none yet it says to talk to the
+assistant first. Every name and description is `plain_label` text, capped, spelled
 (`visible`) and set apart as "the tool's own name", never in the window title, the strip or the
 prompt's own sentences.
 

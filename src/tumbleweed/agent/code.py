@@ -3,7 +3,7 @@
 The agent never compiles, imports or evaluates the code it is given: it is text, and it goes into
 the payload file of a run the broker makes in a sandbox (I1). The command, the payload and the
 reading of the shim's answer are `tumbleweed.sandbox.handler_protocol`, so that the broker can
-build the same run from stored code (S24). This module owns
+build the same run from stored code (S24, D30 (3)). This module owns
 
 - the handler call as the canvas has it (`HandlerCall`) and how it becomes a run;
 - `BrokerHandlerExecutor`, which starts a run on the broker link and reports on the main thread;
