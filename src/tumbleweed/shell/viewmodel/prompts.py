@@ -151,6 +151,9 @@ class PromptCard:
     reason_cut: bool
     task_title: str | None = None
     """The title the assistant gave the task (plain, capped), or None: set apart as its words."""
+    tool_name: str | None = None
+    """The name of `tool` from the broker's index (S24): the tool's own text, plain and capped,
+    set apart as the tool's words (I5)."""
     paths: tuple[str, ...] = ()
     """For `no_undo`: the places the run may change, spelled out (`visible`), and `cause` why they
     could not be saved: the broker's closed code, shown as our own sentence."""
@@ -231,6 +234,9 @@ def card_of(show: ShowPrompt, task_title: str | None = None) -> PromptCard:
             assert_never(access)
     reason, cut = plain_reason(show.reason)
     title = None if not task_title else plain_reason(task_title, MAX_TITLE_SHOWN)[0] or None
+    tool_name = (
+        None if not show.tool_name else plain_reason(show.tool_name, MAX_TITLE_SHOWN)[0] or None
+    )
     return PromptCard(
         prompt=show.prompt,
         task=show.task,
@@ -241,6 +247,7 @@ def card_of(show: ShowPrompt, task_title: str | None = None) -> PromptCard:
         reason=reason,
         reason_cut=cut,
         task_title=title,
+        tool_name=tool_name,
         paths=tuple(visible(each) for each in access.paths)
         if isinstance(access, NoUndoAccess)
         else (),

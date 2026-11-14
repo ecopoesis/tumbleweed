@@ -145,4 +145,12 @@ class StatusStrip(Gtk.Box):
         self.undo_button.add_css_class("caption")
         self.undo_button.set_visible(False)  # shown when there is a broker to ask
         self.append(self.undo_button)
+        # The saved tools and the access given to them (S24): the same kind of widget again.
+        self.tools_button = Gtk.Button(label="Tools…")
+        self.tools_button.set_has_frame(False)
+        self.tools_button.set_focusable(False)
+        self.tools_button.set_focus_on_click(False)
+        self.tools_button.add_css_class("caption")
+        self.tools_button.set_visible(False)  # shown when there is a broker to ask
+        self.append(self.tools_button)
         self.append(self.terminal_button)

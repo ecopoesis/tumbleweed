@@ -7,7 +7,7 @@ whoever made a bundle, so it reaches the model as **data in a frame** (`agent.un
 as our own words: the ID, the version and the taint of each tool are the broker's, and are said
 outside the model's reach to forge only in so far as a name has no line break.
 
-`fetch_stored` is shared with the chrome's tools list: it asks the broker to open a version into the
+`open_with` is shared with the chrome's tools list: it asks the broker to open a version into the
 current task and returns the broker's answer, parsed and checked against the hash the broker gave
 (`StoredBinding` is made only from it).
 """
@@ -173,19 +173,15 @@ class FetchedTool:
     stored: StoredBinding
 
 
-async def fetch_stored(
-    link: BrokerLink, task: TaskId, tool: ToolId, version: ToolVersion | None
+async def open_with(
+    client: BrokerClient, task: TaskId, tool: ToolId, version: ToolVersion | None
 ) -> FetchedTool:
-    """Open `tool` into `task` on the broker and read its answer.
+    """Open `tool` into `task` on the broker (`client`) and read its answer.
 
-    `BrokerRefused` (taint, not found), `BrokerUnavailableError` as the link raises them;
-    `ToolError` if the broker's package does not hash to the hash it named or is not a package.
+    `BrokerRefused` (taint, not found) as the client raises it; `ToolError` if the broker's
+    package does not hash to the hash it named or is not a package.
     """
-
-    async def work(client: BrokerClient) -> ToolOpened:
-        return await client.open_tool(task, tool, version)
-
-    opened = await link.call(work, deadline=BROKER_SECONDS)
+    opened = await client.open_tool(task, tool, version)
     data = opened.document.encode("utf-8")
     try:
         package = parse_package(data)
@@ -201,6 +197,17 @@ async def fetch_stored(
         capabilities=tuple(package.manifest.capabilities),
     )
     return FetchedTool(task, opened, package, stored)
+
+
+async def fetch_stored(
+    link: BrokerLink, task: TaskId, tool: ToolId, version: ToolVersion | None
+) -> FetchedTool:
+    """`open_with` on the broker link (the agent's side)."""
+
+    async def work(client: BrokerClient) -> FetchedTool:
+        return await open_with(client, task, tool, version)
+
+    return await link.call(work, deadline=BROKER_SECONDS)
 
 
 def _source_text(package: ToolPackage) -> str:
