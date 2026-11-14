@@ -252,9 +252,35 @@ shell, voice or `gi` (section 10).
   grants where one is the other or inside it, only the outer is mounted
   (`tumbleweed.broker.compose.disjoint_mounts`).
 - **Flags.** `--unshare-all --unshare-user --disable-userns --die-with-parent --new-session
-  --clearenv --cap-drop ALL`, plus a hostname of its own. There is no network option until S22:
-  the sandbox's `lo` is its own, and no host interface, host loopback or host abstract socket is
-  there.
+  --clearenv --cap-drop ALL`, plus a hostname of its own and an explicit `--unshare-net`
+  (`--share-net` is nowhere). Without `net.full` the sandbox's `lo` is its own, and no host
+  interface, host loopback or host abstract socket is there, and no `/etc/resolv.conf`.
+- **The network (S22, D29).** A run whose policy has `network` (the broker sets it when a
+  `net.full` grant applies to the run, and then mounts no file grant and no input: `SandboxPolicy`
+  refuses the combination, I12) starts bwrap with `--info-fd` and `--block-fd`, and `--uid 0 --gid
+  0` (slirp4netns's own sandbox needs `setegid(0)` in the target's user namespace; every
+  capability is dropped all the same). `tumbleweed.sandbox.network.NetworkLink` reads the child's
+  PID and namespace ids, opens the child's network namespace once and **refuses unless it is the
+  one bwrap reported and not the launcher's own** (with `--share-net` bwrap reports none). It
+  starts `slirp4netns --configure --disable-host-loopback --enable-sandbox --enable-seccomp
+  --ready-fd --exit-fd <pid> tap0` with an empty environment, under `prlimit` (1024 files, 1 GiB
+  of address space), joining the user namespace that owns the network namespace (found with
+  `NS_GET_USERNS`: `--disable-userns` nests the init in a second one, which has no right over it).
+  Only when slirp4netns has said ready does the launcher write `1` to two pipes: bwrap's
+  `--block-fd` (which holds the init after setup and before it execs, and also lets go at
+  end-of-file) and the helper's `--go-fd`, which does **not**: end-of-file there, whoever closed
+  it, is a refusal. So no failure, crash or kill of the launcher starts the program; only a
+  written `1` does. 10 s bounds the setup. Any failure raises `SandboxNetworkError` (bwrap's own
+  failure, a launch error with its words), closes the gates, kills the held init through a pidfd
+  and ends slirp4netns; the broker refuses the run with fixed text and nothing falls back.
+  slirp4netns is killed and reaped on every path out of the run, and ends by itself if the broker
+  dies (its exit pipe). DNS is slirp4netns's resolver at 10.0.2.3 (port 53 only; it forwards to
+  the host's resolver, which may be a loopback stub) and the run's `/etc/resolv.conf` (a memfd,
+  read-only, readable by Landlock) says so. The host's loopback is unreachable
+  (`--disable-host-loopback`: 10.0.2.2, TCP and UDP) and so are its abstract unix sockets (the
+  namespace); everything else the host can reach (its LAN, its own non-loopback services,
+  link-local and cloud metadata addresses) is reachable, because that is what `net.full` is (#31
+  is the narrower grant, post-v1). There is no certificate store in the sandbox.
 - **Environment.** Empty, plus the variables the policy lists, each of which must be on the
   policy's allowlist (otherwise the policy is refused, not trimmed). A name that looks like a
   secret (`key`, `token`, `secret`, `passw`, `credential`, `auth`, `anthropic`) is refused even on
@@ -463,7 +489,7 @@ the broker imports the agent or an LLM (I2).
   snapshot of those places is recorded, in the transaction that authorises it, or after the user
   accepted "no undo" for that run (I13, section 7); it is refused while the task's workspace holds
   more than its budget, and while an undo of the same places is in progress. A `net.full`
-  grant is held but gives no network until S22. The once grants the run uses are consumed, the
+  grant gives the run a network (S22, below) and then no file grant. The once grants the run uses are consumed, the
   task's taint raised and a `sandbox_run` audit entry written in one transaction *before* the
   program starts; `sandbox_run_result` follows when it ends. A `RunId` can be used once, and
   it and the run's place under the task's cap are reserved before the first `await`, so requests

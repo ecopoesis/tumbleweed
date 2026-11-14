@@ -28,7 +28,7 @@ from tests.ui.spec.support import Json, build
 from tumbleweed.ipc.broker_messages import Scope
 from tumbleweed.ipc.prompt_messages import AllowDecision, DenyDecision
 from tumbleweed.shell.prompt_chrome import REASON_CLASS, RESERVED_CLASSES, PromptBanner
-from tumbleweed.shell.viewmodel.prompts import ARM_SECONDS, PromptCard
+from tumbleweed.shell.viewmodel.prompts import ARM_SECONDS, NETWORK_WARNING, PromptCard
 from tumbleweed.ui.spec import SpecError, parse_ui_spec
 
 if TYPE_CHECKING:
@@ -99,6 +99,7 @@ class TestWhereItIs:
 
         shown = texts(shell.window.prompt_banner)
         assert "The assistant asks for full network access." in shown
+        assert NETWORK_WARNING in shown  # D29 (10): the strong warning, as plain text
         assert not any("/home" in line for line in shown)
 
     def test_the_reason_is_quoted_labelled_plain_and_capped(

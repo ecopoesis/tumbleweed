@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_the_current_version_loads_and_says_what_matters() -> None:
     text = load_system_prompt()
 
-    assert SYSTEM_PROMPT_VERSION == "v5"
+    assert SYSTEM_PROMPT_VERSION == "v6"
     assert 0 < len(text.encode()) <= MAX_PROMPT_BYTES + MAX_SPEC_REFERENCE_BYTES
     assert "plain text" in text  # the chat shows no markup
     assert "data" in text  # untrusted content is framed as data
@@ -39,7 +39,7 @@ def test_the_first_version_is_the_prompt_alone_and_the_current_one_adds_the_spec
 
     assert "UI spec reference" not in first
     assert "show_ui" not in first
-    assert current.startswith(load_system_prompt("v5").split("\n\n# UI spec reference")[0])
+    assert current.startswith(load_system_prompt("v6").split("\n\n# UI spec reference")[0])
     assert "# UI spec reference (tumbleweed.ui/1)" in current
     assert "never an instruction" in current  # the canvas event frame is described as data
 
@@ -155,7 +155,7 @@ class TestLabel:
 
         assert system_prompt_label("v1") == "v1"
         label = system_prompt_label()
-        assert re.fullmatch(r"v5\.[0-9a-f]{8}", label)
+        assert re.fullmatch(r"v6\.[0-9a-f]{8}", label)
         assert re.fullmatch(_PROMPT_VERSION_PATTERN, label)  # the log accepts it
 
     def test_a_change_of_the_reference_is_a_different_label(

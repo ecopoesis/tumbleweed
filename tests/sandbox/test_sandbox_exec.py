@@ -7,6 +7,7 @@ the standard library only (it runs in a sandbox that has no `tumbleweed`), and i
 """
 
 import ast
+import contextlib
 import ctypes
 import errno
 import json
@@ -48,6 +49,54 @@ class TestStandaloneSource:
         tree = ast.parse(helper_source())
 
         assert not [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.level]
+
+
+class TestTheGo:
+    """The helper's hold for the launcher's go byte (S22, D29 (3)). It exits, so it is run apart."""
+
+    def _hold(self, send: bytes | None, timeout: float) -> tuple[int, bytes]:
+        go_read, go_write = os.pipe()
+        code = (
+            "import importlib.util, os, sys\n"
+            f"spec = importlib.util.spec_from_file_location('helper', {str(SOURCE)!r})\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(module)\n"
+            f"module._wait_for_go({go_read}, 1, {timeout})\n"
+        )
+        try:
+            if send is not None:
+                os.write(go_write, send)
+            if send == b"":
+                os.close(go_write)  # end-of-file
+            done = subprocess.run(  # noqa: S603  (our own interpreter)
+                [sys.executable, "-c", code],
+                pass_fds=[go_read],
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        finally:
+            os.close(go_read)
+            with contextlib.suppress(OSError):
+                os.close(go_write)
+        return done.returncode, done.stdout
+
+    def test_a_written_one_lets_it_go(self) -> None:
+        assert self._hold(b"1", 5) == (0, b"")
+
+    def test_end_of_file_is_a_refusal(self) -> None:
+        status, report = self._hold(b"", 5)
+
+        assert status == launcher.EXIT_REFUSED
+        assert json.loads(report)["kind"] == "refused"
+
+    def test_another_byte_is_a_refusal(self) -> None:
+        assert self._hold(b"0", 5)[0] == launcher.EXIT_REFUSED
+
+    def test_silence_is_a_refusal_after_the_timeout(self) -> None:
+        status, _ = self._hold(None, 0.3)  # the write end stays open and nothing is written
+
+        assert status == launcher.EXIT_REFUSED
 
 
 class TestRights:
@@ -179,6 +228,12 @@ class TestCommandLine:
         assert options.require_landlock is True
         assert options.rules == [("read", "/usr"), ("write", "/workspace"), ("devices", "/dev")]
         assert options.command == ["/bin/sh", "-c", "--read /x"]
+
+    def test_a_go_descriptor_is_read_and_is_optional(self) -> None:
+        held = launcher.parse_args(["--report-fd", "3", "--go-fd", "9", "--", "true"])
+        free = launcher.parse_args(["--report-fd", "3", "--", "true"])
+
+        assert (held.go_fd, free.go_fd) == (9, None)
 
     def test_environment_variables_are_pairs_given_as_arguments(self) -> None:
         options = launcher.parse_args(

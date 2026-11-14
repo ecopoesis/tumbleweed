@@ -40,6 +40,7 @@ import errno
 import json
 import os
 import platform
+import select
 import stat
 import struct
 import sys
@@ -335,6 +336,7 @@ class Options:
 
     def __init__(self) -> None:
         self.report_fd: int | None = None
+        self.go_fd: int | None = None
         self.require_landlock = False
         self.rules: list[tuple[str, str]] = []
         self.env: list[tuple[str, str]] = []
@@ -345,8 +347,8 @@ _RULE_FLAGS: Final = {"--read": "read", "--write": "write", "--devices": "device
 
 
 def parse_args(argv: list[str]) -> Options:
-    """Parse `--report-fd N [--require-landlock] [--env NAME VALUE]... [--read|--write|--devices
-    PATH]... -- COMMAND`."""
+    """Parse `--report-fd N [--go-fd N] [--require-landlock] [--env NAME VALUE]...
+    [--read|--write|--devices PATH]... -- COMMAND`."""
     options = Options()
     index = 0
     while index < len(argv):
@@ -359,6 +361,9 @@ def parse_args(argv: list[str]) -> Options:
             index += 1
         elif word == "--report-fd" and index + 1 < len(argv) and argv[index + 1].isdigit():
             options.report_fd = int(argv[index + 1])
+            index += 2
+        elif word == "--go-fd" and index + 1 < len(argv) and argv[index + 1].isdigit():
+            options.go_fd = int(argv[index + 1])
             index += 2
         elif word == "--env" and index + 2 < len(argv):
             name = argv[index + 1]
@@ -411,6 +416,27 @@ def _confine(options: Options) -> dict[str, object]:
     }
 
 
+GO_WAIT_SECONDS: Final = 30.0
+"""How long the helper holds for the go byte: the launcher's setup bound (10 s) with margin. A
+launcher that is alive and silent for longer is not going to say it."""
+
+
+def _wait_for_go(go_fd: int, report_fd: int, timeout: float = GO_WAIT_SECONDS) -> None:
+    """Hold the program until the launcher says go (S22, D29): one byte on `go_fd`, written only
+    after the network is up. End of file (the launcher gave up, died or was killed) is never
+    "go": the program is not run. The launcher bounds this wait itself (its setup timeout, and
+    the kernel closing its end when it dies) and so does the helper: silence for `timeout` is a
+    refusal too."""
+    try:
+        answer = os.read(go_fd, 1) if select.select([go_fd], [], [], timeout)[0] else b""
+    except OSError:
+        answer = b""
+    os.close(go_fd)
+    if answer != b"1":
+        _report(report_fd, {"kind": "refused", "code": "setup", "reason": "not released"})
+        os._exit(EXIT_REFUSED)
+
+
 def main(argv: list[str] | None = None) -> NoReturn:
     """Confine this process, report, and replace it with the program. Never returns."""
     try:
@@ -427,6 +453,8 @@ def main(argv: list[str] | None = None) -> NoReturn:
         _report(fd, {"kind": "refused", "code": exc.code, "reason": str(exc)})
         os._exit(EXIT_REFUSED)
     _report(fd, hardening)
+    if options.go_fd is not None:
+        _wait_for_go(options.go_fd, fd)
     # Closed by the exec below: the program never holds the descriptor the report went down.
     os.set_inheritable(fd, False)
     try:

@@ -85,7 +85,7 @@ from tumbleweed.broker.audit import (
 from tumbleweed.broker.audit import TaskEnded as TaskEndedEntry
 from tumbleweed.broker.audit import TaskStarted as TaskStartedEntry
 from tumbleweed.broker.audit import ToolExported as ToolExportedEntry
-from tumbleweed.broker.capabilities import CapabilityKind, FsRead, FsWrite
+from tumbleweed.broker.capabilities import CapabilityKind, FsRead, FsWrite, NetFull
 from tumbleweed.broker.compose import InvalidRunError, Mount, disjoint_mounts, sandbox_environment
 from tumbleweed.broker.config import SNAPSHOT_SLACK, BrokerConfig
 from tumbleweed.broker.deny import DenyRules
@@ -237,6 +237,7 @@ from tumbleweed.ipc.tool_messages import (
 from tumbleweed.sandbox.errors import (
     InvalidPolicyError,
     SandboxLaunchError,
+    SandboxNetworkError,
     SandboxTeardownError,
     SandboxUnavailable,
     SandboxUnsupported,
@@ -1846,6 +1847,17 @@ class BrokerService:
                     if isinstance(grant.capability, FsRead | FsWrite)
                 ]
             )
+            network = any(isinstance(grant.capability, NetFull) for grant in selection.applicable)
+            if network and any(
+                isinstance(grant.capability, FsRead | FsWrite) for grant in selection.applicable
+            ):
+                # I12: the taint rule keeps these apart long before here; this is the last
+                # gate, and it holds whatever composed the selection (S20 handlers, S25).
+                raise _Refuse(
+                    "denied",
+                    "a run with the network cannot also be given files",
+                    "net_with_files",
+                )
             write_paths = tuple(mount.path for mount in mounts if mount.writable)
             if len(write_paths) > MAX_TARGETS:
                 raise InvalidRunError(
@@ -1884,6 +1896,7 @@ class BrokerService:
                     allowlist,
                     authorised,
                     write_paths,
+                    network,
                 )
             finally:
                 self._write_runs.pop(request.run, None)
@@ -1901,6 +1914,7 @@ class BrokerService:
         allowlist: frozenset[EnvName],
         authorised: list[bool],
         write_paths: tuple[StoredPath, ...],
+        network: bool,
     ) -> ResponseBody:
         paths: _RunPaths = await self._fs.call(
             partial(self._open_run_paths, live.state.task, live.workspace, tuple(mounts), rules),
@@ -1912,7 +1926,7 @@ class BrokerService:
                 # I13: nothing that can write starts before its snapshot is recorded (below,
                 # in the transaction that authorises the run) or the user accepted no undo.
                 planned = await self._snapshot_for_run(owner, request, live, mounts, paths)
-            policy, limits = self._policy(request, paths, mounts, variables, allowlist)
+            policy, limits = self._policy(request, paths, mounts, variables, allowlist, network)
             self._authorise_run(request, live, context, selection, mounts, rules, planned)
             authorised[0] = True
         except BaseException:
@@ -2031,6 +2045,7 @@ class BrokerService:
         mounts: Sequence[Mount],
         variables: tuple[EnvVar, ...],
         allowlist: frozenset[EnvName],
+        network: bool,
     ) -> tuple[SandboxPolicy, SandboxLimits]:
         limits = dataclasses.replace(
             self._config.limits,
@@ -2056,6 +2071,7 @@ class BrokerService:
                 env_allowlist=allowlist,
                 require_landlock=self._config.require_landlock,
                 payload=None if request.payload is None else request.payload.encode("utf-8"),
+                network=network,
             )
             policy.check_descriptors()
         except InvalidValueError:  # InvalidPolicyError is one
@@ -2145,6 +2161,9 @@ class BrokerService:
                     consumed=_ids(grant.id for grant in spent),
                     wall_seconds=request.wall_seconds,
                     require_landlock=self._config.require_landlock,
+                    network=any(
+                        isinstance(grant.capability, NetFull) for grant in selection.applicable
+                    ),
                 )
             )
         if planned is not None:
@@ -2175,6 +2194,13 @@ class BrokerService:
         except (SandboxUnavailable, SandboxUnsupported):
             outcome, reason = "failed", "unavailable"
             raise _Refuse("unavailable", "this host cannot run the sandbox safely") from None
+        except SandboxNetworkError:
+            outcome, reason = "failed", "network_unavailable"
+            raise _Refuse(
+                "unavailable",
+                "the sandbox's network could not be set up; the program did not run",
+                "network_unavailable",
+            ) from None
         except SandboxLaunchError:
             outcome, reason = "failed", "launch_failed"
             raise _Refuse("failed", "the sandbox could not be set up") from None
@@ -2200,6 +2226,7 @@ class BrokerService:
             unenforced=tuple(_limit(kind) for kind in result.limits.unenforced),
             landlock=_landlock(result.hardening.landlock),
             mounted_grants=len(policy.grants),
+            network=policy.network,
         )
 
     def _audit_result(

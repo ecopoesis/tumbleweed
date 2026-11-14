@@ -13,9 +13,11 @@ remount of the root, which would otherwise be a writable tmpfs.
 
 from tumbleweed.sandbox.errors import InvalidPolicyError
 from tumbleweed.sandbox.hardening import HardeningFds, exec_command
+from tumbleweed.sandbox.network import NetworkFds
 from tumbleweed.sandbox.policy import (
     HELPER_TARGET,
     PAYLOAD_TARGET,
+    RESOLV_TARGET,
     WORKSPACE_TARGET,
     GrantAccess,
     OpenedDescriptor,
@@ -31,6 +33,7 @@ def build_bwrap_argv(
     *,
     status_fd: int | None = None,
     hardening: HardeningFds | None = None,
+    network: NetworkFds | None = None,
 ) -> list[str]:
     """The arguments to give `bwrap`, program name excluded, ending in `--` and the command.
 
@@ -42,9 +45,18 @@ def build_bwrap_argv(
     that runs is `tumbleweed-sandbox-exec`, which applies Landlock and then runs the policy's
     command. Without it, the arguments are the namespaces alone: no run uses that, but the tests
     use it to prove what the namespaces do by themselves.
+
+    The network namespace is the sandbox's own whatever the policy says (`--unshare-net`, never
+    `--share-net`). A policy with `network` needs `network` (S22): bwrap then waits on the block
+    descriptor after its setup and before it execs the command, reports the child's namespaces on
+    the info one, and the sandbox's user is 0 inside its namespace, which is what slirp4netns's own
+    sandbox needs.
     """
+    if policy.network != (network is not None):
+        raise InvalidPolicyError("a run's network descriptors and its policy disagree")
     argv = [
         "--unshare-all",
+        "--unshare-net",
         "--unshare-user",
         "--disable-userns",
         "--die-with-parent",
@@ -55,6 +67,17 @@ def build_bwrap_argv(
         "--hostname",
         HOSTNAME,
     ]
+    if network is not None:
+        argv += [
+            "--uid",
+            "0",
+            "--gid",
+            "0",
+            "--info-fd",
+            str(network.info),
+            "--block-fd",
+            str(network.block),
+        ]
     if status_fd is not None:
         argv += ["--json-status-fd", str(status_fd)]
     if hardening is not None:
@@ -78,6 +101,10 @@ def build_bwrap_argv(
     if hardening is not None:
         # A file of the root tmpfs, so before the remount below makes it read-only.
         argv += ["--ro-bind-data", str(hardening.helper), HELPER_TARGET]
+    if policy.network and hardening is not None:
+        if hardening.resolv is None:
+            raise InvalidPolicyError("a network needs the resolver file")
+        argv += ["--ro-bind-data", str(hardening.resolv), RESOLV_TARGET]
     if policy.payload is not None:
         if hardening is None or hardening.payload is None:
             raise InvalidPolicyError("a payload needs the hardened launcher")

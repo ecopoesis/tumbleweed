@@ -166,6 +166,7 @@ class SandboxRun(_AuditModel):
     consumed: GrantIds
     wall_seconds: Annotated[int, Field(ge=0)]
     require_landlock: bool
+    network: bool = False
 
 
 class SandboxRunResult(_AuditModel):

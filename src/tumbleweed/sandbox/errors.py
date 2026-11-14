@@ -31,5 +31,12 @@ class SandboxLaunchError(SandboxError):
     """
 
 
+class SandboxNetworkError(SandboxLaunchError):
+    """The network a run was to have could not be set up, so the program never started (S22).
+
+    The message is fixed text: there is no run without the network it was told to have, and none
+    with the host's."""
+
+
 class SandboxTeardownError(SandboxError):
     """The sandbox was killed but its launcher could not be reaped in time."""

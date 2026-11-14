@@ -19,9 +19,11 @@ from typing import Annotated, Final, Literal, final
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from tumbleweed.sandbox import sandbox_exec
+from tumbleweed.sandbox.errors import InvalidPolicyError
 from tumbleweed.sandbox.policy import (
     HELPER_TARGET,
     PAYLOAD_TARGET,
+    RESOLV_TARGET,
     TMPFS_TARGET,
     WORKSPACE_TARGET,
     GrantAccess,
@@ -64,6 +66,11 @@ class HardeningFds:
     """The write end of the report pipe, which the launcher passes on as `--report-fd`."""
     payload: int | None = None
     """A memfd holding the policy's payload (`--ro-bind-data`), when it has one."""
+    go: int | None = None
+    """The read end of the pipe the launcher writes `1` to once the network is up (S22): the
+    program is not run on anything else, end of file included."""
+    resolv: int | None = None
+    """A memfd holding `/etc/resolv.conf` (`--ro-bind-data`), for a run with a network."""
 
 
 def shown(text: str) -> str:
@@ -99,6 +106,8 @@ def landlock_rules(policy: SandboxPolicy) -> tuple[LandlockRule, ...]:
     rules += [LandlockRule(RuleKind.READ, item.target) for item in policy.inputs]
     if policy.payload is not None:
         rules.append(LandlockRule(RuleKind.READ, PAYLOAD_TARGET))
+    if policy.network:
+        rules.append(LandlockRule(RuleKind.READ, RESOLV_TARGET))
     for grant in policy.grants:
         kind = RuleKind.WRITE if grant.access is GrantAccess.WRITE else RuleKind.READ
         rules.append(LandlockRule(kind, grant.target))
@@ -106,7 +115,12 @@ def landlock_rules(policy: SandboxPolicy) -> tuple[LandlockRule, ...]:
 
 
 def exec_command(policy: SandboxPolicy, fds: HardeningFds) -> list[str]:
-    """What bwrap runs: the launcher, its arguments, `--`, and the policy's own command."""
+    """What bwrap runs: the launcher, its arguments, `--`, and the policy's own command.
+
+    A policy with a network needs the go descriptor: without it the helper would not wait, and
+    bwrap's own wait lets go at end-of-file (S22, D29 (3))."""
+    if policy.network and fds.go is None:
+        raise InvalidPolicyError("a run with a network needs the helper's go descriptor")
     argv = [
         policy.runtime.interpreter,
         "-I",
@@ -115,6 +129,8 @@ def exec_command(policy: SandboxPolicy, fds: HardeningFds) -> list[str]:
         "--report-fd",
         str(fds.report),
     ]
+    if fds.go is not None:
+        argv += ["--go-fd", str(fds.go)]
     if policy.require_landlock:
         argv.append("--require-landlock")
     for var in sorted(policy.env, key=lambda item: item.name):

@@ -59,6 +59,7 @@ def result(
             "unenforced": (),
             "landlock": "applied",
             "mounted_grants": 0,
+            "network": False,
         }
     )
 

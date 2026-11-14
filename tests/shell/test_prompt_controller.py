@@ -1327,3 +1327,16 @@ class TestWhatIsShown:
             PickAccess(kind="fs.pick", choose="file"),
         ):
             assert card_of(show_message(access=access)).kind
+
+
+def test_the_network_warning_says_what_the_grant_means_in_plain_words() -> None:
+    from tumbleweed.shell.viewmodel.prompts import NETWORK_WARNING
+
+    for phrase in (
+        "any server",
+        "send anything it holds",
+        "other machines on your network",
+        "is checked",
+    ):
+        assert phrase in NETWORK_WARNING
+    assert "<" not in NETWORK_WARNING  # plain text: no markup
