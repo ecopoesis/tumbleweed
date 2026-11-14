@@ -658,7 +658,7 @@
     },
     "NetworkAccess": {
       "additionalProperties": false,
-      "description": "`net.full`. Can be granted (and taints the task); a run that holds it gets a network (S22).",
+      "description": "`net.full`. Can be granted (and taints the task); a run holding it has a network (S22).",
       "properties": {
         "kind": {
           "const": "net.full",

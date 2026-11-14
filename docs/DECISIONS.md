@@ -1745,7 +1745,7 @@ run never falls back to no network or to the host's. (4) *Timeouts.* The whole s
 `--enable-sandbox` needs `setegid(0)` inside the target's user namespace, so a `net.full` run maps the
 sandbox's user and group to 0 (`--uid 0 --gid 0`); with `--cap-drop ALL`, `--disable-userns`, no
 `CAP_*` and the same Landlock, that is a name for the same unprivileged user, and no run without
-`net.full` changes. (6) *Lifetime.* The process is killed and reaped on every path out of the run
+`net.full` changes. (6) *Lifetime.* A setup that fails kills bwrap's process group and the sandbox's init by PID first (the init is held on the block pipe and does not yet die with its parent, and closing the pipe would release it like a byte does; found when a failed setup left it behind and the reap hung). The process is killed and reaped on every path out of the run
 (normal exit, timeout, output limit, cancellation, an error in setup, the launcher's own failure) in
 a `finally`, `--exit-fd`'s pipe is closed first so it also ends if the broker is killed, and a test
 checks that no `slirp4netns` outlives a run, a timeout and a cancel. (7) *DNS.* slirp4netns answers
