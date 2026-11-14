@@ -425,7 +425,7 @@ class TestFindingNeverShowsWhatTheTaskMustNotSee:
             matches.task_taint,  # type: ignore[attr-defined]
         )
 
-    async def answers(self, fs_text: str | None, *, kind: str) -> list[tuple[object, ...]]:
+    async def answers(self, fs_text: str | None) -> list[tuple[object, ...]]:
         """What a task of `kind` is told for every query, in a store whose only fs-tainted tool
         has the text `fs_text` (or in which there is none)."""
         async with running() as rig:
@@ -437,21 +437,17 @@ class TestFindingNeverShowsWhatTheTaskMustNotSee:
                     await fs_task(rig, client),
                     draft_text(draft(name=f"Photo {fs_text}", description=fs_text)),
                 )
-            task = (
-                await net_task(rig, client)
-                if kind == "net"
-                else (await client.start_task(fresh_context=True)).task
-            )
-            return [self.seen(await client.find_tools(task, q)) for q in self.QUERIES]
+            tasks = (
+                await net_task(rig, client),
+                (await client.start_task(fresh_context=True)).task,
+            )  # a net task, and a clean one that stays clean
+            return [self.seen(await client.find_tools(t, q)) for t in tasks for q in self.QUERIES]
 
-    @pytest.mark.parametrize("kind", ["net", "clean"])
-    def test_two_stores_that_differ_only_in_an_fs_tainted_tools_text_answer_alike(
-        self, kind: str
-    ) -> None:
+    def test_two_stores_that_differ_only_in_an_fs_tainted_tools_text_answer_alike(self) -> None:
         async def scenario() -> None:
-            one = await self.answers("zebra hunter2 secret", kind=kind)
-            other = await self.answers("quokka something else", kind=kind)
-            none = await self.answers(None, kind=kind)
+            one = await self.answers("zebra hunter2 secret")
+            other = await self.answers("quokka something else")
+            none = await self.answers(None)
 
             assert one == other == none
 

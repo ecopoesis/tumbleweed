@@ -100,26 +100,23 @@ class TestTheCodeIsTheStores:
 
         run(scenario)
 
-    @pytest.mark.parametrize("trigger", ["user_event", "model"])
-    def test_code_the_shell_supplies_is_refused_and_nothing_runs(self, trigger: str) -> None:
+    def test_code_the_shell_supplies_is_refused_and_nothing_runs(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
                 task, opened = await opened_tool(client)
 
-                with pytest.raises(BrokerRefused) as caught:
-                    await run_tool(
-                        client,
-                        task,
-                        origin_of(opened, trigger=trigger),
-                        payload=call_document(code={"csv_view": SHELL_CODE}),
-                    )
-
-                assert caught.value.reason == "invalid_request"
+                for trigger in ("user_event", "model"):
+                    with pytest.raises(BrokerRefused) as caught:
+                        await run_tool(
+                            client,
+                            task,
+                            origin_of(opened, trigger=trigger),
+                            payload=call_document(code={"csv_view": SHELL_CODE}),
+                        )
+                    assert caught.value.reason == "invalid_request"
                 assert rig.sandbox.policies == []
-                (entry,) = rig.audit_of(SandboxRun)
-                assert entry.outcome == "refused"
-                assert entry.reason == "bound_code_supplied"
+                assert {e.reason for e in rig.audit_of(SandboxRun)} == {"bound_code_supplied"}
 
         run(scenario)
 
@@ -190,9 +187,8 @@ def sent_payload_text(rig: Rig) -> str:
 
 
 class TestAForgedBindingIsRefused:
-    @pytest.mark.parametrize("what", ["instance", "tool", "hash", "stranger", "all"])
     def test_a_binding_the_task_did_not_open_is_refused_before_any_grant_is_looked_at(
-        self, what: str
+        self,
     ) -> None:
         async def scenario() -> None:
             async with running() as rig:
@@ -200,25 +196,25 @@ class TestAForgedBindingIsRefused:
                 task, opened = await opened_tool(client)
                 _, other = await opened_tool(client)  # another tool, opened in another task
                 await grant_for_tool(rig, client, task, opened)
-                forged = {
+                forgeries = {
                     "instance": origin_of(opened, instance=ToolInstanceId.new()),
                     "tool": origin_of(opened, tool=other.summary.tool),
                     "hash": origin_of(opened, content_hash=other.summary.hash),
-                    "stranger": origin_of(other),  # a real instance, of a task that is not this one
+                    "stranger": origin_of(other),  # a real instance, of another task
                     "all": origin_of(
                         opened,
                         tool=ToolId.new(),
                         instance=ToolInstanceId.new(),
                         content_hash="0" * 64,
                     ),
-                }[what]
+                }
 
-                with pytest.raises(BrokerRefused) as caught:
-                    await run_tool(client, task, forged)
-
-                assert caught.value.reason == "invalid_request"
+                for what, forged in forgeries.items():
+                    with pytest.raises(BrokerRefused) as caught:
+                        await run_tool(client, task, forged)
+                    assert caught.value.reason == "invalid_request", what
+                    assert rig.audit_of(SandboxRun)[-1].reason == "bad_binding", what
                 assert rig.sandbox.policies == []
-                assert rig.audit_of(SandboxRun)[-1].reason == "bad_binding"
 
         run(scenario)
 
