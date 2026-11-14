@@ -39,6 +39,14 @@ OPEN_REFUSAL_TEXT: Final[dict[OpenRefusal, str]] = {
 }
 
 
+NOT_VISIBLE_NET_TEXT: Final = (
+    "No such saved version is visible in this task. Versions made in a task that read your files "
+    "are not shown in a task that used the network; to see them, call start_task with "
+    "fresh_context=true."
+)
+"""The one not-found text a net task gets, for a tool or version that is missing, hidden or nobody's
+alike (D30 (6)): the answers stay identical, and PLAN's "told to start a fresh task" is in it."""
+
 WRITE_HIDDEN_TEXT: Final = (
     "That tool cannot be changed from this task: part of it was made in a task that saw the "
     "user's files, and this task has the network. Call start_task with fresh_context=true, then "

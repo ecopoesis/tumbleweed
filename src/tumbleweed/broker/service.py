@@ -183,6 +183,7 @@ from tumbleweed.broker.store import (
 from tumbleweed.broker.task import TaintKind, TaskState, merged_taint
 from tumbleweed.broker.toolflow import (
     LINEAGE_BOTH_TEXT,
+    NOT_VISIBLE_NET_TEXT,
     OPEN_REFUSAL_TEXT,
     WRITE_HIDDEN_TEXT,
     BoundRunError,
@@ -1145,16 +1146,19 @@ class BrokerService:
             seen = self._tools.view_of(request.tool, taint)
             if seen is None:
                 self._audit_open_refused(request, "hidden_tool")
-                raise ToolNotFoundError("no such tool or version")
+                raise self._not_found(taint)
             version = seen.version
-        opened = self._tools.open(request.tool, version)
+        try:
+            opened = self._tools.open(request.tool, version)
+        except ToolNotFoundError:
+            raise self._not_found(taint) from None
         record = opened.record
         if len(record.taint) > 1:  # fs and net: it opens nowhere, and is nobody's to see
             self._audit_open_refused(request, "both_taints")
-            raise ToolNotFoundError("no such tool or version")
+            raise self._not_found(taint)
         if TaintKind.NET in taint and TaintKind.FS in record.taint:
             self._audit_open_refused(request, "hidden_version")
-            raise ToolNotFoundError("no such tool or version")
+            raise self._not_found(taint)
         refusal = open_refusal(taint, record.taint)
         if refusal is not None:  # a task that has read files, and a version that used the network
             self._audit_open_refused(request, refusal)
@@ -1238,6 +1242,14 @@ class BrokerService:
             raised=raised,
         )
 
+    @staticmethod
+    def _not_found(taint: frozenset[TaintKind]) -> Exception:
+        """The not-found answer of a task: one text for everything it cannot see (D30 (6)); a task
+        that has the network is told how to see more."""
+        if TaintKind.NET in taint:
+            return _Refuse("not_found", NOT_VISIBLE_NET_TEXT, "not_visible")
+        return ToolNotFoundError("no such tool or version")
+
     def _gate_lineage(self, live: _Live, tool: ToolId) -> None:
         """Before a write into the lineage of `tool` (a refinement or a revert): what the answer
         and the new version's number and taint depend on must be within what the task sees.
@@ -1248,15 +1260,15 @@ class BrokerService:
         (D30 (6)). A task that has not read files takes the lineage's taint first, audited and
         persisted, as opening one of its versions would: it then is fs-tainted, and may be told
         anything about it."""
+        taint = live.state.taint
         versions = self._tools.versions(tool)
         if not versions:
-            raise ToolNotFoundError("no such tool")
-        taint = live.state.taint
+            raise self._not_found(taint)
         hidden = [record for record in versions if not record.taint <= taint]
         if not hidden:
             return
         if any(len(record.taint) > 1 for record in versions):
-            raise ToolNotFoundError("no such tool")
+            raise self._not_found(taint)
         if TaintKind.NET in taint and any(TaintKind.FS in record.taint for record in hidden):
             live.saves += 1
             raise _Refuse("denied", WRITE_HIDDEN_TEXT, "hidden_lineage")

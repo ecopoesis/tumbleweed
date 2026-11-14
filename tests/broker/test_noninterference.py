@@ -204,6 +204,41 @@ def test_the_order_of_visible_rows_does_not_move_with_the_fs_rows() -> None:
     run(scenario)
 
 
+def test_a_net_task_is_told_the_one_not_found_text_for_all_it_cannot_see() -> None:
+    async def scenario() -> None:
+        async with running() as rig:
+            client = await rig.client()
+            ids = await build(rig, client, with_fs=True)
+            network = await net_task(rig, client)
+            clean = (await client.start_task(fresh_context=True)).task
+
+            texts = set()
+            for tool, version in (
+                (ids["Y"], None),
+                (ids["X"], 2),
+                (ids["X"], 99),
+                (ToolId.new(), None),
+            ):
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.open_tool(
+                        network, tool, None if version is None else ToolVersion(version)
+                    )
+                assert caught.value.reason == "not_found"
+                texts.add(caught.value.message)
+            with pytest.raises(BrokerRefused) as plain:
+                await client.open_tool(clean, ToolId.new())
+
+            expected = (
+                "No such saved version is visible in this task. Versions made in a task that read "
+                "your files are not shown in a task that used the network; to see them, call "
+                "start_task with fresh_context=true."
+            )
+            assert texts == {expected}
+            assert plain.value.message == "no such tool or version"  # a clean task's text as it was
+
+    run(scenario)
+
+
 class TestTheAcceptedBit:
     """A write into a lineage with a version the task may not see (D30 (6))."""
 

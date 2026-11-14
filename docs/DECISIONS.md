@@ -1982,7 +1982,13 @@ fs versions, from a net task and from a clean task that stays clean, and demands
   `open_tool` for net-tainted versions: a clean task never sees them in a search (it can open one whose
   ID it knows, which marks it as net), so that a search never forces a taint by accident.
 - *`open_tool`.* With no version, the view's newest. With a version outside the view: a task that has
-  the network gets **exactly the not-found answer** (same reason and text; only the audit says why);
+  the network gets **exactly the not-found answer** (same reason and text, whether the version is
+  hidden, missing or nobody's; only the audit says why). That one text, for a net task only, tells
+  it how to see more (PLAN: "start_task with fresh_context=true"): "No such saved version is visible in
+  this task. Versions made in a task that read your files are not shown in a task that used the
+  network; to see them, call start_task with fresh_context=true." (a clean task's text stays "no such
+  tool or version"; the write refusals of a net task, hidden lineage or not found, use the same
+  ideas: one fixed sentence each, pinned in the harness);
   a clean task may name it and is marked (fs or net) as before; a task that has read files and a net
   version is refused with the `fresh_context=true` text. A both-tainted version is not found for
   everyone. (A both-tainted lineage is an import whose claim had `net`: its tool ID is known only to
