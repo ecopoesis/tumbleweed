@@ -5,20 +5,24 @@ whose policy has `network` set gets a user-mode network in it, and the program i
 the network is up:
 
 1. bwrap starts with `--info-fd` and `--block-fd`. It makes its namespaces, sets the sandbox up
-   and then waits for a byte on the block pipe before it execs the program, so the program cannot
-   have started.
-2. The launcher reads the child's PID and namespace ids from the info pipe, and **refuses if the
-   child's network namespace is its own**: a sandbox that shared the host's network would be
-   attached to by nothing and reached by everything.
-3. `slirp4netns --configure --disable-host-loopback` joins the owner of the child's network
-   namespace (see `_owning_user_namespace`) and that namespace, makes `tap0`,
-   brings the interface up and writes a byte to its ready pipe.
-4. The launcher writes the byte that releases bwrap. No sleep, no race.
+   and then waits on the block pipe before it execs the launcher's helper. The helper
+   (`tumbleweed-sandbox-exec --go-fd`) waits for the byte `1` on a pipe of its own before it execs
+   the program. bwrap's wait ends on end-of-file too; the helper's does not, so no failure, crash
+   or kill of the launcher can start the program: **only a written `1` does**.
+2. The launcher reads the child's PID and namespace ids from the info pipe and opens the child's
+   network namespace once. It **refuses unless that namespace is the one bwrap reported and not
+   the launcher's own**. (With `--share-net` bwrap reports none.) Everything after is given that
+   open descriptor, never the PID again.
+3. `slirp4netns --configure --disable-host-loopback` joins the user namespace that owns it
+   (`_owning_user_namespace`) and the network namespace, makes `tap0`, brings the interface up
+   and writes a byte to its ready pipe.
+4. The launcher writes the byte that releases bwrap and the helper.
 
 Everything is bounded by `SETUP_SECONDS`, and every failure raises `SandboxNetworkError` with a
-fixed message, never an attachment that is partly there: there is no run without the network it
-was told to have, and none with the host's. `NetworkLink.aclose` kills and reaps slirp4netns, and
-the launcher calls it on every path out of a run.
+fixed message (or `BwrapEnded`, which the runner turns into the launch error bwrap's own words
+make): there is no run without the network it was told to have, and none with the host's.
+`NetworkLink.abort` closes the gates (end-of-file, never go), kills the held init through a pidfd
+and ends slirp4netns; the launcher calls `aclose` on every path out of a run.
 
 This module and `runner` are the only users of slirp4netns; the argument list for bwrap is built
 by `tumbleweed.sandbox.bwrap` from `NetworkFds`.
@@ -27,9 +31,9 @@ by `tumbleweed.sandbox.bwrap` from `NetworkFds`.
 import asyncio
 import contextlib
 import fcntl
-import json
 import logging
 import os
+import select
 import signal
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,20 +51,32 @@ SETUP_SECONDS: Final = 10.0
 INFO_LIMIT: Final = 4096
 STDERR_LIMIT: Final = 4096
 RESOLVER_ADDRESS: Final = "10.0.2.3"
-"""slirp4netns's resolver; it forwards to the host's."""
+"""slirp4netns's resolver; it forwards to the host's (port 53 only)."""
 RESOLV_CONF: Final = f"nameserver {RESOLVER_ADDRESS}\n".encode("ascii")
 TAP_NAME: Final = "tap0"
+SLIRP_NOFILE: Final = 1024
+"""Open files slirp4netns may hold: a connection of the program is one, and the program has 256."""
+SLIRP_ADDRESS_SPACE: Final = 1 << 30
+"""Address space slirp4netns may use (1 GiB): bounds what a program's traffic can make it hold."""
+_NS_GET_USERNS: Final = 0xB701
 _FAILED: Final = "the sandbox's network could not be set up; the program did not run"
+
+
+class BwrapEnded(Exception):  # noqa: N818  (a fact about the process, not a failure of ours)
+    """bwrap ended before the network was set up: its own words are the reason (the runner reads
+    them), not the network's."""
 
 
 @final
 @dataclass(frozen=True, slots=True)
 class NetworkFds:
-    """The two descriptor numbers bwrap is told about: the pipe it waits on (`--block-fd`) and the
-    one it writes its namespace ids to (`--info-fd`). Both are the child's ends."""
+    """The descriptor numbers bwrap and the helper are told about, all the child's ends: the pipe
+    bwrap waits on (`--block-fd`), the one it writes its namespace ids to (`--info-fd`) and the
+    one the helper waits on for the go byte."""
 
     block: int
     info: int
+    go: int
 
 
 @final
@@ -78,9 +94,10 @@ class _Info(BaseModel):
 def slirp_argv(
     program: str, pid: int, *, ready: int, exit_: int, userns_fd: int | None = None
 ) -> list[str]:
-    """slirp4netns's command line: attached to `pid`'s network namespace (joining the user
+    """slirp4netns's command line: attached to the network namespace of `pid` (joining the user
     namespace open as `userns_fd`, the one that owns it), host loopback unreachable, its own
-    mount namespace and seccomp filter, ready and exit pipes by number."""
+    mount namespace and seccomp filter, ready and exit pipes by number. (Its `--netns-type=path`
+    cannot be used: with `--enable-sandbox` it fails in `setegid(0)`, measured.)"""
     return [
         program,
         *([] if userns_fd is None else [f"--userns-path=/proc/self/fd/{userns_fd}"]),
@@ -97,6 +114,13 @@ def slirp_argv(
     ]
 
 
+def refuse_unless_own_namespace(reported: int | None, opened: int, launcher: int) -> None:
+    """Raise unless the child's network namespace (`opened`, the inode of the descriptor the
+    launcher holds) is the one bwrap reported and is not the launcher's own (`launcher`)."""
+    if reported is None or reported != opened or opened == launcher:
+        raise SandboxNetworkError(_FAILED)  # never attach to, or release, anyone else's
+
+
 def _own_network_namespace() -> int:
     return Path("/proc/self/ns/net").stat().st_ino
 
@@ -107,57 +131,83 @@ class NetworkLink:
     `fds` to the child, call `release_child_ends` once bwrap has been started (or failed to
     start), `attach` once it has, and `aclose` on every path out."""
 
-    def __init__(self, slirp4netns: str) -> None:
+    def __init__(self, slirp4netns: str, *, prlimit: str | None = None) -> None:
         self._program = slirp4netns
+        self._prlimit = prlimit
         self._block_read, self._block_write = os.pipe()
+        self._go_read, self._go_write = os.pipe()
         self._info_read, self._info_write = os.pipe()
         self._child_ends_open = True
-        self._block_write_open = True
+        self._gates_open = True
         self._info_read_open = True
         self._process: asyncio.subprocess.Process | None = None
         self._exit_write: int | None = None
         self._drain: asyncio.Task[None] | None = None
+        self._pidfd: int | None = None
         self.stderr = bytearray()
-        self._child_pid: int | None = None
 
     @property
     def fds(self) -> NetworkFds:
-        return NetworkFds(block=self._block_read, info=self._info_write)
+        return NetworkFds(block=self._block_read, info=self._info_write, go=self._go_read)
 
     def release_child_ends(self) -> None:
-        """Close the ends only bwrap needs (idempotent). Until the parent has, a bwrap that dies
-        would not make the info pipe end."""
+        """Close the ends only bwrap and the helper need (idempotent). Until the parent has, a
+        bwrap that dies would not make the info pipe end."""
         if self._child_ends_open:
             self._child_ends_open = False
             os.close(self._block_read)
             os.close(self._info_write)
+            os.close(self._go_read)
 
     async def attach(self, bwrap: asyncio.subprocess.Process) -> None:
-        """Bring the network up and release bwrap; `SandboxNetworkError` if that cannot be done
-        in `SETUP_SECONDS`. `bwrap` must already have been started with `fds`."""
+        """Bring the network up and release the program; `SandboxNetworkError` if that cannot be
+        done in `SETUP_SECONDS`, `BwrapEnded` if bwrap ended first. `bwrap` must already have been
+        started with `fds`."""
+        net = -1
         try:
             async with asyncio.timeout(SETUP_SECONDS):
                 info = await self._read_info(bwrap)
-                self._child_pid = info.child_pid
-                if info.net_namespace in (None, _own_network_namespace()):
-                    raise SandboxNetworkError(_FAILED)  # never attach to, or release, the host's
-                await self._start_slirp(info.child_pid)
+                self._pidfd = os.pidfd_open(info.child_pid)
+                net = os.open(f"/proc/{info.child_pid}/ns/net", os.O_RDONLY | os.O_CLOEXEC)
+                refuse_unless_own_namespace(
+                    info.net_namespace, os.fstat(net).st_ino, _own_network_namespace()
+                )
+                owner = await _owning_user_namespace(net, info.child_pid, bwrap)
+                try:
+                    self._still_that_namespace(info, net)
+                    await self._start_slirp(info.child_pid, owner)
+                finally:
+                    os.close(owner)
                 self._release()
         except TimeoutError:
             raise SandboxNetworkError(_FAILED) from None
         except OSError as exc:
             log.warning("the sandbox's network setup failed: %s", exc.strerror)
             raise SandboxNetworkError(_FAILED) from None
+        finally:
+            if net >= 0:
+                os.close(net)
 
-    def kill_sandbox(self, bwrap: asyncio.subprocess.Process) -> None:
-        """Kill bwrap's whole process group and the sandbox's init, which is held on the block
-        pipe and does not yet die with its parent: a failed setup must end it for certain, and
-        before the block pipe closes (closing it would release it, like a byte does)."""
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(bwrap.pid, signal.SIGKILL)  # bwrap's own session (`--new-session`)
-        if self._child_pid is not None:
+    def _still_that_namespace(self, info: _Info, opened: int) -> None:
+        """Just before slirp4netns is given the PID: the process is still alive (the pidfd is not
+        readable, so the number is not reaped and cannot have been reused) and its network
+        namespace is still the one checked."""
+        assert self._pidfd is not None  # noqa: S101  (opened above)
+        poller = select.poll()
+        poller.register(self._pidfd, select.POLLIN)
+        if poller.poll(0):
+            raise SandboxNetworkError(_FAILED)  # the init ended: the number may name anyone
+        if Path(f"/proc/{info.child_pid}/ns/net").stat().st_ino != os.fstat(opened).st_ino:
+            raise SandboxNetworkError(_FAILED)
+
+    def abort(self) -> None:
+        """End a setup that did not finish, now: close the gates (end-of-file is never "go": the
+        helper refuses to run the program) and kill the held init through the pidfd, which names
+        that very process however long ago its number was reported. Idempotent."""
+        self._close_gates()
+        if self._pidfd is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(self._child_pid, signal.SIGKILL)
+                signal.pidfd_send_signal(self._pidfd, signal.SIGKILL)
 
     async def _read_info(self, bwrap: asyncio.subprocess.Process) -> _Info:
         loop = asyncio.get_running_loop()
@@ -175,24 +225,32 @@ class NetworkLink:
                     break
                 data += chunk
                 try:
-                    return _Info.model_validate(json.loads(data))
-                except json.JSONDecodeError:
-                    continue  # not all of it yet
-                except ValidationError:
+                    return _Info.model_validate_json(bytes(data))
+                except ValidationError as error:
+                    if all(item["type"] == "json_invalid" for item in error.errors()):
+                        continue  # not all of it yet, or never JSON: more may come, to the limit
                     break
         finally:
             transport.close()
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(1.0):
+                await bwrap.wait()
         if bwrap.returncode is not None:
-            log.warning("bwrap ended before the sandbox's network was set up")
+            raise BwrapEnded
         raise SandboxNetworkError(_FAILED)
 
-    async def _start_slirp(self, pid: int) -> None:
-        owner = await _owning_user_namespace(pid)
+    async def _start_slirp(self, pid: int, owner: int) -> None:
         ready_read, ready_write = os.pipe()
         exit_read, exit_write = os.pipe()
         self._exit_write = exit_write
+        limits = (
+            []
+            if self._prlimit is None
+            else [self._prlimit, f"--nofile={SLIRP_NOFILE}", f"--as={SLIRP_ADDRESS_SPACE}", "--"]
+        )
         try:
             self._process = await asyncio.create_subprocess_exec(
+                *limits,
                 *slirp_argv(
                     self._program, pid, ready=ready_write, exit_=exit_read, userns_fd=owner
                 ),
@@ -209,7 +267,6 @@ class NetworkLink:
         finally:
             os.close(ready_write)
             os.close(exit_read)
-            os.close(owner)
         assert self._process.stderr is not None  # noqa: S101  (PIPE was asked for)
         self._drain = asyncio.ensure_future(_capped(self._process.stderr, self.stderr))
         with os.fdopen(ready_read, "rb", buffering=0) as ready:
@@ -228,23 +285,33 @@ class NetworkLink:
             raise SandboxNetworkError(_FAILED)  # it ended without saying it was ready
 
     def _release(self) -> None:
-        if not self._block_write_open:
+        """Write the go byte to both gates (the helper's is the one that counts), then close."""
+        if not self._gates_open:
             return
-        self._block_write_open = False
+        self._gates_open = False
         try:
-            os.write(self._block_write, b"1")
-        except OSError:  # bwrap is gone: there is nothing to release
+            for end in (self._block_write, self._go_write):
+                os.write(end, b"1")
+        except OSError:  # bwrap or the helper is gone: there is nothing to release
             raise SandboxNetworkError(_FAILED) from None
         finally:
             os.close(self._block_write)
+            os.close(self._go_write)
+
+    def _close_gates(self) -> None:
+        if self._gates_open:
+            self._gates_open = False
+            os.close(self._block_write)
+            os.close(self._go_write)
 
     async def aclose(self) -> None:
         """Stop slirp4netns and close every descriptor still held. Safe to call twice, on every
         path: a failure is logged, never raised over the run's own outcome."""
         self.release_child_ends()
-        if self._block_write_open:
-            self._block_write_open = False  # bwrap, if it is still waiting, sees the end
-            os.close(self._block_write)
+        self.abort()
+        if self._pidfd is not None:
+            os.close(self._pidfd)
+            self._pidfd = None
         if self._info_read_open:
             self._info_read_open = False
             os.close(self._info_read)
@@ -271,31 +338,26 @@ def _printable(data: bytearray) -> str:
     return bytes(data).decode("utf-8", errors="replace").encode("unicode_escape").decode("ascii")
 
 
-async def _owning_user_namespace(pid: int) -> int:
-    """An open descriptor of the user namespace that owns `pid`'s network namespace.
+async def _owning_user_namespace(net: int, pid: int, bwrap: asyncio.subprocess.Process) -> int:
+    """An open descriptor of the user namespace that owns the network namespace open as `net`.
 
     `--disable-userns` gives the sandbox's init a second user namespace of its own, nested in the
     one bwrap made (which owns the network namespace). A process that joins the init's, as
     slirp4netns does by default, has no right over the network namespace (`setns` says EPERM,
-    for good). Joining the owner has. The init is waited for until it has moved into its own,
-    mapped namespace: before that, slirp4netns's own sandbox fails in `setegid(0)`. Bounded by the
-    setup's timeout."""
-    net = os.open(f"/proc/{pid}/ns/net", os.O_RDONLY | os.O_CLOEXEC)
+    for good). Joining the owner has. The init is waited for until it has moved into its own
+    mapped namespace: before that, slirp4netns's own sandbox fails in `setegid(0)` (that wait
+    matters in the container; on a quiet host the init is already there). Raises `BwrapEnded` if
+    bwrap ends meanwhile. Bounded by the setup's timeout."""
+    owner = fcntl.ioctl(net, _NS_GET_USERNS)
     try:
-        owner = fcntl.ioctl(net, _NS_GET_USERNS)
-        try:
-            while True:
-                if _settled(pid, owner):
-                    return owner
-                await asyncio.sleep(0.002)
-        except BaseException:
-            os.close(owner)
-            raise
-    finally:
-        os.close(net)
-
-
-_NS_GET_USERNS: Final = 0xB701
+        while not _settled(pid, owner):
+            if bwrap.returncode is not None:
+                raise BwrapEnded
+            await asyncio.sleep(0.002)
+    except BaseException:
+        os.close(owner)
+        raise
+    return int(owner)
 
 
 def _settled(pid: int, owner: int) -> bool:

@@ -65,6 +65,9 @@ class HardeningFds:
     """The write end of the report pipe, which the launcher passes on as `--report-fd`."""
     payload: int | None = None
     """A memfd holding the policy's payload (`--ro-bind-data`), when it has one."""
+    go: int | None = None
+    """The read end of the pipe the launcher writes `1` to once the network is up (S22): the
+    program is not run on anything else, end of file included."""
     resolv: int | None = None
     """A memfd holding `/etc/resolv.conf` (`--ro-bind-data`), for a run with a network."""
 
@@ -120,6 +123,8 @@ def exec_command(policy: SandboxPolicy, fds: HardeningFds) -> list[str]:
         "--report-fd",
         str(fds.report),
     ]
+    if fds.go is not None:
+        argv += ["--go-fd", str(fds.go)]
     if policy.require_landlock:
         argv.append("--require-landlock")
     for var in sorted(policy.env, key=lambda item: item.name):

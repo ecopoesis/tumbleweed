@@ -252,6 +252,8 @@ class TestTaintInBothOrders:
 
                 assert not write.granted
                 assert not pick.granted
+                assert FRESH in write.message
+                assert FRESH in pick.message
                 assert len(rig.prompts.asked) == asked
 
         run(scenario)

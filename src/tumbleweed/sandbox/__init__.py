@@ -1,4 +1,5 @@
-"""Run untrusted code in bubblewrap with no network, only its own mounts and hard limits (S14, I3).
+"""Run untrusted code in bubblewrap with no network by default (a network only for `net.full`, S22),
+only its own mounts and hard limits (S14, I3).
 
 This package never imports the broker, the agent, the shell or `gi` (ARCHITECTURE section 10): the
 broker builds a `SandboxPolicy` and hands it to a `SandboxRunner`. The pieces:

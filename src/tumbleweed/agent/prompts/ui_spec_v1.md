@@ -736,9 +736,10 @@ A handler has a `name` and a `kind`.
   takes the modules in `code`, a list of `{name, source}`, and every `sandbox` handler's `module` must
   be one of them (a saved tool keeps the same modules in its package, S23). The function is called
   as `function(inputs)`, with one dict of the declared inputs, and returns a dict of outputs, at
-  most 48 KiB of JSON. It runs in the task's sandbox (D27): no network, no home directory, only
-  what the user granted for the task and the task's workspace, which is its working directory, at
-  most 20 seconds. An `image` output is `{"path": name}` for a file it wrote there. There is no field for
+  most 48 KiB of JSON. It runs in the task's sandbox (D27): no home directory and no network, unless the
+  user granted the network to the task (S22; then no granted files either), only what the user
+  granted for the task and the task's workspace, which is its working directory, at most 20
+  seconds. An `image` output is `{"path": name}` for a file it wrote there. There is no field for
   source, a command, a path, an environment, the network or a timeout; the broker's policy decides
   those. A result that does not fit the outputs is refused whole, and a plain line under the tool
   says what happened (never the code's own text). Without a broker to run code, the renderer

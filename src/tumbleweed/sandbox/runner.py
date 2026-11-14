@@ -64,7 +64,7 @@ from tumbleweed.sandbox.limits import (
     probe_scope,
     scope_argv,
 )
-from tumbleweed.sandbox.network import RESOLV_CONF, NetworkLink
+from tumbleweed.sandbox.network import RESOLV_CONF, BwrapEnded, NetworkLink
 from tumbleweed.sandbox.policy import SandboxPolicy
 from tumbleweed.sandbox.process import kill_and_reap
 from tumbleweed.sandbox.result import (
@@ -272,7 +272,7 @@ class SandboxRunner:
         plan = await self.limits_plan()
         # Descriptors only the child needs: closed here once it has been started, or failed to.
         child_ends: list[int] = []
-        link = None if slirp is None else NetworkLink(slirp)
+        link = None if slirp is None else NetworkLink(slirp, prlimit=prlimit)
         try:
             return await self._run_with(policy, bwrap, prlimit, program, plan, child_ends, link)
         finally:
@@ -304,6 +304,7 @@ class SandboxRunner:
                     payload=None
                     if policy.payload is None
                     else _child_memfd(child_ends, "tumbleweed-payload", policy.payload),
+                    go=None if link is None else link.fds.go,
                     resolv=_child_memfd(child_ends, "tumbleweed-resolv", RESOLV_CONF)
                     if policy.network
                     else None,
@@ -329,7 +330,7 @@ class SandboxRunner:
                     pass_fds=[
                         *descriptors_to_pass(policy),
                         *child_ends,
-                        *([] if link is None else [link.fds.block, link.fds.info]),
+                        *([] if link is None else [link.fds.block, link.fds.info, link.fds.go]),
                     ],
                 )
             except OSError as exc:
@@ -342,18 +343,34 @@ class SandboxRunner:
                 if link is not None:
                     link.release_child_ends()
             if link is not None:
-                try:
-                    await link.attach(proc)
-                except BaseException:
-                    # bwrap is held before it sets anything up: nothing ran. Kill all of it (the
-                    # sandbox's init does not yet die with its parent), then reap it.
-                    link.kill_sandbox(proc)
-                    if not await asyncio.shield(kill_and_reap(proc)):
-                        raise SandboxTeardownError(
-                            f"the sandbox's launcher (pid {proc.pid}) did not end after SIGKILL"
-                        ) from None
-                    raise
+                await self._attach_network(link, proc)
+                started_at = time.monotonic()  # the wall time of the run does not hold the setup
             return await self._supervise(proc, status_file, report_file, policy, plan, started_at)
+
+    @staticmethod
+    async def _attach_network(link: NetworkLink, proc: asyncio.subprocess.Process) -> None:
+        """Bring the run's network up, or end the sandbox that is held for it and raise: bwrap's
+        own failure as a launch error, anything else as `SandboxNetworkError`. The program has
+        not run on any of these paths (the helper goes only on a written byte)."""
+        try:
+            await link.attach(proc)
+        except BaseException as failure:
+            link.abort()  # the gates close first: bwrap must not wait on them to be killed
+            message = ""
+            if isinstance(failure, BwrapEnded):
+                assert proc.stderr is not None  # noqa: S101  (PIPE was asked for)
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(1.0):
+                        message = _launch_failure(
+                            proc.returncode, bytearray(await proc.stderr.read(_ERROR_EXCERPT_BYTES))
+                        )
+            if not await asyncio.shield(kill_and_reap(proc)):
+                raise SandboxTeardownError(
+                    f"the sandbox's launcher (pid {proc.pid}) did not end after SIGKILL"
+                ) from None
+            if isinstance(failure, BwrapEnded):
+                raise SandboxLaunchError(message or "the sandbox did not start") from None
+            raise
 
     async def _supervise(
         self,

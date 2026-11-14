@@ -180,6 +180,12 @@ class TestCommandLine:
         assert options.rules == [("read", "/usr"), ("write", "/workspace"), ("devices", "/dev")]
         assert options.command == ["/bin/sh", "-c", "--read /x"]
 
+    def test_a_go_descriptor_is_read_and_is_optional(self) -> None:
+        held = launcher.parse_args(["--report-fd", "3", "--go-fd", "9", "--", "true"])
+        free = launcher.parse_args(["--report-fd", "3", "--", "true"])
+
+        assert (held.go_fd, free.go_fd) == (9, None)
+
     def test_environment_variables_are_pairs_given_as_arguments(self) -> None:
         options = launcher.parse_args(
             ["--report-fd", "3", "--env", "LANG", "C", "--env", "A", "--read=", "--", "true"]

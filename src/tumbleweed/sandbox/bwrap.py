@@ -48,8 +48,9 @@ def build_bwrap_argv(
 
     The network namespace is the sandbox's own whatever the policy says (`--unshare-net`, never
     `--share-net`). A policy with `network` needs `network` (S22): bwrap then waits on the block
-    descriptor before it sets anything up and reports the child's namespaces on the info one, and
-    the sandbox's user is 0 inside its namespace, which is what slirp4netns's own sandbox needs.
+    descriptor after its setup and before it execs the command, reports the child's namespaces on
+    the info one, and the sandbox's user is 0 inside its namespace, which is what slirp4netns's own
+    sandbox needs.
     """
     if policy.network != (network is not None):
         raise InvalidPolicyError("a run's network descriptors and its policy disagree")

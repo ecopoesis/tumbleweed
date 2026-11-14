@@ -1712,74 +1712,132 @@ last. A write grant is not the same as the user having looked at what the code w
 names the place, and undo is the net. Not done and listed for the polish issue: `sandbox_run.mounted`
 does not list read grants merged into a write mount.
 
-## D29 — Network grants: a netns of the sandbox's own, slirp4netns attached before the payload runs, fail closed, and the I12 rules where they already were (2026-11-14, accepted)
+## D29 — Network grants: a netns of the sandbox's own, slirp4netns attached before the program can run, fail closed, and the I12 rules where they already were (2026-11-14, accepted)
 
 **Context.** S16 to S19 made `net.full` a capability the user can grant and the broker can record,
-and made taint sticky. S22 makes a run that holds the grant actually have a network. **What is
+and made taint sticky. S22 makes a run that holds the grant actually have a network. **What was
 already enforced** (verified before S22, not changed by it): a task's taint is sticky and exclusive
 (`TaskState`), issuing a grant adds it, `decide` and `issue_grant` refuse a conflicting grant before
-any prompt (`TaintConflict`, which the model reads as "call start_task with fresh_context=true"),
-`_request_pick` refuses a net-tainted task before it asks, `select_grants` withholds a conflicting
-grant from a run (`TAINT_CONFLICT`), `start_task` copies taint unless `fresh_context`, and the agent
-keeps only a context set that follows the same chain (D26). What did not exist: the sandbox never had
-any network (`--unshare-all`, nothing attached). **Decision.** (1) *Namespace.* Every run gets its own
-network namespace: `--unshare-net` is now explicit in the argument list as well as part of
-`--unshare-all`, and `--share-net` appears nowhere in the code (a test greps for it). A run without
-`net.full` has only `lo`, no route and no resolver file. (2) *`net.full` runs.* The broker sets
-`SandboxPolicy.network` when a `NetFull` grant applies to the run (`select_grants`, so expiry, scope,
-task ending and the taint rule all apply). The launcher then starts bwrap with `--info-fd` and
-`--block-fd`, reads the child's PID and namespace ids from the info pipe, **refuses if the child's
-network namespace is the launcher's own** (a mutant with `--share-net` ends here), starts
-`slirp4netns --configure --disable-host-loopback --enable-sandbox --enable-seccomp --ready-fd
---exit-fd <pid> tap0` with an empty environment, waits for its ready byte, and only then writes the
-byte that releases bwrap's `--block-fd`. bwrap holds the sandbox's init on the block pipe after its setup and privilege drop and before it execs the program, so the payload cannot run before that: there is no sleep and no race with the program, and a program whose first action is a connect succeeds. **Two user namespaces (found in the container, not on a host):** `--disable-userns` moves the init into a second user namespace nested in the first, which owns the network namespace. slirp4netns's default (join the init's user namespace, then its netns) therefore gets EPERM for good once the init has moved, and `setegid(0)` fails before the second one is mapped. The launcher waits (bounded) until the init is in its own mapped namespace, takes the owner with `NS_GET_USERNS` on the init's network namespace and hands that descriptor to slirp4netns as `--userns-path`. `--disable-userns` stays (3) *Fail closed.* A missing `slirp4netns`, a tap that does not come up, a ready byte that
-does not arrive, a namespace that is the launcher's, a bwrap that ends meanwhile or any timeout
-raises `SandboxNetworkError` (a `SandboxLaunchError`); the broker answers with one fixed refusal ("the
-sandbox's network could not be set up; the program did not run") and audits `network_unavailable`. A
-run never falls back to no network or to the host's. (4) *Timeouts.* The whole setup is bounded by
-10 s, every read is bounded (the info document by 4 KiB), and the wait to reap is `kill_and_reap`'s.
-(5) *slirp4netns's own confinement.* `--enable-sandbox` (a mount namespace of its own) and
-`--enable-seccomp`, an empty environment, no stdin, stdout to `/dev/null`, stderr read but capped.
+any prompt (`TaintConflict`), `_request_pick` refuses a net-tainted task before it asks,
+`select_grants` withholds a conflicting grant from a run (`TAINT_CONFLICT`), `start_task` copies taint
+unless `fresh_context`, and the agent keeps only a context set that follows the same chain (D26).
+What did not exist: the sandbox never had any network (`--unshare-all`, nothing attached).
+
+**Decision.** (1) *Namespace.* Every run gets its own network namespace: `--unshare-net` is explicit
+in the argument list as well as part of `--unshare-all`, and `--share-net` appears in no string of the
+package (a test reads the syntax tree). A run without `net.full` has only `lo`, no route and no
+resolver file.
+
+(2) *`net.full` runs.* The broker sets `SandboxPolicy.network` when a `NetFull` grant applies to the
+run (`select_grants`, so expiry, scope, task ending and the taint rule all apply). The launcher then
+starts bwrap with `--info-fd` and `--block-fd`, reads the child's PID and namespace ids, opens the
+child's network namespace once and **refuses unless its inode is the one bwrap reported and is not
+the launcher's own**. With `--share-net` real bwrap reports no `net-namespace` at all, so the missing
+case is the live one; the check is tested with a stub slirp4netns that must never be started and one
+that says ready (the program must not run), and as a unit. slirp4netns is started as `--configure
+--disable-host-loopback --enable-sandbox --enable-seccomp --ready-fd --exit-fd <pid> tap0` with an
+empty environment (a test reads it) and is given the PID, not the descriptor: its `--netns-type=path`
+fails in `--enable-sandbox` (`setegid(0)`, measured), so identity is bound instead by the pidfd
+(alive, so the number is not reaped or reused) and a second comparison of the namespace's inode just
+before it starts. Only when it has said ready is the program released, and a test with a slirp4netns
+that is half a second slow proves the program waits (the mutants that release early fail it).
+
+(3) *The hold.* bwrap blocks the sandbox's init after its setup and privilege drop and before it
+execs, on `--block-fd`, **and also lets go at end-of-file**, so that alone is not a gate: a launcher
+that crashed, was killed or gave up would start the program. The in-sandbox helper
+(`tumbleweed-sandbox-exec`) therefore also reads one byte from its own pipe (`--go-fd`) before it
+execs and treats anything but `1` (end-of-file included) as a refusal. The launcher writes `1` to both
+only after slirp4netns is ready. On every other path it closes both (end-of-file: the program never
+starts) and kills the held init through a **pidfd**, which names that process whatever happened to its
+number (an earlier version did `killpg` on bwrap's pid, which reached nothing: bwrap is not a group
+leader, `--new-session` makes the *child* a session leader). The kernel closing the launcher's
+descriptors when it is killed does the same, so a killed broker never runs the program (tested with a
+real launcher process). Tests: the info document stalled, bwrap ended, garbage, oversized or invalid
+UTF-8 info, a cancel during setup, a launcher killed after the info document, a refusing helper with
+the init left alive.
+
+(4) *Fail closed.* A missing `slirp4netns` binary, a tap that does not come up, a ready byte that does
+not arrive, a namespace that is not the checked one, an info document that is not ours or any timeout
+raises `SandboxNetworkError` (a `SandboxLaunchError`); the broker answers with one fixed refusal
+("the sandbox's network could not be set up; the program did not run") and audits
+`network_unavailable`. bwrap's own failure during setup (a mount source gone) is a launch error with
+bwrap's words, at once, not after the timeout. A run never falls back to no network or to the host's.
+
+(5) *Timeouts.* The setup is bounded by 10 s (`network.SETUP_SECONDS`, shortened in tests), the info
+document by 4 KiB, slirp4netns's stderr by 4 KiB; reaping is `kill_and_reap`'s. The wall time of a run
+does not include the setup (`SandboxResult.wall_time` starts after it, the limit always did).
+
+(6) *slirp4netns's confinement and limits.* Its own `--enable-sandbox` and `--enable-seccomp`, an
+empty environment, no stdin, stdout to `/dev/null`, and `prlimit` of 1024 open files and 1 GiB of
+address space (the program has 256 files itself; a test makes 200 connections at once and one reads
+the limits from `/proc`). It is not in the run's cgroup scope (it is the broker's child): CPU and
+memory beyond the address-space bound are not limited for it, which is recorded for the polish issue.
 `--enable-sandbox` needs `setegid(0)` inside the target's user namespace, so a `net.full` run maps the
 sandbox's user and group to 0 (`--uid 0 --gid 0`); with `--cap-drop ALL`, `--disable-userns`, no
-`CAP_*` and the same Landlock, that is a name for the same unprivileged user, and no run without
-`net.full` changes. (6) *Lifetime.* A setup that fails kills bwrap's process group and the sandbox's init by PID first (the init is held on the block pipe and does not yet die with its parent, and closing the pipe would release it like a byte does; found when a failed setup left it behind and the reap hung). The process is killed and reaped on every path out of the run
-(normal exit, timeout, output limit, cancellation, an error in setup, the launcher's own failure) in
-a `finally`, `--exit-fd`'s pipe is closed first so it also ends if the broker is killed, and a test
-checks that no `slirp4netns` outlives a run, a timeout and a cancel. (7) *DNS.* slirp4netns answers
-at 10.0.2.3 and forwards to the host's resolver; the sandbox gets `/etc/resolv.conf` with only that
-nameserver, as a read-only file made from a memfd (`--ro-bind-data`), and Landlock lets the program
-read that one file. A run without `net.full` has no `/etc/resolv.conf`. (8) *What stays out of
-reach.* The host's loopback: the sandbox's `127.0.0.1` is its own `lo`, and the gateway 10.0.2.2,
-which slirp4netns maps to the host's loopback, is refused by `--disable-host-loopback` (a test that
-fails on the mutant without it). The host's abstract unix sockets: a network namespace owns its
-abstract namespace, and seccomp refuses `AF_UNIX` sockets as well (S15); a test proves the namespace
-alone (without the filter) keeps them out. Host path sockets: not in the sandbox's mount tree. What
-is **not** kept out, because `net.full` means it: any other address the host can reach, including
-its LAN, its own non-loopback addresses and link-local ranges such as a cloud metadata address. That
-is why the prompt says so; host-scoped egress (an allowlist of hosts through a filtering proxy) is
-#31 and stays post-v1. (9) *Taint in the broker.* Unchanged rules, completed: the refusal text now
-says "call start_task with fresh_context=true"; both orders (files then network, network then files)
-are tested including after the first grant expired, was revoked or was a used `once` grant, and a
-refusal never reaches the prompt interface (the prompt counter is asserted). A run that holds
-`net.full` mounts no grant and no input: `run_in_sandbox` refuses the combination (`net_with_files`)
-even if a selection said otherwise, and `SandboxPolicy` refuses it too, so S25's composition cannot
-make it. (10) *The prompt.* A network card says, in plain-text labels, that the assistant would be
-able to send anything it can reach out to any server and to read from any server, that this includes
-other machines on the user's network, that nothing it reads or sends is checked, and that it is not
-a safe thing to allow after it has seen private files (in which case the broker would already have
-refused). (11) *Model context.* A net-tainted task's context holds no turn of an fs-tainted one: the
-context set only grows along non-fresh starts, taint only grows along the same chain, so every
-ancestor of a net-tainted task is at most net-tainted. After a restart the context is the head task
-alone (D26 (3)); **#157 amends D26 (3):** a restore whose newest tagged message is a hidden reply
-(the user started a fresh task in it) now starts with no head and an empty context set instead of
-reviving the old task, so the user's fresh start survives a restart and none of the old task's turns
-is visible. The test runs on real stored history. (12) *The model.* `run_code`'s and `request_access`'s
-descriptions say a network exists only for a task that was granted it and that such a task cannot
-read files; the system prompt becomes v6. **Folded in.** #80 (`TaskId` through the transcript)
-was done in S19 (`TranscriptMessage.task`, `ContextTurn.task`, stored `task_id`) and is ticked; #157's
-"a restart can undo a fresh start" is fixed as in (11); #31 stays post-v1 as in (8). **Consequences.**
-A `net.full` run takes about 10 to 30 ms more to start; each needs a `/dev/net/tun` the user can open
-(ARCHITECTURE section 11) and slirp4netns installed, and where either is missing the run is refused,
-not weakened. The model can still exfiltrate what a net-tainted task saw (the user's words and what
-it fetched) to any host: that is what the grant is, and the prompt says so.
+capability of any kind (a test compares every capability set, `NoNewPrivs` and `Seccomp` with a plain
+run) and the same Landlock, that is a name for the same unprivileged user, and no run without
+`net.full` changes.
+
+(7) *Two user namespaces.* `--disable-userns` moves the sandbox's init into a second user namespace
+nested in the one bwrap made, which owns the network namespace. slirp4netns's default (join the
+init's user namespace, then its netns) fails with EPERM for good once the init has moved (on a host
+too: the `--userns-path` mutant fails the reach test there), so the launcher takes the owner with
+`NS_GET_USERNS` on the network namespace and gives slirp4netns that descriptor as `--userns-path`.
+Only the wait for the init to have moved into its own *mapped* namespace (before it, `setegid(0)`
+fails) mattered in the container alone. `--disable-userns` stays.
+
+(8) *Lifetime.* slirp4netns is killed and reaped in a `finally` on every path (normal exit, timeout,
+output limit, cancellation, setup failure; tests), and its `--exit-fd` pipe ends it if the broker is
+killed (a test kills a launcher process and looks for the child).
+
+(9) *DNS.* slirp4netns answers at 10.0.2.3 **port 53** and forwards to the host's resolver; where that
+is a loopback stub (systemd-resolved's 127.0.0.53), the sandbox reaches that one port of the host's
+loopback by this route and nothing else there. The sandbox gets `/etc/resolv.conf` with only that
+nameserver as a read-only mount of a memfd (a test reads `mountinfo`), and Landlock lets the program
+read that one file. A run without `net.full` has no `/etc/resolv.conf`. **No certificate store is
+mounted** (new surface; a follow-up decides): HTTPS cannot be verified in a net sandbox and the system
+prompt says so.
+
+(10) *What stays out of reach, and what does not.* The host's loopback: the sandbox's `127.0.0.1` is
+its own `lo`, and the gateway 10.0.2.2, which slirp4netns maps to the host's loopback, is refused by
+`--disable-host-loopback` for TCP and UDP (tests that fail on the mutant without it); other ports of
+10.0.2.3 are refused too. The host's abstract unix sockets: a network namespace owns its abstract
+namespace, seccomp refuses `AF_UNIX` sockets as well (S15), and a test proves the namespace alone.
+Host path sockets are not in the sandbox's mount tree. **Not kept out, because `net.full` means it:**
+any address the host can reach, including its LAN, the host's own non-loopback addresses and the
+services bound to them (what the acceptance test uses), **link-local ranges such as a cloud metadata
+address (169.254.0.0/16)** and the other end of a VPN. slirp4netns has no egress filter beyond the
+host-loopback flag, so this is by design for v1, the prompt says so, and host-scoped egress (an
+allowlist through a filtering proxy) is #31, post-v1.
+
+(11) *Taint in the broker.* Unchanged rules, completed: the refusal text says "call start_task with
+fresh_context=true"; both orders (files then network, network then files) are tested including after
+the first grant expired, was revoked or was a used `once` grant, with the prompt interface never
+asked and the fixed text checked on the read, write and picker paths. A run that holds `net.full`
+mounts no grant and no input: `run_in_sandbox` refuses the combination (`net_with_files`) even if a
+selection said otherwise, and `SandboxPolicy` refuses it too, so S25's composition cannot make it.
+
+(12) *The prompt.* A network card says, in plain-text labels, that the assistant's code would be able
+to reach any server the computer can reach, other machines on the network and the programs on this
+computer that accept connections, that nothing it reads or sends is checked, that while the network
+is allowed it gets no files, and that a task that has seen files cannot be given the network.
+
+(13) *Model context.* A net-tainted task's context holds no turn of an fs-tainted one: the context set
+only grows along non-fresh starts, taint only grows along the same chain, so every ancestor of a
+net-tainted task is at most net-tainted. After a restart the context is the head task alone (D26 (3));
+**#157 amends D26 (3):** a restore whose newest tagged message is a hidden reply (the user started a
+fresh task in it) now starts with no head and an empty context set instead of reviving the old task,
+so the user's fresh start survives a restart and none of the old task's turns is visible. The test
+runs on real stored history.
+
+(14) *The model.* `run_code`'s and `request_access`'s descriptions and the UI spec's sandbox-handler
+paragraph say a network exists only for a task that was granted it and that such a task sees no
+granted files; the system prompt becomes v6 and tells the model HTTPS cannot be verified.
+
+**Folded in.** #80 (`TaskId` through the transcript) was done in S19 (`TranscriptMessage.task`,
+`ContextTurn.task`, stored `task_id`) and is ticked; #157's "a restart can undo a fresh start" is
+fixed as in (13); #31 stays post-v1 as in (10). **Consequences.** A `net.full` run takes a few tens of
+milliseconds more to start; each needs a `/dev/net/tun` the user can open (ARCHITECTURE section 11)
+and slirp4netns installed, and where either is missing the run is refused, not weakened. The model
+can still exfiltrate what a net-tainted task saw (the user's words and what it fetched) to any host:
+that is what the grant is, and the prompt says so.
