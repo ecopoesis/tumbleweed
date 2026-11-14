@@ -36,7 +36,7 @@ from tumbleweed.agent.saved_tools import (
 from tumbleweed.agent.tools import ToolError
 from tumbleweed.broker.audit import ToolSaved
 from tumbleweed.core.ids import TaskId, ToolId, ToolInstanceId
-from tumbleweed.core.types import ContentHash
+from tumbleweed.core.types import ContentHash, ToolVersion
 from tumbleweed.ipc.tool_messages import ToolOpened, ToolSummary
 
 
@@ -204,8 +204,8 @@ class TestOpenTexts:
             once, again = reply_text(
                 second,
                 [
-                    FakeTurn(tool_calls=(call("open_tool", tool=str(tool)),)),
-                    FakeTurn(tool_calls=(call("open_tool", tool=str(tool)),)),
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(tool), version=1),)),
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(tool), version=1),)),
                     FakeTurn(chunks=("x",)),
                 ],
             )
@@ -314,7 +314,7 @@ class TestOpenWithChecksTheBrokersAnswer:
             document=made.data.decode("utf-8"),
             taint=(),
             raised=False,
-            newest=None,
+            newest=ToolVersion(1),
         )
 
     def test_a_package_that_is_not_the_one_the_broker_named_is_refused(self) -> None:

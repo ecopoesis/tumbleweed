@@ -1,4 +1,4 @@
-"""A search made safe for SQLite FTS5.
+"""A search made safe for SQLite FTS5, and the ranking the model's search uses instead of it.
 
 `MATCH` takes a query language (`AND`, `NOT`, `NEAR`, column filters, `*`, quotes, parentheses),
 and a syntax error in it is an exception, while some well-formed queries are costly. A user's or
@@ -9,6 +9,7 @@ well-formed conjunction of at most `MAX_QUERY_TERMS` prefix terms. The text is a
 SQLite as a bound parameter, never spliced into SQL.
 """
 
+import unicodedata
 from typing import Final
 
 import regex
@@ -19,6 +20,45 @@ from tumbleweed.tools.limits import MAX_QUERY_CHARS, MAX_QUERY_TERMS, MAX_TERM_C
 # Letters, digits and the combining marks that belong to them: a letter with no precomposed form
 # (`x` and U+0301) is one word, not two.
 _WORD: Final = regex.compile(r"[\w\p{M}]+")
+NAME_WEIGHT: Final = 10
+TAG_WEIGHT: Final = 5
+DESCRIPTION_WEIGHT: Final = 2
+
+
+def fold(text: str) -> str:
+    """`text` as a search compares it: NFC, accents removed, case folded (what FTS5's `unicode61`
+    does, written out so that matching and ranking are ours)."""
+    decomposed = unicodedata.normalize("NFKD", normalize_text(text))
+    return "".join(char for char in decomposed if not unicodedata.combining(char)).casefold()
+
+
+def query_terms(text: str) -> tuple[str, ...]:
+    """The words of a query, folded: at most `MAX_QUERY_TERMS` of at most `MAX_TERM_CHARS`, taken
+    from the first `MAX_QUERY_CHARS` characters. Empty if there is no word in it."""
+    searched = normalize_text(text[: MAX_QUERY_CHARS * 4])[:MAX_QUERY_CHARS]
+    return tuple(fold(word)[:MAX_TERM_CHARS] for word in _WORD.findall(searched)[:MAX_QUERY_TERMS])
+
+
+def match_score(terms: tuple[str, ...], name: str, tags: str, description: str) -> int:
+    """How well one tool matches `terms`, from **that tool's text alone**: 0 if some term starts no
+    word of any field, else the sum, over terms, of the weights of the fields whose words it starts
+    (name over tag over description). Nothing here reads another tool: the order of the model's
+    search must not depend on what else is stored (D30 (6): bm25's statistics over the whole table
+    would let a task read the order of tools it may not see)."""
+    fields = (
+        (NAME_WEIGHT, _WORD.findall(fold(name))),
+        (TAG_WEIGHT, _WORD.findall(fold(tags))),
+        (DESCRIPTION_WEIGHT, _WORD.findall(fold(description))),
+    )
+    total = 0
+    for term in terms:
+        gained = sum(
+            weight for weight, words in fields if any(word.startswith(term) for word in words)
+        )
+        if gained == 0:
+            return 0
+        total += gained
+    return total
 
 
 def fts_match(text: str) -> str | None:

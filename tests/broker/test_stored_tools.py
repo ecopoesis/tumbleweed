@@ -14,7 +14,7 @@ from tests.broker.stored import draft_text, save
 from tests.ipc.bounded import run
 from tests.tools.support import draft, package
 from tumbleweed.broker.audit import ToolOpened as ToolOpenedEntry
-from tumbleweed.broker.audit import ToolOpenRefused, ToolSaved, ToolSearchTainted
+from tumbleweed.broker.audit import ToolOpenRefused, ToolSaved, ToolSearchTainted, ToolWriteTainted
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
 from tumbleweed.broker.service import MAX_SAVES_PER_TASK
 from tumbleweed.core.ids import RunId, TaskId, ToolId
@@ -105,9 +105,8 @@ class TestSaving:
                 with pytest.raises(BrokerRefused) as caught:
                     await save(client, task, tool=imported.summary.tool)
 
-                assert caught.value.reason == "denied"
-                assert "cannot be refined" in caught.value.message
-                assert FRESH not in caught.value.message  # a fresh task would not help
+                # A lineage nobody may see does not exist for a task: not found, like any other.
+                assert caught.value.reason == "not_found"
 
         run(scenario)
 
@@ -175,7 +174,7 @@ class TestRevertAndOpenAreBounded:
                 client = await rig.client()
                 saved = await save(client, await fs_task(rig, client))
                 task = (await client.start_task(fresh_context=True)).task
-                await client.open_tool(task, saved.summary.tool)
+                await client.open_tool(task, saved.summary.tool, ToolVersion(1))
 
                 stored = rig.rows("select id, taint from tasks")  # test data only
                 assert (str(task), "fs") in stored
@@ -283,7 +282,7 @@ class TestOpeningTaintsTheTask:
                 saved = await save(client, await fs_task(rig, client))
                 task = (await client.start_task(fresh_context=True)).task
 
-                opened = await client.open_tool(task, saved.summary.tool)
+                opened = await client.open_tool(task, saved.summary.tool, ToolVersion(1))
 
                 assert opened.taint == ("fs",)
                 assert opened.summary.hash == saved.summary.hash
@@ -308,17 +307,27 @@ class TestOpeningTaintsTheTask:
                 saved = await save(client, await fs_task(rig, client))
                 network = await net_task(rig, client)
 
-                with pytest.raises(BrokerRefused) as caught:
+                with pytest.raises(BrokerRefused) as by_number:
+                    await client.open_tool(network, saved.summary.tool, ToolVersion(1))
+                with pytest.raises(BrokerRefused) as newest:
                     await client.open_tool(network, saved.summary.tool)
+                with pytest.raises(BrokerRefused) as missing:
+                    await client.open_tool(network, ToolId.new(), ToolVersion(1))
 
-                assert caught.value.reason == "denied"
-                assert FRESH in caught.value.message
-                (entry,) = rig.audit_of(ToolOpenRefused)
-                assert entry.reason == "fs_in_net_task"
+                # What the task may not see is not found, word for word like what is not there.
+                for caught in (by_number, newest, missing):
+                    assert caught.value.reason == "not_found"
+                    assert caught.value.message == missing.value.message
+                assert {e.reason for e in rig.audit_of(ToolOpenRefused)} == {
+                    "hidden_version",
+                    "hidden_tool",
+                }
                 assert rig.audit_of(ToolOpenedEntry) == []
                 # Nothing changed: the task is still net-tainted only, and a fresh one opens it.
                 fresh = (await client.start_task(previous=network, fresh_context=True)).task
-                assert (await client.open_tool(fresh, saved.summary.tool)).taint == ("fs",)
+                assert (
+                    await client.open_tool(fresh, saved.summary.tool, ToolVersion(1))
+                ).taint == ("fs",)
 
         run(scenario)
 
@@ -330,17 +339,18 @@ class TestOpeningTaintsTheTask:
                 files = await fs_task(rig, client)
 
                 with pytest.raises(BrokerRefused) as caught:
-                    await client.open_tool(files, saved.summary.tool)
+                    await client.open_tool(files, saved.summary.tool, ToolVersion(1))
 
                 assert caught.value.reason == "denied"
                 assert FRESH in caught.value.message
                 assert rig.audit_of(ToolOpenRefused)[0].reason == "net_in_fs_task"
                 clean = (await client.start_task()).task
-                assert (await client.open_tool(clean, saved.summary.tool)).taint == ("net",)
+                opened = await client.open_tool(clean, saved.summary.tool, ToolVersion(1))
+                assert opened.taint == ("net",)
 
         run(scenario)
 
-    def test_a_version_that_is_both_is_refused_in_every_task(self) -> None:
+    def test_a_version_that_is_both_is_not_found_in_every_task(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
@@ -352,11 +362,13 @@ class TestOpeningTaintsTheTask:
                 ]
 
                 for task in tasks:
-                    with pytest.raises(BrokerRefused) as caught:
-                        await client.open_tool(task, imported.summary.tool)
-                    assert caught.value.reason == "denied"
+                    for version in (None, ToolVersion(1)):
+                        with pytest.raises(BrokerRefused) as caught:
+                            await client.open_tool(task, imported.summary.tool, version)
+                        assert caught.value.reason == "not_found"
 
-                assert {e.reason for e in rig.audit_of(ToolOpenRefused)} == {"both_taints"}
+                reasons = {e.reason for e in rig.audit_of(ToolOpenRefused)}
+                assert "both_taints" in reasons
 
         run(scenario)
 
@@ -370,26 +382,42 @@ class TestOpeningTaintsTheTask:
                 clean = (await client.start_task()).task
 
                 with pytest.raises(BrokerRefused):
-                    await client.open_tool(network, imported.summary.tool)
-                assert (await client.open_tool(clean, imported.summary.tool)).taint == ("fs",)
+                    await client.open_tool(network, imported.summary.tool, ToolVersion(1))
+                opened = await client.open_tool(clean, imported.summary.tool, ToolVersion(1))
+                assert opened.taint == ("fs",)
 
         run(scenario)
 
-    def test_a_refined_version_carries_the_taint_of_what_it_refines_when_opened(self) -> None:
+    def test_a_clean_task_that_refines_an_fs_lineage_takes_its_taint_first(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
                 first = await save(client, await fs_task(rig, client))
-                second = await save(
-                    client,
-                    (await client.start_task(fresh_context=True)).task,
-                    tool=first.summary.tool,
-                )
-                network = await net_task(rig, client)
+                clean = (await client.start_task(fresh_context=True)).task
+
+                second = await save(client, clean, tool=first.summary.tool)
 
                 assert second.summary.taint == ("fs",)
-                with pytest.raises(BrokerRefused):
-                    await client.open_tool(network, first.summary.tool)  # the newest is v2: fs
+                assert [e.tool for e in rig.audit_of(ToolWriteTainted)] == [first.summary.tool]
+                heir = (await client.start_task(previous=clean)).task  # persisted
+                rig.prompts.allow("task")
+                assert not (await client.request_network(heir, RunId.new(), "x")).granted
+
+        run(scenario)
+
+    def test_a_net_task_sees_a_tool_as_its_newest_clean_version(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                first = await save(client, (await client.start_task()).task)
+                await save_from(client, await fs_task(rig, client), first.summary.tool)
+                network = await net_task(rig, client)
+
+                seen = await client.open_tool(network, first.summary.tool)
+                found = await client.find_tools(network, "csv")
+
+                assert seen.summary.version == 1
+                assert [t.version for t in found.tools] == [1]
 
         run(scenario)
 
@@ -585,8 +613,8 @@ class TestFindingNeverShowsWhatTheTaskMustNotSee:
                 clean = (await client.start_task(fresh_context=True)).task
                 newest = await client.open_tool(clean, first.summary.tool, ToolVersion(1))
 
-                assert opened.newest is None  # version 2 is fs-tainted: not for this task
-                assert newest.newest == 2  # a clean task may open it
+                assert opened.newest == 1  # version 2 is fs-tainted: not for this task to know of
+                assert newest.newest == 1  # nor for a clean one that did not ask for it
 
         run(scenario)
 

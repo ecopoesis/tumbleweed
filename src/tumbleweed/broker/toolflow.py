@@ -39,6 +39,20 @@ OPEN_REFUSAL_TEXT: Final[dict[OpenRefusal, str]] = {
 }
 
 
+WRITE_HIDDEN_TEXT: Final = (
+    "That tool cannot be changed from this task: part of it was made in a task that saw the "
+    "user's files, and this task has the network. Call start_task with fresh_context=true, then "
+    "try again."
+)
+"""What a net task is told when a write would land on a lineage with a version it may not see: one
+fixed sentence (D30 (6): the one bit this tells a task is accepted, and counted)."""
+
+LINEAGE_BOTH_TEXT: Final = (
+    "this tool carries both file and network taint (it came from a bundle that claims the "
+    "network), so it cannot be refined: save a new tool instead"
+)
+
+
 def open_refusal(
     task_taint: frozenset[TaintKind], version_taint: frozenset[TaintKind]
 ) -> OpenRefusal | None:

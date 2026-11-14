@@ -253,14 +253,26 @@ class ToolSearchTainted(_AuditModel):
     task: TaskId
 
 
+class ToolWriteTainted(_AuditModel):
+    """A save or revert into a lineage that holds versions the task may not see made the task
+    fs- or net-tainted first (S24, D30 (6)): it takes the lineage's taint, then the write goes
+    on. Written before the taint is, in its transaction."""
+
+    kind: Literal["tool_write_tainted"] = "tool_write_tainted"
+    task: TaskId
+    tool: ToolId
+
+
 class ToolOpenRefused(_AuditModel):
     """An `open_tool` the taint rule refused (I12): `reason` is closed, nothing else is kept."""
 
     kind: Literal["tool_open_refused"] = "tool_open_refused"
     task: TaskId
     tool: ToolId
-    version: ToolVersion
-    reason: Literal["both_taints", "fs_in_net_task", "net_in_fs_task"]
+    version: ToolVersion | None
+    reason: Literal[
+        "both_taints", "fs_in_net_task", "net_in_fs_task", "hidden_tool", "hidden_version"
+    ]
 
 
 class ToolExported(_AuditModel):
@@ -377,6 +389,7 @@ type AuditEntry = Annotated[
     | ToolOpened
     | ToolOpenRefused
     | ToolSearchTainted
+    | ToolWriteTainted
     | ToolExported
     | ToolImportRefused
     | SnapshotTaken

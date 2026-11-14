@@ -184,15 +184,18 @@ def _line(number: int, summary: ToolSummary) -> str:
 
 
 NOT_SHOWN_CLEAN: Final = (
-    "Tools made in tasks that saw the user's files or used the network are not shown. To also "
-    "see the ones made in tasks that saw files, call find_tools again with "
-    "include_file_tools=true: that makes this task count as having seen the user's files, so it "
-    "can no longer be given the network."
+    "Tools, and newer versions of tools, made in tasks that saw the user's files or used the "
+    "network are not shown. To also see the ones made in tasks that saw files, call find_tools "
+    "again with include_file_tools=true: that makes this task count as having seen the user's "
+    "files, so it can no longer be given the network."
 )
-NOT_SHOWN_FILES: Final = "Tools made in tasks that used the network are not shown."
+NOT_SHOWN_FILES: Final = (
+    "Tools, and newer versions of tools, made in tasks that used the network are not shown."
+)
 NOT_SHOWN_NET: Final = (
-    "Tools made in tasks that saw the user's files are never shown to a task that has the "
-    "network. To search for them, call start_task with fresh_context=true first."
+    "Tools, and newer versions of tools, made in tasks that saw the user's files are never shown "
+    "to a task that has the network. To search for them, call start_task with "
+    "fresh_context=true first."
 )
 
 
@@ -384,7 +387,7 @@ def register_saved_tool_tools(
             )
         else:
             parts.append("No saved tool matches.")
-        if arguments.include_file_tools and found.task_taint == ("fs",):
+        if found.raised:
             parts.append("This task now counts as having seen the user's files.")
         parts.append(not_shown(found.task_taint))
         return "\n".join(parts)
@@ -409,9 +412,7 @@ def register_saved_tool_tools(
                 if taint == ("fs",)
                 else " This task now counts as having used the network."
             )
-        newest = (
-            "" if fetched.opened.newest is None else f" (the newest is {fetched.opened.newest})"
-        )
+        newest = f" (the newest you can see is {fetched.opened.newest})"
         count = "" if shown.on_canvas == 1 else f" ({shown.on_canvas} tools)"
         text = (
             f"Opened version {fetched.stored.version} of the saved tool{newest} on the "

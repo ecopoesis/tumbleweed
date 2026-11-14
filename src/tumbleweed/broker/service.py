@@ -82,6 +82,7 @@ from tumbleweed.broker.audit import (
     ToolOpenRefused,
     ToolSaved,
     ToolSearchTainted,
+    ToolWriteTainted,
     UndoDone,
     WorkspaceDeleted,
     cut,
@@ -180,7 +181,14 @@ from tumbleweed.broker.store import (
     net_marks,
 )
 from tumbleweed.broker.task import TaintKind, TaskState, merged_taint
-from tumbleweed.broker.toolflow import OPEN_REFUSAL_TEXT, BoundRunError, bound_payload, open_refusal
+from tumbleweed.broker.toolflow import (
+    LINEAGE_BOTH_TEXT,
+    OPEN_REFUSAL_TEXT,
+    WRITE_HIDDEN_TEXT,
+    BoundRunError,
+    bound_payload,
+    open_refusal,
+)
 from tumbleweed.broker.toolstore import StoredTool, ToolStore, taint_names
 from tumbleweed.broker.treeops import RestoreStats, measure
 from tumbleweed.broker.workspace import open_in_workspace, read_workspace_file
@@ -320,10 +328,7 @@ FIND_FILES_REFUSED: Final = (
     "start_task with fresh_context=true and search again."
 )
 _BAD_BINDING: Final = "the tool binding is not one this task opened"
-_LINEAGE_BOTH: Final = (
-    "this tool carries both file and network taint (it came from a bundle that claims the "
-    "network), so it cannot be refined: save a new tool instead"
-)
+_LINEAGE_BOTH: Final = LINEAGE_BOTH_TEXT
 _TAINT_CONFLICT: Final = (
     "this task's taint cannot be combined with the tool's: call start_task with "
     "fresh_context=true, then save again"
@@ -1127,30 +1132,38 @@ class BrokerService:
 
     def _open_tool(self, owner: Owner, request: OpenTool) -> ResponseBody:
         """Open a stored version into a task: the task's taint is checked against the version's
-        index taint and raised, in the block that records it, and the instance to show is named."""
+        index taint and raised, in the block that records it, and the instance to show is named.
+
+        A task sees a tool as its newest version within its taint (D30 (6)): with no version that
+        is what is opened, and what a task may not see is **not found** for it, the same answer as
+        for a tool that does not exist. Only a task that has not read files may name a version
+        made in one: it is then marked, as by any other way of learning what that task read."""
         live = self._owned(owner, request.task)
-        opened = self._tools.open(request.tool, request.version)
+        taint = live.state.taint
+        version = request.version
+        if version is None:
+            seen = self._tools.view_of(request.tool, taint)
+            if seen is None:
+                self._audit_open_refused(request, "hidden_tool")
+                raise ToolNotFoundError("no such tool or version")
+            version = seen.version
+        opened = self._tools.open(request.tool, version)
         record = opened.record
-        refusal = open_refusal(live.state.taint, record.taint)
-        if refusal is not None:
-            try:
-                self._audit.append(
-                    ToolOpenRefused(
-                        at=self._now(),
-                        task=request.task,
-                        tool=record.tool,
-                        version=record.version,
-                        reason=refusal,
-                    )
-                )
-            except AuditError:
-                _log.error("a refused open of a stored tool could not be audited")
+        if len(record.taint) > 1:  # fs and net: it opens nowhere, and is nobody's to see
+            self._audit_open_refused(request, "both_taints")
+            raise ToolNotFoundError("no such tool or version")
+        if TaintKind.NET in taint and TaintKind.FS in record.taint:
+            self._audit_open_refused(request, "hidden_version")
+            raise ToolNotFoundError("no such tool or version")
+        refusal = open_refusal(taint, record.taint)
+        if refusal is not None:  # a task that has read files, and a version that used the network
+            self._audit_open_refused(request, refusal)
             raise _Refuse("denied", OPEN_REFUSAL_TEXT[refusal], f"open_{refusal}")
-        merged = live.state.taint | record.taint
-        raised = merged != live.state.taint
+        merged = taint | record.taint
+        raised = merged != taint
         instance = ToolInstanceId.new()
         with self._atomic() as entries:
-            if merged != live.state.taint:
+            if raised:
                 self._store.set_taint(live.state.task, merged)
             entries.append(
                 ToolOpenedEntry(
@@ -1170,12 +1183,7 @@ class BrokerService:
         )
         while len(live.instances) > MAX_INSTANCES_PER_TASK:
             del live.instances[next(iter(live.instances))]
-        newest_record = self._store.tool_record(record.tool, None)
-        newest = (
-            newest_record.version
-            if newest_record is not None and open_refusal(merged, newest_record.taint) is None
-            else None
-        )
+        view = self._tools.view_of(record.tool, merged)
         return ToolOpened(
             kind="tool_opened",
             instance=instance,
@@ -1183,30 +1191,82 @@ class BrokerService:
             document=opened.canonical.data.decode("utf-8"),
             taint=taint_names(merged),
             raised=raised,
-            newest=newest,
+            newest=record.version if view is None else view.version,
         )
 
+    def _audit_open_refused(
+        self,
+        request: OpenTool,
+        reason: Literal[
+            "both_taints", "fs_in_net_task", "net_in_fs_task", "hidden_tool", "hidden_version"
+        ],
+    ) -> None:
+        try:
+            self._audit.append(
+                ToolOpenRefused(
+                    at=self._now(),
+                    task=request.task,
+                    tool=request.tool,
+                    version=request.version,
+                    reason=reason,
+                )
+            )
+        except AuditError:
+            _log.error("a refused open of a stored tool could not be audited")
+
     def _find_tools(self, owner: Owner, request: FindTools) -> ResponseBody:
-        """The model's search: matches the task may see (I12), best first, and how many it may
-        not (names and descriptions are text the saving task wrote)."""
+        """The model's search: each tool as the task sees it (D30 (6), I12), best first."""
         live = self._owned(owner, request.task)
         taint = live.state.taint
+        raised = False
         if request.include_file_tools and TaintKind.FS not in taint:
             if TaintKind.NET in taint:
                 raise _Refuse("denied", FIND_FILES_REFUSED, "find_files_in_net_task")
             taint = taint | {TaintKind.FS}
+            raised = True
             with self._atomic() as entries:
                 self._store.set_taint(live.state.task, taint)
                 entries.append(ToolSearchTainted(at=self._now(), task=request.task))
             live.state = TaskState(task=live.state.task, taint=taint)
-        # What the answer holds depends only on versions within the task's own taint: the filter
-        # is in the search, before the ranking cut, and nothing says what was left out.
-        shown = self._tools.find_visible(request.query, taint, request.limit)
+        # What the answer holds depends only on versions within the task's own taint, and each
+        # tool is matched and ranked on its own text: nothing says what was left out.
+        shown = self._tools.find_view(request.query, taint, request.limit)
         return ToolMatches(
             kind="tool_matches",
             tools=tuple(_tool_summary(record) for record in shown),
             task_taint=taint_names(taint),
+            raised=raised,
         )
+
+    def _gate_lineage(self, live: _Live, tool: ToolId) -> None:
+        """Before a write into the lineage of `tool` (a refinement or a revert): what the answer
+        and the new version's number and taint depend on must be within what the task sees.
+
+        A lineage nobody sees (an import that claims both) is not found. A net task whose lineage
+        has a version made in a task that read files is refused with one fixed sentence, and the
+        attempt counts toward the task's saves: the one bit that tells it is accepted and metered
+        (D30 (6)). A task that has not read files takes the lineage's taint first, audited and
+        persisted, as opening one of its versions would: it then is fs-tainted, and may be told
+        anything about it."""
+        versions = self._tools.versions(tool)
+        if not versions:
+            raise ToolNotFoundError("no such tool")
+        taint = live.state.taint
+        hidden = [record for record in versions if not record.taint <= taint]
+        if not hidden:
+            return
+        if any(len(record.taint) > 1 for record in versions):
+            raise ToolNotFoundError("no such tool")
+        if TaintKind.NET in taint and any(TaintKind.FS in record.taint for record in hidden):
+            live.saves += 1
+            raise _Refuse("denied", WRITE_HIDDEN_TEXT, "hidden_lineage")
+        if taint:
+            return  # a task that has read files, and a net version: the store's own conflict
+        merged = frozenset().union(*(record.taint for record in hidden))
+        with self._atomic() as entries:
+            self._store.set_taint(live.state.task, merged)
+            entries.append(ToolWriteTainted(at=self._now(), task=live.state.task, tool=tool))
+        live.state = TaskState(task=live.state.task, taint=merged)
 
     def _list_tool_versions(self, request: ListToolVersions) -> ResponseBody:
         records = self._tools.versions(request.tool)
@@ -1226,6 +1286,8 @@ class BrokerService:
             draft = parse_draft(request.draft.encode("utf-8"))
         except UnicodeEncodeError:  # a lone surrogate: not text, so not a draft
             raise _Refuse("invalid_request", "the tool draft is not acceptable") from None
+        if request.tool is not None:
+            self._gate_lineage(live, request.tool)
         stored = self.save_tool(owner, request.task, draft, tool=request.tool)
         live.saves += 1
         return ToolStored(kind="tool_stored", summary=_tool_summary(stored.record))
@@ -1236,6 +1298,7 @@ class BrokerService:
         live = self._owned(owner, request.task)
         if live.saves >= MAX_SAVES_PER_TASK:
             raise _Refuse("busy", "this task has saved as many tools as it may", "save_cap")
+        self._gate_lineage(live, request.tool)
         newest = self._store.latest_version(request.tool)
         if newest is None:
             raise ToolNotFoundError("no such tool")

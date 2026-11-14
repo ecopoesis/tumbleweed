@@ -198,9 +198,8 @@ class ToolOpened(Response):
     taint: Annotated[tuple[Taint, ...], Field(max_length=1)]
     raised: bool
     """Whether this open raised the task's taint (it did not hold the version's already)."""
-    newest: ToolVersion | None
-    """The newest version's number, or null when this task could not open the newest version (its
-    number would say something about a task the task must not learn of)."""
+    newest: ToolVersion
+    """The newest version **this task sees** of the tool (D30 (6)): never one it may not see."""
 
 
 @final
@@ -227,6 +226,8 @@ class ToolMatches(Response):
     kind: Literal["tool_matches"]
     tools: Annotated[tuple[ToolSummary, ...], Field(max_length=MAX_FOUND)]
     task_taint: Annotated[tuple[Taint, ...], Field(max_length=1)]
+    raised: bool
+    """Whether this call raised the task's taint (the opt-in, on a task that did not hold it)."""
 
 
 @final

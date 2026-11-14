@@ -1017,6 +1017,26 @@ class BrokerStore:
             (sequence, record.name, record.description, " ".join(record.tags)),
         )
 
+    @staticmethod
+    def _view_texts(taint: frozenset[TaintKind]) -> tuple[str, ...]:
+        """The stored taint texts a task tainted `taint` may see: none, and its own."""
+        return ("none",) if not taint else ("none", _tool_taint_text(taint))
+
+    def visible_tools(self, taint: frozenset[TaintKind]) -> list[ToolRecord]:
+        """Each tool's **view for a task tainted `taint`** (D30 (6)): its newest version whose
+        taint is within the task's, tools with none left out. A lineage's taint never goes down
+        from one version to the next (`ToolStore.save` adds the refined version's), so what a task
+        may see of a tool is a prefix of its versions, and this is its end."""
+        marks = ",".join("?" * len(self._view_texts(taint)))
+        texts = self._view_texts(taint)
+        return self._tools(
+            f"{_TOOL_COLUMNS} FROM tools t JOIN tool_versions v ON v.tool = t.seq "  # noqa: S608
+            f"WHERE v.taint IN ({marks}) AND v.version = "
+            f"(SELECT max(w.version) FROM tool_versions w "
+            f"WHERE w.tool = t.seq AND w.taint IN ({marks}))",
+            (*texts, *texts),
+        )
+
     def list_tools(self, limit: int) -> list[ToolRecord]:
         """The newest version of each tool, the most recently saved first, at most `limit`."""
         return self._tools(

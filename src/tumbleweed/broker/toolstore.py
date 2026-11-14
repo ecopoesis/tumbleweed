@@ -79,7 +79,7 @@ from tumbleweed.tools.package import (
     canonical_package,
     parse_package,
 )
-from tumbleweed.tools.query import fts_match
+from tumbleweed.tools.query import fts_match, match_score, query_terms
 
 _FULL: Final = "the tool store is full"
 
@@ -274,20 +274,40 @@ class ToolStore:
         """Every stored version of `tool`, newest first (at most `MAX_VERSIONS_PER_TOOL`)."""
         return self._store.tool_versions(tool, MAX_VERSIONS_PER_TOOL)
 
-    def find_visible(
-        self, query: str | None, visible: frozenset[TaintKind], limit: int
+    def find_view(
+        self, query: str | None, taint: frozenset[TaintKind], limit: int
     ) -> list[ToolRecord]:
-        """The best `limit` newest versions matching `query` whose taint is within `visible`.
+        """The best `limit` tools for a task tainted `taint`, each as the task sees it.
 
-        The taint filter is applied **before** the limit and the ranking cut, over every match
-        (at most `MAX_TOOLS`), so a version outside `visible` cannot change what is returned: not
-        by being there, nor by pushing a visible one out (D30 (6), I12)."""
+        A task sees each tool as its newest version within its taint (`BrokerStore.visible_tools`),
+        and that version's text is what is matched and what is shown. Matching and ranking read
+        one record at a time (`tumbleweed.tools.query.match_score`: weighted prefix hits, then
+        newest saved, then ID), never the whole table, so nothing about a version the task may not
+        see, not even its presence, can change what is returned (D30 (6), I12)."""
+        records = self._store.visible_tools(taint)
         if query is None:
-            records = self._store.list_tools(MAX_TOOLS)
+            ranked = [(0, record) for record in records]
         else:
-            match = fts_match(query)
-            records = [] if match is None else self._store.search_tools(match, MAX_TOOLS)
-        return [record for record in records if record.taint <= visible][:limit]
+            terms = query_terms(query)
+            if not terms:
+                return []
+            ranked = [
+                (score, record)
+                for record in records
+                if (
+                    score := match_score(
+                        terms, record.name, " ".join(record.tags), record.description
+                    )
+                )
+            ]
+        ranked.sort(key=lambda item: (-item[0], -item[1].saved_at.timestamp(), str(item[1].tool)))
+        return [record for _, record in ranked[:limit]]
+
+    def view_of(self, tool: ToolId, taint: frozenset[TaintKind]) -> ToolRecord | None:
+        """`tool` as a task tainted `taint` sees it: its newest version within the taint."""
+        return next(
+            (record for record in self._store.visible_tools(taint) if record.tool == tool), None
+        )
 
     def find(self, query: str | None, limit: int = MAX_RESULTS) -> list[ToolRecord]:
         """The newest version of the tools that match `query` (name, description and tags), best
