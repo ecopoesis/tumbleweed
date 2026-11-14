@@ -27,6 +27,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, final
@@ -67,7 +68,26 @@ class _Info(BaseModel):
     model_config = ConfigDict(strict=True, extra="ignore", frozen=True, populate_by_name=True)
 
     child_pid: int = Field(alias="child-pid", gt=0)
-    net_namespace: int = Field(alias="net-namespace", gt=0)
+    net_namespace: int | None = Field(default=None, alias="net-namespace", gt=0)
+    """Absent when bwrap did not unshare the network: then it is refused."""
+
+
+def slirp_argv(program: str, pid: int, *, ready: int, exit_: int) -> list[str]:
+    """slirp4netns's command line: attached to `pid`'s namespaces, host loopback unreachable, its
+    own mount namespace and seccomp filter, ready and exit pipes by number."""
+    return [
+        program,
+        "--configure",
+        "--disable-host-loopback",
+        "--enable-sandbox",
+        "--enable-seccomp",
+        "--ready-fd",
+        str(ready),
+        "--exit-fd",
+        str(exit_),
+        str(pid),
+        TAP_NAME,
+    ]
 
 
 def _own_network_namespace() -> int:
@@ -91,6 +111,7 @@ class NetworkLink:
         self._exit_write: int | None = None
         self._drain: asyncio.Task[None] | None = None
         self.stderr = bytearray()
+        self._child_pid: int | None = None
 
     @property
     def fds(self) -> NetworkFds:
@@ -110,7 +131,8 @@ class NetworkLink:
         try:
             async with asyncio.timeout(SETUP_SECONDS):
                 info = await self._read_info(bwrap)
-                if info.net_namespace == _own_network_namespace():
+                self._child_pid = info.child_pid
+                if info.net_namespace in (None, _own_network_namespace()):
                     raise SandboxNetworkError(_FAILED)  # never attach to, or release, the host's
                 await self._start_slirp(info.child_pid)
                 self._release()
@@ -119,6 +141,16 @@ class NetworkLink:
         except OSError as exc:
             log.warning("the sandbox's network setup failed: %s", exc.strerror)
             raise SandboxNetworkError(_FAILED) from None
+
+    def kill_sandbox(self, bwrap: asyncio.subprocess.Process) -> None:
+        """Kill bwrap's whole process group and the sandbox's init, which is held on the block
+        pipe and does not yet die with its parent: a failed setup must end it for certain, and
+        before the block pipe closes (closing it would release it, like a byte does)."""
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(bwrap.pid, signal.SIGKILL)  # bwrap's own session (`--new-session`)
+        if self._child_pid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(self._child_pid, signal.SIGKILL)
 
     async def _read_info(self, bwrap: asyncio.subprocess.Process) -> _Info:
         loop = asyncio.get_running_loop()
@@ -153,17 +185,7 @@ class NetworkLink:
         self._exit_write = exit_write
         try:
             self._process = await asyncio.create_subprocess_exec(
-                self._program,
-                "--configure",
-                "--disable-host-loopback",
-                "--enable-sandbox",
-                "--enable-seccomp",
-                "--ready-fd",
-                str(ready_write),
-                "--exit-fd",
-                str(exit_read),
-                str(pid),
-                TAP_NAME,
+                *slirp_argv(self._program, pid, ready=ready_write, exit_=exit_read),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,

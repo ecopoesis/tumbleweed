@@ -100,9 +100,9 @@ def build_bwrap_argv(
     if hardening is not None:
         # A file of the root tmpfs, so before the remount below makes it read-only.
         argv += ["--ro-bind-data", str(hardening.helper), HELPER_TARGET]
-    if policy.network:
-        if hardening is None or hardening.resolv is None:
-            raise InvalidPolicyError("a network needs the hardened launcher")
+    if policy.network and hardening is not None:
+        if hardening.resolv is None:
+            raise InvalidPolicyError("a network needs the resolver file")
         argv += ["--ro-bind-data", str(hardening.resolv), RESOLV_TARGET]
     if policy.payload is not None:
         if hardening is None or hardening.payload is None:

@@ -345,7 +345,9 @@ class SandboxRunner:
                 try:
                     await link.attach(proc)
                 except BaseException:
-                    # bwrap is held before it sets anything up: nothing ran. Kill it, reap it.
+                    # bwrap is held before it sets anything up: nothing ran. Kill all of it (the
+                    # sandbox's init does not yet die with its parent), then reap it.
+                    link.kill_sandbox(proc)
                     if not await asyncio.shield(kill_and_reap(proc)):
                         raise SandboxTeardownError(
                             f"the sandbox's launcher (pid {proc.pid}) did not end after SIGKILL"
