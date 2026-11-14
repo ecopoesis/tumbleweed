@@ -21,7 +21,6 @@ from tumbleweed.broker.client import BrokerClient, BrokerRefused
 from tumbleweed.core.ids import GrantId, ToolId
 from tumbleweed.core.types import ToolVersion
 from tumbleweed.ipc.tool_messages import ToolGrantInfo, ToolSummary
-from tumbleweed.shell.viewmodel.prompts import plain_reason
 from tumbleweed.shell.viewmodel.tools import ToolsOutcome
 
 if TYPE_CHECKING:
@@ -37,9 +36,24 @@ NO_TASK: Final = (
 _UNAVAILABLE: Final = "Not done: the broker is not available."
 
 
+_REFUSED: Final[dict[str, str]] = {
+    "denied": (
+        "Not done: this tool and this conversation's task cannot be mixed, because one has seen "
+        "your files and the other used the network. Ask the assistant to start a new task, then "
+        "try again."
+    ),
+    "not_found": "Not done: that tool or version is not stored.",
+    "busy": "Not done: the store is full or busy.",
+    "too_large": "Not done: the tool has no version number left.",
+    "unsafe": "Not done: the stored tool failed its integrity check and was not used.",
+    "unknown_task": "Not done: the conversation's task has ended. Say something to the assistant.",
+}
+_REFUSED_OTHERWISE: Final = "Not done: the broker would not."
+
+
 def _refusal(refusal: BrokerRefused) -> ToolsOutcome:
-    text, _ = plain_reason(f"Not done: {refusal.message}.", 300)
-    return ToolsOutcome("refused", text)
+    """Our own sentence for a refusal: the broker's text is written for the model."""
+    return ToolsOutcome("refused", _REFUSED.get(refusal.reason, _REFUSED_OTHERWISE))
 
 
 @final
@@ -102,7 +116,14 @@ class BrokerToolsPort:
                 _log.exception("showing a stored tool failed")
                 done(ToolsOutcome("failed", "Not opened: the tool could not be shown."))
                 return
-            done(ToolsOutcome("done", "Opened on the canvas."))
+            raised = (
+                " This conversation's task now counts as having seen your files."
+                if outcome.opened.raised and outcome.opened.taint == ("fs",)
+                else " This conversation's task now counts as having used the network."
+                if outcome.opened.raised
+                else ""
+            )
+            done(ToolsOutcome("done", f"Opened on the canvas.{raised}"))
 
         self._act(work, finished, done)
 

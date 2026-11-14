@@ -18,13 +18,18 @@ from typing import Final, Literal, Protocol, assert_never, final
 
 from tumbleweed.core.ids import GrantId, ToolId
 from tumbleweed.core.types import ToolVersion
-from tumbleweed.ipc.tool_messages import ToolGrantInfo, ToolSummary
+from tumbleweed.ipc.tool_messages import (
+    MAX_LISTED,
+    MAX_TOOL_GRANTS_LISTED,
+    ToolGrantInfo,
+    ToolSummary,
+)
 from tumbleweed.shell.viewmodel.prompts import plain_reason, visible
 
 _log = logging.getLogger(__name__)
 
-MAX_ROWS: Final = 30
-MAX_GRANT_ROWS: Final = 30
+MAX_ROWS: Final = MAX_LISTED
+MAX_GRANT_ROWS: Final = MAX_TOOL_GRANTS_LISTED  # every grant: one not shown cannot be revoked
 MAX_NAME_SHOWN: Final = 64
 MAX_DESCRIPTION_SHOWN: Final = 160
 MAX_TAGS_SHOWN: Final = 80
@@ -208,18 +213,22 @@ class ToolsModel:
         if self._working:
             return
         self._begin()
+        notes: list[str] = [] if note is None else [note]
 
         def tools_done(found: tuple[ToolSummary, ...] | None) -> None:
             if found is None:
-                self._finish(
-                    (), (), "The saved tools could not be read: the broker is not answering."
-                )
+                notes.append("The saved tools could not be read: the broker is not answering.")
+                self._finish((), (), notes)
                 return
             self.tools = tuple(row_of(each) for each in found[:MAX_ROWS])
             self._summaries = {each.tool: each for each in found[:MAX_ROWS]}
-            self._port.grants(lambda grants: grants_done(grants))
+            if len(found) >= MAX_ROWS:
+                notes.append(f"Only the newest {MAX_ROWS} saved tools are listed.")
+            self._port.grants(grants_done)
 
         def grants_done(found: tuple[ToolGrantInfo, ...] | None) -> None:
+            if found is None:
+                notes.append("The access list could not be read: the broker is not answering.")
             self.grants = (
                 ()
                 if found is None
@@ -228,7 +237,7 @@ class ToolsModel:
             if self._expanded is None or self._expanded not in self._summaries:
                 self._expanded = None
                 self.history = ()
-                self._finish_with(note)
+                self._finish_with(notes)
                 return
             self._port.versions(self._expanded, versions_done)
 
@@ -239,7 +248,7 @@ class ToolsModel:
                 if found is None or newest is None
                 else tuple(version_row_of(each, newest) for each in found)
             )
-            self._finish_with(note)
+            self._finish_with(notes)
 
         self._port.list(tools_done)
 
@@ -296,13 +305,15 @@ class ToolsModel:
         self._view.busy(True)
 
     def _finish(
-        self, history: tuple[VersionRow, ...], grants: tuple[GrantRow, ...], note: str | None
+        self, history: tuple[VersionRow, ...], grants: tuple[GrantRow, ...], notes: list[str]
     ) -> None:
         self.tools, self.history, self.grants = (), history, grants
-        self._finish_with(note)
+        self._finish_with(notes)
 
-    def _finish_with(self, note: str | None) -> None:
+    def _finish_with(self, notes: list[str]) -> None:
         self._working = False
         self._view.busy(False)
-        empty = None if self.tools else "No tool has been saved yet."
-        self._view.present(self.tools, self.history, self.grants, note or empty)
+        lines = list(notes)
+        if not self.tools and not any("could not be read" in line for line in lines):
+            lines.append("No tool has been saved yet.")
+        self._view.present(self.tools, self.history, self.grants, " ".join(lines) or None)

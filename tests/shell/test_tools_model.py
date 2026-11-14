@@ -234,3 +234,50 @@ def test_the_prompt_card_names_the_tool_as_its_own_words_and_offers_the_tool_sco
     assert card.tool_name is not None
     assert "\n" not in card.tool_name
     assert "‮" not in card.tool_name
+
+
+def test_every_grant_the_broker_can_hold_is_listed_so_each_can_be_revoked() -> None:
+    tool = summary()
+    many = tuple(grant(tool.tool, path=f"/home/u/p{n}") for n in range(100))
+    port, view = FakePort(tool, grants=many), FakeView()
+
+    ToolsModel(port, view).refresh()
+
+    assert len(view.shown[-1][2]) == 100
+
+
+def test_a_failed_read_of_the_grants_is_an_error_not_an_empty_list() -> None:
+    port, view = FakePort(summary()), FakeView()
+    port.granted = None
+
+    ToolsModel(port, view).refresh()
+
+    assert view.shown[-1][2] == ()
+    assert "access list could not be read" in str(view.shown[-1][3])
+
+
+def test_a_full_page_of_tools_says_that_only_the_newest_are_listed() -> None:
+    port, view = FakePort(*(summary(name=f"T{n}") for n in range(50))), FakeView()
+
+    ToolsModel(port, view).refresh()
+
+    assert len(view.shown[-1][0]) == 50
+    assert "Only the newest 50 saved tools are listed." in str(view.shown[-1][3])
+
+
+def test_the_chrome_says_refusals_in_its_own_words_not_the_models() -> None:
+    from tumbleweed.broker.client import BrokerRefused
+    from tumbleweed.broker.toolflow import OPEN_REFUSAL_TEXT
+    from tumbleweed.shell.broker_tools import _refusal
+
+    for text in OPEN_REFUSAL_TEXT.values():
+        said = _refusal(BrokerRefused("denied", text)).text
+
+        assert "start_task" not in said
+        assert "fresh_context" not in said
+        assert ".." not in said
+        assert "new task" in said
+    assert (
+        _refusal(BrokerRefused("not_found", "x")).text
+        == "Not done: that tool or version is not stored."
+    )
