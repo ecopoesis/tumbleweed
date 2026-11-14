@@ -9,7 +9,7 @@ from tests.broker.rig import START, scratch_home
 from tumbleweed.broker.identity import FsIdentity
 from tumbleweed.broker.paths import StoredPath
 from tumbleweed.broker.snapshots import BackendKind, SnapshotKind, SnapshotRecord, SnapshotTarget
-from tumbleweed.broker.store import BrokerStore
+from tumbleweed.broker.store import BrokerStore, MarkChange
 from tumbleweed.core.ids import RunId, SnapshotId, TaskId
 
 
@@ -81,7 +81,9 @@ def test_a_superseded_snapshot_is_not_the_latest_and_not_undoable(store: BrokerS
     add(store, newer)
 
     with store.transaction():
-        store.mark_superseded([newer.id], START, older.id)
+        store.apply_marks(
+            [MarkChange(what="superseded", snapshot=newer.id, on=True, by=older.id)], START
+        )
 
     latest = store.latest_run_snapshot(task)
     assert latest is not None

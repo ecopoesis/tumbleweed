@@ -61,6 +61,13 @@ def edit(directory: Path) -> Callable[[SandboxPolicy], None]:
     return change
 
 
+def stamp_text(path: Path, text: str) -> Callable[[SandboxPolicy], None]:
+    def change(policy: SandboxPolicy) -> None:
+        path.write_text(text)
+
+    return change
+
+
 def restored(directory: Path) -> bool:
     return (
         (directory / "a.txt").read_text() == "alpha"

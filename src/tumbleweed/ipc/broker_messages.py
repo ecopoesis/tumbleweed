@@ -408,6 +408,8 @@ class SnapshotInfo(IpcMessage):
     undoable: bool
     undone: bool
     superseded: bool = False
+    blocked: bool = False
+    """Not undoable for now: a later, wider change must be undone first (D28, J5)."""
 
 
 @final

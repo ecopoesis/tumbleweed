@@ -82,6 +82,8 @@ def row_of(info: SnapshotInfo) -> UndoRow:
         status = "undone"
     elif info.superseded:
         status = "a later undo covers it"
+    elif info.blocked:
+        status = "undo the later change to that folder first"
     elif not info.undoable:
         status = "ran with no undo"
     return UndoRow(

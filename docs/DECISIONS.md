@@ -1563,7 +1563,15 @@ task cannot bury a change under cheap runs); if it goes wider, or is only partly
 done, because putting the narrow run back would take away what the wider one changed outside it; the
 user undoes the wider runs in order. The undo of an undo (the safety copy, `undoes` set) also gives the
 marks back (J4): the run it undid is undoable again and what it superseded no longer is superseded
-(`superseded_by`). "Most recent" is by a monotonic sequence (`seq`), not the clock. **If the safety snapshot cannot be taken** (a cap, depth,
+(`superseded_by`). **A later run done with no undo never blocks an older undo (K1):** nothing could put
+its changes back, and what the undo overwrites of it is gone either way; if it lies inside the places it
+is superseded as above, otherwise the undo goes ahead. The list shows a snapshot whose undo would be
+refused because of a wider later run as *not undoable for now* (`blocked`, with our reason text). **The
+marks follow the files (K3):** each undo keeps, with its safety snapshot, the exact list of marks it
+changed (what it undid, what it superseded, and the inverse of what the undo it undid had changed);
+undoing that safety snapshot applies the inverse, so undo, redo, undo leaves the first run undone and
+the later one superseded, and the model's undo cannot bring the first change back. "Most recent" is by
+a monotonic sequence (`seq`), not the clock. **If the safety snapshot cannot be taken** (a cap, depth,
 I/O, the store full), the model's undo is refused and points the user to the list; the *chrome's* undo
 asks the user, in a trusted prompt of the no-undo kind (purpose `undo`, once scope: "undo without being
 able to undo this undo?"); a no refuses it; a yes does it and says `safety: none`. A restore makes the
@@ -1582,20 +1590,35 @@ were put back but the record of it cannot be written, the answer says the files 
 *Retention and making room.* A snapshot is deleted at the sweep when it is past 7 days. The count (100) and
 size (8 GiB of copies) caps are enforced when **room is needed** for a new snapshot of task T, and
 **each task has a share of the store** (J1; replaces the first round's tiers, which one busy task could
-fill for everybody): `max(10, max_snapshots // 4)` snapshots and a quarter of the store's bytes (at
-least one snapshot's cap), configurable; a safety snapshot counts against the task whose run it undoes.
+fill for everybody): `max(10, max_snapshots // 4)` snapshots (never more than the cap) and a quarter of
+the store's bytes, **but at least three snapshots' worth** (`3 * max_bytes`, K2), configurable (a
+smaller explicit byte share is clamped up to one snapshot); a safety snapshot counts against the task
+whose run it undoes.
 Room for T's new snapshot is made in this order: (1) snapshots already undone or superseded, and any past
 retention, of any task; (2) while T is at its share, T's *own* snapshots that are not anchors, oldest
 first, and if T is still at its share, `STORE_FULL` for T alone (the no-undo prompt for a run; the
 chrome prompt or the model's refusal for an undo's safety copy); (3) while the store is full, any task's
 non-anchors, oldest first, and only then `STORE_FULL`. An **anchor** is, per task and per place, its
-oldest not-undone snapshot (the state before the task first touched that place), its newest not-undone
-run (what `undo_last_change` needs) and every not-undone safety snapshot (the user's later edits);
+oldest not-undone run (the state before the task first touched that place), its newest not-undone
+run (what `undo_last_change` needs) and, per place, its **newest** not-undone safety snapshot (the
+user's latest edits from before an undo; **trade-off (K2):** an *older* safety copy is not an anchor,
+so under pressure the edits the user had made before an earlier undo can now be evicted, which reverses
+round 1's stated reason for anchoring every safety copy and is what lets run/undo loops go on);
 anchors, a snapshot being undone and one being taken are never deleted to make room, and only age
-(the sweep) removes an anchor. So a busy task's handler runs stay quiet (its own middle snapshots go
-first), one task cannot starve another of undo, a task's churn cannot evict the state before it first
-touched a place, and a snapshot in the middle may be gone (undoing it is then refused: it is no longer
-listed). A safety snapshot is protected only while its undo runs. The count cap is soft by up to the
+(the sweep) removes an anchor. **The invariant (K2), tested at the default ratios:** one task doing
+repeated runs, or run/undo cycles, on *one* place of any size up to `max_bytes` never gets `STORE_FULL`
+from its own share, the safety copy of its undo included. The arithmetic: such a task keeps at most
+three anchors (its oldest run, its newest safety copy and the run being made), so the share is
+`3 * max_bytes`; the anchor the new snapshot is about to replace (the task's newest run for a run, the
+newest safety copy of those places for an undo) is left out of the share check but is **not deleted
+before the new record lands** (a failed snapshot followed by "no undo" must not lose the previous run's
+undo), so the share is overshot by at most one snapshot; what the new snapshot will take is estimated
+from the task's last snapshot of the same places, never more than `max_bytes`. Several big places per
+task, or several big tasks together, can still reach `STORE_FULL`: that goes to the trusted prompt. The
+bound: a task holds at most its share (3 GiB by default of the 8 GiB store, so two big tasks and a part
+of a third), and a task's own middle snapshots go first, so a busy task's handler runs stay quiet, one
+task cannot starve another of undo, a task's churn cannot evict the state before it first touched a
+place, and a snapshot in the middle may be gone (undoing it is then refused: it is no longer listed). A safety snapshot is protected only while its undo runs. The count cap is soft by up to the
 number of runs in flight (`max_concurrent_runs`). The sweep also enforces the size cap against undone
 and superseded snapshots (a lowered cap) and deletes copies no row names. Everything is configurable
 (`SnapshotSettings`) and every deletion audited (`snapshot_deleted`: `age`, `count`, `size`,
@@ -1610,7 +1633,12 @@ before each run the broker walks the workspace through descriptors (no link foll
 a deadline) and refuses a run while it holds more or is nested deeper than 64 (`workspace_full`: the
 task's own code made it, and a new task starts clean). One run can pass the budget by what it writes in
 its wall time; the next is refused; a quota would stop it in the middle but needs a subvolume per
-workspace, which S27 may add. (10) *Audit (#82).* S21 adds `snapshot_taken`, `snapshot_fallback`,
+workspace, which S27 may add. The `..` climb of a removal has one residual case: a process outside the sandbox (same uid, outside the
+threat model) that moves the directory being emptied to outside the target gets its contents deleted at
+the new place before the identity check on the way up notices; overlapping runs are stopped or refused
+during an undo, so a sandbox cannot do it. A write run waiting for another holds a run slot for up to
+`write_run_wait` (20 s): the slots are 4 and the wait is short, so it is documented, not avoided.
+(10) *Audit (#82).* S21 adds `snapshot_taken`, `snapshot_fallback`,
 `snapshot_refused`, `no_undo_accepted`, `undo` (a `busy` refusal included) and `snapshot_deleted`. The
 log is still append-only, not fsynced and not tamper evident; the snapshot entry precedes the run it
 protects, so a crash can leave a copy without a record (swept as an orphan) but never a write run

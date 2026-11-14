@@ -1623,6 +1623,11 @@
       "additionalProperties": false,
       "description": "One snapshot, for the list: what it saved (canonical paths, which are data to show, never\nto believe), when, and whether it can be put back (`undoable`) or already was.",
       "properties": {
+        "blocked": {
+          "default": false,
+          "title": "Blocked",
+          "type": "boolean"
+        },
         "kind": {
           "enum": [
             "run",

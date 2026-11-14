@@ -24,7 +24,7 @@ from tests.broker.test_daemon_snapshots import (
 )
 from tests.broker.test_snapshot_hardening import BLOCKS, stamp, until_set
 from tests.ipc.bounded import run
-from tumbleweed.broker.audit import SnapshotDeleted
+from tumbleweed.broker.audit import SandboxRun, SnapshotDeleted
 from tumbleweed.broker.client import BrokerRefused
 from tumbleweed.broker.config import BrokerConfig
 from tumbleweed.core.ids import RunId
@@ -77,49 +77,87 @@ def test_a_busy_ended_task_does_not_take_undo_from_the_next_task() -> None:
     run(scenario)
 
 
-def test_a_task_that_runs_and_undoes_in_a_loop_cannot_starve_the_others() -> None:
+def test_a_task_that_runs_and_undoes_in_a_loop_neither_stops_nor_starves_the_others() -> None:
     async def scenario() -> None:
-        async with running(config=settings(max_snapshots=40)) as rig:  # a share of ten
+        # The invariant of D28 K2: one task on one place never gets STORE_FULL from its own share.
+        async with running(config=settings(max_bytes=BLOCKS, store_max_bytes=8 * BLOCKS)) as rig:
             client = await rig.client()
             hostile_dir = project(rig)
             victim_dir = rig.home / "Documents" / "v"
             victim_dir.mkdir(parents=True, exist_ok=True)
             (victim_dir / "f").write_text("v")
             hostile = await write_task(rig, client, hostile_dir)
-            refused_at = None
-            for cycle in range(30):
+            for _ in range(60):
                 rig.clock.advance(timedelta(seconds=1))
-                try:
-                    await client.run_in_sandbox(hostile, RunId.new(), COMMAND)
-                    await client.undo_last_change(hostile)
-                except BrokerRefused:
-                    refused_at = cycle
-                    break
-            assert refused_at is not None  # the task was stopped by its own share
-            held = len(rig.rows("SELECT id FROM snapshots"))
-            assert held <= 10 + 1
+                await client.run_in_sandbox(hostile, RunId.new(), COMMAND)
+                await client.undo_last_change(hostile)
 
             victim = await write_task(rig, client, victim_dir)
-            before = len([p for p in rig.prompts.asked if p.no_undo is not None])
             await client.run_in_sandbox(victim, RunId.new(), COMMAND)  # not asked, not refused
 
-            asked = len([p for p in rig.prompts.asked if p.no_undo is not None]) - before
-            assert asked == 0
+            assert [p for p in rig.prompts.asked if p.no_undo is not None] == []
 
     run(scenario)
 
 
-def test_a_task_at_its_share_is_refused_alone_and_asks_for_itself() -> None:
+@pytest.mark.parametrize("fraction", [0.7, 1.0])
+def test_one_task_on_one_place_of_any_size_up_to_the_cap_never_runs_out_of_its_share(
+    fraction: float,
+) -> None:
     async def scenario() -> None:
-        async with running(config=settings(max_snapshots=40, task_snapshots=2)) as rig:
+        cap = int(BLOCKS / fraction)  # the folder holds BLOCKS: `fraction` of the cap
+        async with running(config=settings(max_bytes=cap, store_max_bytes=8 * cap)) as rig:
             client = await rig.client()
-            directory = project(rig)
-            task = await write_task(rig, client, directory)
+            task = await write_task(rig, client, project(rig))
+            for _ in range(10):
+                rig.clock.advance(timedelta(seconds=1))
+                await client.run_in_sandbox(task, RunId.new(), COMMAND)
+            assert [p for p in rig.prompts.asked if p.no_undo is not None] == []
+
+    run(scenario)
+
+
+def test_four_tasks_cycling_leave_a_fifth_unaffected() -> None:
+    async def scenario() -> None:
+        async with running(config=settings(max_bytes=BLOCKS, store_max_bytes=8 * BLOCKS)) as rig:
+            client = await rig.client()
+            places = []
+            for index in range(5):
+                place = rig.home / "Projects" / f"p{index}"
+                (place / "sub").mkdir(parents=True, exist_ok=True)
+                (place / "a.txt").write_text("alpha")
+                (place / "sub" / "b.txt").write_text("beta")
+                places.append(place)
+            tasks = [await write_task(rig, client, place) for place in places[:4]]
+            for _ in range(5):
+                for task in tasks:
+                    rig.clock.advance(timedelta(seconds=1))
+                    await client.run_in_sandbox(task, RunId.new(), COMMAND)
+                    await client.undo_last_change(task)
+            fifth = await write_task(rig, client, places[4])
+
+            await client.run_in_sandbox(fifth, RunId.new(), COMMAND)
+
+            assert [p for p in rig.prompts.asked if p.no_undo is not None] == []
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("limit", [{"task_bytes": BLOCKS}, {"task_snapshots": 1}])
+def test_a_task_over_its_share_is_refused_alone_and_asks_for_itself(
+    limit: dict[str, int],
+) -> None:
+    async def scenario() -> None:
+        async with running(
+            config=settings(max_bytes=BLOCKS, store_max_bytes=100 * BLOCKS, **limit)
+        ) as rig:
+            client = await rig.client()
+            task = await write_task(rig, client, project(rig))
             await client.run_in_sandbox(task, RunId.new(), COMMAND)
             rig.clock.advance(timedelta(seconds=1))
-            await client.run_in_sandbox(task, RunId.new(), COMMAND)  # two: the oldest and newest
+            await client.run_in_sandbox(task, RunId.new(), COMMAND)  # the first is replaced
 
-            with pytest.raises(BrokerRefused) as refused:
+            with pytest.raises(BrokerRefused) as refused:  # oldest and newest are both anchors
                 await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
             assert refused.value.reason == "no_undo"
@@ -132,6 +170,27 @@ def test_a_task_at_its_share_is_refused_alone_and_asks_for_itself() -> None:
             await client.run_in_sandbox(other, RunId.new(), COMMAND)  # another task: fine
 
     run(scenario)
+
+
+def test_the_defaults_satisfy_the_same_relation_as_the_scaled_settings() -> None:
+    from tumbleweed.broker.config import GIB, SnapshotSettings
+
+    defaults = SnapshotSettings()
+
+    # the oldest run, the newest safety copy and the run being made, each up to the cap
+    assert defaults.task_share_bytes >= 3 * defaults.max_bytes
+    assert defaults.task_share_bytes <= defaults.store_max_bytes
+    assert defaults.task_share_snapshots >= 4
+    assert defaults.max_bytes == GIB
+
+
+def test_a_task_share_below_one_snapshot_is_clamped_up_not_refused() -> None:
+    from tumbleweed.broker.config import SnapshotSettings
+
+    clamped = SnapshotSettings(max_bytes=1000, store_max_bytes=100_000, task_bytes=10)
+
+    assert clamped.task_share_bytes == 1000
+    assert SnapshotSettings(max_snapshots=5).task_share_snapshots == 5  # never more than the cap
 
 
 def test_the_safety_snapshot_of_an_undo_is_an_anchor_and_is_not_evicted() -> None:
@@ -402,6 +461,7 @@ def test_a_write_run_on_places_another_run_is_writing_is_refused_after_the_wait(
 
             assert refused.value.reason == "busy"
             assert "writing those files" in refused.value.message
+            assert rig.audit_of(SandboxRun)[-1].reason == "write_run_in_progress"
             long_run.cancel()
             with contextlib.suppress(asyncio.CancelledError, BrokerRefused):
                 await long_run
@@ -492,5 +552,25 @@ def test_a_later_run_on_other_places_neither_blocks_nor_is_overtaken() -> None:
             assert other.undoable
             await client.undo_last_change(second)
             assert not (documents / "n.txt").exists()
+
+    run(scenario)
+
+
+def test_what_the_new_snapshot_will_take_is_what_the_last_one_of_the_same_places_took() -> None:
+    async def scenario() -> None:
+        # A share of exactly one cap: it holds the oldest run and one being made only if the
+        # folder, which is half the cap, is counted as what it is.
+        async with running(
+            config=settings(
+                max_bytes=2 * BLOCKS, store_max_bytes=100 * BLOCKS, task_bytes=2 * BLOCKS
+            )
+        ) as rig:
+            client = await rig.client()
+            task = await write_task(rig, client, project(rig))
+            for _ in range(4):
+                rig.clock.advance(timedelta(seconds=1))
+                await client.run_in_sandbox(task, RunId.new(), COMMAND)
+
+            assert [p for p in rig.prompts.asked if p.no_undo is not None] == []
 
     run(scenario)

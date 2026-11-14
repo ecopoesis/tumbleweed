@@ -155,6 +155,7 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     undone_at INTEGER CHECK (undone_at IS NULL OR undone_at {_MILLIS}),
     superseded_at INTEGER CHECK (superseded_at IS NULL OR superseded_at {_MILLIS}),
     superseded_by TEXT,
+    marks TEXT CHECK (marks IS NULL OR length(CAST(marks AS BLOB)) <= 65536),
     record TEXT NOT NULL CHECK (length(CAST(record AS BLOB)) <= 65536)
 ) STRICT""",
         "CREATE INDEX snapshots_by_task ON snapshots (task_id, kind, seq)",
@@ -163,6 +164,27 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
 
 _GRANTS: Final[TypeAdapter[Grant]] = TypeAdapter(Grant)
 _SNAPSHOTS: Final[TypeAdapter[SnapshotRecord]] = TypeAdapter(SnapshotRecord)
+MAX_MARK_CHANGES: Final = 100
+"""The most marks one undo may change (`marks` is a column of at most 64 KiB)."""
+
+
+@final
+class MarkChange(PolicyModel):
+    """One change an undo made to the marks of a snapshot: `undone` or `superseded` set (`on`) or
+    cleared. `by` is the snapshot whose undo superseded it. The undo's safety snapshot keeps the
+    list; undoing that safety snapshot applies the inverse, so the marks follow the files (D28, K3).
+    """
+
+    what: Literal["undone", "superseded"]
+    snapshot: SnapshotId
+    on: bool
+    by: SnapshotId | None = None
+
+    def inverse(self) -> "MarkChange":
+        return MarkChange(what=self.what, snapshot=self.snapshot, on=not self.on, by=self.by)
+
+
+_MARKS: Final[TypeAdapter[list[MarkChange]]] = TypeAdapter(list[MarkChange])
 
 
 @final
@@ -732,27 +754,43 @@ class BrokerStore:
             == 1
         )
 
-    def mark_superseded(
-        self, snapshots: Sequence[SnapshotId], at: datetime, by: SnapshotId
-    ) -> None:
-        """Record that these snapshots' changes were overtaken by the undo of `by` (inside
-        `transaction()`): `reinstate(by)` undoes that."""
-        for snapshot in snapshots:
-            self._execute(
-                "UPDATE snapshots SET superseded_at = ?, superseded_by = ? "
-                "WHERE id = ? AND superseded_at IS NULL AND undone_at IS NULL",
-                (_millis(at), str(by), str(snapshot)),
-            )
+    def apply_marks(self, changes: Sequence[MarkChange], at: datetime) -> None:
+        """Apply `changes` in order (inside `transaction()`)."""
+        for change in changes:
+            if change.what == "undone":
+                self._execute(
+                    "UPDATE snapshots SET undone_at = ? WHERE id = ?",
+                    (_millis(at) if change.on else None, str(change.snapshot)),
+                )
+            else:
+                self._execute(
+                    "UPDATE snapshots SET superseded_at = ?, superseded_by = ? WHERE id = ?",
+                    (
+                        _millis(at) if change.on else None,
+                        None if not change.on or change.by is None else str(change.by),
+                        str(change.snapshot),
+                    ),
+                )
 
-    def reinstate(self, snapshot: SnapshotId) -> None:
-        """The undo of `snapshot` was itself undone (inside `transaction()`): it can be undone
-        again, and the snapshots its undo overtook are no longer overtaken."""
-        self._execute("UPDATE snapshots SET undone_at = NULL WHERE id = ?", (str(snapshot),))
+    def set_marks(self, snapshot: SnapshotId, changes: Sequence[MarkChange]) -> None:
+        """Keep, with the safety snapshot of an undo, the marks that undo changed (inside
+        `transaction()`)."""
         self._execute(
-            "UPDATE snapshots SET superseded_at = NULL, superseded_by = NULL "
-            "WHERE superseded_by = ?",
-            (str(snapshot),),
+            "UPDATE snapshots SET marks = ? WHERE id = ?",
+            (_MARKS.dump_json(list(changes)).decode("utf-8"), str(snapshot)),
         )
+
+    def marks_of(self, snapshot: SnapshotId) -> list[MarkChange]:
+        """What the undo that made `snapshot` (its safety snapshot) changed; empty if nothing was
+        kept or it cannot be read."""
+        rows = self._query("SELECT marks FROM snapshots WHERE id = ?", (str(snapshot),))
+        if not rows or rows[0][0] is None:
+            return []
+        try:
+            return _MARKS.validate_json(_text(rows[0][0]), strict=True)
+        except ValidationError:
+            _log.warning("the marks of a snapshot cannot be read; skipped")
+            return []
 
     def snapshot(self, snapshot: SnapshotId) -> StoredSnapshot | None:
         """A snapshot with its state; None if there is none (or it cannot be read)."""

@@ -161,7 +161,15 @@ from tumbleweed.broker.snapshots import (
     SnapshotRecord,
     SnapshotTarget,
 )
-from tumbleweed.broker.store import MAX_LIST, BrokerStore, StoredSnapshot, TaskRecord, ToolRecord
+from tumbleweed.broker.store import (
+    MAX_LIST,
+    MAX_MARK_CHANGES,
+    BrokerStore,
+    MarkChange,
+    StoredSnapshot,
+    TaskRecord,
+    ToolRecord,
+)
 from tumbleweed.broker.task import TaintKind, TaskState
 from tumbleweed.broker.toolstore import StoredTool, ToolStore, taint_names
 from tumbleweed.broker.treeops import RestoreStats, measure
@@ -2241,7 +2249,9 @@ class BrokerService:
         self._inflight.add(snapshot)
         try:
             try:
-                await self._make_room(live.state.task)
+                await self._make_room(
+                    live.state.task, SnapshotKind.RUN, [path for path, _ in writable]
+                )
                 taken = await self._fs.call(
                     partial(self._snapshots.take, snapshot, writable),
                     deadline=self._config.snapshots.timeout + SNAPSHOT_SLACK,
@@ -2388,19 +2398,22 @@ class BrokerService:
     @staticmethod
     def _anchors(stored: Sequence[StoredSnapshot]) -> set[SnapshotId]:
         """The snapshots that make a task's undo possible and are never evicted to make room (D28,
-        J1): for each task, per place, its oldest not-undone snapshot (the state before the task
-        first touched it), its newest not-undone run (what `undo_last_change` needs), and every
-        not-undone safety snapshot (they hold the user's later edits). Only the age sweep removes
-        an anchor."""
+        J1, K2): for each task, per place, its oldest not-undone run (the state before the task
+        first touched it), its newest not-undone run (what `undo_last_change` needs), and, per
+        place, its newest not-undone safety snapshot (the user's latest edits from before an undo).
+        An older safety snapshot is not an anchor: under pressure it may go. Only the age sweep
+        removes an anchor."""
         anchors: set[SnapshotId] = set()
         seen: set[tuple[TaskId, str]] = set()
         newest: dict[TaskId, SnapshotId] = {}
+        newest_safety: dict[tuple[TaskId, str], SnapshotId] = {}
         for each in stored:  # oldest first
             record = each.record
             if each.undone:
                 continue
             if record.kind is SnapshotKind.UNDO:
-                anchors.add(record.id)
+                for target in record.targets:
+                    newest_safety[(record.task, target.path.path)] = record.id
                 continue
             if each.superseded or record.no_undo:
                 continue
@@ -2410,42 +2423,63 @@ class BrokerService:
                     seen.add((record.task, target.path.path))
                     anchors.add(record.id)
         anchors.update(newest.values())
+        anchors.update(newest_safety.values())
         return anchors
 
-    async def _make_room(self, task: TaskId) -> None:
-        """Before a new snapshot of `task`: make room under the caps (D28, J1). Each task has a
-        share of the store (`SnapshotSettings.task_share_*`) so that one task cannot fill it for the
-        others. In this order: (1) snapshots already undone or superseded, and any past retention,
-        of any task; (2) while `task` is at its share, its own snapshots that are not anchors,
-        oldest first, and if it is still at its share `STORE_FULL` for it alone; (3) while the store
-        is full, any task's non-anchors, oldest first. An anchor, a snapshot being undone or taken
-        is never deleted. If that is not enough `SnapshotError(STORE_FULL)`: the run then asks the
-        user (the undo's safety copy: the chrome asks, the model is refused)."""
+    async def _make_room(
+        self, task: TaskId, kind: SnapshotKind, paths: Sequence[StoredPath]
+    ) -> None:
+        """Before a new snapshot of `kind` of `paths` for `task`: make room under the caps (D28, J1,
+        K2). Each task has a share of the store (`SnapshotSettings.task_share_*`) so that one task
+        cannot fill it for the others. In this order: (1) snapshots already undone or superseded,
+        and any past retention, of any task; (2) while `task` is at its share, its own snapshots
+        that are not anchors, oldest first, and if it is still at its share `STORE_FULL` for it
+        alone; (3) while the store is full, any task's non-anchors, oldest first. An anchor, a
+        snapshot being undone or taken is never deleted. If that is not enough
+        `SnapshotError(STORE_FULL)`: the run then asks the user (the undo's safety copy: the chrome
+        asks, the model is refused).
+
+        What the new snapshot will take is taken to be what the task's last snapshot of the same
+        places took (never more than `max_bytes`). The anchor the new one is about to replace (the
+        task's newest run for a run, the newest safety copy of those places for an undo) is left out
+        of the share, but is not deleted here: if this snapshot fails and the user accepts no undo,
+        the previous run's undo must still be there. So the share is overshot by at most one."""
         settings = self._config.snapshots
         async with self._sweep_lock:
             stored = self._store.oldest_snapshots(MAX_LIST)
             now = self._now()
             keep = self._inflight | self._protected
             anchors = self._anchors(stored)
+            where = {path.path for path in paths}
+            replaced = self._replaced_by(task, kind, where, stored, anchors)
+            incoming = settings.max_bytes
+            for each in reversed(stored):
+                record = each.record
+                if record.task == task and {t.path.path for t in record.targets} == where:
+                    if record.saved_bytes > 0:
+                        incoming = min(settings.max_bytes, record.saved_bytes)
+                    break
             gone: set[SnapshotId] = set()
 
             def left() -> list[StoredSnapshot]:
                 return [each for each in stored if each.record.id not in gone]
 
             def at_share() -> bool:
-                mine = [each.record for each in left() if each.record.task == task]
+                mine = [
+                    each.record
+                    for each in left()
+                    if each.record.task == task and each.record.id not in replaced
+                ]
                 return (
                     len(mine) >= settings.task_share_snapshots
-                    or sum(r.saved_bytes for r in mine) + settings.max_bytes
-                    > settings.task_share_bytes
+                    or sum(r.saved_bytes for r in mine) + incoming > settings.task_share_bytes
                 )
 
             def full() -> bool:
                 every = [each.record for each in left()]
                 return (
                     len(every) >= settings.max_snapshots
-                    or sum(r.saved_bytes for r in every) + settings.max_bytes
-                    > settings.store_max_bytes
+                    or sum(r.saved_bytes for r in every) + incoming > settings.store_max_bytes
                 )
 
             async def evict(candidates: list[StoredSnapshot], while_: Callable[[], bool]) -> None:
@@ -2484,6 +2518,32 @@ class BrokerService:
             await evict([each for each in left() if each.record.id not in anchors], full)
             if full():
                 raise SnapshotError(SnapshotFault.STORE_FULL)
+
+    @staticmethod
+    def _replaced_by(
+        task: TaskId,
+        kind: SnapshotKind,
+        where: set[str],
+        stored: Sequence[StoredSnapshot],
+        anchors: set[SnapshotId],
+    ) -> set[SnapshotId]:
+        """The anchors a new snapshot of `kind` of the places `where` is about to take the place of:
+        the task's newest run (for a run), the newest safety copy of each of the places (for an
+        undo)."""
+        newest_run: SnapshotId | None = None
+        newest_safety: dict[str, SnapshotId] = {}
+        for each in stored:
+            record = each.record
+            if record.task != task or each.undone or record.id not in anchors:
+                continue
+            if record.kind is SnapshotKind.RUN:
+                newest_run = record.id
+            else:
+                for target in record.targets:
+                    newest_safety[target.path.path] = record.id
+        if kind is SnapshotKind.RUN:
+            return set() if newest_run is None else {newest_run}
+        return {newest_safety[path] for path in where if path in newest_safety}
 
     async def _sweep_snapshots(self, now: datetime) -> int:
         """Retention (D28): delete snapshots past `retention` (and undone or superseded ones past
@@ -2547,6 +2607,9 @@ class BrokerService:
         infos: list[SnapshotInfo] = []
         for each in self._store.recent_snapshots(request.limit):
             record = each.record
+            blocked = each.undoable and (
+                self._overtaken_by(each, tuple(target.path for target in record.targets)) is None
+            )
             infos.append(
                 SnapshotInfo(
                     snapshot=record.id,
@@ -2554,9 +2617,10 @@ class BrokerService:
                     task=record.task,
                     taken_at=record.taken_at,
                     paths=tuple(target.path.path for target in record.targets),
-                    undoable=each.undoable,
+                    undoable=each.undoable and not blocked,
                     undone=each.undone,
                     superseded=each.superseded,
+                    blocked=blocked,
                 )
             )
         return SnapshotList(kind="snapshot_list", snapshots=tuple(infos))
@@ -2758,7 +2822,7 @@ class BrokerService:
         before: SnapshotRecord | None = None
         try:
             try:
-                await self._make_room(task)
+                await self._make_room(task, SnapshotKind.UNDO, paths)
                 taken = await self._fs.call(
                     partial(
                         self._snapshots.take,
@@ -2873,20 +2937,24 @@ class BrokerService:
     def _overtaken_by(
         self, stored: StoredSnapshot, paths: tuple[StoredPath, ...]
     ) -> list[SnapshotId] | None:
-        """What the undo of `stored` would overtake (D28, J5): each later run, of any task, on the
-        same places. A run whose every place lies inside or equals one of these is superseded (its
-        changes are inside what this undo puts back). A run that goes wider, or only partly inside,
-        cannot be overtaken without losing what it changed outside: then `None`, and the undo is
-        refused until that run is undone first."""
+        """What the undo of `stored` would overtake (D28, J5, K1): each later `run` snapshot, of any
+        task, on the same places. A run whose every place lies inside or equals one of these is
+        superseded (its changes are inside what this undo puts back). A run that goes wider, or is
+        only partly inside, cannot be overtaken without losing what it changed outside, so the
+        undo is refused until that run is undone first (`None`), **unless it was done with no
+        undo**: nothing could ever put its changes back, so it never blocks an older undo, and
+        what this undo overwrites of it is gone either way. More than `MAX_MARK_CHANGES` runs to
+        overtake is also `None`: undo the later ones first."""
         found: list[SnapshotId] = []
         for each in self._store.newer_run_snapshots(stored.seq):
             theirs = tuple(target.path for target in each.record.targets)
             if each.record.id == stored.record.id or not _overlaps(theirs, paths):
                 continue
-            if not all(any(_nested(mine, outer) for outer in paths) for mine in theirs):
+            if all(any(_nested(mine, outer) for outer in paths) for mine in theirs):
+                found.append(each.record.id)
+            elif not each.record.no_undo:
                 return None
-            found.append(each.record.id)
-        return found
+        return found if len(found) <= MAX_MARK_CHANGES else None
 
     def _record_undone(
         self,
@@ -2898,16 +2966,29 @@ class BrokerService:
         removed: int,
         overtaken: list[SnapshotId],
     ) -> None:
-        """Record a finished undo: it is undone, later runs inside the same places are superseded,
-        and, if what was undone is itself an undo, the change it had undone is undoable again and
-        what that overtook is no longer overtaken; the audit entry says so, in one transaction."""
+        """Record a finished undo, in one transaction: the snapshot is undone, later runs inside the
+        same places are superseded, and, if what was undone is itself an undo, the marks that undo
+        changed are reverted exactly (K3: the undo of an undo puts the marks back as they were
+        before it, whatever sequence of undos and redos led here). The marks changed are kept with
+        the safety snapshot, so undoing *that* reverts them in turn."""
         record = stored.record
+        changes: list[MarkChange] = []
+        if record.kind is SnapshotKind.UNDO:
+            changes.extend(change.inverse() for change in reversed(self._store.marks_of(record.id)))
+        changes.append(MarkChange(what="undone", snapshot=record.id, on=True))
+        changes.extend(
+            MarkChange(what="superseded", snapshot=each, on=True, by=record.id)
+            for each in overtaken
+        )
         with self._atomic() as entries:
             if not self._store.mark_undone(record.id, self._now()):
                 raise _Refuse("not_undoable", "that change was already undone", "already_undone")
-            self._store.mark_superseded(overtaken, self._now(), record.id)
-            if record.kind is SnapshotKind.UNDO and record.undoes is not None:
-                self._store.reinstate(record.undoes)
+            self._store.apply_marks(  # (the snapshot itself is marked by the guarded call above)
+                [c for c in changes if not (c.what == "undone" and c.snapshot == record.id)],
+                self._now(),
+            )
+            if before is not None:
+                self._store.set_marks(before.id, changes)
             entries.append(
                 UndoDone(
                     at=self._now(),

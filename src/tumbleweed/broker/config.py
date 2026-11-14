@@ -106,8 +106,9 @@ class SnapshotSettings:
       tree over either is refused before the run (the user may accept "no undo" instead).
     - `store_max_bytes`: all the copies together; over it the oldest are deleted (audited).
     - `retention`, `max_snapshots`: a snapshot is kept 7 days or until 100 newer ones exist.
-    - `task_snapshots`, `task_bytes`: one task's share of the store (D28, J1): by default a quarter
-      of `max_snapshots` (at least 10) and of `store_max_bytes` (at least `max_bytes`). A task at
+    - `task_snapshots`, `task_bytes`: one task's share of the store (D28, J1, K2): by default a
+      quarter of `max_snapshots` (at least 10) and of `store_max_bytes` (at least three times
+      `max_bytes`). A task at
       its share makes room from its own snapshots or is refused alone; it cannot fill the store
       for the others. The count cap is soft by up to `max_concurrent_runs`: runs that are in the
       same step together each see the room the others are about to take.
@@ -131,11 +132,19 @@ class SnapshotSettings:
 
     @property
     def task_share_snapshots(self) -> int:
-        return self.task_snapshots or max(10, self.max_snapshots // 4)
+        """A task's share of the snapshot count: a quarter of the cap, never less than 10 (a task
+        keeps up to three anchors and one snapshot being made, D28 K2), never more than the cap."""
+        return min(self.max_snapshots, self.task_snapshots or max(10, self.max_snapshots // 4))
 
     @property
     def task_share_bytes(self) -> int:
-        return self.task_bytes or max(self.max_bytes, self.store_max_bytes // 4)
+        """A task's share of the store's bytes: a quarter of the store, but at least three
+        snapshots' worth, so that one task on one place of any size up to `max_bytes` can keep its
+        oldest run, its newest safety copy and the run it is making (D28 K2); never more than the
+        store. An explicit `task_bytes` is clamped up to one snapshot (below it nothing fits)."""
+        if self.task_bytes is not None:
+            return min(self.store_max_bytes, max(self.task_bytes, self.max_bytes))
+        return min(self.store_max_bytes, max(3 * self.max_bytes, self.store_max_bytes // 4))
 
     def __post_init__(self) -> None:
         if type(self.mode) is not SnapshotMode:
