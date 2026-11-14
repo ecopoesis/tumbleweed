@@ -27,6 +27,7 @@ from tumbleweed.sandbox.hardening import (
     landlock_rules,
     parse_report,
 )
+from tumbleweed.sandbox.network import NetworkFds
 from tumbleweed.sandbox.policy import (
     HELPER_TARGET,
     MAX_PAYLOAD_BYTES,
@@ -46,6 +47,26 @@ FDS = HardeningFds(seccomp=11, helper=12, report=13)
 def operations(argv: list[str], flag: str, arity: int) -> list[tuple[str, ...]]:
     head = argv[: argv.index("--")]
     return [tuple(head[i + 1 : i + 1 + arity]) for i, word in enumerate(head) if word == flag]
+
+
+class TestNetworkNeedsTheGate:
+    def test_a_network_policy_without_a_go_descriptor_is_refused_not_run_ungated(
+        self, workspace: Opened
+    ) -> None:
+        made = dataclasses.replace(policy(workspace, "true"), network=True)
+        fds = dataclasses.replace(FDS, resolv=14)
+
+        with pytest.raises(InvalidPolicyError, match="go descriptor"):
+            exec_command(made, fds)
+        with pytest.raises(InvalidPolicyError, match="go descriptor"):
+            build_bwrap_argv(made, hardening=fds, network=NetworkFds(block=7, info=8, go=9))
+
+    def test_with_one_the_helper_is_told_where_it_is(self, workspace: Opened) -> None:
+        made = dataclasses.replace(policy(workspace, "true"), network=True)
+
+        command = exec_command(made, dataclasses.replace(FDS, go=9))
+
+        assert command[command.index("--go-fd") + 1] == "9"
 
 
 class TestPolicyFields:

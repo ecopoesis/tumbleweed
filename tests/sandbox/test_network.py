@@ -235,7 +235,9 @@ class TestReachability:
             "status = dict(line.split(':\\t', 1) for line in open('/proc/self/status')\n"
             "              if ':\\t' in line)\n"
             "keys = ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb', 'NoNewPrivs', 'Seccomp')\n"
-            "print(json.dumps({k: status[k].strip() for k in keys}))\n"
+            "seen = {k: status[k].strip() for k in keys}\n"
+            "seen['fds'] = sorted(int(n) for n in os.listdir('/proc/self/fd'))\n"
+            "print(json.dumps(seen))\n"
         )
         net = json.loads(run_sandbox(with_network(workspace, PYTHON, "-c", code)).stdout)
         plain = json.loads(run_sandbox(policy(workspace, PYTHON, "-c", code)).stdout)
@@ -245,6 +247,9 @@ class TestReachability:
             "0000000000000000"
         }
         assert (net["NoNewPrivs"], net["Seccomp"]) == ("1", "2")
+        # Only standard streams (and the directory being listed): neither the go pipe nor any
+        # other descriptor of the setup reaches the program.
+        assert set(net["fds"]) <= {0, 1, 2, 3}
 
     def test_a_run_without_the_network_has_only_loopback_no_route_and_cannot_reach_the_server(
         self, workspace: Opened

@@ -121,6 +121,21 @@ def refuse_unless_own_namespace(reported: int | None, opened: int, launcher: int
         raise SandboxNetworkError(_FAILED)  # never attach to, or release, anyone else's
 
 
+def still_that_namespace(pidfd: int, pid: int, opened: int) -> None:
+    """Just before slirp4netns is given the PID: the process is still alive (the pidfd is not
+    readable, so the number is not reaped and cannot have been reused) and its network
+    namespace is still the one open as `opened`. The rest of the window (slirp4netns's own open of
+    `/proc/PID`) fails closed: it first joins the owner of the namespace checked above, and the
+    network namespace of any other process is owned by another user namespace, which `setns`
+    refuses (EPERM)."""
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    if poller.poll(0):
+        raise SandboxNetworkError(_FAILED)  # the init ended: the number may name anyone
+    if Path(f"/proc/{pid}/ns/net").stat().st_ino != os.fstat(opened).st_ino:
+        raise SandboxNetworkError(_FAILED)
+
+
 def _own_network_namespace() -> int:
     return Path("/proc/self/ns/net").stat().st_ino
 
@@ -164,17 +179,21 @@ class NetworkLink:
         done in `SETUP_SECONDS`, `BwrapEnded` if bwrap ended first. `bwrap` must already have been
         started with `fds`."""
         net = -1
+        pidfd = -1
         try:
             async with asyncio.timeout(SETUP_SECONDS):
                 info = await self._read_info(bwrap)
-                self._pidfd = os.pidfd_open(info.child_pid)  # type: ignore[attr-defined,unused-ignore]  # Linux only: sandboxes never run elsewhere
+                pidfd = os.pidfd_open(info.child_pid)  # type: ignore[attr-defined,unused-ignore]  # Linux only: sandboxes never run elsewhere
                 net = os.open(f"/proc/{info.child_pid}/ns/net", os.O_RDONLY | os.O_CLOEXEC)
                 refuse_unless_own_namespace(
                     info.net_namespace, os.fstat(net).st_ino, _own_network_namespace()
                 )
+                # Only now is the pidfd ours to kill with: a number that was reused (refused
+                # above) never gets a signal from us.
+                self._pidfd, pidfd = pidfd, -1
                 owner = await _owning_user_namespace(net, info.child_pid, bwrap)
                 try:
-                    self._still_that_namespace(info, net)
+                    still_that_namespace(self._pidfd, info.child_pid, net)
                     await self._start_slirp(info.child_pid, owner)
                 finally:
                     os.close(owner)
@@ -185,20 +204,9 @@ class NetworkLink:
             log.warning("the sandbox's network setup failed: %s", exc.strerror)
             raise SandboxNetworkError(_FAILED) from None
         finally:
-            if net >= 0:
-                os.close(net)
-
-    def _still_that_namespace(self, info: _Info, opened: int) -> None:
-        """Just before slirp4netns is given the PID: the process is still alive (the pidfd is not
-        readable, so the number is not reaped and cannot have been reused) and its network
-        namespace is still the one checked."""
-        assert self._pidfd is not None  # noqa: S101  (opened above)
-        poller = select.poll()
-        poller.register(self._pidfd, select.POLLIN)
-        if poller.poll(0):
-            raise SandboxNetworkError(_FAILED)  # the init ended: the number may name anyone
-        if Path(f"/proc/{info.child_pid}/ns/net").stat().st_ino != os.fstat(opened).st_ino:
-            raise SandboxNetworkError(_FAILED)
+            for descriptor in (net, pidfd):
+                if descriptor >= 0:
+                    os.close(descriptor)
 
     def abort(self) -> None:
         """End a setup that did not finish, now: close the gates (end-of-file is never "go": the

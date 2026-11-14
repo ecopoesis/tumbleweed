@@ -22,9 +22,15 @@ import pytest
 from tests.sandbox.support import PYTHON, Opened, opened, policy
 from tests.sandbox.test_network import need_tools, slirp_children  # noqa: F401  (fixture)
 from tumbleweed.sandbox import network
+from tumbleweed.sandbox import runner as runner_module
 from tumbleweed.sandbox.errors import SandboxLaunchError, SandboxNetworkError
-from tumbleweed.sandbox.network import NetworkLink, refuse_unless_own_namespace
+from tumbleweed.sandbox.network import (
+    NetworkLink,
+    refuse_unless_own_namespace,
+    still_that_namespace,
+)
 from tumbleweed.sandbox.policy import MountPath, RuntimeSpec, SandboxPolicy
+from tumbleweed.sandbox.process import kill_and_reap
 from tumbleweed.sandbox.runner import SandboxRunner
 
 pytestmark = pytest.mark.linux
@@ -173,12 +179,21 @@ class TestTheProgramRunsOnlyOnAWrittenGo:
         assert gone(token)
         assert not (tmp_path / "ws" / "ran").exists()
 
-    def test_the_gates_closing_without_a_go_never_start_the_program(
+    def test_the_helpers_gate_alone_keeps_the_program_from_running_on_end_of_file(
         self, workspace: Opened, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # bwrap goes on at end-of-file; the helper must not. The init is not killed here, so it is
-        # the helper that stands between end-of-file and the program.
+        # bwrap goes on at end-of-file; the helper must not. Everything else that could stop the
+        # program is switched off: no pidfd kill, and the kill of bwrap (and with it, by
+        # `--die-with-parent`, of the init) is two seconds late, long enough for the program to
+        # run if the helper let it. (Without `--go-fd` on the helper this test fails.)
         monkeypatch.setattr(signal, "pidfd_send_signal", lambda *args: None)
+        real = kill_and_reap
+
+        async def late(proc: asyncio.subprocess.Process) -> bool:
+            await asyncio.sleep(1.0)
+            return await real(proc)
+
+        monkeypatch.setattr(runner_module, "kill_and_reap", late)
         token = f"nogo-{os.getpid()}"
         stub = stub_slirp(tmp_path, ready=False, marker=tmp_path / "m", hold=0)
         runner = SandboxRunner(use_systemd_scope=False, slirp4netns=stub)
@@ -186,8 +201,52 @@ class TestTheProgramRunsOnlyOnAWrittenGo:
         with pytest.raises(SandboxNetworkError):
             run(runner, payload_policy(workspace, token))
 
-        assert gone(token)  # the helper saw end-of-file and refused
+        assert gone(token)
         assert not (tmp_path / "ws" / "ran").exists()
+
+    def test_a_refused_namespace_never_gets_a_signal_from_us(
+        self, workspace: Opened, tmp_path: Path
+    ) -> None:
+        # The number bwrap reported now names some other process (a reused PID): the namespace
+        # check refuses, and that process must not be killed on the way out.
+        bystander = subprocess.Popen(["sleep", "30"])  # noqa: S607  (a bystander)
+        try:
+            stub = script(
+                tmp_path / "bwrap-reused",
+                f"""
+import os, sys, time
+args = sys.argv[1:]
+info = int(args[args.index("--info-fd") + 1])
+os.write(info, b'{{"child-pid": {bystander.pid}, "net-namespace": 12345}}')
+time.sleep(30)
+""",
+            )
+
+            with pytest.raises(SandboxNetworkError):
+                run(SandboxRunner(use_systemd_scope=False, bwrap=stub), payload_policy(workspace))
+
+            assert bystander.poll() is None
+        finally:
+            bystander.kill()
+            bystander.wait()
+
+    def test_the_last_moment_check_refuses_an_ended_process_and_a_changed_namespace(self) -> None:
+        own = os.open("/proc/self/ns/net", os.O_RDONLY)
+        other = os.open("/proc/self/ns/user", os.O_RDONLY)  # an inode that is not the net one
+        child = subprocess.Popen(["sleep", "30"])  # noqa: S607  (a process to look at)
+        pidfd = os.pidfd_open(child.pid)
+        try:
+            still_that_namespace(pidfd, child.pid, own)  # alive, same namespace as ours: fine
+            with pytest.raises(SandboxNetworkError):
+                still_that_namespace(pidfd, child.pid, other)  # not the namespace that was checked
+            child.kill()
+            child.wait()
+            with pytest.raises(SandboxNetworkError):  # ended: the number may name anyone now
+                still_that_namespace(pidfd, child.pid, own)
+        finally:
+            child.kill()
+            for descriptor in (pidfd, own, other):
+                os.close(descriptor)
 
     def test_a_launcher_killed_after_the_info_document_never_runs_the_program(
         self, workspace: Opened, tmp_path: Path

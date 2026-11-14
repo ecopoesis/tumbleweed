@@ -19,6 +19,7 @@ from typing import Annotated, Final, Literal, final
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from tumbleweed.sandbox import sandbox_exec
+from tumbleweed.sandbox.errors import InvalidPolicyError
 from tumbleweed.sandbox.policy import (
     HELPER_TARGET,
     PAYLOAD_TARGET,
@@ -114,7 +115,12 @@ def landlock_rules(policy: SandboxPolicy) -> tuple[LandlockRule, ...]:
 
 
 def exec_command(policy: SandboxPolicy, fds: HardeningFds) -> list[str]:
-    """What bwrap runs: the launcher, its arguments, `--`, and the policy's own command."""
+    """What bwrap runs: the launcher, its arguments, `--`, and the policy's own command.
+
+    A policy with a network needs the go descriptor: without it the helper would not wait, and
+    bwrap's own wait lets go at end-of-file (S22, D29 (3))."""
+    if policy.network and fds.go is None:
+        raise InvalidPolicyError("a run with a network needs the helper's go descriptor")
     argv = [
         policy.runtime.interpreter,
         "-I",

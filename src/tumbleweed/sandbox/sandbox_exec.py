@@ -40,6 +40,7 @@ import errno
 import json
 import os
 import platform
+import select
 import stat
 import struct
 import sys
@@ -415,13 +416,19 @@ def _confine(options: Options) -> dict[str, object]:
     }
 
 
-def _wait_for_go(go_fd: int, report_fd: int) -> None:
+GO_WAIT_SECONDS: Final = 30.0
+"""How long the helper holds for the go byte: the launcher's setup bound (10 s) with margin. A
+launcher that is alive and silent for longer is not going to say it."""
+
+
+def _wait_for_go(go_fd: int, report_fd: int, timeout: float = GO_WAIT_SECONDS) -> None:
     """Hold the program until the launcher says go (S22, D29): one byte on `go_fd`, written only
     after the network is up. End of file (the launcher gave up, died or was killed) is never
     "go": the program is not run. The launcher bounds this wait itself (its setup timeout, and
-    the kernel closing its end when it dies)."""
+    the kernel closing its end when it dies) and so does the helper: silence for `timeout` is a
+    refusal too."""
     try:
-        answer = os.read(go_fd, 1)
+        answer = os.read(go_fd, 1) if select.select([go_fd], [], [], timeout)[0] else b""
     except OSError:
         answer = b""
     os.close(go_fd)
