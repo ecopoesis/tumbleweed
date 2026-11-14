@@ -436,7 +436,7 @@ def test_one_failed_audit_does_not_end_the_orphan_sweep() -> None:
 def test_the_size_cap_is_enforced_at_the_sweep_on_undone_snapshots() -> None:
     async def scenario() -> None:
         async with running(
-            config=settings(max_bytes=BLOCKS, store_max_bytes=4 * BLOCKS, task_bytes=4 * BLOCKS)
+            config=settings(max_bytes=BLOCKS, store_max_bytes=8 * BLOCKS, task_bytes=4 * BLOCKS)
         ) as rig:
             client = await rig.client()
             directory = project(rig)

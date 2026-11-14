@@ -43,9 +43,10 @@ def prompts_for_no_undo(rig: Rig) -> list[object]:
 # --- L1: the model alone cannot make a safety copy holding the user's edits go ------------------
 
 
-def test_a_place_near_the_cap_has_no_model_undo_and_the_users_edit_is_untouched() -> None:
+def test_a_place_bigger_than_the_pool_has_no_model_undo_and_the_users_edit_is_untouched() -> None:
     async def scenario() -> None:
-        async with running(config=settings(max_bytes=B, store_max_bytes=8 * B)) as rig:
+        # the pin pool is an eighth of the store: half a place here
+        async with running(config=settings(max_bytes=B, store_max_bytes=4 * B)) as rig:
             client = await rig.client()
             directory = project(rig)
             task = await write_task(rig, client, directory)
@@ -58,7 +59,7 @@ def test_a_place_near_the_cap_has_no_model_undo_and_the_users_edit_is_untouched(
 
             assert refused.value.reason == "unavailable"
             assert "undo list" in refused.value.message
-            assert rig.audit_of(UndoDone)[-1].reason == "pin_reserve"  # and not for another reason
+            assert rig.audit_of(UndoDone)[-1].reason == "pin_pool"  # and not for another reason
             assert (directory / "sub" / "b.txt").read_text() == "USER EDIT"
             assert (directory / "a.txt").read_text() == "run"  # nothing was undone
 
@@ -109,17 +110,17 @@ def unlink_big(directory: Path) -> Callable[[SandboxPolicy], None]:
 def test_the_reserve_is_checked_against_what_the_present_place_takes_too() -> None:
     async def scenario() -> None:
         # The run's snapshot was small; the run made the place big: the safety copy is the big one.
-        async with running(config=settings(max_bytes=100_000, store_max_bytes=800_000)) as rig:
+        async with running(config=settings(max_bytes=200_000, store_max_bytes=800_000)) as rig:
             client = await rig.client()
             directory = project(rig)
             task = await write_task(rig, client, directory)
-            rig.sandbox.on_run = stamp_text(directory / "big", "x" * 90_000)
+            rig.sandbox.on_run = stamp_text(directory / "big", "x" * 95_000)
             await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
             with pytest.raises(BrokerRefused):
                 await client.undo_last_change(task)
 
-            assert rig.audit_of(UndoDone)[-1].reason == "pin_reserve"
+            assert rig.audit_of(UndoDone)[-1].reason == "pin_pool"
             assert (directory / "big").exists()  # nothing was undone
             assert len(rig.rows("SELECT id FROM snapshots")) == 1  # and the copy was not kept
             assert len(list(rig.config.snapshots_directory.iterdir())) == 1  # nor left behind
@@ -130,10 +131,10 @@ def test_the_reserve_is_checked_against_what_the_present_place_takes_too() -> No
 def test_the_reserve_is_checked_against_the_run_that_is_undone_too() -> None:
     async def scenario() -> None:
         # The run's snapshot was big; the run emptied the place: the estimate is the big one.
-        async with running(config=settings(max_bytes=100_000, store_max_bytes=800_000)) as rig:
+        async with running(config=settings(max_bytes=200_000, store_max_bytes=800_000)) as rig:
             client = await rig.client()
             directory = project(rig)
-            (directory / "big").write_bytes(b"x" * 90_000)
+            (directory / "big").write_bytes(b"x" * 95_000)
             task = await write_task(rig, client, directory)
             rig.sandbox.on_run = unlink_big(directory)
             await client.run_in_sandbox(task, RunId.new(), COMMAND)
@@ -141,38 +142,42 @@ def test_the_reserve_is_checked_against_the_run_that_is_undone_too() -> None:
             with pytest.raises(BrokerRefused):
                 await client.undo_last_change(task)
 
-            assert rig.audit_of(UndoDone)[-1].reason == "pin_reserve"
+            assert rig.audit_of(UndoDone)[-1].reason == "pin_pool"
             assert not (directory / "big").exists()
             assert rig.audit_of(SnapshotDeleted) == []  # refused before a copy was taken
 
     run(scenario)
 
 
-def test_how_many_copies_a_task_may_pin_is_bounded_by_its_count_share_too() -> None:
+def test_how_many_copies_may_be_pinned_is_bounded_by_the_pools_count() -> None:
     async def scenario() -> None:
         async with running(
-            config=settings(max_bytes=40 * B, store_max_bytes=400 * B, task_snapshots=5)
-        ) as rig:
+            config=settings(max_bytes=40 * B, store_max_bytes=400 * B, max_snapshots=20)
+        ) as rig:  # a tenth of 20: two pins
             client = await rig.client()
             directory = project(rig)
             task = await write_task(rig, client, directory)
             rig.sandbox.on_run = stamp_text(directory / "a.txt", "run")
-            await client.run_in_sandbox(task, RunId.new(), COMMAND)
-            await client.undo_last_change(task)  # one pinned copy: 1 + 4 <= 5
+            for _ in range(2):
+                rig.clock.advance(timedelta(seconds=1))
+                await client.run_in_sandbox(task, RunId.new(), COMMAND)
+                await client.undo_last_change(task)
             rig.clock.advance(timedelta(seconds=1))
             await client.run_in_sandbox(task, RunId.new(), COMMAND)
 
             with pytest.raises(BrokerRefused):
-                await client.undo_last_change(task)  # a second: 2 + 4 > 5
+                await client.undo_last_change(task)  # a third
 
-            assert rig.audit_of(UndoDone)[-1].reason == "pin_reserve"
+            assert rig.audit_of(UndoDone)[-1].reason == "pin_pool"
 
     run(scenario)
 
 
 def test_another_tasks_churn_cannot_evict_a_pinned_copy() -> None:
     async def scenario() -> None:
-        async with running(config=settings(max_bytes=4 * B, store_max_bytes=7 * B)) as rig:
+        async with running(
+            config=settings(max_bytes=4 * B, store_max_bytes=40 * B, max_snapshots=20)
+        ) as rig:
             client = await rig.client()
             directory = project(rig)
             first = await write_task(rig, client, directory)
@@ -502,9 +507,9 @@ def test_the_order_of_what_an_undo_reverts_matters() -> None:
     assert [c.on for c in wrong if c.snapshot == a] == [True]
 
 
-def test_more_runs_to_overtake_than_a_record_holds_refuse_the_undo_before_any_file_changes() -> (
-    None
-):
+def test_more_runs_to_overtake_than_a_record_holds_refuse_the_undo_before_any_file_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def scenario() -> None:
         async with running() as rig:
             client = await rig.client()
@@ -529,11 +534,16 @@ def test_more_runs_to_overtake_than_a_record_holds_refuse_the_undo_before_any_fi
 
             assert service._overtaken_by(first, paths, newer=fresh(MAX_MARK_CHANGES)) is not None  # noqa: SLF001
             assert service._overtaken_by(first, paths, newer=fresh(MAX_MARK_CHANGES + 1)) is None  # noqa: SLF001
-            snapshots = [
-                SnapshotId.new() for _ in range(MAX_NET_MARKS + 1)
-            ]  # more marks than a record may hold
-            assert service._plan_marks(first.record, snapshots) is None  # noqa: SLF001
-            assert service._plan_marks(first.record, snapshots[: MAX_NET_MARKS - 1]) is not None  # noqa: SLF001
+            ghosts = [SnapshotId.new() for _ in range(MAX_NET_MARKS + 1)]
+            plan = service._plan_marks(first.record, ghosts)  # noqa: SLF001
+            assert plan is not None  # marks of copies that are gone mean nothing (M3)
+            monkeypatch.setattr("tumbleweed.broker.service.MAX_NET_MARKS", 3)
+            later = fresh(4)
+            for each in later:
+                service._store.insert_snapshot(each.record)  # noqa: SLF001
+            ids = [each.record.id for each in later]
+            assert service._plan_marks(first.record, ids) is None  # noqa: SLF001  4 + 1 > 3
+            assert service._plan_marks(first.record, ids[:2]) is not None  # noqa: SLF001
             assert (directory / "a.txt").read_text() == "alpha"  # nothing was touched
 
     run(scenario)

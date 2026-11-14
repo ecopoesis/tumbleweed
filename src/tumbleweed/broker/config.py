@@ -146,6 +146,18 @@ class SnapshotSettings:
             return min(self.store_max_bytes, max(self.task_bytes, self.max_bytes))
         return min(self.store_max_bytes, max(3 * self.max_bytes, self.store_max_bytes // 4))
 
+    @property
+    def pin_pool_bytes(self) -> int:
+        """The broker-wide pool for safety copies made for the model's undos (D28, M1): an eighth
+        of the store, outside every task's share. With the shares (two tasks at three snapshots of
+        `max_bytes` each) and one snapshot being made, the pool still fits the default store."""
+        return self.store_max_bytes // 8
+
+    @property
+    def pin_pool_snapshots(self) -> int:
+        """How many pinned safety copies the pool holds: a tenth of the count cap, at least one."""
+        return max(1, self.max_snapshots // 10)
+
     def __post_init__(self) -> None:
         if type(self.mode) is not SnapshotMode:
             raise InvalidValueError("snapshot mode must be a SnapshotMode")
