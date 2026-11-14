@@ -220,10 +220,7 @@ class TestTheProgramRunsOnlyOnAWrittenGo:
             deadline = time.monotonic() + 20
             while not slirp_children(launcher.pid) and time.monotonic() < deadline:
                 time.sleep(0.05)
-            assert slirp_children(launcher.pid), (
-                launcher.poll(),
-                launcher.poll(),
-            )
+            (slirp,) = slirp_children(launcher.pid)
             launcher.kill()
             launcher.wait(10)
         finally:
@@ -232,7 +229,10 @@ class TestTheProgramRunsOnlyOnAWrittenGo:
             if launcher.stderr is not None:
                 launcher.stderr.close()
 
-        assert gone("slirp4netns", 3.0) or not slirp_children(launcher.pid)
+        deadline = time.monotonic() + 5
+        while Path(f"/proc/{slirp}").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not Path(f"/proc/{slirp}").exists()  # its exit pipe closed with the launcher
         assert gone(token)
 
 
