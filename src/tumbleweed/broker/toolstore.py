@@ -274,6 +274,21 @@ class ToolStore:
         """Every stored version of `tool`, newest first (at most `MAX_VERSIONS_PER_TOOL`)."""
         return self._store.tool_versions(tool, MAX_VERSIONS_PER_TOOL)
 
+    def find_visible(
+        self, query: str | None, visible: frozenset[TaintKind], limit: int
+    ) -> list[ToolRecord]:
+        """The best `limit` newest versions matching `query` whose taint is within `visible`.
+
+        The taint filter is applied **before** the limit and the ranking cut, over every match
+        (at most `MAX_TOOLS`), so a version outside `visible` cannot change what is returned: not
+        by being there, nor by pushing a visible one out (D30 (6), I12)."""
+        if query is None:
+            records = self._store.list_tools(MAX_TOOLS)
+        else:
+            match = fts_match(query)
+            records = [] if match is None else self._store.search_tools(match, MAX_TOOLS)
+        return [record for record in records if record.taint <= visible][:limit]
+
     def find(self, query: str | None, limit: int = MAX_RESULTS) -> list[ToolRecord]:
         """The newest version of the tools that match `query` (name, description and tags), best
         first; with no query, every tool, newest saved first. At most `limit` (and `MAX_RESULTS`).

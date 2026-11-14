@@ -245,6 +245,14 @@ class ToolOpened(_AuditModel):
     task_taint: Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=1)]
 
 
+class ToolSearchTainted(_AuditModel):
+    """A `find_tools` with `include_file_tools` made the task fs-tainted (S24, D30 (6)), whatever
+    it found. Written before the taint is, in its transaction."""
+
+    kind: Literal["tool_search_tainted"] = "tool_search_tainted"
+    task: TaskId
+
+
 class ToolOpenRefused(_AuditModel):
     """An `open_tool` the taint rule refused (I12): `reason` is closed, nothing else is kept."""
 
@@ -368,6 +376,7 @@ type AuditEntry = Annotated[
     | ToolSaved
     | ToolOpened
     | ToolOpenRefused
+    | ToolSearchTainted
     | ToolExported
     | ToolImportRefused
     | SnapshotTaken

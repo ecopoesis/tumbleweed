@@ -237,7 +237,7 @@ class CanvasTools:
             task,
             sink,
             runs,
-            InstanceSource(spec, code, stored),
+            InstanceSource(spec, code, stored, task),
         )
         keep = 0 if placement == "replace" else MAX_STACKED - 1
         while len(self._shown) > keep:

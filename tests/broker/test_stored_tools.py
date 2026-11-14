@@ -14,7 +14,7 @@ from tests.broker.stored import draft_text, save
 from tests.ipc.bounded import run
 from tests.tools.support import draft, package
 from tumbleweed.broker.audit import ToolOpened as ToolOpenedEntry
-from tumbleweed.broker.audit import ToolOpenRefused, ToolSaved
+from tumbleweed.broker.audit import ToolOpenRefused, ToolSaved, ToolSearchTainted
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
 from tumbleweed.broker.service import MAX_SAVES_PER_TASK
 from tumbleweed.core.ids import RunId, TaskId, ToolId
@@ -147,6 +147,44 @@ class TestSaving:
                 assert caught.value.reason == "busy"
                 other_task = (await client.start_task()).task
                 assert (await save(client, other_task, tool=first.summary.tool)).summary.version
+
+        run(scenario)
+
+
+class TestRevertAndOpenAreBounded:
+    def test_a_revert_counts_toward_the_saves_a_task_may_make(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+                first = await save(client, task)
+                await save(client, task, tool=first.summary.tool)
+                for _ in range(MAX_SAVES_PER_TASK - 2):
+                    await client.revert_tool(task, first.summary.tool, ToolVersion(1))
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.revert_tool(task, first.summary.tool, ToolVersion(1))
+
+                assert caught.value.reason == "busy"
+
+        run(scenario)
+
+    def test_the_taint_an_open_raises_is_on_record_and_survives_the_end_of_the_task(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                saved = await save(client, await fs_task(rig, client))
+                task = (await client.start_task(fresh_context=True)).task
+                await client.open_tool(task, saved.summary.tool)
+
+                stored = rig.rows("select id, taint from tasks")  # test data only
+                assert (str(task), "fs") in stored
+                await client.end_task(task)
+                heir = (await client.start_task(previous=task)).task
+                asked = len(rig.prompts.asked)
+                rig.prompts.allow("task")
+                assert not (await client.request_network(heir, RunId.new(), "x")).granted
+                assert len(rig.prompts.asked) == asked
 
         run(scenario)
 
@@ -372,43 +410,187 @@ class TestOpeningTaintsTheTask:
         run(scenario)
 
 
-class TestFindingWithholdsWhatATaintedTaskMustNotSee:
-    def test_a_net_task_is_not_shown_fs_tainted_tools_and_is_told_how_many(self) -> None:
-        async def scenario() -> None:
-            async with running() as rig:
-                client = await rig.client()
-                clean_task = (await client.start_task()).task
-                await client.save_tool(clean_task, draft_text(draft(name="Clean csv tool")))
+class TestFindingNeverShowsWhatTheTaskMustNotSee:
+    """D30 (6): if a task is not fs-tainted after a find, the answer does not depend on any
+    fs-tainted version: not its text, its presence, its count, its rank, nor whether it pushed a
+    clean row out of the top-k."""
+
+    QUERIES = (None, "zebra", "zeb", "hunter", "hunter2", "secret", "photo", "zzz", "!!!")
+
+    @staticmethod
+    def seen(found: object) -> tuple[object, ...]:
+        matches = found  # a ToolMatches
+        return (
+            [(t.name, t.description, t.tags, t.taint) for t in matches.tools],  # type: ignore[attr-defined]
+            matches.task_taint,  # type: ignore[attr-defined]
+        )
+
+    async def answers(self, fs_text: str | None, *, kind: str) -> list[tuple[object, ...]]:
+        """What a task of `kind` is told for every query, in a store whose only fs-tainted tool
+        has the text `fs_text` (or in which there is none)."""
+        async with running() as rig:
+            client = await rig.client()
+            clean = (await client.start_task()).task
+            await client.save_tool(clean, draft_text(draft(name="Clean photo tool")))
+            if fs_text is not None:
                 await client.save_tool(
-                    await fs_task(rig, client), draft_text(draft(name="Photo csv tool"))
+                    await fs_task(rig, client),
+                    draft_text(draft(name=f"Photo {fs_text}", description=fs_text)),
                 )
-                network = await net_task(rig, client)
+            task = (
+                await net_task(rig, client)
+                if kind == "net"
+                else (await client.start_task(fresh_context=True)).task
+            )
+            return [self.seen(await client.find_tools(task, q)) for q in self.QUERIES]
 
-                seen = await client.find_tools(network, "csv")
-                everything = await client.find_tools(clean_task, "csv")
+    @pytest.mark.parametrize("kind", ["net", "clean"])
+    def test_two_stores_that_differ_only_in_an_fs_tainted_tools_text_answer_alike(
+        self, kind: str
+    ) -> None:
+        async def scenario() -> None:
+            one = await self.answers("zebra hunter2 secret", kind=kind)
+            other = await self.answers("quokka something else", kind=kind)
+            none = await self.answers(None, kind=kind)
 
-                assert [t.name for t in seen.tools] == ["Clean csv tool"]
-                assert seen.withheld == 1
-                assert {t.name for t in everything.tools} == {"Clean csv tool", "Photo csv tool"}
-                assert everything.withheld == 0
+            assert one == other == none
 
         run(scenario)
 
-    def test_a_both_tainted_tool_is_shown_to_nobody_and_a_query_with_no_word_finds_nothing(
-        self,
-    ) -> None:
+    def test_a_net_task_is_told_one_fixed_state_not_a_count(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
-                await client.import_tool(imported_bundle("net"))
-                task = (await client.start_task()).task
+                await client.save_tool(
+                    await fs_task(rig, client), draft_text(draft(description="zebra"))
+                )
+                network = await net_task(rig, client)
 
-                found = await client.find_tools(task, "csv")
-                nothing = await client.find_tools(task, "!!! ???")
+                found = await client.find_tools(network, "zebra")
 
                 assert found.tools == ()
-                assert found.withheld == 1
+                assert found.task_taint == ("net",)
+                assert not hasattr(found, "withheld")
+
+        run(scenario)
+
+    def test_fs_tools_do_not_push_a_clean_match_out_of_the_top_k(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                clean = (await client.start_task()).task
+                await client.save_tool(clean, draft_text(draft(name="Old clean csv")))
+                files = await fs_task(rig, client)
+                for number in range(10):  # newer, same words: they would fill the top 8
+                    await client.save_tool(files, draft_text(draft(name=f"csv {number}")))
+                task = (await client.start_task(fresh_context=True)).task
+
+                found = await client.find_tools(task, "csv")
+
+                assert [t.name for t in found.tools] == ["Old clean csv"]
+
+        run(scenario)
+
+    def test_a_clean_task_that_searches_stays_clean_and_can_then_have_the_network(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                await client.save_tool(
+                    await fs_task(rig, client), draft_text(draft(description="hunter2 bank"))
+                )
+                clean = (await client.start_task(fresh_context=True)).task
+
+                found = await client.find_tools(clean, "hunter2")
+                rig.prompts.allow("task")
+                granted = await client.request_network(clean, RunId.new(), "x")
+
+                assert found.tools == ()
+                assert found.task_taint == ()
+                assert granted.granted
+
+        run(scenario)
+
+    def test_the_opt_in_shows_fs_tools_and_taints_the_task_whatever_matches(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                await client.save_tool(
+                    await fs_task(rig, client), draft_text(draft(name="Photo tool"))
+                )
+                clean = (await client.start_task(fresh_context=True)).task
+
+                nothing = await client.find_tools(clean, "zzz", include_file_tools=True)
+                (entry,) = rig.audit_of(ToolSearchTainted)
+                assert entry.task == clean
                 assert nothing.tools == ()
+                assert nothing.task_taint == ("fs",)  # whatever matched
+                found = await client.find_tools(clean, "photo")
+                assert [t.name for t in found.tools] == ["Photo tool"]
+                # Persisted: a task that inherits from it is fs-tainted, and no prompt is shown.
+                await client.end_task(clean)
+                heir = (await client.start_task(previous=clean)).task
+                asked = len(rig.prompts.asked)
+                rig.prompts.allow("task")
+                assert not (await client.request_network(heir, RunId.new(), "x")).granted
+                assert len(rig.prompts.asked) == asked
+
+        run(scenario)
+
+    def test_the_opt_in_is_refused_for_a_task_that_has_the_network(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                network = await net_task(rig, client)
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.find_tools(network, "x", include_file_tools=True)
+
+                assert caught.value.reason == "denied"
+                assert FRESH in caught.value.message
+                assert rig.audit_of(ToolSearchTainted) == []
+
+        run(scenario)
+
+    def test_a_net_tool_is_shown_to_a_net_task_only_and_a_both_tool_to_nobody(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                await client.save_tool(
+                    await net_task(rig, client), draft_text(draft(name="Fetcher csv"))
+                )
+                await client.import_tool(imported_bundle("net"))
+                clean = (await client.start_task(fresh_context=True)).task
+                files = await fs_task(rig, client)
+                network = await net_task(rig, client)
+
+                names = {
+                    kind: [
+                        t.name
+                        for t in (
+                            await client.find_tools(task, "csv", include_file_tools=False)
+                        ).tools
+                    ]
+                    for kind, task in (("clean", clean), ("files", files), ("net", network))
+                }
+
+                assert names == {"clean": [], "files": [], "net": ["Fetcher csv"]}
+
+        run(scenario)
+
+    def test_the_newest_number_is_not_revealed_to_a_task_that_could_not_open_it(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                first = await save(client, (await client.start_task()).task)
+                await save_from(client, await fs_task(rig, client), first.summary.tool)
+                network = await net_task(rig, client)
+
+                opened = await client.open_tool(network, first.summary.tool, ToolVersion(1))
+                clean = (await client.start_task(fresh_context=True)).task
+                newest = await client.open_tool(clean, first.summary.tool, ToolVersion(1))
+
+                assert opened.newest is None  # version 2 is fs-tainted: not for this task
+                assert newest.newest == 2  # a clean task may open it
 
         run(scenario)
 
@@ -425,3 +607,7 @@ class TestFindingWithholdsWhatATaintedTaskMustNotSee:
                 assert len(found.tools) == 8  # the top-k the model re-ranks
 
         run(scenario)
+
+
+async def save_from(client: BrokerClient, task: TaskId, tool: ToolId) -> None:
+    await client.save_tool(task, draft_text(draft(name="v2")), tool=tool)

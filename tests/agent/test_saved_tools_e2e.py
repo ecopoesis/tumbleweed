@@ -127,7 +127,7 @@ class StoredCanvas:
             self.runtimes.clear()
         self.runtimes[instance] = runtime
         self.targets[instance] = target
-        source = InstanceSource(spec, code, stored)
+        source = InstanceSource(spec, code, stored, task)
         self._sources[instance] = source
         self.shown.append(source)
         self.instances.append(instance)

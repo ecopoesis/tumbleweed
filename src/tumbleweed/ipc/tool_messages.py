@@ -196,7 +196,11 @@ class ToolOpened(Response):
     summary: ToolSummary
     document: Annotated[str, Field(max_length=MAX_PACKAGE_BYTES)]
     taint: Annotated[tuple[Taint, ...], Field(max_length=1)]
-    newest: ToolVersion
+    raised: bool
+    """Whether this open raised the task's taint (it did not hold the version's already)."""
+    newest: ToolVersion | None
+    """The newest version's number, or null when this task could not open the newest version (its
+    number would say something about a task the task must not learn of)."""
 
 
 @final
@@ -208,15 +212,21 @@ class FindTools(Request):
     task: TaskId
     query: Annotated[str, Field(max_length=MAX_QUERY_CHARS)] | None = None
     limit: Annotated[int, Field(ge=1, le=MAX_FOUND)] = MAX_FOUND
+    include_file_tools: bool = False
+    """The model's opt-in (D30 (6)): also show tools made in tasks that read files. It makes the
+    task fs-tainted, whatever matches (persisted and audited), and is refused for a task that
+    has the network."""
 
 
 @final
 class ToolMatches(Response):
-    """`withheld` counts matches left out because of the task's taint."""
+    """What the task may see. `task_taint` is the task's taint after the call: the one fact the
+    answer says about what was left out, so that nothing in it depends on tools the task must not
+    see (not their text, their number or their rank)."""
 
     kind: Literal["tool_matches"]
     tools: Annotated[tuple[ToolSummary, ...], Field(max_length=MAX_FOUND)]
-    withheld: Annotated[int, Field(ge=0, le=MAX_FOUND)]
+    task_taint: Annotated[tuple[Taint, ...], Field(max_length=1)]
 
 
 @final

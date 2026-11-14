@@ -90,6 +90,9 @@ class InstanceSource:
     spec: UiSpec
     code: tuple[CodeModule, ...]
     stored: StoredBinding | None
+    task: TaskId | None
+    """The task the instance was shown in. `save_tool` saves only an instance of the current task:
+    what another task showed may hold what that task read (I12)."""
 
 
 @final

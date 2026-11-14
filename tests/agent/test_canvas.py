@@ -69,7 +69,7 @@ class FakeCanvas:
             if self._ids
             else ToolInstanceId.new()
         )
-        self.sources[instance] = InstanceSource(spec, code, stored)
+        self.sources[instance] = InstanceSource(spec, code, stored, task)
         if placement == "replace":
             self.runtimes.clear()
         self.runtimes[instance] = UiRuntime(spec)

@@ -74,6 +74,7 @@ from tumbleweed.ipc.messages import Ping, Pong, RequestBody, Response, Role
 from tumbleweed.ipc.peercred import PeerCredentialsProvider
 from tumbleweed.ipc.sockdir import SocketPath
 from tumbleweed.ipc.tool_messages import (
+    MAX_FOUND,
     ExportTool,
     FindTools,
     ImportTool,
@@ -374,15 +375,25 @@ class BrokerClient:
         )
 
     async def find_tools(
-        self, task: TaskId, query: str | None = None, *, limit: int | None = None
+        self,
+        task: TaskId,
+        query: str | None = None,
+        *,
+        limit: int | None = None,
+        include_file_tools: bool = False,
     ) -> ToolMatches:
-        """The model's search: what `task` may see of the stored tools matching `query`."""
-        if limit is None:
-            return await self._ask(
-                FindTools(kind="find_tools", task=task, query=query), ToolMatches
-            )
+        """The model's search: what `task` may see of the stored tools matching `query`.
+        `include_file_tools` also shows tools made in tasks that read files, and makes `task`
+        fs-tainted."""
         return await self._ask(
-            FindTools(kind="find_tools", task=task, query=query, limit=limit), ToolMatches
+            FindTools(
+                kind="find_tools",
+                task=task,
+                query=query,
+                limit=limit or MAX_FOUND,
+                include_file_tools=include_file_tools,
+            ),
+            ToolMatches,
         )
 
     async def list_tool_versions(self, tool: ToolId) -> ToolVersions:

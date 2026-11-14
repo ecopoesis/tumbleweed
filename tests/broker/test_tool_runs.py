@@ -7,6 +7,7 @@ works, is audited and takes effect for the next run.
 """
 
 from collections.abc import Sequence
+from datetime import timedelta
 
 import pytest
 
@@ -22,7 +23,7 @@ from tests.broker.stored import (
 )
 from tests.ipc.bounded import run
 from tests.tools.support import SOURCE, draft
-from tumbleweed.broker.audit import GrantDecision, GrantRevoked, SandboxRun
+from tumbleweed.broker.audit import FileAccess, GrantDecision, GrantRevoked, SandboxRun
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
 from tumbleweed.broker.grants import GrantScope
 from tumbleweed.broker.prompts import Allowed
@@ -30,13 +31,15 @@ from tumbleweed.core.ids import GrantId, RunId, TaskId, ToolId, ToolInstanceId
 from tumbleweed.core.types import ToolVersion
 from tumbleweed.ipc.broker_messages import (
     MODEL_ORIGIN,
-    FileContent,
     ListDir,
+    NetworkAccess,
     PickAccess,
+    ReadAccess,
     ReadFile,
     Refused,
     RequestGrant,
     RunOrigin,
+    WriteAccess,
 )
 from tumbleweed.ipc.messages import Response
 from tumbleweed.ipc.tool_messages import ToolOpened
@@ -511,26 +514,129 @@ class TestToolGrants:
 
         run(scenario)
 
-    def test_a_request_for_a_file_with_a_tool_binding_reads_through_the_grant(self) -> None:
+    def test_no_tool_grant_serves_a_read_or_a_listing_whatever_the_origin_says(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
                 task, opened = await opened_tool(client)
                 await grant_for_tool(rig, client, task, opened)
-                origin = origin_of(opened)
                 path = str(rig.home / "Photos" / "a.jpg")
+                folder = str(rig.home / "Photos")
 
-                answer = await client.connection.call(
-                    ReadFile(
-                        kind="read_file", task=task, run=RunId.new(), path=path, origin=origin
-                    ),
-                    FileContent,
-                )
+                for trigger in ("user_event", "model"):
+                    origin = origin_of(opened, trigger=trigger)
+                    read = await client.connection.call(
+                        ReadFile(
+                            kind="read_file", task=task, run=RunId.new(), path=path, origin=origin
+                        ),
+                        Response,
+                    )
+                    listing = await client.connection.call(
+                        ListDir(
+                            kind="list_dir", task=task, run=RunId.new(), path=folder, origin=origin
+                        ),
+                        Response,
+                    )
+                    assert isinstance(read, Refused)
+                    assert isinstance(listing, Refused)
+                    assert read.reason == listing.reason == "invalid_request"
+                refused = [e for e in rig.audit_of(FileAccess) if e.reason == "bound_read"]
+                assert len(refused) == 4
                 with pytest.raises(BrokerRefused) as model:
-                    await client.read_file(task, RunId.new(), path)  # the same read, as the model
-
-                assert answer.size == 4
+                    await client.read_file(task, RunId.new(), path)  # the model's own read
                 assert model.value.reason == "not_granted"
+
+        run(scenario)
+
+    @pytest.mark.parametrize("kind", ["read", "write"])
+    def test_a_user_event_request_for_a_path_the_requester_chose_is_refused_unasked(
+        self, kind: str
+    ) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task, opened = await opened_tool(client)
+                path = str(rig.home / "Photos")
+                access = (
+                    ReadAccess(kind="fs.read", path=path)
+                    if kind == "read"
+                    else WriteAccess(kind="fs.write", path=path)
+                )
+                asked = len(rig.prompts.asked)
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await client.request_grant(task, RunId.new(), access, "x", origin_of(opened))
+
+                assert caught.value.reason == "invalid_request"
+                assert len(rig.prompts.asked) == asked
+                assert rig.audit_of(GrantDecision)[-1].reason == "bound_access"
+
+        run(scenario)
+
+    def test_the_network_is_asked_for_a_tool_at_the_tool_scope(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task, opened = await opened_tool(client)
+                rig.prompts.answers.append(Allowed(scope=GrantScope.TOOL))
+
+                outcome = await client.request_grant(
+                    task, RunId.new(), NetworkAccess(kind="net.full"), "x", origin_of(opened)
+                )
+
+                assert outcome.granted
+                assert outcome.scope == "tool"
+                assert GrantScope.TOOL in rig.prompts.asked[-1].scopes
+
+        run(scenario)
+
+    def test_an_expired_tool_grant_is_neither_listed_nor_counted(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task, opened = await opened_tool(client)
+                rig.prompts.answers.append(
+                    Allowed(
+                        scope=GrantScope.TOOL,
+                        picked=str(rig.home / "Photos"),
+                        expires_at=rig.clock.now + timedelta(minutes=5),
+                    )
+                )
+                await client.request_grant(
+                    task,
+                    RunId.new(),
+                    PickAccess(kind="fs.pick", choose="folder"),
+                    "x",
+                    origin_of(opened),
+                )
+                assert len((await client.list_tool_grants()).grants) == 1
+
+                rig.clock.advance(timedelta(minutes=6))
+
+                assert (await client.list_tool_grants()).grants == ()
+                await run_tool(client, task, origin_of(opened))
+                assert mounted(rig) == []
+
+        run(scenario)
+
+    def test_a_binding_for_an_instance_the_task_no_longer_remembers_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("tumbleweed.broker.service.MAX_INSTANCES_PER_TASK", 2)
+
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task, first = await opened_tool(client)
+                second = await client.open_tool(task, first.summary.tool)
+                third = await client.open_tool(task, first.summary.tool)
+
+                await run_tool(client, task, origin_of(second))
+                await run_tool(client, task, origin_of(third))
+                with pytest.raises(BrokerRefused) as caught:
+                    await run_tool(client, task, origin_of(first))  # the oldest was forgotten
+
+                assert caught.value.reason == "invalid_request"
 
         run(scenario)
 
