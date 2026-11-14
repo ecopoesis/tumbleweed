@@ -200,6 +200,7 @@ def test_one_action_at_a_time_and_its_text_is_the_note_of_the_next_list() -> Non
     model.refresh()
 
     assert model.open(tool.tool)
+    assert port.calls == [("open", (tool.tool, tool.version))]  # the version in the row
     assert not model.open(tool.tool)  # one is under way
     port.outcome = ToolsOutcome("refused", "Not done: refused.")
     port.pending.pop()()

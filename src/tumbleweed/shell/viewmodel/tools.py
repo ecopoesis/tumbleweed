@@ -264,6 +264,10 @@ class ToolsModel:
         """Open a tool (the newest, or a version of the history) on the canvas."""
         if not self._known(tool, version):
             return False
+        if version is None:
+            # The version the user is looking at: a task sees only what its taint allows of a
+            # tool, and the list is the user's own (D30 (6)).
+            version = self._summaries[tool].version
         self._act(lambda done: self._port.open(tool, version, done))
         return True
 
