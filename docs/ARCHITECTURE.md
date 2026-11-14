@@ -1101,10 +1101,14 @@ decisions; an import that finds the very same version stored changes nothing and
   refused with the text that says `start_task` with `fresh_context=true`; otherwise the task's taint
   becomes the merge, in the transaction that audits it), and **names the instance** (`inst_...`)
   that the canvas must show the tool under. At most 32 instances per task are remembered.
-- `find_tools(task, query?)`: top 8 by FTS rank over the newest versions, minus what the task's
-  taint must not see (names and descriptions are text the saving task wrote); the answer counts
-  the ones withheld. The model re-ranks by choosing; results reach it as framed data.
-- A run, a grant request, a read or a listing may carry an `origin`: a trigger (`model`, the
+- `find_tools(task, query?, include_file_tools?)`: top 8 by FTS rank over the newest versions whose
+  taint is within the task's own, the filter applied in the search before ranking and the limit
+  (names and descriptions are text the saving task wrote, so **if a task is not fs-tainted after
+  the call, the answer does not depend on any fs-tainted version**; what is left out is said by one
+  fixed sentence that depends on the task's taint alone, never a count). `include_file_tools`
+  makes the task fs-tainted, whatever matches, audited as `tool_search_tainted`. The model
+  re-ranks by choosing; results reach it as framed data with our own facts outside the frame.
+- A run, a grant request, a read or a listing carries an `origin` (a read or a listing may carry only the default: the broker refuses any other): a trigger (`model`, the
   default, or `user_event`) and a binding (instance, tool, hash). The broker accepts a binding only
   if the task opened that instance for exactly that tool and hash and the store still has the
   version. A run with a binding brings **no code**: its command must be the handler shim's and its
@@ -1216,7 +1220,8 @@ audited.
   taint purposes; a tool grant that would conflict with the task's taint is withheld from
   that run. Tool grants are applied oldest first, so of two conflicting ones the older applies
   and the newer is withheld: the older is the one the user made first, and the result then does
-  not depend on which request happens to arrive first. A task inheriting turns from an fs-tainted task starts fs-tainted (§2):
+  not depend on which request happens to arrive first (telling the user which tool grant a run
+  withheld is #167). A task inheriting turns from an fs-tainted task starts fs-tainted (§2):
   `start_task` passes `fresh_context` to the broker, which copies the ended task's taint to
   the new task unless it is true. The broker's taint state is authoritative. A tool
   package records the taint of the task it was saved from, because its code and defaults

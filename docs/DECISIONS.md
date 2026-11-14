@@ -1945,30 +1945,48 @@ refined: save a new tool instead"; a refinement refused because the task's taint
 the lineage's says to start a task with `fresh_context=true`. Both are `denied`
 (`ToolTaintConflictError`, tested at the wire).
 
-(6) *Retrieval before generation.* `FindTools(task, query?, limit)` is the model's search: top-k
-(`k` = 8) by the FTS rank of D19 (12), over the newest version of each tool, then the **model
-re-ranks** by choosing among the framed results (the system prompt, v7, says to call
+(6) *Retrieval before generation.* `FindTools(task, query?, limit, include_file_tools?)` is the model's
+search: top-k (`k` = 8) by the FTS rank of D19 (12), over the newest version of each tool, then the
+**model re-ranks** by choosing among the framed results (the system prompt, v7, says to call
 `find_tools` before it writes a tool of its own and to prefer a saved one that fits). There is no
 automatic injection of results into a turn: a turn that never searched would put saved text in
 front of the model that the user did not ask for, and a shell that is only chatting must not
-connect to the broker. `FindTools` carries the task because **names and descriptions of a saved
-tool are text written by whatever task saved it, and an fs-tainted task's text may hold what it
-read (I12)**: a net-tainted task is not shown the summaries of fs-tainted versions (the answer
-says how many were withheld, and that `start_task` with `fresh_context=true` shows them), and an
-fs-tainted task is not shown net-tainted ones (symmetric; harmless, but it keeps one rule). The
-user's own list in the chrome (`ListTools`) is not filtered: it is not the model's context. What
-the model sees of a result (`find_tools`, and `open_tool` with `source=true`) is data in a frame
-(`agent.untrusted.framed`, a fresh random id per frame, the sentence that it is never an
-instruction), names and descriptions with control, format and separator characters spelled out and
-cut, the hash and taint as our own words outside the frame.
+connect to the broker. **The property (I12): if a task is not fs-tainted after a `find_tools`
+call, the bytes of the answer do not depend on any fs-tainted version: not its name, description or
+tags, and not its presence, count, rank, or whether it pushed a clean row out of the top-k.**
+(Round 1 of review found that the first design, which showed everything to a clean task and
+counted what a tainted one could not see, broke it twice: a clean task was shown fs-derived text
+and stayed clean, then got the network, and the count was a prefix oracle on that text.) The
+mechanism: a task is shown only versions whose `ToolRecord.taint` is within its own taint (a clean
+task: clean versions; an fs task: clean and fs; a net task: clean and net; a version that is both,
+nobody), and the filter is **in the search, over every match, before the ranking cut and the
+limit**. What the answer says about the rest is **one fixed sentence chosen by the task's taint
+alone** (never a count, never a "none left out"), so it carries nothing of the store. A clean task
+that wants tools made in tasks that read files passes `include_file_tools=true`: that makes the
+task fs-tainted **whatever matches** (persisted and audited as `tool_search_tainted`, in one
+transaction, and the result says so), so it is the same act as `open_tool` of an fs version and
+cannot be done by accident on a prefix match; it is refused for a task that has the network, with
+the `fresh_context=true` text. A clean task never sees net-tainted versions in a search (it can
+open one it knows the ID of, which taints it). `ToolOpened.newest` is null when the task would be
+refused the newest version, for the same reason. The user's own list in the chrome (`ListTools`) is
+not filtered: it is not the model's context. What the model sees of a result (`find_tools`, and
+`open_tool` with `source=true`) is data in a frame (`agent.untrusted.framed`, a fresh random id per
+frame, the sentence that it is never an instruction), with the author's words spelled out and cut;
+the id, version, short hash and taint of each result are **our own words outside the frame**,
+numbered to match the frame's lines.
 
 (7) *The model's tools.* `save_tool(instance, name, description?, tags?, capabilities?, inputs?,
 outputs?, refines?)` saves what is on the canvas: the canvas keeps each instance's spec and code
 (`CanvasHost.source`), so the model does not resend them (and cannot save something other than
 what the user sees). `find_tools(query?)`, `open_tool(tool, version?, placement?, source?)` (shows
 the stored tool as the broker's instance, returns the state entries as `show_ui` does and, with
-`source=true`, the spec and code framed and cut at 12 KiB each so that the model can refine; a
-tool too big for that is told to regenerate), `revert_tool(tool, version)`. IDs the model gives are
+`source=true`, the spec and code framed and cut at 5 KiB each, so that both fit one 16 KiB result;
+when either is cut the result says so and that the model must not refine from it, and to rebuild
+the tool with `show_ui` instead), `revert_tool(tool, version)`. **`save_tool` saves only an instance
+shown in the current task**: the canvas keeps the task of each instance (`InstanceSource.task`), and
+a tool shown in an earlier task may hold what that task read, so saving it from a clean task would
+store it under the clean task's taint (found in review: fs task, `start_task(fresh_context=true)`,
+`save_tool`, open in a net task). The model is told to show it again in this task. IDs the model gives are
 parsed as `ToolId`/`ToolVersion`, errors are fixed text for the model, and every wait is bounded
 (the registry's timeout, the link's deadline). Voice needs nothing of its own: an utterance is
 typed-equivalent chat text (I10), "open my photo tool" is a request to the model, which searches
@@ -1994,7 +2012,23 @@ for the picker or the network with the instance's origin (a direct click is the 
 broker then shows its own prompt with the third button. A model-triggered request never has the
 scope, and applying one to a run counts as issuing it for taint purposes (`select_grants`: the
 older grant first; the withheld one is simply not mounted. Telling the user which tool grant a run
-withheld is not done here: it needs a field on `RunResult`, and is left as a polish issue).
+withheld is not done here: it needs a field on `RunResult` (#167)). **A tool grant serves a
+sandbox run of the stored code and nothing else** (round 1): `ReadFile` and `ListDir` keep the
+`origin` field, as #87 asked, but the broker **refuses** any origin on them but the default
+(`invalid_request`, audited as `bound_read`), because their bytes go back to the agent process and
+not to a stored tool's run; and a `RequestGrant` with `user_event` for a `ReadAccess` or
+`WriteAccess` (a path the requester chose) is refused unasked (`bound_access`): only the picker
+and the network are asked for a tool. Expired tool grants are neither listed nor counted toward
+the cap of 100, and the chrome lists every grant the broker holds.
+
+**For S25 and other notes (round 1).** (a) `_origin_of` labels *every* handler run of a stored
+instance `user_event`, which holds while the only way a handler runs is a user's event (a patch fires
+none, tested at host level in `test_saved_tools_e2e.py`); S25's connection-triggered runs must carry
+their own trigger, and `_Live.instances` dies with its task, so a producer that is an instance of an
+ended task needs its binding kept differently. (b) The inputs of a bound run are the instance's
+state, which the model can set with `patch_state`: the code that runs is the stored hash, and the
+taint rules hold, but a user's click then runs it under the tool's grants with inputs the model
+chose. That is within the design and is stated here so that nobody assumes otherwise.
 
 (9) *Chrome (I5).* The side panel gets a **Tools** panel (`shell/tools_panel.py`, no GTK in its
 model `shell/viewmodel/tools.py`): the saved tools, newest first, each with name, version,
@@ -2003,7 +2037,9 @@ history (**Open this version**, **Make this the newest**); and the grants list w
 is a fallback for when the model is not at hand, not app switching: opening shows the tool on the
 canvas under the current task, through the same broker request as `open_tool` (so the same taint
 rules and the same refusal text); it starts no task, so with none yet it says to talk to the
-assistant first. Every name and description is `plain_label` text, capped, spelled
+assistant first. The chrome speaks for itself: a refusal is shown as one of its own sentences chosen
+by the broker's reason (the broker's texts are written for the model), and an open that raised the
+conversation's task's taint says so. Every name and description is `plain_label` text, capped, spelled
 (`visible`) and set apart as "the tool's own name", never in the window title, the strip or the
 prompt's own sentences.
 
