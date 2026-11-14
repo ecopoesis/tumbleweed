@@ -14,7 +14,7 @@ current task and returns the broker's answer, parsed and checked against the has
 
 import json
 from dataclasses import dataclass
-from typing import Final, Literal, final
+from typing import Final, Literal, Protocol, final
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -217,8 +217,16 @@ class FetchedTool:
     stored: StoredBinding
 
 
+class Opens(Protocol):
+    """What `open_with` needs of the broker's client: its `open_tool` (a seam for the tests)."""
+
+    async def open_tool(
+        self, task: TaskId, tool: ToolId, version: ToolVersion | None = None
+    ) -> ToolOpened: ...
+
+
 async def open_with(
-    client: BrokerClient, task: TaskId, tool: ToolId, version: ToolVersion | None
+    client: Opens, task: TaskId, tool: ToolId, version: ToolVersion | None
 ) -> FetchedTool:
     """Open `tool` into `task` on the broker (`client`) and read its answer.
 
