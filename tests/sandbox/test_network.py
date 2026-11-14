@@ -1,5 +1,5 @@
 """A run's network (S22, D29): what a `net.full` run reaches, what it never does, and how
-slirp4netns lives and dies. Real bubblewrap and slirp4netns; servers are local, never the internet."""
+slirp4netns lives and dies. Real bubblewrap and slirp4netns; servers are local only."""
 
 import asyncio
 import dataclasses
