@@ -40,6 +40,7 @@ from tumbleweed.agent.prompts import (
 from tumbleweed.agent.recorder import InvocationRecorder, JsonlInvocationLog
 from tumbleweed.agent.responder import Responder
 from tumbleweed.agent.runtime import AgentResponder, MainThreadDispatcher, UnavailableResponder
+from tumbleweed.agent.saved_tools import register_saved_tool_tools
 from tumbleweed.agent.tasks import TaskSession
 from tumbleweed.agent.tools import ToolRegistry
 from tumbleweed.core.errors import TumbleweedError
@@ -105,6 +106,7 @@ def _build_anthropic(
         register_canvas_tools(registry, canvas, tasks)
         register_access_tools(registry, tasks, broker)
         register_code_tools(registry, tasks, broker)
+        register_saved_tool_tools(registry, tasks, broker, canvas)
         responder = AgentResponder(
             provider=AnthropicProvider(client, effort=config.effort),
             recorder=recorder,

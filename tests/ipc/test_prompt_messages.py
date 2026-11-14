@@ -5,9 +5,9 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from tumbleweed.core.ids import PromptId, TaskId
+from tumbleweed.core.ids import PromptId, TaskId, ToolId
 from tumbleweed.ipc.broker_messages import MAX_PATH_CHARS, MAX_REASON_CHARS
-from tumbleweed.ipc.prompt_messages import AnswerPrompt, ShowPrompt
+from tumbleweed.ipc.prompt_messages import AllowDecision, AnswerPrompt, ShowPrompt
 
 
 def show_body(**changes: object) -> dict[str, object]:
@@ -45,8 +45,10 @@ def test_a_well_formed_prompt_and_answers_are_accepted() -> None:
     "changes",
     [
         {"scopes": []},
-        {"scopes": ["once", "task", "once"]},
-        {"scopes": ["tool"]},
+        {"scopes": ["once", "task", "tool", "once"]},
+        {"scopes": ["forever"]},
+        {"tool_name": ""},
+        {"tool_name": "x" * 65},
         {"reason": "x" * (MAX_REASON_CHARS + 1)},
         {"expires_in_ms": 0},
         {"expires_in_ms": 3_600_001},
@@ -64,11 +66,35 @@ def test_a_prompt_the_schema_refuses(changes: dict[str, object]) -> None:
         ShowPrompt.model_validate_json(json.dumps(show_body(**changes)))
 
 
+def test_a_prompt_may_offer_the_tool_scope_and_name_the_tool() -> None:
+    show = ShowPrompt.model_validate_json(
+        json.dumps(
+            show_body(
+                scopes=["once", "task", "tool"],
+                tool=str(ToolId.new()),
+                tool_name="Photo tool",
+            )
+        )
+    )
+
+    assert show.scopes == ("once", "task", "tool")
+    assert show.tool_name == "Photo tool"
+
+
+def test_an_answer_may_choose_the_tool_scope() -> None:
+    decision = AnswerPrompt.model_validate_json(
+        json.dumps(answer_body({"kind": "allow", "scope": "tool", "picked": None}))
+    )
+
+    assert isinstance(decision.decision, AllowDecision)
+    assert decision.decision.scope == "tool"
+
+
 @pytest.mark.parametrize(
     "decision",
     [
         {"kind": "approve", "scope": "task", "picked": None},
-        {"kind": "allow", "scope": "tool", "picked": None},
+        {"kind": "allow", "scope": "forever", "picked": None},
         {"kind": "allow", "scope": "task"},  # picked is required, even if null
         {"kind": "allow", "scope": "task", "picked": ""},
         {"kind": "allow", "scope": "task", "picked": "/" + "a" * MAX_PATH_CHARS},

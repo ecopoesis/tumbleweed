@@ -9,9 +9,8 @@ A grant is a capability (`capabilities`) with a **scope** (ARCHITECTURE section 
 - `tool` is persisted, bound to a `ToolId` **and** the exact version's `ContentHash` (a new
   version must be granted again), and applies only to sandbox handler runs triggered by a direct
   user input event on an instance of that tool: runs triggered by the model, by `patch_state`
-  or by a connection get task grants only (I8). It is data here and applied by
-  `policy.select_grants`; the shell wiring that creates tool grants and the runs they apply to
-  is S24.
+  or by a connection get task grants only (I8). It is applied by `policy.select_grants`, made
+  by `policy.issue_grant` after a prompt at the `tool` scope, and stored with no task (S24, D30).
 
 Every grant can also expire (`expires_at`; a grant is expired from that instant on). Whether a
 grant is in force is decided by `policy`, against a `now` it is given, never by reading a clock

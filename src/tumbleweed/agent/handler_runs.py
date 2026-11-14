@@ -25,6 +25,7 @@ from typing import Final, Protocol, final
 
 from pydantic import JsonValue
 
+from tumbleweed.agent.canvas import StoredBinding
 from tumbleweed.agent.canvas_events import Scheduler
 from tumbleweed.agent.code import HandlerCall, HandlerExecutor, HandlerOutcome, failure_text
 from tumbleweed.core.ids import TaskId
@@ -69,7 +70,9 @@ class HandlerRuns:
         executor: HandlerExecutor,
         scheduler: Scheduler,
         target: RunTarget,
+        stored: StoredBinding | None = None,
     ) -> None:
+        self._stored = stored
         self._task = task
         self._code = tuple(code)
         self._executor = executor
@@ -137,7 +140,9 @@ class HandlerRuns:
         try:
             cancel = self._executor.start(
                 task,
-                HandlerCall(str(handler.module), str(handler.function), inputs, self._code),
+                HandlerCall(
+                    str(handler.module), str(handler.function), inputs, self._code, self._stored
+                ),
                 partial(self._done, handler),
             )
             self._cancel = cancel

@@ -211,6 +211,11 @@ class ToolTaintConflictError(ToolStoreError):
     the version it refines cannot be combined."""
 
 
+class ToolLineageBothError(ToolTaintConflictError):
+    """The version being refined is itself both fs- and net-tainted (an import whose claim had
+    `net`): no task can refine it, whatever the task's taint (D30 (5), #99)."""
+
+
 class ToolBlobWriteError(ToolStoreError):
     """A package could not be written to the store (the disk is full, the directory unwritable, the
     bytes are not what their name says): not a sign that anything stored was tampered with."""

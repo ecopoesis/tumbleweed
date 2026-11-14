@@ -130,6 +130,7 @@ def show_message(
     scopes: tuple[Scope, ...] = ("once", "task"),
     task: TaskId | None = None,
     tool: ToolId | None = None,
+    tool_name: str | None = None,
     prompt: PromptId | None = None,
     expires_in_ms: int = 60_000,
 ) -> ShowPrompt:
@@ -138,6 +139,7 @@ def show_message(
         prompt=PromptId.new() if prompt is None else prompt,
         task=TaskId.new() if task is None else task,
         tool=tool,
+        tool_name=tool_name,
         access=ReadAccess(kind="fs.read", path="/home/u/Photos") if access is None else access,
         scopes=scopes,
         reason=reason,

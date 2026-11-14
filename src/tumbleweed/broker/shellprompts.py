@@ -62,7 +62,11 @@ _MAX_WAITING_PER_OWNER: Final = 8
 """The shell holds 8 prompts (`viewmodel.prompts.MAX_QUEUED`); one connection cannot take the
 rest of the room from another."""
 
-_SCOPES: Final[dict[GrantScope, Scope]] = {GrantScope.ONCE: "once", GrantScope.TASK: "task"}
+_SCOPES: Final[dict[GrantScope, Scope]] = {
+    GrantScope.ONCE: "once",
+    GrantScope.TASK: "task",
+    GrantScope.TOOL: "tool",
+}
 
 
 @final
@@ -113,7 +117,7 @@ def _cause_of(fault: SnapshotFault) -> SnapshotCause:
 
 
 def _scopes_of(prompt: GrantPrompt) -> tuple[Scope, ...]:
-    """The scopes the shell can offer, in a fixed order. The wire has no `tool` scope (S24)."""
+    """The scopes the shell can offer, in a fixed order."""
     return tuple(text for scope, text in _SCOPES.items() if scope in prompt.scopes)
 
 
@@ -155,6 +159,7 @@ class ShellPrompts:
                 prompt=prompt_id,
                 task=prompt.task,
                 tool=prompt.tool,
+                tool_name=prompt.tool_name,
                 access=_access_of(prompt),
                 scopes=scopes,
                 reason=prompt.reason,

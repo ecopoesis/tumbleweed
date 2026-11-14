@@ -112,7 +112,8 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     # S23: the tool store's index. A package is a file (`toolblobs`); these rows say which exist,
     # and the name, description and tags are copies of the package's own, for listing and search
     # (a read that opens a package checks them against it). `taint` is what a decision must use: for
-    # a saved version it is the package's own, for an imported one the package's claim plus `fs`
+    # a saved version it is its task's plus that of the version it refines (its lineage), for an
+    # imported one the package's claim plus `fs`
     # (an imported package is user-filesystem input of unknown provenance, I12); `claimed_taint` is
     # the package's own, for display. `tool_search` indexes the newest
     # version of each tool, under the rowid of its `tools` row.
@@ -159,6 +160,16 @@ MIGRATIONS: Final[tuple[tuple[str, ...], ...]] = (
     record TEXT NOT NULL CHECK (length(CAST(record AS BLOB)) <= 65536)
 ) STRICT""",
         "CREATE INDEX snapshots_by_task ON snapshots (task_id, kind, seq)",
+    ),
+    # S24 (D30 (6)): a task's context root (null: the task is its own root; a task that continues
+    # another, live or ended, shares its root) and, on the root's row, how many lineage writes
+    # the context has made while net-tainted: one budget for a context, whoever continues it.
+    (
+        (
+            "ALTER TABLE tasks ADD COLUMN tool_writes INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (tool_writes BETWEEN 0 AND 1000000)"
+        ),
+        "ALTER TABLE tasks ADD COLUMN context_root TEXT",
     ),
 )
 
@@ -429,6 +440,8 @@ class TaskRecord(PolicyModel):
     workspace_present: bool
     workspace: FsIdentity
     failures: int = 0  # failed attempts to delete the workspace
+    tool_writes: int = 0  # on a context root: the lineage writes its context made on the network
+    context_root: TaskId | None = None  # None: the task is the root of its own context (S24)
 
     @property
     def ended(self) -> bool:
@@ -619,7 +632,8 @@ class BrokerStore:
         """Add a new task (inside `transaction()`)."""
         self._execute(
             "INSERT INTO tasks (id, state, taint, created_at, ended_at, workspace, "
-            "workspace_fsid, workspace_ino) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "workspace_fsid, workspace_ino, tool_writes, context_root) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 str(record.task),
                 "ended" if record.ended else "live",
@@ -629,8 +643,19 @@ class BrokerStore:
                 "present" if record.workspace_present else "deleted",
                 str(record.workspace.fsid),
                 str(record.workspace.ino),
+                record.tool_writes,
+                None if record.context_root is None else str(record.context_root),
             ),
         )
+
+    def context_writes(self, root: TaskId) -> int:
+        """The lineage writes made on the network in the context whose root is `root`."""
+        rows = self._query("SELECT tool_writes FROM tasks WHERE id = ?", (str(root),))
+        return _failures(rows[0][0]) if rows else 0
+
+    def count_context_write(self, root: TaskId) -> None:
+        """Count one more (inside `transaction()`)."""
+        self._execute("UPDATE tasks SET tool_writes = tool_writes + 1 WHERE id = ?", (str(root),))
 
     def set_taint(self, task: TaskId, taint: frozenset[TaintKind]) -> None:
         """Replace a task's taint (inside `transaction()`); the caller only ever grows it."""
@@ -706,6 +731,8 @@ class BrokerStore:
                 workspace_present=_text(row[4]) == "present",
                 workspace=_identity(_text(row[5]), _text(row[6])),
                 failures=_failures(row[7]),
+                tool_writes=_failures(row[8]),
+                context_root=None if row[9] is None else TaskId(_text(row[9])),
             )
         except (InvalidValueError, ValidationError):
             raise StoreCorruptError("the broker's database holds a malformed task") from None
@@ -964,6 +991,14 @@ class BrokerStore:
             )
         return self._tool_row(rows[0]) if rows else None
 
+    def tool_versions(self, tool: ToolId, limit: int) -> list[ToolRecord]:
+        """The stored versions of `tool`, newest first, at most `limit` (S24's history)."""
+        return self._tools(
+            f"{_TOOL_COLUMNS} FROM tools t JOIN tool_versions v ON v.tool = t.seq "
+            "WHERE t.id = ? ORDER BY v.version DESC LIMIT ?",
+            (str(tool), _limit(limit)),
+        )
+
     def insert_tool_version(self, record: ToolRecord) -> None:
         """Add a version (inside `transaction()`). A new tool gets a row of its own; the next
         version of a tool the store has must be exactly the one after its newest, and becomes the
@@ -1006,6 +1041,26 @@ class BrokerStore:
         self._execute(
             "INSERT INTO tool_search (rowid, name, description, tags) VALUES (?, ?, ?, ?)",
             (sequence, record.name, record.description, " ".join(record.tags)),
+        )
+
+    @staticmethod
+    def _view_texts(taint: frozenset[TaintKind]) -> tuple[str, ...]:
+        """The stored taint texts a task tainted `taint` may see: none, and its own."""
+        return ("none",) if not taint else ("none", _tool_taint_text(taint))
+
+    def visible_tools(self, taint: frozenset[TaintKind]) -> list[ToolRecord]:
+        """Each tool's **view for a task tainted `taint`** (D30 (6)): its newest version whose
+        taint is within the task's, tools with none left out. A lineage's taint never goes down
+        from one version to the next (`ToolStore.save` adds the refined version's), so what a task
+        may see of a tool is a prefix of its versions, and this is its end."""
+        marks = ",".join("?" * len(self._view_texts(taint)))
+        texts = self._view_texts(taint)
+        return self._tools(
+            f"{_TOOL_COLUMNS} FROM tools t JOIN tool_versions v ON v.tool = t.seq "  # noqa: S608
+            f"WHERE v.taint IN ({marks}) AND v.version = "
+            f"(SELECT max(w.version) FROM tool_versions w "
+            f"WHERE w.tool = t.seq AND w.taint IN ({marks}))",
+            (*texts, *texts),
         )
 
     def list_tools(self, limit: int) -> list[ToolRecord]:
@@ -1083,7 +1138,7 @@ _TOOL_COLUMNS: Final = (
 
 _TASK_COLUMNS: Final = (
     "SELECT id, taint, created_at, ended_at, workspace, workspace_fsid, workspace_ino, "
-    "delete_failures"
+    "delete_failures, tool_writes, context_root"
 )
 
 

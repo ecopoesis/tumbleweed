@@ -173,6 +173,59 @@ class TestWhereItIs:
         assert set(buttons(shell.window.prompt_banner)) == expected
 
 
+class TestAToolsPrompt:
+    """S24 (D30 (8)): the tool is named in its own words, and the third button is the tool's."""
+
+    def test_the_tool_name_is_labelled_as_the_tools_own_and_the_tool_button_is_offered(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        from tumbleweed.core.ids import ToolId
+
+        shell = build_prompt_shell()
+        shell.own_controller()
+        present(shell)
+
+        pending(
+            shell,
+            read_card(
+                scopes=("once", "task", "tool"), tool=ToolId.new(), tool_name="Photo <b>tool</b>"
+            ),
+        )
+
+        banner = shell.window.prompt_banner
+        shown = texts(banner)
+        assert "The tool's own name (its words, not checked):" in shown
+        assert "Photo <b>tool</b>" in shown  # literal
+        assert "Allow for this tool" in buttons(banner)
+        assert any("Allow for this tool: only for this version" in line for line in shown)
+
+    def test_a_prompt_for_a_tool_without_the_tool_scope_has_no_such_button(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        from tumbleweed.core.ids import ToolId
+
+        shell = build_prompt_shell()
+        shell.own_controller()
+        present(shell)
+
+        pending(shell, read_card(tool=ToolId.new(), tool_name="Photo tool"))
+
+        assert "Allow for this tool" not in buttons(shell.window.prompt_banner)
+
+    def test_the_tool_button_answers_at_the_tool_scope(self, build_prompt_shell: Builder) -> None:
+        shell = build_prompt_shell()
+        _controller, answers = shell.own_controller()
+        present(shell)
+        pending(shell, read_card(scopes=("once", "task", "tool")))
+        shell.wait_armed()
+
+        user_click(shell, buttons(shell.window.prompt_banner)["Allow for this tool"])
+
+        assert [d for _, d in answers.given] == [
+            AllowDecision(kind="allow", scope="tool", picked=None)
+        ]
+
+
 class TestFocusAndInput:
     def test_deny_has_the_focus_whatever_had_it_before(self, build_prompt_shell: Builder) -> None:
         shell = build_prompt_shell()

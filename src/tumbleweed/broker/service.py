@@ -33,8 +33,10 @@ that is opened is the one that is audited and returned, and a store that changes
 make the two differ. An export is audited before the bundle is returned and an import before it
 commits (inside `_atomic`, like every act that changes state); listing, showing and searching are
 reads of the broker's own store and are not decisions. `save_tool` is the same block for a tool
-saved from a task, whose taint is the broker's own record of it (I12); it has no IPC request until
-S24 gives the model a `save_tool`.
+saved from a task, whose taint is the broker's own record of it (I12); `save_tool`, `revert_tool`,
+`open_tool`, `find_tools` and the tool-grant requests (S24, D30) are the same kind of synchronous
+block, and a request that names a stored tool's binding has it **verified** against what this
+module recorded when it opened the tool and against the store (`_context`) before anything else.
 
 **Refusals never carry input.** A `Refused` message is fixed text: paths, commands and the
 model's reason are never repeated in a response, a log line or an exception message, and no
@@ -77,7 +79,10 @@ from tumbleweed.broker.audit import (
     SnapshotTaken,
     TaskEndReason,
     ToolImportRefused,
+    ToolOpenRefused,
     ToolSaved,
+    ToolSearchTainted,
+    ToolWriteTainted,
     UndoDone,
     WorkspaceDeleted,
     cut,
@@ -85,6 +90,7 @@ from tumbleweed.broker.audit import (
 from tumbleweed.broker.audit import TaskEnded as TaskEndedEntry
 from tumbleweed.broker.audit import TaskStarted as TaskStartedEntry
 from tumbleweed.broker.audit import ToolExported as ToolExportedEntry
+from tumbleweed.broker.audit import ToolOpened as ToolOpenedEntry
 from tumbleweed.broker.capabilities import CapabilityKind, FsRead, FsWrite, NetFull
 from tumbleweed.broker.compose import InvalidRunError, Mount, disjoint_mounts, sandbox_environment
 from tumbleweed.broker.config import SNAPSHOT_SLACK, BrokerConfig
@@ -100,6 +106,7 @@ from tumbleweed.broker.errors import (
     ToolBlobError,
     ToolBlobWriteError,
     ToolConflictError,
+    ToolLineageBothError,
     ToolNotFoundError,
     ToolStoreFullError,
     ToolTaintConflictError,
@@ -119,6 +126,7 @@ from tumbleweed.broker.grants import (
     RunContext,
     RunTrigger,
     TaskGrant,
+    ToolBinding,
     ToolGrant,
 )
 from tumbleweed.broker.identity import FsIdentity
@@ -172,15 +180,27 @@ from tumbleweed.broker.store import (
     ToolRecord,
     net_marks,
 )
-from tumbleweed.broker.task import TaintKind, TaskState
+from tumbleweed.broker.task import TaintKind, TaskState, merged_taint
+from tumbleweed.broker.toolflow import (
+    BIT_CAP_TEXT,
+    LINEAGE_BOTH_TEXT,
+    NOT_VISIBLE_NET_TEXT,
+    OPEN_REFUSAL_TEXT,
+    SAVE_CAP_TEXT,
+    WRITE_HIDDEN_TEXT,
+    BoundRunError,
+    bound_payload,
+    open_refusal,
+)
 from tumbleweed.broker.toolstore import StoredTool, ToolStore, taint_names
 from tumbleweed.broker.treeops import RestoreStats, measure
 from tumbleweed.broker.workspace import open_in_workspace, read_workspace_file
 from tumbleweed.broker.workspaces import Listing, Workspaces, list_directory
 from tumbleweed.core.errors import InvalidValueError
-from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId
-from tumbleweed.core.types import ByteCount, WorkspaceRelPath
+from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId, ToolInstanceId
+from tumbleweed.core.types import ByteCount, ContentHash, ToolVersion, WorkspaceRelPath
 from tumbleweed.ipc.broker_messages import (
+    MODEL_ORIGIN,
     DirEntry,
     DirListing,
     EndTask,
@@ -200,6 +220,7 @@ from tumbleweed.ipc.broker_messages import (
     Revoked,
     RevokeGrant,
     RunInSandbox,
+    RunOrigin,
     RunResult,
     Scope,
     SnapshotInfo,
@@ -224,15 +245,29 @@ from tumbleweed.ipc.prompt_messages import (
     ShowPrompt,
 )
 from tumbleweed.ipc.tool_messages import (
+    MAX_TOOL_GRANTS_LISTED,
     ExportTool,
+    FindTools,
     ImportTool,
+    ListToolGrants,
     ListTools,
+    ListToolVersions,
+    OpenTool,
+    RevertTool,
+    RevokeToolGrant,
+    SaveTool,
     ShowTool,
     ToolBundle,
+    ToolGrantInfo,
+    ToolGrantList,
     ToolImported,
     ToolList,
+    ToolMatches,
+    ToolOpened,
     ToolShown,
+    ToolStored,
     ToolSummary,
+    ToolVersions,
 )
 from tumbleweed.sandbox.errors import (
     InvalidPolicyError,
@@ -242,6 +277,7 @@ from tumbleweed.sandbox.errors import (
     SandboxUnavailable,
     SandboxUnsupported,
 )
+from tumbleweed.sandbox.handler_protocol import handler_command
 from tumbleweed.sandbox.limits import LimitsPlan
 from tumbleweed.sandbox.policy import (
     EnvName,
@@ -262,9 +298,12 @@ from tumbleweed.tools import (
     ToolDraft,
     ToolPackageError,
     ToolTooLargeError,
+    draft_of,
     export_bundle,
     parse_bundle,
+    parse_draft,
 )
+from tumbleweed.tools.limits import MAX_VERSIONS_PER_TOOL
 
 _log = logging.getLogger(__name__)
 
@@ -281,6 +320,25 @@ _DENIAL_MESSAGES: Final = {
     "user_denied": "the user did not allow it",
 }
 _DENIED: Final = "the request was denied"
+MAX_TOOL_GRANTS: Final = 100
+"""Stored tool grants (I9): beyond it the prompt no longer offers `tool` (D30 (8))."""
+MAX_INSTANCES_PER_TASK: Final = 32
+"""Stored tools a task has opened and may still name in a binding (D30 (4))."""
+MAX_SAVES_PER_TASK: Final = 20
+"""Versions one task may save (D30 (5)), so that one reply cannot fill the store."""
+FIND_FILES_REFUSED: Final = (
+    "This task has the network, so it cannot be shown tools made in tasks that read files. Call "
+    "start_task with fresh_context=true and search again."
+)
+MAX_CONTEXT_BITS: Final = 20
+"""Lineage writes a context may make while net-tainted (D30 (6)): the bound on what a net task can
+learn about versions it may not see, per user approval of the network."""
+_BAD_BINDING: Final = "the tool binding is not one this task opened"
+_LINEAGE_BOTH: Final = LINEAGE_BOTH_TEXT
+_TAINT_CONFLICT: Final = (
+    "this task's taint cannot be combined with the tool's: call start_task with "
+    "fresh_context=true, then save again"
+)
 _PROBE_WAIT: Final = timedelta(seconds=15)
 _SWEEP_BATCH: Final = 100
 UNDO_LOCK_WAIT: Final = timedelta(seconds=90)
@@ -353,6 +411,20 @@ class _Live:
     runs: set[RunId] = field(default_factory=set)
     pending_runs: set[RunId] = field(default_factory=set)  # reserved, not yet authorised
     running: set["asyncio.Future[ResponseBody]"] = field(default_factory=set)
+    instances: dict[ToolInstanceId, "_OpenedTool"] = field(default_factory=dict)
+    saves: int = 0  # saves, refinements and reverts this task has made (not inherited)
+    root: TaskId | None = None  # the root of its context (None: itself), which holds the bit budget
+
+
+@dataclass(frozen=True, slots=True)
+class _OpenedTool:
+    """A stored version the broker opened into a task, under the instance it named (D30 (4)):
+    what a binding naming that instance must say."""
+
+    tool: ToolId
+    version: ToolVersion
+    content_hash: ContentHash
+    name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,7 +532,7 @@ def _wire_scope(grant: Grant) -> Scope | None:
         case TaskGrant():
             return "task"
         case ToolGrant():
-            return None
+            return "tool"
         case _ as unreachable:
             assert_never(unreachable)
 
@@ -756,12 +828,10 @@ class BrokerService:
             )
         except ToolStoreFullError:
             return Refused(kind="refused", reason="busy", message="the tool store is full")
+        except ToolLineageBothError:
+            return Refused(kind="refused", reason="denied", message=_LINEAGE_BOTH)
         except ToolTaintConflictError:
-            return Refused(
-                kind="refused",
-                reason="denied",
-                message="the task's taint cannot be combined with the tool's",
-            )
+            return Refused(kind="refused", reason="denied", message=_TAINT_CONFLICT)
         except ToolVersionExhaustedError:
             return Refused(
                 kind="refused", reason="too_large", message="the tool has no version number left"
@@ -826,6 +896,20 @@ class BrokerService:
                 return self._export_tool(request)
             case ImportTool():
                 return self._import_tool(request)
+            case SaveTool():
+                return self._save_tool_request(owner, request)
+            case RevertTool():
+                return self._revert_tool(owner, request)
+            case OpenTool():
+                return self._open_tool(owner, request)
+            case FindTools():
+                return self._find_tools(owner, request)
+            case ListToolVersions():
+                return self._list_tool_versions(request)
+            case ListToolGrants():
+                return self._list_tool_grants()
+            case RevokeToolGrant():
+                return self._revoke_tool_grant(request)
             case AnswerPrompt():
                 return self._answer_prompt(owner, request)
             case ShowPrompt() | ClosePrompt() | Ping() | Echo():
@@ -946,7 +1030,7 @@ class BrokerService:
         stores the version (I12), so a grant that arrived a moment ago is in it. Raises
         `UnknownTaskError` if `task` is not a live task of `owner`, `ToolNotFoundError`,
         `ToolStoreFullError`, `ToolPackageError`, `AuditError` and `StoreError` as the store and
-        the audit log do. There is no IPC request for it yet: S24's `save_tool` is the caller.
+        the audit log do. The `SaveTool` request calls it.
         """
         try:
             live = self._owned(owner, task)
@@ -957,6 +1041,387 @@ class BrokerService:
             stored = self._tools.save(draft, tool=tool, taint=live.state.taint, at=now)
             entries.append(_saved_entry(stored, now, task=task))
         return stored
+
+    # --- stored tools in a task (S24, D30) -----------------------------------------------------
+
+    def _context(self, live: _Live, run: RunId, origin: RunOrigin) -> RunContext:
+        """The run a request comes from, with the binding **verified** (D30 (2)): the instance
+        must be one this task opened, for exactly that tool and hash, and the store must still
+        have that version. The trigger is the shell's claim, and means something only with a
+        binding that held."""
+        trigger: RunTrigger
+        match origin.trigger:
+            case "model":
+                trigger = RunTrigger.MODEL
+            case "user_event":
+                trigger = RunTrigger.USER_EVENT
+            case _ as unreachable:
+                assert_never(unreachable)
+        binding = origin.binding
+        if binding is None:
+            return RunContext(run=run, trigger=trigger, tool=None)
+        opened = live.instances.get(binding.instance)
+        if (
+            opened is None
+            or opened.tool != binding.tool
+            or opened.content_hash != binding.content_hash
+        ):
+            raise _Refuse("invalid_request", _BAD_BINDING, "bad_binding")
+        record = self._store.tool_record(opened.tool, opened.version)
+        if record is None or record.hash != opened.content_hash:
+            raise _Refuse("invalid_request", _BAD_BINDING, "bad_binding")
+        return RunContext(
+            run=run,
+            trigger=trigger,
+            tool=ToolBinding(
+                instance=binding.instance, tool=opened.tool, content_hash=opened.content_hash
+            ),
+        )
+
+    def _payload_of(self, live: _Live, request: RunInSandbox, context: RunContext) -> str | None:
+        """The payload a run starts with. A run without a binding brings its own (model code, or
+        the handlers of a tool that was not opened from the store). A run **with** one brings none:
+        the broker reads the stored package, checks the handler is one its spec declares, and
+        builds the payload from the stored code (I8, D30 (3))."""
+        binding = context.tool
+        if binding is None:
+            return request.payload
+        if request.command != handler_command():
+            raise _Refuse(
+                "invalid_request",
+                "a stored tool runs through the handler shim only",
+                "bound_command",
+            )
+        held = live.instances[binding.instance]  # `_context` checked that it is there
+        try:
+            opened = self._tools.open(held.tool, held.version)
+        except ToolBlobError:
+            raise _Refuse(
+                "unsafe",
+                "the stored tool failed its integrity check and is not used",
+                "tool_integrity",
+            ) from None
+        except ToolNotFoundError:
+            raise _Refuse("invalid_request", _BAD_BINDING, "bad_binding") from None
+        if opened.record.hash != binding.content_hash:
+            raise _Refuse("invalid_request", _BAD_BINDING, "bad_binding")
+        try:
+            return bound_payload(opened.canonical.package, request.payload)
+        except BoundRunError as error:
+            raise _Refuse(
+                "too_large" if error.fault == "too_large" else "invalid_request",
+                "the stored tool's handler run is not acceptable",
+                f"bound_{error.fault}",
+            ) from None
+
+    @staticmethod
+    def _tool_of(live: _Live, context: RunContext) -> tuple[ToolId | None, str | None]:
+        """The tool a prompt is for and its name (the tool's own text, from the index)."""
+        binding = context.tool
+        if binding is None:
+            return None, None
+        held = live.instances.get(binding.instance)
+        return binding.tool, None if held is None else held.name
+
+    def _live_tool_grants(self) -> list[Grant]:
+        """The stored tool grants in force: an expired one is neither listed nor counted."""
+        now = self._now()
+        return [grant for grant in self._store.tool_grants() if not grant.is_expired(now)]
+
+    def _tool_grant_count(self) -> int:
+        return len(self._live_tool_grants())
+
+    def _offered(self, scopes: frozenset[GrantScope]) -> frozenset[GrantScope]:
+        """`scopes` without `tool` once as many tool grants are stored as there may be (I9)."""
+        if GrantScope.TOOL in scopes and self._tool_grant_count() >= MAX_TOOL_GRANTS:
+            return scopes - {GrantScope.TOOL}
+        return scopes
+
+    def _open_tool(self, owner: Owner, request: OpenTool) -> ResponseBody:
+        """Open a stored version into a task: the task's taint is checked against the version's
+        index taint and raised, in the block that records it, and the instance to show is named.
+
+        A task sees a tool as its newest version within its taint (D30 (6)): with no version that
+        is what is opened, and what a task may not see is **not found** for it, the same answer as
+        for a tool that does not exist. Only a task that has not read files may name a version
+        made in one: it is then marked, as by any other way of learning what that task read."""
+        live = self._owned(owner, request.task)
+        taint = live.state.taint
+        version = request.version
+        if version is None:
+            seen = self._tools.view_of(request.tool, taint)
+            if seen is None:
+                self._audit_open_refused(request, "hidden_tool")
+                raise self._not_found(taint)
+            version = seen.version
+        # Whether the task may see the version is decided on the index, before the blob is read.
+        indexed = self._store.tool_record(request.tool, version)
+        if indexed is None:
+            raise self._not_found(taint)
+        if len(indexed.taint) > 1:  # fs and net: it opens nowhere, and is nobody's to see
+            self._audit_open_refused(request, "both_taints")
+            raise self._not_found(taint)
+        if TaintKind.NET in taint and TaintKind.FS in indexed.taint:
+            self._audit_open_refused(request, "hidden_version")
+            raise self._not_found(taint)
+        refusal = open_refusal(taint, indexed.taint)
+        if refusal is not None:  # a task that has read files, and a version that used the network
+            self._audit_open_refused(request, refusal)
+            raise _Refuse("denied", OPEN_REFUSAL_TEXT[refusal], f"open_{refusal}")
+        try:
+            opened = self._tools.open(request.tool, version)
+        except ToolNotFoundError:
+            raise self._not_found(taint) from None
+        record = opened.record
+        merged = taint | record.taint
+        raised = merged != taint
+        instance = ToolInstanceId.new()
+        with self._atomic() as entries:
+            if raised:
+                self._store.set_taint(live.state.task, merged)
+            entries.append(
+                ToolOpenedEntry(
+                    at=self._now(),
+                    task=request.task,
+                    tool=record.tool,
+                    version=record.version,
+                    hash=record.hash,
+                    instance=instance,
+                    taint=taint_names(record.taint),
+                    task_taint=taint_names(merged),
+                )
+            )
+        live.state = TaskState(task=live.state.task, taint=merged)
+        live.instances[instance] = _OpenedTool(
+            tool=record.tool, version=record.version, content_hash=record.hash, name=record.name
+        )
+        while len(live.instances) > MAX_INSTANCES_PER_TASK:
+            del live.instances[next(iter(live.instances))]
+        view = self._tools.view_of(record.tool, merged)
+        return ToolOpened(
+            kind="tool_opened",
+            instance=instance,
+            summary=_tool_summary(record),
+            document=opened.canonical.data.decode("utf-8"),
+            taint=taint_names(merged),
+            raised=raised,
+            newest=record.version if view is None else view.version,
+        )
+
+    def _audit_open_refused(
+        self,
+        request: OpenTool,
+        reason: Literal[
+            "both_taints", "fs_in_net_task", "net_in_fs_task", "hidden_tool", "hidden_version"
+        ],
+    ) -> None:
+        try:
+            self._audit.append(
+                ToolOpenRefused(
+                    at=self._now(),
+                    task=request.task,
+                    tool=request.tool,
+                    version=request.version,
+                    reason=reason,
+                )
+            )
+        except AuditError:
+            _log.error("a refused open of a stored tool could not be audited")
+
+    def _find_tools(self, owner: Owner, request: FindTools) -> ResponseBody:
+        """The model's search: each tool as the task sees it (D30 (6), I12), best first."""
+        live = self._owned(owner, request.task)
+        taint = live.state.taint
+        raised = False
+        if request.include_file_tools and TaintKind.FS not in taint:
+            if TaintKind.NET in taint:
+                raise _Refuse("denied", FIND_FILES_REFUSED, "find_files_in_net_task")
+            taint = taint | {TaintKind.FS}
+            raised = True
+            with self._atomic() as entries:
+                self._store.set_taint(live.state.task, taint)
+                entries.append(ToolSearchTainted(at=self._now(), task=request.task))
+            live.state = TaskState(task=live.state.task, taint=taint)
+        # What the answer holds depends only on versions within the task's own taint, and each
+        # tool is matched and ranked on its own text: nothing says what was left out.
+        shown = self._tools.find_view(request.query, taint, request.limit)
+        return ToolMatches(
+            kind="tool_matches",
+            tools=tuple(_tool_summary(record) for record in shown),
+            task_taint=taint_names(taint),
+            raised=raised,
+        )
+
+    @staticmethod
+    def _not_found(taint: frozenset[TaintKind]) -> Exception:
+        """The not-found answer of a task: one text for everything it cannot see (D30 (6)); a task
+        that has the network is told how to see more."""
+        if TaintKind.NET in taint:
+            return _Refuse("not_found", NOT_VISIBLE_NET_TEXT, "not_visible")
+        return ToolNotFoundError("no such tool or version")
+
+    def _check_saves(self, live: _Live) -> None:
+        """A task saves, refines and reverts at most `MAX_SAVES_PER_TASK` times (I9)."""
+        if live.saves >= MAX_SAVES_PER_TASK:
+            raise _Refuse("busy", SAVE_CAP_TEXT, "save_cap")
+
+    def _spend_bit(self, live: _Live) -> None:
+        """Count a write into a lineage made while the task has the network, before the gate and
+        whatever the answer: what such an attempt can tell it about versions it may not see is at
+        most a bit (D30 (6)), and a context has `MAX_CONTEXT_BITS` of them. The budget is kept on
+        the context's root, shared by every task that continues it, live or ended, and only
+        `fresh_context` starts a new one. A task without the network spends nothing: a write
+        into a lineage it does not see whole marks it first, and then it carries no bit."""
+        if TaintKind.NET not in live.state.taint:
+            return
+        root = live.root or live.state.task
+        if self._store.context_writes(root) >= MAX_CONTEXT_BITS:
+            raise _Refuse("busy", BIT_CAP_TEXT, "bit_cap")
+        with self._store.transaction():
+            self._store.count_context_write(root)
+
+    def _gate_lineage(self, live: _Live, tool: ToolId) -> bool:
+        """Before a write into the lineage of `tool` (a refinement or a revert): what the answer
+        and the new version's number and taint depend on must be within what the task sees.
+
+        A lineage nobody sees (an import that claims both) is not found. A net task whose lineage
+        has a version made in a task that read files is refused with one fixed sentence, and the
+        attempt counts toward the task's saves: the one bit that tells it is accepted and metered
+        (D30 (6)). A task that has not read files takes the lineage's taint first, audited and
+        persisted, as opening one of its versions would: it then is fs-tainted, and may be told
+        anything about it."""
+        taint = live.state.taint
+        versions = self._tools.versions(tool)
+        if not versions:
+            raise self._not_found(taint)
+        hidden = [record for record in versions if not record.taint <= taint]
+        if not hidden:
+            return False
+        if any(len(record.taint) > 1 for record in versions):
+            raise self._not_found(taint)
+        if TaintKind.NET in taint and any(TaintKind.FS in record.taint for record in hidden):
+            if len(hidden) == len(versions):  # nothing of it is the task's to see: not found
+                raise self._not_found(taint)
+            raise _Refuse("denied", WRITE_HIDDEN_TEXT, "hidden_lineage")
+        if taint:
+            return False  # a task that has read files, and a net version: the store's own conflict
+        merged = frozenset().union(*(record.taint for record in hidden))
+        with self._atomic() as entries:
+            self._store.set_taint(live.state.task, merged)
+            entries.append(ToolWriteTainted(at=self._now(), task=live.state.task, tool=tool))
+        live.state = TaskState(task=live.state.task, taint=merged)
+        return True
+
+    def _list_tool_versions(self, request: ListToolVersions) -> ResponseBody:
+        records = self._tools.versions(request.tool)
+        if not records:
+            raise ToolNotFoundError("no such tool")
+        return ToolVersions(
+            kind="tool_versions", versions=tuple(_tool_summary(record) for record in records)
+        )
+
+    def _save_tool_request(self, owner: Owner, request: SaveTool) -> ResponseBody:
+        """Save the model's draft from the task: the broker parses it again, as strictly as a
+        bundle, and takes the taint from its own record of the task."""
+        live = self._owned(owner, request.task)
+        self._check_saves(live)
+        try:
+            draft = parse_draft(request.draft.encode("utf-8"))
+        except UnicodeEncodeError:  # a lone surrogate: not text, so not a draft
+            raise _Refuse("invalid_request", "the tool draft is not acceptable") from None
+        if request.tool is not None:
+            self._spend_bit(live)  # before the gate, whatever the answer
+            raised = self._gate_lineage(live, request.tool)
+        else:
+            raised = False
+        stored = self.save_tool(owner, request.task, draft, tool=request.tool)
+        live.saves += 1
+        return ToolStored(kind="tool_stored", summary=_tool_summary(stored.record), raised=raised)
+
+    def _revert_tool(self, owner: Owner, request: RevertTool) -> ResponseBody:
+        """Save a copy of an older version as the newest (D30 (5)): versions stay immutable and the
+        lineage linear. The copy's taint is the task's together with the copied version's."""
+        live = self._owned(owner, request.task)
+        self._check_saves(live)
+        self._spend_bit(live)  # every attempt, before the gate, whatever the answer
+        raised = self._gate_lineage(live, request.tool)
+        newest = self._store.latest_version(request.tool)
+        if newest is None:
+            raise self._not_found(live.state.taint)
+        if request.version == newest:
+            raise _Refuse("invalid_request", "that is already the newest version", "revert_newest")
+        try:
+            source = self._tools.open(request.tool, request.version)
+        except ToolNotFoundError:
+            raise self._not_found(live.state.taint) from None
+        claim = merged_taint(live.state.taint, source.record.taint)
+        if claim is None:
+            raise ToolTaintConflictError("the task's taint and the tool's cannot be combined")
+        draft = draft_of(source.canonical.package)
+        now = self._now()
+        with self._atomic() as entries:
+            stored = self._tools.save(draft, tool=request.tool, taint=claim, at=now)
+            entries.append(
+                _saved_entry(stored, now, task=request.task, reverted_from=request.version)
+            )
+        live.saves += 1
+        return ToolStored(kind="tool_stored", summary=_tool_summary(stored.record), raised=raised)
+
+    def _list_tool_grants(self) -> ResponseBody:
+        infos: list[ToolGrantInfo] = []
+        for grant in self._live_tool_grants():
+            if not isinstance(grant, ToolGrant):
+                continue
+            capability = grant.capability
+            access: Literal["fs.read", "net.full"]
+            path: str | None
+            match capability:
+                case FsRead(path=stored):
+                    access, path = "fs.read", stored.path
+                case NetFull():
+                    access, path = "net.full", None
+                case FsWrite():
+                    continue  # a tool grant is never a write (D30 (8)); not shown, not used
+                case _ as unreachable:
+                    assert_never(unreachable)
+            versions = self._store.tool_versions(grant.tool, MAX_VERSIONS_PER_TOOL)
+            bound = next((record for record in versions if record.hash == grant.content_hash), None)
+            infos.append(
+                ToolGrantInfo(
+                    grant=grant.id,
+                    tool=grant.tool,
+                    tool_name=None if bound is None else bound.name,
+                    version=None if bound is None else bound.version,
+                    newest=bool(versions) and bound is not None and bound is versions[0],
+                    access=access,
+                    path=path,
+                    issued_at=grant.issued_at,
+                    expires_at=grant.expires_at,
+                )
+            )
+        return ToolGrantList(kind="tool_grant_list", grants=tuple(infos[:MAX_TOOL_GRANTS_LISTED]))
+
+    def _revoke_tool_grant(self, request: RevokeToolGrant) -> ResponseBody:
+        """Revoke a tool grant: the user's chrome action. Audited in the transaction that revokes
+        it; the next run selects its grants again, so it takes effect for that run."""
+        found = next(
+            (
+                g
+                for g in self._store.tool_grants()
+                if isinstance(g, ToolGrant) and g.id == request.grant
+            ),
+            None,
+        )
+        if found is None:
+            raise _Refuse("not_found", "no such tool grant")
+        now = self._now()
+        with self._atomic() as entries:
+            if not self._store.revoke_grant(found.id, now):
+                raise _Refuse("not_found", "no such tool grant")
+            entries.append(
+                GrantRevoked(at=now, task=None, grant=found.id, reason="revoked_by_user")
+            )
+        return Revoked(kind="revoked")
 
     # --- atomic sections and the end of a task -------------------------------------------------
 
@@ -1095,6 +1560,7 @@ class BrokerService:
             else previous.successor(task, fresh_context=request.fresh_context)
         )
         now = self._now()
+        root = self._context_root(request, replaced)
         with self._atomic() as entries:
             if replaced is not None:
                 self._end_stored(replaced, TaskEndReason.REPLACED, now, entries)
@@ -1106,6 +1572,7 @@ class BrokerService:
                     ended_at=None,
                     workspace_present=True,
                     workspace=identity,
+                    context_root=root,
                 )
             )
             entries.append(
@@ -1125,8 +1592,22 @@ class BrokerService:
             else self._ended_allowance(owner, request.previous)
             or self._new_budget(self._config.prompts_per_window)
         )
-        self._live[task] = _Live(owner=owner, state=state, workspace=identity, prompts=budget)
+        self._live[task] = _Live(
+            owner=owner, state=state, workspace=identity, prompts=budget, root=root
+        )
         return TaskStarted(kind="task_started", task=task, taint=_taint_names(state.taint))
+
+    def _context_root(self, request: StartTask, replaced: "_Live | None") -> TaskId | None:
+        """The root of the context a new task is in: the task itself (None) for one started
+        with `fresh_context` or with no previous, else the root of the task it continues, live or
+        ended, so that every task that continues one context shares its budget (D30 (6)). It is the
+        broker's own record, never what the caller says about its current task."""
+        if request.previous is None or request.fresh_context:
+            return None
+        if replaced is not None:
+            return replaced.root or replaced.state.task
+        record = self._store.task(request.previous)
+        return None if record is None else record.context_root or record.task
 
     async def _discard_workspace(self, task: TaskId) -> None:
         """Remove a workspace whose task could not be recorded. Best effort: a failure leaves an
@@ -1240,13 +1721,24 @@ class BrokerService:
         return budget
 
     async def _request_grant(self, owner: Owner, request: RequestGrant) -> ResponseBody:
-        self._owned(owner, request.task)
+        context = self._context(self._owned(owner, request.task), request.run, request.origin)
         access = request.access
+        if request.origin.trigger == "user_event" and isinstance(access, ReadAccess | WriteAccess):
+            # The user's own buttons ask for the picker or the network; a path the requester chose
+            # is never offered the tool scope (D30 (8)).
+            kind = (
+                CapabilityKind.FS_READ
+                if isinstance(access, ReadAccess)
+                else CapabilityKind.FS_WRITE
+            )
+            self._audit_denied(request, kind, None, "bound_access")
+            raise _Refuse(
+                "invalid_request", "a tool's access is asked by picker or network", "bound_access"
+            )
         if isinstance(access, PickAccess):
-            return await self._request_pick(owner, request, access)
+            return await self._request_pick(owner, request, access, context)
         capability, resolved = await self._access_target(access)
         rules = await self._rules()
-        context = RunContext(run=request.run, trigger=RunTrigger.MODEL, tool=None)
         asked = AccessRequest(task=request.task, run=context, capability=capability, path=resolved)
         path_text = None if resolved is None else resolved.text
         # From here to the prompt there is no `await`: the decision is made on the state as it is.
@@ -1276,11 +1768,14 @@ class BrokerService:
             case Deny(reason=refusal):
                 return self._denied(request, capability, path_text, refusal.kind, describe(refusal))
             case NeedsPrompt() as needs:
+                tool, tool_name = self._tool_of(live, context)
                 prompt = GrantPrompt(
                     task=request.task,
                     run=request.run,
+                    tool=tool,
+                    tool_name=tool_name,
                     capability=needs.capability,
-                    scopes=needs.scopes,
+                    scopes=self._offered(needs.scopes),
                     reason=request.reason,
                 )
             case _:
@@ -1308,7 +1803,7 @@ class BrokerService:
             raise
 
     async def _request_pick(
-        self, owner: Owner, request: RequestGrant, access: PickAccess
+        self, owner: Owner, request: RequestGrant, access: PickAccess, context: RunContext
     ) -> ResponseBody:
         """The trusted picker: the user chooses a file or folder and the choice is the grant (S18).
 
@@ -1328,11 +1823,18 @@ class BrokerService:
         if (limit := self._rate_limited(live)) is not None:
             return self._denied(request, capability, None, limit, _denial_message(limit))
         self._count_prompt(live)
+        tool, tool_name = self._tool_of(live, context)
         prompt = GrantPrompt(
             task=request.task,
             run=request.run,
             pick=access.choose,
-            scopes=frozenset({GrantScope.ONCE, GrantScope.TASK}),
+            tool=tool,
+            tool_name=tool_name,
+            scopes=self._offered(
+                frozenset({GrantScope.ONCE, GrantScope.TASK, GrantScope.TOOL})
+                if context.tool is not None and context.trigger is RunTrigger.USER_EVENT
+                else frozenset({GrantScope.ONCE, GrantScope.TASK})
+            ),
             reason=request.reason,
         )
         answer = await self._ask(prompt, owner)
@@ -1348,7 +1850,6 @@ class BrokerService:
         try:
             resolved = await self._resolve(answer.picked)
             picked_text = resolved.text
-            context = RunContext(run=request.run, trigger=RunTrigger.MODEL, tool=None)
             asked = AccessRequest(
                 task=request.task, run=context, capability=capability, path=resolved
             )
@@ -1391,8 +1892,13 @@ class BrokerService:
                 return self._denied(request, capability, path_text, refusal.kind, describe(refusal))
             case Issued(grant=grant, task=state):
                 scope = _wire_scope(grant)
+                if isinstance(grant, ToolGrant) and self._tool_grant_count() >= MAX_TOOL_GRANTS:
+                    raise _Refuse("busy", "as many tool grants are held as there may be")
                 with self._atomic() as entries:
-                    self._store.insert_grant(grant, live.state.task)
+                    # A tool grant belongs to no task: it outlives this one (D30 (8)).
+                    self._store.insert_grant(
+                        grant, None if isinstance(grant, ToolGrant) else live.state.task
+                    )
                     self._store.set_taint(live.state.task, state.taint)
                     entries.append(
                         self._decision(
@@ -1406,7 +1912,10 @@ class BrokerService:
                             expires_at=grant.expires_at,
                         )
                     )
-                live.grants.append(grant)
+                if not isinstance(
+                    grant, ToolGrant
+                ):  # `_grants_for` reads tool grants from the store
+                    live.grants.append(grant)
                 live.state = state
                 return GrantOutcome(
                     kind="grant_outcome",
@@ -1585,7 +2094,7 @@ class BrokerService:
 
     async def _read_file(self, owner: Owner, request: ReadFile) -> ResponseBody:
         allow, stored, rules, resolved = await self._authorise_file(
-            owner, request.task, request.run, request.path, "read_file"
+            owner, request.task, request.run, request.path, "read_file", request.origin
         )
         try:
             data: bytes = await self._fs.call(
@@ -1608,7 +2117,7 @@ class BrokerService:
 
     async def _list_dir(self, owner: Owner, request: ListDir) -> ResponseBody:
         allow, stored, rules, resolved = await self._authorise_file(
-            owner, request.task, request.run, request.path, "list_dir"
+            owner, request.task, request.run, request.path, "list_dir", request.origin
         )
         try:
             listing: Listing = await self._fs.call(
@@ -1656,14 +2165,22 @@ class BrokerService:
         run: RunId,
         text: str,
         operation: Literal["read_file", "list_dir"],
+        origin: RunOrigin,
     ) -> tuple[Allow, StoredPath, DenyRules, ResolvedPath]:
         """Decide a read or listing under a grant. On success, the consumption of a once grant,
         the task's taint and the audit entry are recorded, and the grant to open is returned."""
         self._owned(owner, task)
+        if origin != MODEL_ORIGIN:
+            # A read hands its bytes back to the caller, not to a stored tool's sandboxed run: no
+            # tool grant serves it, whatever the origin claims (D30 (2)(b)).
+            self._audit_bound_read(task, run, operation, text)
+            raise _Refuse(
+                "invalid_request", "a read or listing is never a stored tool's", "bound_read"
+            )
         resolved = await self._resolve(text)
         rules = await self._rules()
         live = self._owned(owner, task)  # the task may have ended while the file system answered
-        context = RunContext(run=run, trigger=RunTrigger.MODEL, tool=None)
+        context = self._context(live, run, origin)
         asked = AccessRequest(
             task=task, run=context, capability=CapabilityKind.FS_READ, path=resolved
         )
@@ -1689,6 +2206,26 @@ class BrokerService:
                 raise _Refuse("not_granted", "no grant covers that: request access first")
             case _:
                 assert_never(decision)
+
+    def _audit_bound_read(
+        self, task: TaskId, run: RunId, operation: Literal["read_file", "list_dir"], text: str
+    ) -> None:
+        try:
+            self._audit.append(
+                FileAccess(
+                    at=self._now(),
+                    task=task,
+                    run=run,
+                    operation=operation,
+                    path=cut(text, 4096),
+                    outcome="refused",
+                    grant=None,
+                    consumed=False,
+                    reason="bound_read",
+                )
+            )
+        except AuditError:
+            _log.error("a refused bound read could not be audited")
 
     def _file_entry(
         self,
@@ -1832,7 +2369,8 @@ class BrokerService:
             await self._require_limits(request)
             rules = await self._rules()
             live = self._owned(owner, request.task)
-            context = RunContext(run=request.run, trigger=RunTrigger.MODEL, tool=None)
+            context = self._context(live, request.run, request.origin)
+            payload = self._payload_of(live, request, context)
             selection = select_grants(
                 live.state, context, self._grants_for(live), rules=rules, now=self._now()
             )
@@ -1897,6 +2435,7 @@ class BrokerService:
                     authorised,
                     write_paths,
                     network,
+                    payload,
                 )
             finally:
                 self._write_runs.pop(request.run, None)
@@ -1915,6 +2454,7 @@ class BrokerService:
         authorised: list[bool],
         write_paths: tuple[StoredPath, ...],
         network: bool,
+        payload: str | None,
     ) -> ResponseBody:
         paths: _RunPaths = await self._fs.call(
             partial(self._open_run_paths, live.state.task, live.workspace, tuple(mounts), rules),
@@ -1926,7 +2466,9 @@ class BrokerService:
                 # I13: nothing that can write starts before its snapshot is recorded (below,
                 # in the transaction that authorises the run) or the user accepted no undo.
                 planned = await self._snapshot_for_run(owner, request, live, mounts, paths)
-            policy, limits = self._policy(request, paths, mounts, variables, allowlist, network)
+            policy, limits = self._policy(
+                request, paths, mounts, variables, allowlist, network, payload
+            )
             self._authorise_run(request, live, context, selection, mounts, rules, planned)
             authorised[0] = True
         except BaseException:
@@ -2046,6 +2588,7 @@ class BrokerService:
         variables: tuple[EnvVar, ...],
         allowlist: frozenset[EnvName],
         network: bool,
+        payload: str | None,
     ) -> tuple[SandboxPolicy, SandboxLimits]:
         limits = dataclasses.replace(
             self._config.limits,
@@ -2070,7 +2613,7 @@ class BrokerService:
                 env=variables,
                 env_allowlist=allowlist,
                 require_landlock=self._config.require_landlock,
-                payload=None if request.payload is None else request.payload.encode("utf-8"),
+                payload=None if payload is None else payload.encode("utf-8"),
                 network=network,
             )
             policy.check_descriptors()
@@ -3220,7 +3763,13 @@ def _tool_summary(record: ToolRecord) -> ToolSummary:
     )
 
 
-def _saved_entry(stored: StoredTool, at: datetime, *, task: TaskId | None) -> ToolSaved:
+def _saved_entry(
+    stored: StoredTool,
+    at: datetime,
+    *,
+    task: TaskId | None,
+    reverted_from: ToolVersion | None = None,
+) -> ToolSaved:
     record = stored.record
     return ToolSaved(
         at=at,
@@ -3232,6 +3781,7 @@ def _saved_entry(stored: StoredTool, at: datetime, *, task: TaskId | None) -> To
         claimed_taint=taint_names(record.claimed_taint),
         origin=record.origin,
         task=task,
+        reverted_from=reverted_from,
     )
 
 

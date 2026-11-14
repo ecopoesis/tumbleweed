@@ -72,13 +72,25 @@ from tumbleweed.ipc.prompt_messages import (
 )
 from tumbleweed.ipc.tool_messages import (
     ExportTool,
+    FindTools,
     ImportTool,
+    ListToolGrants,
     ListTools,
+    ListToolVersions,
+    OpenTool,
+    RevertTool,
+    RevokeToolGrant,
+    SaveTool,
     ShowTool,
     ToolBundle,
+    ToolGrantList,
     ToolImported,
     ToolList,
+    ToolMatches,
+    ToolOpened,
     ToolShown,
+    ToolStored,
+    ToolVersions,
 )
 
 ECHO_MAX_CHARS = 1024
@@ -133,6 +145,13 @@ RequestBody = Annotated[
     | ShowTool
     | ExportTool
     | ImportTool
+    | SaveTool
+    | RevertTool
+    | OpenTool
+    | FindTools
+    | ListToolVersions
+    | ListToolGrants
+    | RevokeToolGrant
     | AnswerPrompt
     | ShowPrompt
     | ClosePrompt,
@@ -156,6 +175,11 @@ ResponseBody = Annotated[
     | ToolShown
     | ToolBundle
     | ToolImported
+    | ToolStored
+    | ToolOpened
+    | ToolMatches
+    | ToolVersions
+    | ToolGrantList
     | PromptShown
     | PromptClosed
     | PromptAnswered
@@ -189,6 +213,13 @@ BROKER_SERVES: Final[tuple[type[Request], ...]] = (
     ShowTool,
     ExportTool,
     ImportTool,
+    SaveTool,
+    RevertTool,
+    OpenTool,
+    FindTools,
+    ListToolVersions,
+    ListToolGrants,
+    RevokeToolGrant,
     AnswerPrompt,
 )
 """The requests the broker serves: what the shell (and `tumbleweed-tools`) asks it."""

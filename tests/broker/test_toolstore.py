@@ -14,6 +14,7 @@ from tumbleweed.broker.errors import (
     StoreError,
     ToolBlobError,
     ToolConflictError,
+    ToolLineageBothError,
     ToolNotFoundError,
     ToolStoreFullError,
     ToolTaintConflictError,
@@ -237,8 +238,37 @@ class TestRefiningNeverCleansALineage:
         assert stored.record.taint == {TaintKind.FS, TaintKind.NET}
 
         for taint in (frozenset(), frozenset({TaintKind.FS}), frozenset({TaintKind.NET})):
-            with pytest.raises(ToolTaintConflictError):
+            with pytest.raises(ToolLineageBothError):  # a ToolTaintConflictError with its own text
                 rig.save(tool=both.package.manifest.id, taint=taint)
+
+    def test_a_lineages_taint_never_goes_down_so_what_a_task_sees_is_a_prefix(
+        self, rig: Rig
+    ) -> None:
+        tool = rig.save(taint=frozenset()).record.tool
+        for taint in (
+            frozenset(),
+            frozenset({TaintKind.FS}),
+            frozenset(),
+            frozenset({TaintKind.FS}),
+        ):
+            rig.save(tool=tool, taint=taint)
+
+        taints = [record.taint for record in reversed(rig.tools.versions(tool))]
+
+        assert taints == [
+            frozenset(),
+            frozenset(),
+            frozenset({TaintKind.FS}),
+            frozenset({TaintKind.FS}),
+            frozenset({TaintKind.FS}),
+        ]
+        clean = rig.tools.view_of(tool, frozenset())
+        files = rig.tools.view_of(tool, frozenset({TaintKind.FS}))
+        network = rig.tools.view_of(tool, frozenset({TaintKind.NET}))
+        assert clean is not None
+        assert files is not None
+        assert network is not None
+        assert (clean.version, files.version, network.version) == (2, 5, 2)
 
     def test_open_refuses_a_refinement_whose_index_taint_was_lowered(self, rig: Rig) -> None:
         first = rig.save(taint=frozenset({TaintKind.FS}))

@@ -17,7 +17,7 @@ from typing import Final
 
 from tumbleweed.core.errors import InvalidValueError
 
-SYSTEM_PROMPT_VERSION: Final = "v6"
+SYSTEM_PROMPT_VERSION: Final = "v7"
 MAX_PROMPT_BYTES: Final = 16 * 1024  # of the prompt's own file
 MAX_SPEC_REFERENCE_BYTES: Final = 64 * 1024  # of the generated reference
 _VERSION = re.compile(r"[A-Za-z0-9]{1,16}")
@@ -27,6 +27,7 @@ _SPEC_REFERENCE_OF: Final = {
     "v4": "ui_spec_v1",
     "v5": "ui_spec_v1",
     "v6": "ui_spec_v1",
+    "v7": "ui_spec_v1",
 }  # prompt version -> file of its spec reference
 
 

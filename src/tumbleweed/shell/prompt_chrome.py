@@ -93,10 +93,15 @@ _NO_UNDO_CAUSE: Final[dict[str, str]] = {
 }
 _NO_UNDO_LABEL: Final = "Run without undo"
 _UNDO_UNDO_LABEL: Final = "Undo without a way back"
-_SCOPE_LABEL: Final[dict[Scope, str]] = {"once": "Allow once", "task": "Allow for this task"}
+_SCOPE_LABEL: Final[dict[Scope, str]] = {
+    "once": "Allow once",
+    "task": "Allow for this task",
+    "tool": "Allow for this tool",
+}
 _PICK_LABEL: Final[dict[Scope, str]] = {
     "once": "Choose, allow once…",
     "task": "Choose, allow for this task…",
+    "tool": "Choose, allow for this tool…",
 }
 
 
@@ -406,6 +411,26 @@ class PromptBanner(Gtk.Box):
             self.append(
                 plain_label(display_text(card.task_title), wrap=True, css_classes=[REASON_CLASS])
             )
+        if card.tool_name is not None:
+            self.append(
+                plain_label(
+                    "The tool's own name (its words, not checked):",
+                    wrap=True,
+                    css_classes=["caption", "dim-label"],
+                )
+            )
+            self.append(
+                plain_label(display_text(card.tool_name), wrap=True, css_classes=[REASON_CLASS])
+            )
+            if "tool" in card.scopes:
+                self.append(
+                    plain_label(
+                        "Allow for this tool: only for this version of it, only when you use it, "
+                        "and until you take it back in the Tools list.",
+                        wrap=True,
+                        css_classes=["caption", "dim-label"],
+                    )
+                )
         for line, detail in self._what(card):
             self.append(plain_label(line, wrap=True))
             if detail is not None:

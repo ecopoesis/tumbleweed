@@ -270,6 +270,7 @@ source_modules = [
     "tumbleweed.broker.store",
     "tumbleweed.broker.task",
     "tumbleweed.broker.toolblobs",
+    "tumbleweed.broker.toolflow",
     "tumbleweed.broker.toolstore",
     "tumbleweed.broker.treeops",
     "tumbleweed.broker.workspace",

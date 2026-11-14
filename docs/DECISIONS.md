@@ -1854,3 +1854,279 @@ tens of milliseconds more to start; each needs a `/dev/net/tun` the user can ope
 section 11) and slirp4netns installed, and where either is missing the run is refused, not
 weakened. The model can still exfiltrate what a net-tainted task saw (the user's words and what it
 fetched) to any host: that is what the grant is, and the prompt says so.
+
+## D30 — Save, reuse, refine: a stored tool runs from the broker's own copy, the broker opens it into a task and names its instance, and a tool grant is applied only where the broker can verify the binding (2026-11-14, accepted)
+
+**Context.** S24 is where a generated tool becomes the user's. What S16 to S23 already gave: the
+`tool` grant scope as data (`grants.ToolGrant`, `ToolBinding`, `RunContext`), its application and
+its taint accounting in `policy.select_grants`/`issue_grant`/`_scopes_for`, persistence of tool
+grants (`BrokerStore.insert_grant(grant, None)`, `tool_grants()`, which `_grants_for` already merges
+into every decision), the tool store with immutable versions, `ToolRecord.taint` (the taint a
+decision must read, D19 (8)), `BrokerService.save_tool` and the tool IPC requests (list, show,
+export, import), the closed audit entries for saves, the handler shim and its trusted side in
+`sandbox.handler_protocol` (D27, written so the broker can build a run from stored code), the
+`GrantPrompt.tool` field and `ShowPrompt.tool`. What did not exist: any request that carries a
+run's trigger or tool binding (#87: the broker hard-codes `RunTrigger.MODEL` and no binding in all
+six places it builds a `RunContext`), any IPC request that saves or opens a tool, the `tool` scope
+on the wire, a way to list or revoke a tool grant, and the model's four tools.
+
+**Decision.** (1) *The wire carries an origin.* `RunInSandbox`, `RequestGrant`, `ReadFile` and
+`ListDir` get one optional field, `origin: RunOrigin` (default: trigger `model`, no binding), made
+of `trigger` (`model` or `user_event`; `state_patch` and `connection` are S25's) and `binding`
+(`instance`, `tool`, `content_hash`: the broker's `ToolBinding`). A `user_event` without a binding
+is not a valid message. Everything the broker does with it goes through one function,
+`_context(live, run, origin)`, which replaces the six hard-coded contexts.
+
+(2) *How the broker tells a run is user-triggered (#87).* It cannot see a pointer; the shell is
+trusted code (section 2) and the model has no way to write the field. So the claim is narrowed to
+what only the shell's own event path can reach, and checked against what only the broker knows:
+(a) the broker **mints the instance** of a stored tool: `open_tool` (below) answers with a fresh
+`ToolInstanceId` and records `(task, instance) -> (tool, version, hash)`; the canvas shows the tool
+under that ID and the shell sends it back. A binding is accepted only if the task holds that
+instance and the instance maps to exactly that tool and hash, and the store still has that
+version (a record read, then the blob verified by `ToolStore.open` when the code is built). A
+forged binding (an ID the task never opened, another tool's ID, the right tool with another hash,
+a tool that is not in the store, an instance of another task or connection) is refused
+`invalid_request` ("the tool binding is not one this task opened") and audited as a refused run;
+no grant is looked at. (b) `user_event` is accepted only on the **stored-code form**: a run whose
+code the broker built itself (3). (c) The model's tools build `RunInSandbox`, `RequestGrant`,
+`ReadFile` and `ListDir` with the default origin; no tool input model has a field for it, and a
+tripwire test (AST, like I10's) fails if `user_event` or `RunOrigin(` appears in the agent's tools
+or anywhere but `agent/code.py`'s handler executor and the shell's tool-access port. A model that
+`patch_state`s or `show_ui`s on an instance never reaches either: a patch fires no handler (D24),
+and `show_ui` makes an instance with **no binding** (no tool grant ever applies to a tool that was
+not opened from the store). What this does not do: a compromised shell can claim `user_event` for
+a tool the task opened. That is the trust boundary of section 2, unchanged, and no weaker than the
+prompt's own (I2): the same process decides which button the user pressed.
+
+(3) *I8: the broker runs its own copy.* A run with a binding does not carry code. `command` must be
+`handler_command()` and the payload is the handler document with an **empty** `code` object; the
+broker reads the stored package (`ToolStore.open`: blob hash, strict parse, index agreement),
+requires `(module, function)` to be a `sandbox` handler the stored spec declares, and builds the
+payload itself with `handler_payload(module, function, inputs, stored modules)`. A request that
+brings code with a binding, a command that is not the shim's, or a handler the spec does not
+declare is refused (`invalid_request`, `unsafe` for a package that fails its check). The sandbox
+receives bytes the broker made from its store; a test replaces the sandbox with one that records
+the payload and checks it is the stored source, not what the shell sent. Without a binding the
+run is what it was (`run_code`, an unsaved tool's handlers: model code, no tool grants).
+
+(4) *`open_tool` is a broker request, and it is where taint is decided.* `OpenTool(task, tool,
+version?)` reads `ToolStore.open`, then checks `ToolRecord.taint` (never the package's claim)
+against the task, before anything else and with no prompt: a version that is both fs and net (an
+import whose claim has `net`, or a lineage that was both) is refused in every task; an fs version
+in a net-tainted task is refused with the fixed text that says to call `start_task` with
+`fresh_context=true`; a net version in an fs-tainted task is refused likewise (symmetric: I12 holds
+in both orders); otherwise the task's taint becomes the merge, persisted and audited in one
+transaction (`tool_opened`), and an fs version thereby makes a clean task fs-tainted. A refusal is
+audited (`tool_open_refused`, closed reason). At most 32 instances are held per task (I9); the
+oldest is forgotten, and a binding for a forgotten instance is refused. The answer carries the
+instance, the summary and the package (canonical JSON, as `ToolShown`), which the agent parses
+with `parse_package`; the hash in the summary is the broker's, and the broker re-verifies it on
+every run.
+
+(5) *`save_tool`, `revert_tool`, versions.* Saving is `SaveTool(task, draft, tool?)`: the draft is
+the canonical JSON text of a `ToolDraft` (at most `MAX_PACKAGE_BYTES`), parsed again by the broker
+with `parse_draft` (the agent also parses it first, so the model gets the problems back); the
+taint is the broker's record of the task (D19 (9)); no prompt, since a saved version holds no
+privilege (I8) and the store is bounded; at most 20 saves per task, so one reply cannot fill the
+store (`busy`). Refining is a save with `tool` set: version = newest + 1, effective taint = the
+task's plus the version refined (D19 (8)). **Revert is a new version, not a pointer**: `RevertTool(
+task, tool, version)` saves a copy of that version's draft as the next version (`reverted_from` is
+in the audit entry). A pointer would need a schema change, a non-linear `refines` and a rewrite of
+the "newest is the one that is opened" rule that D19, `_taint_differs` and the search index rest on;
+a copy keeps every version immutable and the lineage linear. Costs, accepted: version 1 is *not*
+current again byte for byte (its hash differs, because the number is in the manifest), so a tool
+grant on version 1 does not carry to the copy, and the user grants again; and the copy's taint never
+gets cleaner than the lineage (D19 (8)). Reverting to the newest version is refused. The version
+history is `ListToolVersions(tool)`: the summaries of up to 100 versions, a read like `ListTools`.
+The #99 message: a refinement refused because the lineage is already both fs and net (an import
+whose claim had `net`) says "this imported tool carries both file and network taint and cannot be
+refined: save a new tool instead"; a refinement refused because the task's taint conflicts with
+the lineage's says to start a task with `fresh_context=true`. Both are `denied`
+(`ToolTaintConflictError`, tested at the wire).
+
+(6) *Retrieval before generation, and what a task is told about the store.* `FindTools(task, query?,
+limit, include_file_tools?)` is the model's search: top-k (`k` = 8), then the **model re-ranks** by
+choosing among the framed results (the system prompt, v7, says to call `find_tools` before it writes a
+tool of its own and to prefer a saved one that fits). There is no automatic injection of results into a
+turn: a turn that never searched would put saved text in front of the model that the user did not ask
+for, and a shell that is only chatting must not connect to the broker.
+
+**Noninterference (I12).** For a task that is not fs-tainted after the call, the answer to
+`find_tools`, `open_tool`, `revert_tool` and `save_tool` (with or without `refines`) is byte-identical
+to the answer the same call would get from the same store with every fs-tainted version deleted. The
+only exceptions are the accepted residuals listed here. (Round 1 found the first design leaked twice, a
+clean task shown fs text and a count that was a prefix oracle; round 2 found the same class in the
+ranking, in a tool's newest version and in writes; this is the property all of it is held to, and
+`tests/broker/test_noninterference.py` runs one script against a store and the same store without its
+fs versions, from a net task and from a clean task that stays clean, and demands equal answers.)
+
+- *A task's view of a tool.* A lineage's taint never goes down (`ToolStore.save` adds the refined
+  version's), so what a task may see of a tool, the versions whose taint is within its own, is a
+  prefix of the lineage. A task sees a tool as **its newest version within that prefix**: that
+  version's text is what `find_tools` matches and shows, `ToolOpened.newest` is that version, and
+  `open_tool` with no version opens it. A tool with no version in the prefix does not exist for the
+  task. A version that is both fs and net exists for nobody.
+- *Ranking reads one tool at a time.* FTS only decided matches in the old design, but `bm25` ranked
+  with statistics of the whole table, so a task could plant tools and read the order of tools it may
+  not see. `find_tools` now matches and ranks in code on each visible version's own name, tags and
+  text (`tools.query.match_score`: a prefix hit weighs 10 in the name, 5 in a tag, 2 in the
+  description, summed over the query's words), then newest saved, then ID. FTS5 remains for the
+  chrome's list and `tumbleweed-tools`, which are not the model's context.
+- *What is said about the rest* is **one fixed sentence chosen by the task's taint alone** (never a
+  count, never "none left out"); it says that tools and *newer versions of tools* may be hidden, and
+  names the opt-in. A clean task that wants tools made in tasks that read files passes
+  `include_file_tools=true`: that makes the task fs-tainted **whatever matches** (persisted and
+  audited as `tool_search_tainted`, in one transaction, and the result says so only if it changed
+  anything); it is refused for a task that has the network. `find_tools` is deliberately stricter than
+  `open_tool` for net-tainted versions: a clean task never sees them in a search (it can open one whose
+  ID it knows, which marks it as net), so that a search never forces a taint by accident.
+- *`open_tool`.* With no version, the view's newest. With a version outside the view: a task that has
+  the network gets **exactly the not-found answer** (same reason and text, whether the version is
+  hidden, missing or nobody's; only the audit says why). That one text, for a net task only, tells
+  it how to see more (PLAN: "start_task with fresh_context=true"): "No such saved version is visible in
+  this task. Versions made in a task that read your files are not shown in a task that used the
+  network; to see them, call start_task with fresh_context=true." (a clean task's text stays "no such
+  tool or version"; the write refusals of a net task, hidden lineage or not found, use the same
+  ideas: one fixed sentence each, pinned in the harness);
+  a clean task may name it and is marked (fs or net) as before; a task that has read files and a net
+  version is refused with the `fresh_context=true` text. A both-tainted version is not found for
+  everyone. (A both-tainted lineage is an import whose claim had `net`: its tool ID is known only to
+  the user, so "this imported tool cannot be refined" is no longer something a model can reach; the
+  store still raises `ToolLineageBothError` with its own text, #99 (tested in `test_toolstore.py`),
+  and the chrome has its own sentence for it. The `ToolTaintConflictError` to `denied` mapping is
+  tested through the other conflict that remains reachable: a task that has read files refining a
+  net lineage.) The chrome says its own sentences, never the model's: a tool of the user's own list
+  that the conversation cannot open (it used the network) is not called "not stored", an import that
+  claims both is explained without asking the broker, and "Make this the newest" says when it marked
+  the conversation's task.
+- *Writes into a lineage* (`save_tool` with `refines`, `revert_tool`): the new version's number and
+  taint depend on all its versions, so a write into a lineage that holds a version the task may not see
+  is gated first. A clean task takes the lineage's taint first (audited as `tool_write_tainted`,
+  persisted), then the answer is given: it is fs-tainted after the call, so the property does not
+  apply to it. A net task is **refused with one fixed sentence** when the lineage has versions it
+  sees and versions it does not, and gets the not-found text when it sees none of it.
+  **Two limits, kept apart (round 4).** (a) A task saves, refines and reverts at most
+  `MAX_SAVES_PER_TASK` (20) times, as always: a per-task cap (I9), counted on success, not inherited.
+  (b) **The bit budget**: every lineage write (`save_tool` with `refines`, `revert_tool`) made **while
+  the task is net-tainted** is counted before the gate, whatever the answer (written, refused, already
+  the newest, not found), so a zero answer costs what a one answer does; a context has
+  `MAX_CONTEXT_BITS` (20) of them. A clean task's writes never count (the gate fs-taints it first, so
+  it carries no bit), nor do new tools: ordinary use is never throttled by it. The budget lives **on a
+  context root** that the broker records: a task started with `fresh_context` or with no previous is a
+  new root, any other shares the root of the task it continues, live or ended, whatever the caller
+  says its current task is. So every heir of one task, and a branch from an older ended task, share one
+  count (`tasks.context_root`, the count on the root's row), persisted across end and resume. Only
+  `fresh_context` starts a new budget, which drops the turns and, for a net task, needs the user's
+  approval of the network again. Each limit has its own fixed busy text, which says which it was and,
+  for the context, that `start_task` with `fresh_context=true` lifts it (adding no bit).
+  **Accepted residual (a decision, not an oversight):** a net task learns at most one bit per counted
+  attempt, "this tool has a version made in a task that read files", so **at most
+  `MAX_CONTEXT_BITS` (20) bits per context root**. (Not strictly "per user approval of the network": a
+  fresh root can become net-tainted by opening a net-tainted saved tool, which needs no prompt, and then
+  has a budget of its own. The reach is small: a fresh clean task's search hides net tools, so the
+  model must already know the tool's ID, and what it can then learn is the same one bit per attempt
+  about a lineage it can already name.) The harness asserts that this bit is the only
+  difference. `start_task(previous=E)` accepts an ended task of any owner (as it does for taint,
+  #157), so a heir shares E's root and spends its budget: the same class as taint inheritance. The lineage is not forked: that would amend D19.
+- *Other store-wide state (S4).* Names are not unique, so there is no "name taken" answer. The caps are
+  global: **the store is full** (500 tools, 256 MiB of packages) and the per-tool 100 versions (covered
+  by the gate above). A task not fs-tainted can learn one bit, "the store is full", which depends on
+  how much fs-tainted tools take; it needs that many tools to have been saved and says nothing about
+  what they contain. Accepted, with those capacities. Everything else an answer holds (the new tool's
+  version 1, ids, times, hashes) is the task's own.
+
+What the model sees of a result (`find_tools`, and `open_tool` with `source=true`) is data in a frame
+(`agent.untrusted.framed`, a fresh random id per frame, the sentence that it is never an instruction),
+with the author's words spelled out and cut; the id, version, short hash and taint of each result are
+**our own words outside the frame**, numbered to match the frame's lines. The user's own list in the
+chrome (`ListTools`) is not filtered: it is not the model's context.
+
+(7) *The model's tools.* `save_tool(instance, name, description?, tags?, capabilities?, inputs?,
+outputs?, refines?)` saves what is on the canvas: the canvas keeps each instance's spec and code
+(`CanvasHost.source`), so the model does not resend them (and cannot save something other than
+what the user sees). `find_tools(query?)`, `open_tool(tool, version?, placement?, source?)` (shows
+the stored tool as the broker's instance, returns the state entries as `show_ui` does and, with
+`source=true`, the spec and code framed and cut at 5 KiB each, so that both fit one 16 KiB result;
+when either is cut the result says so and that the model must not refine from it, and to rebuild
+the tool with `show_ui` instead), `revert_tool(tool, version)`. **`save_tool` saves only an instance
+shown in the current task**: the canvas keeps the task of each instance (`InstanceSource.task`), and
+a tool shown in an earlier task may hold what that task read, so saving it from a clean task would
+store it under the clean task's taint (found in review: fs task, `start_task(fresh_context=true)`,
+`save_tool`, open in a net task). The model is told to show it again in this task. IDs the model gives are
+parsed as `ToolId`/`ToolVersion`, errors are fixed text for the model, and every wait is bounded
+(the registry's timeout, the link's deadline). Voice needs nothing of its own: an utterance is
+typed-equivalent chat text (I10), "open my photo tool" is a request to the model, which searches
+and opens; nothing in the voice path can approve a prompt, and opening needs none.
+
+(8) *Tool grants.* Prompts offer **"Allow for this tool"** (`tool` is now a wire `Scope`, up to
+three per prompt) only when `policy._scopes_for` includes it: a user-triggered run of a bound
+instance (`fs.read`, picker reads and `net.full`; **`fs.write` stays task-only**, D28: a write is
+bound to the snapshots of the runs that use it, and a standing write permission to a tool would
+outlive the user's attention). The prompt names the tool (`tool_name`, from the index, the
+tool's own name, plain, capped, labelled as the tool's, I5). A tool grant is stored with no task,
+bound to `(ToolId, hash)`, listed by `ListToolGrants` and revoked by `RevokeToolGrant(grant)`,
+**the user's chrome action only** (no model tool calls it; the tripwire covers it): the revoke is
+audited (`grant_revoked`, reason `revoked_by_user`) in the transaction that revokes it and takes
+effect for the next run (a run in flight keeps what it was mounted with, as for a task grant).
+A new version has another hash, so its first run asks again; the chrome shows each tool grant with
+the tool, the version it is bound to (or "an older version" when that hash is no longer the
+newest), the access, and a Revoke button. At most 100 tool grants are stored (I9: `busy` beyond
+it, before anyone is asked). **The user can reach "allow for this tool" without the model:** a
+card of a stored tool has, for each capability its manifest declares, one plain button (`Choose a
+file for this tool...`, `Choose a folder...`, `Allow the network...`) which sends a `RequestGrant`
+for the picker or the network with the instance's origin (a direct click is the user event); the
+broker then shows its own prompt with the third button. A model-triggered request never has the
+scope, and applying one to a run counts as issuing it for taint purposes (`select_grants`: the
+older grant first; the withheld one is simply not mounted. Telling the user which tool grant a run
+withheld is not done here: it needs a field on `RunResult` (#167)). **A tool grant serves a
+sandbox run of the stored code and nothing else** (round 1): `ReadFile` and `ListDir` keep the
+`origin` field, as #87 asked, but the broker **refuses** any origin on them but the default
+(`invalid_request`, audited as `bound_read`), because their bytes go back to the agent process and
+not to a stored tool's run; and a `RequestGrant` with `user_event` for a `ReadAccess` or
+`WriteAccess` (a path the requester chose) is refused unasked (`bound_access`): only the picker
+and the network are asked for a tool. Expired tool grants are neither listed nor counted toward
+the cap of 100, and the chrome lists every grant the broker holds.
+
+**For S25 and other notes (round 1).** (a) `_origin_of` labels *every* handler run of a stored
+instance `user_event`, which holds while the only way a handler runs is a user's event (a patch fires
+none, tested at host level in `test_saved_tools_e2e.py`); S25's connection-triggered runs must carry
+their own trigger, and `_Live.instances` dies with its task, so a producer that is an instance of an
+ended task needs its binding kept differently. (b) The inputs of a bound run are the instance's
+state, which the model can set with `patch_state`: the code that runs is the stored hash, and the
+taint rules hold, but a user's click then runs it under the tool's grants with inputs the model
+chose. That is within the design and is stated here so that nobody assumes otherwise.
+
+(9) *Chrome (I5).* The side panel gets a **Tools** panel (`shell/tools_panel.py`, no GTK in its
+model `shell/viewmodel/tools.py`): the saved tools, newest first, each with name, version,
+taint badge ("saw your files" / "used the network") and **Open**; a row expands to the version
+history (**Open this version**, **Make this the newest**); and the grants list with **Revoke**. It
+is a fallback for when the model is not at hand, not app switching: opening shows the tool on the
+canvas under the current task, through the same broker request as `open_tool` (so the same taint
+rules and the same refusal text); it starts no task, so with none yet it says to talk to the
+assistant first. The chrome speaks for itself: a refusal is shown as one of its own sentences chosen
+by the broker's reason (the broker's texts are written for the model), and an open that raised the
+conversation's task's taint says so. Every name and description is `plain_label` text, capped, spelled
+(`visible`) and set apart as "the tool's own name", never in the window title, the strip or the
+prompt's own sentences.
+
+(10) *Limits and waits (I9).* The new requests are bounded by schema: draft and package
+`MAX_PACKAGE_BYTES`, query `MAX_QUERY_CHARS`, at most 50 results (8 for `FindTools`), 100 versions,
+100 tool grants, 32 instances and 20 saves per task. Every broker call from the agent goes through
+the link's deadlines; the tests inject the bounds.
+
+**Folded in.** #87 as (1) to (3). #99: the `ToolTaintConflictError` to `denied` mapping test
+(through `SaveTool`), the "this imported tool cannot be refined" message (5), and the three wording
+fixes (ARCHITECTURE "Taint of an import", `broker/store.py`'s schema comment, `ToolSummary`'s
+docstring: a saved version's effective taint includes its lineage). #157's `HIDDEN_TASK` item does
+not apply: S24 reads no stored task id (instances, bindings and saves are keyed by live tasks the
+broker itself holds), so it stays open for the first step that does. #95 (a newer version from a
+bundle) is not done: it needs a screen that shows the user what changes, and the refine and revert
+flows here only make versions inside one lineage; the issue gets a comment. #94: a tool that could
+be deleted must revoke its tool grants in the same transaction, and `RevokeToolGrant` is the audited
+path for it; the issue gets a comment. **Consequences.** A saved tool is as trusted as its hash and
+no more: editing the tool is a new version and a new grant. A tool opened into a task taints the
+task, so a user who opens an old photo tool that once read their files cannot then give the same
+task the network (the refusal says why and what to do). Revert is cheap but adds a version each
+time; the 100-version cap is the bound. The `user_event` claim rests on the shell, as every
+decision of the chrome does.

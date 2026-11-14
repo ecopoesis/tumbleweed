@@ -15,7 +15,7 @@ issues the grant (`issue_grant`), bounds the wait (`BrokerConfig.prompt_timeout`
 denial) and treats a prompt that raises as a denial.
 
 The answers are a closed union so that adding a kind is a visible edit. The interface is also what
-later prompts (an imported tool's taint, S24's tool grants, #98) extend: with a new subject next to
+later prompts (an imported tool's taint, #98) extend: with a new subject next to
 `capability` and `pick`.
 """
 
@@ -55,6 +55,8 @@ class GrantPrompt(PolicyModel):
     task: TaskId
     run: RunId
     tool: ToolId | None = None
+    tool_name: Annotated[str, Field(min_length=1, max_length=64)] | None = None
+    """`tool`'s name from the index: the tool's own text (I5), shown plain, capped, the tool's."""
     capability: Capability | None = None
     pick: Literal["file", "folder"] | None = None
     no_undo: NoUndoSubject | None = None

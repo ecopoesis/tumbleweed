@@ -26,6 +26,7 @@ from tumbleweed.tools.package import (
     ToolTag,
     build_package,
     canonical_package,
+    draft_of,
     parse_draft,
     parse_package,
 )
@@ -45,6 +46,7 @@ __all__ = [
     "ToolTooLargeError",
     "build_package",
     "canonical_package",
+    "draft_of",
     "export_bundle",
     "fts_match",
     "parse_bundle",

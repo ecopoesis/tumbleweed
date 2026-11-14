@@ -28,11 +28,12 @@ bundle cannot appear as a newer version of a tool the user has. It carries no gr
 tool that was imported is granted again like any other version, since a grant binds to its hash.
 
 **Taint (I12).** `ToolRecord.taint` is what open and grant decisions must read (S24): for a saved
-version the taint of its task; for an imported one **the package's claim plus `fs`**
-(`effective_taint`), because a bundle is file input that a task which could read files and write
-one may have made, with their content in it, claiming none. The package keeps its claim (so the
-hash is the bundle's, and export and import are hash-stable) and `claimed_taint` records it for
-display. `open` refuses a version whose index taint is not what its origin and package give.
+version the taint of its task together with that of the version it refines; for an imported one
+**the package's claim plus `fs`** (`effective_taint`), because a bundle is file input that a task
+which could read files and write one may have made, with their content in it, claiming none. The
+package keeps its claim (so the hash is the bundle's, and export and import are hash-stable) and
+`claimed_taint` records it for display. `open` refuses a version whose index taint is not what its
+origin, package and lineage give.
 
 **Bounds (I9).** At most `MAX_TOOLS` tools, `MAX_VERSIONS_PER_TOOL` versions of one and
 `MAX_STORE_BYTES` of packages; beyond that a save or import is refused (`ToolStoreFullError`), not
@@ -51,6 +52,7 @@ from typing import Final, Literal, assert_never, final
 from tumbleweed.broker.errors import (
     ToolBlobError,
     ToolConflictError,
+    ToolLineageBothError,
     ToolNotFoundError,
     ToolStoreFullError,
     ToolTaintConflictError,
@@ -77,7 +79,7 @@ from tumbleweed.tools.package import (
     canonical_package,
     parse_package,
 )
-from tumbleweed.tools.query import fts_match
+from tumbleweed.tools.query import fts_match, match_score, query_terms
 
 _FULL: Final = "the tool store is full"
 
@@ -125,7 +127,7 @@ def effective_taint(
     An imported package is input from the user's file system or from elsewhere: it may have been
     written by a task that read files and could write one, with those files' content in it, under
     any claim, so it is `fs`-tainted whatever it says, and what it says is kept beside it
-    (`claimed_taint`). Lowering it later is a user's decision in a trusted prompt (S18, S24), never
+    (`claimed_taint`). Lowering it later is a user's decision in a trusted prompt (#98), never
     something a bundle can state, and editing the package or its hash gains nothing: the taint of
     an import is made here, from the origin.
 
@@ -202,6 +204,8 @@ class ToolStore:
             identifier = tool
             previous = self._store.tool_record(tool, latest)
             refines = frozenset() if previous is None else previous.taint
+            if len(refines) > 1:
+                raise ToolLineageBothError("the tool carries both file and network taint")
             if len(taint | refines) > 1:
                 raise ToolTaintConflictError("the task's taint and the tool's cannot be combined")
             try:
@@ -265,6 +269,45 @@ class ToolStore:
         return record
 
     # --- reads -----------------------------------------------------------------------------
+
+    def versions(self, tool: ToolId) -> list[ToolRecord]:
+        """Every stored version of `tool`, newest first (at most `MAX_VERSIONS_PER_TOOL`)."""
+        return self._store.tool_versions(tool, MAX_VERSIONS_PER_TOOL)
+
+    def find_view(
+        self, query: str | None, taint: frozenset[TaintKind], limit: int
+    ) -> list[ToolRecord]:
+        """The best `limit` tools for a task tainted `taint`, each as the task sees it.
+
+        A task sees each tool as its newest version within its taint (`BrokerStore.visible_tools`),
+        and that version's text is what is matched and what is shown. Matching and ranking read
+        one record at a time (`tumbleweed.tools.query.match_score`: weighted prefix hits, then
+        newest saved, then ID), never the whole table, so nothing about a version the task may not
+        see, not even its presence, can change what is returned (D30 (6), I12)."""
+        records = self._store.visible_tools(taint)
+        if query is None:
+            ranked = [(0, record) for record in records]
+        else:
+            terms = query_terms(query)
+            if not terms:
+                return []
+            ranked = [
+                (score, record)
+                for record in records
+                if (
+                    score := match_score(
+                        terms, record.name, " ".join(record.tags), record.description
+                    )
+                )
+            ]
+        ranked.sort(key=lambda item: (-item[0], -item[1].saved_at.timestamp(), str(item[1].tool)))
+        return [record for _, record in ranked[:limit]]
+
+    def view_of(self, tool: ToolId, taint: frozenset[TaintKind]) -> ToolRecord | None:
+        """`tool` as a task tainted `taint` sees it: its newest version within the taint."""
+        return next(
+            (record for record in self._store.visible_tools(taint) if record.tool == tool), None
+        )
 
     def find(self, query: str | None, limit: int = MAX_RESULTS) -> list[ToolRecord]:
         """The newest version of the tools that match `query` (name, description and tags), best
