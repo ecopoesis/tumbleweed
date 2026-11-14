@@ -405,9 +405,11 @@ def register_code_tools(registry: ToolRegistry, tasks: TaskSession, link: Broker
     registry.register(
         ToolName("run_code"),
         "Run Python 3 once in the sandbox, in the task's workspace (the working directory), with "
-        "Pillow and numpy installed. It has no network and no home directory, and sees only "
+        "Pillow and numpy installed. It has no home directory and no network unless the user "
+        "granted the network for this task (request_access kind network); it sees only "
         "the files the user granted for this task (access allowed for one reply does not reach "
-        "it) and the workspace. Its output is returned as data. Use print for what you want back.",
+        "it) and the workspace, and a task with the network sees no granted files. "
+        "Its output is returned as data. Use print for what you want back.",
         RunCodeInput,
         run_code,
         timeout_seconds=60.0 + _SETUP_SECONDS + 5.0,

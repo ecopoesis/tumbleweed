@@ -194,6 +194,15 @@ def visible(text: str) -> str:
     )
 
 
+NETWORK_WARNING: Final = (
+    "WARNING. Code the assistant runs would be able to reach any server your computer can "
+    "reach, send anything it holds to it and fetch anything from it, including other "
+    "machines on your network. Nothing it sends or fetches is checked. While the network is "
+    "allowed the assistant gets no access to your files, and a task that has seen your files "
+    "cannot be given the network. Allow it only if you trust what it is about to do."
+)
+"""What a network prompt says, in our words (D29 (10)). Shown as plain text, with the card."""
+
 MAX_TITLE_SHOWN: Final = 80
 """The most characters of a task's title that are shown (I5: capped)."""
 

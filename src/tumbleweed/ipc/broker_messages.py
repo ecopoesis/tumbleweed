@@ -128,7 +128,7 @@ class WriteAccess(IpcMessage):
 
 @final
 class NetworkAccess(IpcMessage):
-    """`net.full`. Can be granted (and taints the task); the sandbox gets a network in S22."""
+    """`net.full`. Can be granted (and taints the task); a run holding it has a network (S22)."""
 
     kind: Literal["net.full"]
 
@@ -344,6 +344,7 @@ class RunResult(Response):
     ]
     landlock: Literal["applied", "unavailable", "unknown"]
     mounted_grants: Annotated[int, Field(ge=0, le=64)]
+    network: bool
 
 
 # --- snapshots and undo (S21) ---------------------------------------------------------------

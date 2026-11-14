@@ -180,7 +180,7 @@ def describe(reason: Refusal) -> str:
         case TaintConflict(held=held, wanted=wanted):
             return (
                 f"refused: this task has been given {held.value} access and may not also be "
-                f"given {wanted.value} access; start a new task with fresh_context=true"
+                f"given {wanted.value} access; call start_task with fresh_context=true"
             )
         case TaskEnded():
             return "refused: the task has ended"

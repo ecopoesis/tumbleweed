@@ -78,7 +78,9 @@ class RequestAccessInput(BaseModel):
             "read: a file or folder you name by absolute path. write: the same, to change it "
             "(for the task only; the user is asked and every run that can change it is saved "
             "first so that undo_last_change can put it back). pick_file or pick_folder: the "
-            "user chooses in a picker (to read). network: full network access."
+            "user chooses in a picker (to read). network: full network access for code you run, "
+            "for this task; the task then cannot be given files (and the reverse: start_task with "
+            "fresh_context=true first)."
         )
     )
     path: str | None = Field(

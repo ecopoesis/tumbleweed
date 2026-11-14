@@ -1,0 +1,232 @@
+"""A run's network (S22, D29): slirp4netns attached to the sandbox's own network namespace.
+
+Every sandbox has a network namespace of its own (`--unshare-net`, never `--share-net`). A run
+whose policy has `network` set gets a user-mode network in it, and the program is held back until
+the network is up:
+
+1. bwrap starts with `--info-fd` and `--block-fd`. It makes its namespaces and then waits for a
+   byte on the block pipe before it sets the sandbox up, so the program cannot have started.
+2. The launcher reads the child's PID and namespace ids from the info pipe, and **refuses if the
+   child's network namespace is its own**: a sandbox that shared the host's network would be
+   attached to by nothing and reached by everything.
+3. `slirp4netns --configure --disable-host-loopback` joins the child's namespaces, makes `tap0`,
+   brings the interface up and writes a byte to its ready pipe.
+4. The launcher writes the byte that releases bwrap. No sleep, no race.
+
+Everything is bounded by `SETUP_SECONDS`, and every failure raises `SandboxNetworkError` with a
+fixed message, never an attachment that is partly there: there is no run without the network it
+was told to have, and none with the host's. `NetworkLink.aclose` kills and reaps slirp4netns, and
+the launcher calls it on every path out of a run.
+
+This module and `runner` are the only users of slirp4netns; the argument list for bwrap is built
+by `tumbleweed.sandbox.bwrap` from `NetworkFds`.
+"""
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Final, final
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from tumbleweed.sandbox.errors import SandboxNetworkError
+from tumbleweed.sandbox.process import kill_and_reap
+
+log = logging.getLogger(__name__)
+
+SETUP_SECONDS: Final = 10.0
+"""The whole of the setup: the info document, slirp4netns's tap and the release."""
+INFO_LIMIT: Final = 4096
+STDERR_LIMIT: Final = 4096
+RESOLVER_ADDRESS: Final = "10.0.2.3"
+"""slirp4netns's resolver; it forwards to the host's."""
+RESOLV_CONF: Final = f"nameserver {RESOLVER_ADDRESS}\n".encode("ascii")
+TAP_NAME: Final = "tap0"
+_FAILED: Final = "the sandbox's network could not be set up; the program did not run"
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class NetworkFds:
+    """The two descriptor numbers bwrap is told about: the pipe it waits on (`--block-fd`) and the
+    one it writes its namespace ids to (`--info-fd`). Both are the child's ends."""
+
+    block: int
+    info: int
+
+
+@final
+class _Info(BaseModel):
+    """What bwrap writes to `--info-fd` (many more keys than these; ignoring them is the
+    documented reason this is not `extra="forbid"`)."""
+
+    model_config = ConfigDict(strict=True, extra="ignore", frozen=True, populate_by_name=True)
+
+    child_pid: int = Field(alias="child-pid", gt=0)
+    net_namespace: int = Field(alias="net-namespace", gt=0)
+
+
+def _own_network_namespace() -> int:
+    return Path("/proc/self/ns/net").stat().st_ino
+
+
+@final
+class NetworkLink:
+    """The pipes and the slirp4netns process of one run. Create it before bwrap starts, pass
+    `fds` to the child, call `release_child_ends` once bwrap has been started (or failed to
+    start), `attach` once it has, and `aclose` on every path out."""
+
+    def __init__(self, slirp4netns: str) -> None:
+        self._program = slirp4netns
+        self._block_read, self._block_write = os.pipe()
+        self._info_read, self._info_write = os.pipe()
+        self._child_ends_open = True
+        self._block_write_open = True
+        self._info_read_open = True
+        self._process: asyncio.subprocess.Process | None = None
+        self._exit_write: int | None = None
+        self._drain: asyncio.Task[None] | None = None
+        self.stderr = bytearray()
+
+    @property
+    def fds(self) -> NetworkFds:
+        return NetworkFds(block=self._block_read, info=self._info_write)
+
+    def release_child_ends(self) -> None:
+        """Close the ends only bwrap needs (idempotent). Until the parent has, a bwrap that dies
+        would not make the info pipe end."""
+        if self._child_ends_open:
+            self._child_ends_open = False
+            os.close(self._block_read)
+            os.close(self._info_write)
+
+    async def attach(self, bwrap: asyncio.subprocess.Process) -> None:
+        """Bring the network up and release bwrap; `SandboxNetworkError` if that cannot be done
+        in `SETUP_SECONDS`. `bwrap` must already have been started with `fds`."""
+        try:
+            async with asyncio.timeout(SETUP_SECONDS):
+                info = await self._read_info(bwrap)
+                if info.net_namespace == _own_network_namespace():
+                    raise SandboxNetworkError(_FAILED)  # never attach to, or release, the host's
+                await self._start_slirp(info.child_pid)
+                self._release()
+        except TimeoutError:
+            raise SandboxNetworkError(_FAILED) from None
+        except OSError as exc:
+            log.warning("the sandbox's network setup failed: %s", exc.strerror)
+            raise SandboxNetworkError(_FAILED) from None
+
+    async def _read_info(self, bwrap: asyncio.subprocess.Process) -> _Info:
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader()
+        file = os.fdopen(self._info_read, "rb", buffering=0)
+        self._info_read_open = False  # `file` owns it now
+        transport, _ = await loop.connect_read_pipe(
+            lambda: asyncio.StreamReaderProtocol(reader), file
+        )
+        try:
+            data = bytearray()
+            while len(data) < INFO_LIMIT:
+                chunk = await reader.read(INFO_LIMIT - len(data))
+                if not chunk:
+                    break
+                data += chunk
+                try:
+                    return _Info.model_validate(json.loads(data))
+                except json.JSONDecodeError:
+                    continue  # not all of it yet
+                except ValidationError:
+                    break
+        finally:
+            transport.close()
+        if bwrap.returncode is not None:
+            log.warning("bwrap ended before the sandbox's network was set up")
+        raise SandboxNetworkError(_FAILED)
+
+    async def _start_slirp(self, pid: int) -> None:
+        ready_read, ready_write = os.pipe()
+        exit_read, exit_write = os.pipe()
+        self._exit_write = exit_write
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                self._program,
+                "--configure",
+                "--disable-host-loopback",
+                "--enable-sandbox",
+                "--enable-seccomp",
+                "--ready-fd",
+                str(ready_write),
+                "--exit-fd",
+                str(exit_read),
+                str(pid),
+                TAP_NAME,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env={},
+                cwd="/",
+                pass_fds=[ready_write, exit_read],
+            )
+        except BaseException:
+            os.close(ready_read)
+            raise
+        finally:
+            os.close(ready_write)
+            os.close(exit_read)
+        assert self._process.stderr is not None  # noqa: S101  (PIPE was asked for)
+        self._drain = asyncio.ensure_future(_capped(self._process.stderr, self.stderr))
+        with os.fdopen(ready_read, "rb", buffering=0) as ready:
+            loop = asyncio.get_running_loop()
+            reader = asyncio.StreamReader()
+            transport, _ = await loop.connect_read_pipe(
+                lambda: asyncio.StreamReaderProtocol(reader), ready
+            )
+            try:
+                answer = await reader.read(1)
+            finally:
+                transport.close()
+        if answer != b"1":
+            raise SandboxNetworkError(_FAILED)  # slirp4netns ended without saying it was ready
+
+    def _release(self) -> None:
+        if not self._block_write_open:
+            return
+        self._block_write_open = False
+        try:
+            os.write(self._block_write, b"1")
+        except OSError:  # bwrap is gone: there is nothing to release
+            raise SandboxNetworkError(_FAILED) from None
+        finally:
+            os.close(self._block_write)
+
+    async def aclose(self) -> None:
+        """Stop slirp4netns and close every descriptor still held. Safe to call twice, on every
+        path: a failure is logged, never raised over the run's own outcome."""
+        self.release_child_ends()
+        if self._block_write_open:
+            self._block_write_open = False  # bwrap, if it is still waiting, sees the end
+            os.close(self._block_write)
+        if self._info_read_open:
+            self._info_read_open = False
+            os.close(self._info_read)
+        if self._exit_write is not None:
+            os.close(self._exit_write)  # slirp4netns's own signal to end
+            self._exit_write = None
+        process = self._process
+        if process is not None and not await asyncio.shield(kill_and_reap(process)):
+            log.error("slirp4netns (pid %s) did not end after SIGKILL", process.pid)
+        if self._drain is not None:
+            self._drain.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._drain
+
+
+async def _capped(stream: asyncio.StreamReader, into: bytearray) -> None:
+    """Read a pipe to its end and keep the first `STDERR_LIMIT` bytes (a full pipe would stop
+    slirp4netns)."""
+    while chunk := await stream.read(4096):
+        into += chunk[: max(0, STDERR_LIMIT - len(into))]

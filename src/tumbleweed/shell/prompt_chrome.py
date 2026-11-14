@@ -39,6 +39,7 @@ from tumbleweed.shell._widgets import plain_label
 from tumbleweed.shell.prompt_guard import PromptGuard
 from tumbleweed.shell.viewmodel.display import display_text
 from tumbleweed.shell.viewmodel.prompts import (
+    NETWORK_WARNING,
     NO_DEVICE,
     DeviceNo,
     InputId,
@@ -440,7 +441,10 @@ class PromptBanner(Gtk.Box):
                     ("The assistant asks to change this file or folder and all in it:", card.path)
                 ]
             case "network":
-                return [("The assistant asks for full network access.", None)]
+                return [
+                    ("The assistant asks for full network access.", None),
+                    (NETWORK_WARNING, None),
+                ]
             case "pick_file":
                 return [("The assistant asks you to choose a file it may read.", None)]
             case "pick_folder":

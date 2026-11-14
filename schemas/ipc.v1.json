@@ -658,7 +658,7 @@
     },
     "NetworkAccess": {
       "additionalProperties": false,
-      "description": "`net.full`. Can be granted (and taints the task); the sandbox gets a network in S22.",
+      "description": "`net.full`. Can be granted (and taints the task); a run that holds it gets a network (S22).",
       "properties": {
         "kind": {
           "const": "net.full",
@@ -1422,6 +1422,10 @@
           "title": "Mounted Grants",
           "type": "integer"
         },
+        "network": {
+          "title": "Network",
+          "type": "boolean"
+        },
         "stderr": {
           "maxLength": 349528,
           "title": "Stderr",
@@ -1479,7 +1483,8 @@
         "wall_milliseconds",
         "unenforced",
         "landlock",
-        "mounted_grants"
+        "mounted_grants",
+        "network"
       ],
       "title": "RunResult",
       "type": "object"

@@ -173,13 +173,13 @@ class ChatSession:
         else:
             self._controller.set_session(restored.session.id)
             if self._lineage is not None:
-                # A hidden reply (D26 (3)) is never the task to inherit from.
-                tagged = (
-                    m.task_id
-                    for m in reversed(restored.messages)
-                    if m.task_id is not None and m.task_id != HIDDEN_TASK
-                )
-                self._lineage.restore(next(tagged, None))
+                # The newest tagged message names the task to inherit from. A hidden reply
+                # (D26 (3)) is never one, and it means the user's fresh start happened in it: the
+                # task the user message before it names is the old one, so nothing is inherited
+                # and no turn of it is visible (D29 (11), #157).
+                tagged = (m.task_id for m in reversed(restored.messages) if m.task_id is not None)
+                newest = next(tagged, None)
+                self._lineage.restore(None if newest == HIDDEN_TASK else newest)
         self._saving = True
         self._set_notice(notice)
         self._transcript.subscribe(self)

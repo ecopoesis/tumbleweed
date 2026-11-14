@@ -64,6 +64,7 @@ from tumbleweed.sandbox.limits import (
     probe_scope,
     scope_argv,
 )
+from tumbleweed.sandbox.network import RESOLV_CONF, NetworkLink
 from tumbleweed.sandbox.policy import SandboxPolicy
 from tumbleweed.sandbox.process import kill_and_reap
 from tumbleweed.sandbox.result import (
@@ -163,7 +164,9 @@ class SandboxRunner:
         prlimit: str | None = None,
         systemd_run: str | None = None,
         use_systemd_scope: bool = True,
+        slirp4netns: str | None = None,
     ) -> None:
+        self._slirp4netns = slirp4netns
         self._bwrap = bwrap
         self._prlimit = prlimit
         self._systemd_run = systemd_run
@@ -259,11 +262,33 @@ class SandboxRunner:
             raise SandboxUnavailable("bubblewrap (bwrap) is not installed")
         if prlimit is None:
             raise SandboxUnavailable("prlimit (util-linux) is not installed")
+        slirp = None
+        if policy.network:
+            slirp = self._slirp4netns or shutil.which("slirp4netns")
+            if slirp is None:
+                raise SandboxUnavailable("slirp4netns is not installed: a network cannot be given")
         policy.check_descriptors()
         program = filter_program()  # raises SandboxUnavailable: nothing runs without the filter
         plan = await self.limits_plan()
         # Descriptors only the child needs: closed here once it has been started, or failed to.
         child_ends: list[int] = []
+        link = None if slirp is None else NetworkLink(slirp)
+        try:
+            return await self._run_with(policy, bwrap, prlimit, program, plan, child_ends, link)
+        finally:
+            if link is not None:
+                await link.aclose()  # on every path: slirp4netns never outlives the run
+
+    async def _run_with(
+        self,
+        policy: SandboxPolicy,
+        bwrap: str,
+        prlimit: str,
+        program: bytes,
+        plan: LimitsPlan,
+        child_ends: list[int],
+        link: NetworkLink | None,
+    ) -> SandboxResult:
         with contextlib.ExitStack() as files:
             try:
                 status_file, status_fd = _pipe()
@@ -279,12 +304,20 @@ class SandboxRunner:
                     payload=None
                     if policy.payload is None
                     else _child_memfd(child_ends, "tumbleweed-payload", policy.payload),
+                    resolv=_child_memfd(child_ends, "tumbleweed-resolv", RESOLV_CONF)
+                    if policy.network
+                    else None,
                 )
                 argv = [
                     *scope_argv(plan, policy.limits),
                     *prlimit_argv(plan, policy.limits, prlimit=prlimit),
                     bwrap,
-                    *build_bwrap_argv(policy, status_fd=status_fd, hardening=fds),
+                    *build_bwrap_argv(
+                        policy,
+                        status_fd=status_fd,
+                        hardening=fds,
+                        network=None if link is None else link.fds,
+                    ),
                 ]
                 started_at = time.monotonic()
                 proc = await asyncio.create_subprocess_exec(
@@ -293,7 +326,11 @@ class SandboxRunner:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=_user_manager_env() if plan.scope else {},
-                    pass_fds=[*descriptors_to_pass(policy), *child_ends],
+                    pass_fds=[
+                        *descriptors_to_pass(policy),
+                        *child_ends,
+                        *([] if link is None else [link.fds.block, link.fds.info]),
+                    ],
                 )
             except OSError as exc:
                 raise SandboxLaunchError(
@@ -302,6 +339,18 @@ class SandboxRunner:
             finally:
                 for number in child_ends:
                     os.close(number)
+                if link is not None:
+                    link.release_child_ends()
+            if link is not None:
+                try:
+                    await link.attach(proc)
+                except BaseException:
+                    # bwrap is held before it sets anything up: nothing ran. Kill it, reap it.
+                    if not await asyncio.shield(kill_and_reap(proc)):
+                        raise SandboxTeardownError(
+                            f"the sandbox's launcher (pid {proc.pid}) did not end after SIGKILL"
+                        ) from None
+                    raise
             return await self._supervise(proc, status_file, report_file, policy, plan, started_at)
 
     async def _supervise(

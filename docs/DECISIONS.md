@@ -1718,7 +1718,7 @@ does not list read grants merged into a write mount.
 and made taint sticky. S22 makes a run that holds the grant actually have a network. **What is
 already enforced** (verified before S22, not changed by it): a task's taint is sticky and exclusive
 (`TaskState`), issuing a grant adds it, `decide` and `issue_grant` refuse a conflicting grant before
-any prompt (`TaintConflict`, which the model reads as "start a new task with fresh_context=true"),
+any prompt (`TaintConflict`, which the model reads as "call start_task with fresh_context=true"),
 `_request_pick` refuses a net-tainted task before it asks, `select_grants` withholds a conflicting
 grant from a run (`TAINT_CONFLICT`), `start_task` copies taint unless `fresh_context`, and the agent
 keeps only a context set that follows the same chain (D26). What did not exist: the sandbox never had

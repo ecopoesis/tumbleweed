@@ -36,6 +36,8 @@ HELPER_TARGET: Final = "/tumbleweed-sandbox-exec"
 PAYLOAD_TARGET: Final = "/tw-payload"
 """Where a run's payload is put (S20): the code and inputs of a run, as a read-only file bwrap
 makes from a memfd. Not on any argv, so other users of the host cannot read it in /proc."""
+RESOLV_TARGET: Final = "/etc/resolv.conf"
+"""The resolver file of a run with a network (S22, D29): bwrap makes it from a memfd."""
 MAX_PAYLOAD_BYTES: Final = 256 * 1024
 # Paths of the sandbox that are not the policy's to hand out, nor anything inside them: bwrap makes
 # them itself, or (the workspace and inputs) a mount point inside would be created in the host's
@@ -50,6 +52,7 @@ RESERVED_TARGETS: Final = (
     INPUTS_TARGET,
     HELPER_TARGET,
     PAYLOAD_TARGET,
+    RESOLV_TARGET,
     TMPFS_TARGET,
 )
 
@@ -448,8 +451,10 @@ class SandboxPolicy:
       weaker one nobody chose. A dev kernel without it (Docker Desktop's, #44) sets this false,
       and each result then records that no Landlock was applied (`SandboxResult.hardening`).
 
-    There is no network option: a sandbox never has one in S14, and S22 adds it as its own
-    field.
+    - `network`: the run gets a network of its own, attached by slirp4netns before the program
+      starts (S22, D29). Without it the sandbox has only its own `lo`. A run with a network
+      mounts no grant and no input (I12: a task never holds files and the network): the policy
+      is refused otherwise.
     """
 
     command: tuple[str, ...]
@@ -462,9 +467,11 @@ class SandboxPolicy:
     env_allowlist: frozenset[EnvName] = frozenset()
     require_landlock: bool = True
     payload: bytes | None = None
+    network: bool = False
 
     def __post_init__(self) -> None:
         self._check_command()
+        _require_type(self.network, bool, "network")
         if self.payload is not None and (
             type(self.payload) is not bytes or len(self.payload) > MAX_PAYLOAD_BYTES
         ):
@@ -475,6 +482,8 @@ class SandboxPolicy:
         _require_type(self.limits, SandboxLimits, "limits")
         inputs = _require_tuple(self.inputs, InputMount, "inputs", MAX_INPUTS)
         grants = _require_tuple(self.grants, GrantMount, "grants", MAX_GRANTS)
+        if self.network and (inputs or grants):
+            raise InvalidPolicyError("a run with a network mounts no input and no grant (I12)")
         if len({mount.connection for mount in inputs}) != len(inputs):
             raise InvalidPolicyError("two inputs name the same connection")
         # No grant may be inside another (or the same). bwrap makes the mount point of an inner
