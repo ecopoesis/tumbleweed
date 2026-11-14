@@ -234,7 +234,7 @@ time.sleep(30)
         own = os.open("/proc/self/ns/net", os.O_RDONLY)
         other = os.open("/proc/self/ns/user", os.O_RDONLY)  # an inode that is not the net one
         child = subprocess.Popen(["sleep", "30"])  # noqa: S607  (a process to look at)
-        pidfd = os.pidfd_open(child.pid)
+        pidfd = os.pidfd_open(child.pid)  # type: ignore[attr-defined,unused-ignore]  # Linux only
         try:
             still_that_namespace(pidfd, child.pid, own)  # alive, same namespace as ours: fine
             with pytest.raises(SandboxNetworkError):
