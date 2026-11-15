@@ -2188,13 +2188,14 @@ acyclic (3), so a value moves along each edge at most once per change and propag
 store's own `MAX_DELIVERIES` stays the backstop. The wire carries `RunOrigin(trigger="connection",
 binding, connection)`; the broker accepts it only for an instance that is the consumer of the named
 connection **of this task** (`_context`), and `policy.select_grants` already applies tool grants to
-`user_event` only, so a connection run gets none (test: `tests/broker/test_connections.py::
-TestConnectionRuns`, and the D30 tripwire is extended: `"connection"` as a trigger appears only in
-`agent/code.py`, `agent/routing.py` and the shell's wiring). When a user's event and a connection
+`user_event` only, so a connection run gets none (tests: `tests/broker/test_connection_runs.py::
+TestTheTrigger`; the D30 tripwire is extended in `tests/agent/test_user_trigger_isolation.py`: only
+`agent/code.py` builds an origin that says `connection`, and only the canvas's endpoint calls
+`UiRuntime.connection_input`). When a user's event and a connection
 value are due for the same handler the **newest** event decides the run (it is one run with the
 newest inputs, D27 (5)): a connection value replaced by a click is a user's run (the user did click),
-a click replaced by a value is a connection run (fewer rights, never more). Test:
-`tests/agent/test_handler_runs.py`.
+a click replaced by a value is a connection run (fewer rights, never more). Tests: `tests/agent/test_handler_runs.py::TestTheTriggerOfARun`,
+`tests/agent/test_routing.py` (fan-out, a chain, the cap at and over the limit, a cycle that ends).
 
 (5) *Files.* Within one task, file refs pass as values (one workspace). Across tasks the broker
 mounts the producer task's retained workspace **read-only** at `/inputs/<ConnectionId>/` of a run:
@@ -2210,7 +2211,8 @@ refuses the same combination below it). Retention is not extended: if the produc
 was deleted or its identity no longer matches, the run is refused with a fixed text and the
 connection stays. A producer continued by an heir after the connection was made is a different task
 with its own workspace; the mount shows the producer **as it ended**, frozen. Tests:
-`tests/broker/test_connections.py::TestInputMounts` (a recording sandbox) and
+`tests/broker/test_connection_runs.py` (`TestAConnectionRun`, `TestTheNetwork`,
+`TestTheFilesAreGone`: a recording sandbox) and
 `tests/broker/test_inputs_linux.py` (`linux`: read, and write, create, delete, rename, chmod, link
 all fail; a `net.full` run mounts nothing).
 
@@ -2226,7 +2228,8 @@ and "has used the network"); what the model said (a reason) is not part of it, t
 made, the data crosses, **the consumer's taint is not raised** (the only exception, I12), and the
 entry carries the `PromptId` (`Allowed.prompt`, stamped by `ShellPrompts`). Denied, timed out, no
 prompt interface or rate limited: no connection, one fixed text, audited. Removing a connection
-never lowers a taint (a task's taint is never lowered). Tests: `TestTaint`, `TestCrossing`.
+never lowers a taint (a task's taint is never lowered). Tests: `tests/broker/test_connection_taint.py` (`TestTaintPropagation`, `TestCrossing`: approve,
+deny, time out, no prompt interface, rate limited, no prompt when none is needed).
 
 (7) *Lifetimes.* A connection belongs to its **consumer task** (`_Live.connections`) and ends when
 that task ends: routing stops (the router asks the broker's list; a connection of an ended task is
@@ -2269,7 +2272,7 @@ offers no way for a user to connect fs data into a net task. `tests/broker/
 test_connection_noninterference.py` runs one script against a state and the same state without its fs
 tasks' instances, from a net consumer and from a clean consumer that stays clean, and demands equal
 answers, equal listings and equal routed values (`agent.routing` is driven from the broker's
-listing).
+listing, with a secret in the fs producer's output).
 
 (9) *Chrome.* The Tools panel gets a Connections list for the current task (`ListConnections`):
 producer tool and port, consumer tool and port, the effect on the task ("passes on: saw your files",
@@ -2282,7 +2285,14 @@ tools, and the system prompt becomes v8: connect only saved tools, one value typ
 instance of an ended task is connectable in the same conversation only, a crossing asks the user. A
 connected value reaches the model only as framed data (`agent.untrusted`, as a canvas event does).
 The fixed texts are pinned word for word in `tests/broker/test_connections.py::TestTexts` and
-`tests/agent/test_connect_tool.py`.
+`tests/agent/test_composition_e2e.py` (the model's `connect_tools`, with the fake provider).
+
+**Known limits.** (a) A cross-task `image` value reaches the consumer's code (under `/inputs`, with
+`root`), but the consumer's own image widget resolves refs in the consumer's workspace, so it shows
+not-found; showing a producer's file in the consumer's widget would need a read-only resolver over
+the mount and is not done. (b) A value routed to a tool whose task has ended still moves while both
+instances are on the canvas and the connection is listed; a connection ends with its consumer
+task, so the listing of an ended task is gone and routing stops.
 
 **Folded in.** #25 is closed by this PR. #157's owner check is done for the connection path as (2);
 `start_task(previous=)` still accepts another owner's ended task (a comment on #157). #168 items:

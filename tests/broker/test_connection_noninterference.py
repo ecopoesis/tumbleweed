@@ -8,7 +8,8 @@ worlds, once with fs-tainted tasks (an ended one whose instance a net task may n
 and consumers that used up the fan-out of a shared producer) and once without; the same calls are
 made from a net-tainted consumer and from a clean consumer that stays clean, and every answer, a
 result or a refusal, with random IDs replaced by their order of appearance, must be equal.
-The routed values are checked on the same worlds in `tests/agent/test_routing.py`.
+The values the router passes on are checked on the same worlds: it follows the broker's listing, so
+a secret held by an fs producer's output reaches no consumer that stayed clean.
 """
 
 import dataclasses
@@ -82,7 +83,7 @@ async def build(rig: Rig, client: BrokerClient, *, with_fs: bool) -> World:
             reader = await fs_tainted(rig, client)
             sink = (await opened(client, reader, taker)).instance
             await client.connect_tools(reader, clean_producer, "out", sink, "src")
-            await client.end_task(reader)
+            # The reader stays live: a count kept for the owner, not the task, would see it.
     return World(fs_producer, fs_live, net_producer, clean_producer, image_producer)
 
 
