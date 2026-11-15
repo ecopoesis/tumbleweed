@@ -2272,7 +2272,11 @@ non-fresh chain (D26 (3), D29 (13)), so a task that saw a net task's turns is ne
 `fresh_context` the old instance IDs are gone; the instance ID of an old net task's tool on the
 canvas reaches an fs task's model only in the turn the shell writes when the user uses that tool, or
 typed by the user. An ended task's card is inert and its events are dropped, so no
-shell turn carries its ID into a later task: the model path needs the user to give the ID in chat.
+shell turn carries its ID into a later task: the model learns an ID from the user in chat or from the
+tool store (a saved tool's description can hold one, and `find_tools` shows it to a task that may see
+that tool), which is why the instances of another task are read-only to the model (below): an ID
+that leaks that way can name a producer but not change what it passes on. The refusal is one fixed
+text whatever the instance holds, so `patch_state` on it is no oracle for a guessed value.
 The acceptance "a taint-crossing connection prompts" is met at the broker, through IPC
 (`test_connection_taint.py`, `test_connection_prompts.py`). The prompt is therefore reachable, narrowly, and **a net-tainted consumer after
 an approved crossing does not exist** (the approved case is an fs consumer, which stays fs). v1

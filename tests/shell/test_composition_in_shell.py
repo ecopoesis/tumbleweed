@@ -151,6 +151,16 @@ def test_a_tool_of_an_earlier_task_cannot_be_written_and_its_value_is_the_one_it
     assert one.runtime.store.value(StateKey("src")) == "what it made"
     assert two.runtime.store.value(StateKey("src")) == "what it made"
 
+    # No oracle: a guess that matches the frozen state is refused exactly as one that does not,
+    # and the refusal is the same whatever the state holds (s25-sec's probe, as a negative test).
+    errors = []
+    for guess in ("what it made", "something else", ""):
+        with pytest.raises(FrozenInstanceError) as caught:
+            tools.patch(producer.instance, {"src": guess})
+        errors.append(str(caught.value))
+    assert len(set(errors)) == 1
+    assert two.runtime.store.value(StateKey("src")) == "what it made"
+
 
 def test_a_tool_of_another_task_that_has_not_ended_is_read_only_to_the_model_too(
     echo_shell: Shell,
