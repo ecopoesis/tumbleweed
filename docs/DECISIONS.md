@@ -2130,3 +2130,164 @@ task, so a user who opens an old photo tool that once read their files cannot th
 task the network (the refusal says why and what to do). Revert is cheap but adds a version each
 time; the 100-version cap is the bound. The `user_event` claim rests on the shell, as every
 decision of the chrome does.
+
+
+## D31 — Tool composition: the broker records every connection and decides it from its own records; values route in the UI runtime, files by a read-only mount, taint before anything flows, one trusted prompt for the one crossing a model can reach (2026-11-15, accepted)
+
+**Context.** S25 wires one stored tool's output port to another's input port. What was there:
+`Port`/`PortType` in the package (checked against the spec), `ConnectionId`, `InputMount` and the
+`/inputs/<ConnectionId>` mount in the launcher (S14), `RunTrigger.CONNECTION` and the rule that tool
+grants apply to `user_event` runs only (D30 (2)), the broker's per-task `instances` (D30 (4)), taint
+and context roots (D26, D30 (6)), the prompt machinery (D25) and `net_with_files` (D29 (11)).
+What did not exist: any request that names two instances, any record of a connection, the wire
+trigger `connection`, and a record of an ended task's instances (`_Live.instances` dies with its
+task, D30 note (a)).
+
+**Decision.** (1) *Which instances.* Only instances the broker minted (`open_tool`) can be connected,
+at both ends: the broker holds their package by hash and checks the ports against it. An instance
+the broker never minted (a `show_ui` tool) is refused with the one text of every unknown instance
+(`UNKNOWN_INSTANCE_TEXT`: it says a tool made with `show_ui` must be saved and opened first); the
+agent may pre-check an unsaved instance **of the current task** for a better text
+("save it first"), never one of another task (that would tell a net task that an fs task's
+instance exists). Enforced in the broker (`BrokerService._connect_tools`). Test:
+`tests/broker/test_connections.py::TestWhichInstances`.
+
+(2) *The broker's own records.* Producer, consumer, their tasks, taint and ended state come from
+the broker's records, never from the request (D30 round 1). The consumer is an instance of the
+request's live task. The producer is an instance of **that task** (a same-task connection) or of
+an **ended task of the same owner**, kept in `BrokerService._ended` (below); an ended task of
+another owner, a live task that is not the consumer's and a task the broker forgot are all **the
+same answer as an unknown instance** (#157 is not repeated: a connection would mount someone
+else's workspace). *Where the record of ended instances lives.* In memory, per owner, at most 32
+ended tasks per owner (the oldest forgotten), written when a task ends (`_apply_ended`), dropped
+with the owner's connection. It is **not persisted**: `Owner` is a per-process counter (the
+daemon's) and a reconnect gets a new one, so a persisted owner would never match and a persisted
+instance could never be checked against an owner. Fail closed, and tested: after a reconnect or a
+broker restart an ended task's instances cannot be connected. The accepted residual: whether an
+ended task is still in the 32 depends on how many tasks of the owner ended since, fs-tainted ones
+included (the same class as D30's "the store is full": one bit about a count, nothing about content).
+Test: `TestEndedProducers`.
+
+(3) *`connect_tools(from, to)`.* `from` is (instance, output port), `to` (instance, input port).
+The refusals, each one fixed text and pinned word for word, in this order: unknown instance; (the
+visibility gate of (8)); unknown port; type mismatch (`PortType` equality, no coercion); a computed
+input (defence in depth: a package cannot declare one); an input already connected; the same
+instance at both ends; a cycle (a path from the consumer to the producer through the task's
+connections); the bounds. The broker mints the `ConnectionId` and keeps the record on
+`_Live.connections`. Bounds (I9; `BrokerConfig`, so tests inject them), all **per consumer task**
+because a global count would let an fs task's connections show in a net task's answers:
+`max_connections_per_task` = 16, `max_connections_per_instance` = 8 (either end), `max_fan_out` = 4
+(one output port into this task's inputs), and the value cap `MAX_ROUTED_VALUE_BYTES` = 64 KiB
+(the router, (4)). Each is tested at the limit (allowed) and one over (refused).
+
+(4) *Values.* In-memory values are routed by the UI runtime (`agent.routing.ConnectionRouter`, GTK-free,
+main thread): a producer's output entry that changes is written to the consumer's input entry
+(`Origin.CONNECTION`, validated like any patch, the whole value or none, never past the cap), and
+the consumer's `sandbox` handlers that list that input run with the trigger `connection`. Graph
+acyclic (3), so a value moves along each edge at most once per change and propagation ends; the
+store's own `MAX_DELIVERIES` stays the backstop. The wire carries `RunOrigin(trigger="connection",
+binding, connection)`; the broker accepts it only for an instance that is the consumer of the named
+connection **of this task** (`_context`), and `policy.select_grants` already applies tool grants to
+`user_event` only, so a connection run gets none (test: `tests/broker/test_connections.py::
+TestConnectionRuns`, and the D30 tripwire is extended: `"connection"` as a trigger appears only in
+`agent/code.py`, `agent/routing.py` and the shell's wiring). When a user's event and a connection
+value are due for the same handler the **newest** event decides the run (it is one run with the
+newest inputs, D27 (5)): a connection value replaced by a click is a user's run (the user did click),
+a click replaced by a value is a connection run (fewer rights, never more). Test:
+`tests/agent/test_handler_runs.py`.
+
+(5) *Files.* Within one task, file refs pass as values (one workspace). Across tasks the broker
+mounts the producer task's retained workspace **read-only** at `/inputs/<ConnectionId>/` of a run:
+opened by the identity the broker recorded (`workspaces.open_workspace`), bound by descriptor
+(S14), never writable, never a write into another task's workspace; the code sees a value's file
+at `<root>/<path>` (the broker adds `root` to a connected file or image input, in the payload it
+builds itself). **Which runs get which mounts.** A run gets the `/inputs/<c>` of every
+cross-task connection `c` whose consumer is *the instance the run is bound to* and nothing else:
+a `run_code` run, a run of another instance and a run of the same instance in a different task
+get none; and **a run that holds `net.full` mounts none** (D29 (11) stays: `net_with_files` is
+extended from grants to inputs and the run is refused with its own fixed text; `SandboxPolicy`
+refuses the same combination below it). Retention is not extended: if the producer's workspace
+was deleted or its identity no longer matches, the run is refused with a fixed text and the
+connection stays. A producer continued by an heir after the connection was made is a different task
+with its own workspace; the mount shows the producer **as it ended**, frozen. Tests:
+`tests/broker/test_connections.py::TestInputMounts` (a recording sandbox) and
+`tests/broker/test_inputs_linux.py` (`linux`: read, and write, create, delete, rename, chmod, link
+all fail; a `net.full` run mounts nothing).
+
+(6) *Taint.* A cross-task connection propagates the producer task's taint to the consumer task
+**before anything flows**: set in the same transaction as the audit entry (`connection_made`
+with both taints), persisted, like `open_tool`. A connection within one task changes nothing. If the
+merge would make the consumer both fs- and net-tainted, the broker asks the user in a **trusted
+prompt**, a new subject of the existing prompt machinery (`CrossingSubject`, wire `CrossingAccess`,
+scope `once` only: the approval is for this crossing and is never kept). The chrome states in its own plain words
+both tools, by their index names set apart as the tools' own, and both effects ("has seen your files"
+and "has used the network"); what the model said (a reason) is not part of it, there is none
+(I5). The same per-task and per-owner prompt limits as any prompt apply. Approved: the connection is
+made, the data crosses, **the consumer's taint is not raised** (the only exception, I12), and the
+entry carries the `PromptId` (`Allowed.prompt`, stamped by `ShellPrompts`). Denied, timed out, no
+prompt interface or rate limited: no connection, one fixed text, audited. Removing a connection
+never lowers a taint (a task's taint is never lowered). Tests: `TestTaint`, `TestCrossing`.
+
+(7) *Lifetimes.* A connection belongs to its **consumer task** (`_Live.connections`) and ends when
+that task ends: routing stops (the router asks the broker's list; a connection of an ended task is
+not listed), mounts go (a run of an ended task is refused already). **An heir inherits taint, as
+D26 and D30 say, and neither connections nor the crossing approval**: an approval is for one
+connection of one task, and an heir that wants the data makes a new connection, and is asked
+again if it is still a crossing. For each case: end and resume (`start_task(previous=ended)`): the
+new task has no connection, the taint of the record, a new prompt if a crossing; `start_task(
+previous=live)`: the replaced task ends first, same; a branch from an older ended task: the same
+and the producer's registry entry is still there, so the heir can connect afresh; `fresh_context`:
+no connection, no inherited taint, so a producer that was fs is a clean task's to connect to (and
+taints it); a producer continued by an heir: the mount shows the producer as it ended (5).
+Test: `tests/broker/test_connection_lifetimes.py`, one test per case.
+
+(8) *The property (I12), the counterpart of D30 (6).* For a consumer task that is not fs-tainted after the
+call, the answer to `connect_tools`, the routed values it receives and the connections listing it can
+see are byte-identical to the answers from the same broker state with every fs-tainted task's
+instances and every fs-tainted version deleted. In particular a net-tainted consumer that names an
+instance of an fs-tainted task is answered exactly like an unknown instance and is never shown a
+crossing prompt for it. Enforcement is in the order of the checks in `_connect_tools`:
+(a) resolve the consumer (own live task's instance) and the producer (same task, or the ended
+registry of the owner); (b) **the gate**: if the producer's task is fs-tainted and the consumer is net-tainted,
+the answer is the unknown-instance text, with no prompt, no cap spent and no further read of the
+producer; (c) a clean consumer that names an fs-tainted producer takes the fs taint **first**
+(persisted, audited as `connection_tainted`) and is then answered by the rules below: it is
+fs-tainted after the call, so the property does not apply (the D30 write gate's shape: otherwise
+"type mismatch" against "unknown instance" would tell a task that stays clean that the instance
+exists); (d) only then ports, types, caps and the crossing. The caps are per consumer task (3), the
+connections listing is the task's own, and a net or clean consumer's listing holds no connection to
+an fs producer (it would be fs-tainted). **Reachability.** A crossing needs {consumer, producer}
+taints to be {fs, net}. (fs producer, net consumer) is the exfiltration direction and is
+forbidden by the property: no model request reaches a prompt for it. (net producer, fs consumer)
+is the only crossing that prompts. Whether a model can name it: context and taint travel the same
+non-fresh chain (D26 (3), D29 (13)), so a task that saw a net task's turns is net itself, and after
+`fresh_context` the old instance IDs are gone; the instance ID of an old net task's tool on the
+canvas reaches an fs task's model only in the turn the shell writes when the user uses that tool, or
+typed by the user. The prompt is therefore reachable, narrowly, and **a net-tainted consumer after
+an approved crossing does not exist** (the approved case is an fs consumer, which stays fs). v1
+offers no way for a user to connect fs data into a net task. `tests/broker/
+test_connection_noninterference.py` runs one script against a state and the same state without its fs
+tasks' instances, from a net consumer and from a clean consumer that stays clean, and demands equal
+answers, equal listings and equal routed values (`agent.routing` is driven from the broker's
+listing).
+
+(9) *Chrome.* The Tools panel gets a Connections list for the current task (`ListConnections`):
+producer tool and port, consumer tool and port, the effect on the task ("passes on: saw your files",
+"passes on: used the network", none), "you approved this" for a crossing, and **Remove**
+(`RemoveConnection`, the user's chrome action only; no model tool). Names are the tools' own, plain,
+capped. The canvas shows instances **side by side** (a flow of cards that wraps) instead of one column.
+
+(10) *Model texts.* `connect_tools(from_instance, from_port, to_instance, to_port)` joins the model
+tools, and the system prompt becomes v8: connect only saved tools, one value type per port, an
+instance of an ended task is connectable in the same conversation only, a crossing asks the user. A
+connected value reaches the model only as framed data (`agent.untrusted`, as a canvas event does).
+The fixed texts are pinned word for word in `tests/broker/test_connections.py::TestTexts` and
+`tests/agent/test_connect_tool.py`.
+
+**Folded in.** #25 is closed by this PR. #157's owner check is done for the connection path as (2);
+`start_task(previous=)` still accepts another owner's ended task (a comment on #157). #168 items:
+see the PR. **Consequences.** A connection is a few records in memory and one transaction at
+the moment it is made; nothing about it is persisted, so a broker restart ends them with their tasks
+(tasks do not survive a restart anyway). After a reconnect the model has to open its tools again
+in the new task, and an old task's tools cannot feed it. A net.full run of a consumer with a
+cross-task input is refused while the connection stands; removing the connection is the way out.
