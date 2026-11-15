@@ -2298,7 +2298,8 @@ only what the canvas holds, which no answer reports. No other model tool takes a
 the canvas. **Residual, exactly.** The task that closes cards needs no instance ID (`replace` closes all of them,
 `stack` the oldest); a later task that holds the IDs (from the tool store or the user) can learn
 which of up to 4 cards were closed, because a connection routes values only while both of its cards
-are shown and a consumer's input then stops changing. That is seen only in the consumer's own state,
+are shown: a producer whose card was closed before the connect never gives the consumer's input
+a value, so the input never receives one. That is seen only in the consumer's own state,
 in one direction (closing is the only act, and nothing flows back to the closer), at most one bit per
 connection and at most log2(5) bits per closing task.
 A crossing denied by the broker's *timeout* carries no PromptId (the interface that mints the id
