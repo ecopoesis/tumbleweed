@@ -63,7 +63,8 @@ type Placement = Literal["replace", "stack"]
 _NO_CANVAS: Final = "The canvas is not available right now."
 FROZEN_TEXT: Final = (
     "That tool cannot be changed: it is not on the canvas, or it belongs to an earlier task. If "
-    "you need it, show it again (show_ui) or open it again (open_tool) in this task and use the new instance id."
+    "you need it, show it again (show_ui) or open it again (open_tool) in this task and use the "
+    "new instance id."
 )
 _FIX_AND_RETRY: Final = "Fix these and call show_ui again (nothing was shown):"
 
