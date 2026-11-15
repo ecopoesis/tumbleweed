@@ -18,12 +18,15 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 
+from tests.agent.test_routing import Stage
 from tests.broker.connect_support import fs_tainted, net_tainted, opened, stored_tool
 from tests.broker.rig import Rig, running
 from tests.ipc.bounded import run
+from tumbleweed.agent.routing import ConnectionRouter
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
 from tumbleweed.core.ids import TaskId, ToolInstanceId
 from tumbleweed.ipc.base import Response
+from tumbleweed.ui.spec.names import StateKey
 
 _ID = re.compile(r"(?P<id>(?:tool|inst|conn)_[0-9a-z]{26})|(?P<hash>[0-9a-f]{64})")
 
@@ -112,7 +115,9 @@ CALLS: tuple[tuple[str, Call], ...] = (
 )
 
 
-async def script(*, with_fs: bool, who: str) -> tuple[list[tuple[str, Answer]], list[object]]:
+async def script(
+    *, with_fs: bool, who: str
+) -> tuple[list[tuple[str, Answer]], list[object], list[object]]:
     """The calls of one consumer (`net` or `clean`) in one world, and the crossing prompts asked."""
     answers: list[tuple[str, Answer]] = []
     async with running(config=lambda c: dataclasses.replace(c, max_fan_out=FAN_OUT)) as rig:
@@ -132,7 +137,34 @@ async def script(*, with_fs: bool, who: str) -> tuple[list[tuple[str, Answer]], 
             except BrokerRefused as refusal:
                 answers.append((name, ("refused", refusal.reason, refusal.message)))
         crossings = [asked for asked in rig.prompts.asked if asked.crossing is not None]
-    return answers, list(crossings)
+        routed = await routed_values(client, task, world)
+    return answers, list(crossings), routed
+
+
+async def routed_values(client: BrokerClient, task: TaskId, world: World) -> list[object]:
+    """What the consumer's four inputs hold after the producers took their values and the router
+    followed the broker's listing: every instance of the world has an endpoint, the fs ones hold a
+    secret, and only what the broker listed can move."""
+    ends = {
+        world.fs_producer: Stage(),
+        world.fs_live: Stage(),
+        world.net_producer: Stage(),
+        world.clean_producer: Stage(),
+        world.image_producer: Stage(),
+    }
+    sinks = {instance: Stage() for instance in INSTANCES[task]}
+    router = ConnectionRouter()
+    for instance, stage in {**ends, **sinks}.items():
+        router.attach(instance, stage)
+    router.set_connections(task, (await client.list_connections(task)).connections)
+    for name, value in (
+        ("fs_producer", "SECRET"),
+        ("fs_live", "SECRET"),
+        ("net_producer", "from the net"),
+        ("clean_producer", "from clean"),
+    ):
+        ends[getattr(world, name)].set(value)
+    return [sinks[instance].value(StateKey("src")) for instance in INSTANCES[task]]
 
 
 async def _clean(rig: Rig, client: BrokerClient) -> TaskId:
@@ -145,6 +177,9 @@ class TestNoninterference:
         async def scenario() -> None:
             with_fs = await script(with_fs=True, who=who)
             without = await script(with_fs=False, who=who)
+            assert with_fs[2] == without[2]  # the routed values
+            assert "SECRET" not in repr(with_fs[2])
+            assert len([value for value in with_fs[2] if value]) >= 2  # and something did flow
             assert [name for name, _ in with_fs[0]] == [name for name, _ in without[0]]
             assert len(with_fs[0]) >= 7
             for (name, left), (_, right) in zip(with_fs[0], without[0], strict=True):
@@ -156,7 +191,7 @@ class TestNoninterference:
 
     def test_a_net_consumer_is_answered_as_for_an_unknown_instance(self) -> None:
         async def scenario() -> None:
-            answers, crossings = await script(with_fs=True, who="net")
+            answers, crossings, _routed = await script(with_fs=True, who="net")
             hidden = [answer for name, answer in answers if name.startswith("fs ")]
             assert len(hidden) == 4
             assert all(answer == hidden[0] for answer in hidden)
