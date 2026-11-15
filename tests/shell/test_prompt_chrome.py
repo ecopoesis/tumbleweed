@@ -20,7 +20,7 @@ from tests.shell.gtk_support import (
     pump_until,
 )
 from tests.shell.gtk_support import user_click as gtk_user_click
-from tests.shell.prompt_support import Answers, network_card, pick_card, read_card
+from tests.shell.prompt_support import Answers, crossing_card, network_card, pick_card, read_card
 from tests.ui.gtk.hostile import hostile_spec
 from tests.ui.gtk.test_no_surfaces import show as show_spec
 from tests.ui.gtk.test_no_surfaces import surfaces_below, use_every_widget
@@ -101,6 +101,28 @@ class TestWhereItIs:
         assert "The assistant asks for full network access." in shown
         assert NETWORK_WARNING in shown  # D29 (10): the strong warning, as plain text
         assert not any("/home" in line for line in shown)
+
+    def test_a_crossing_names_both_tools_and_both_effects_in_the_chromes_words(
+        self, build_prompt_shell: Builder
+    ) -> None:
+        shell = build_prompt_shell()
+        shell.own_controller()
+        present(shell)
+
+        pending(shell, crossing_card("Fetcher <b>x</b>", "Photo tool"))
+
+        banner = shell.window.prompt_banner
+        shown = texts(banner)
+        assert any("asks to connect two tools" in line for line in shown)
+        assert "Fetcher <b>x</b>" in shown  # the tool's own name, as text, on a line of its own
+        assert "Photo tool" in shown
+        assert "The task it came from has used the network." in shown
+        assert "The task it is in has seen your files." in shown
+        assert any("A task is never allowed to have both" in line for line in shown)
+        assert sorted(label for label in buttons(banner) if label.startswith("Allow")) == [
+            "Allow this connection"
+        ]
+        assert all(not label.get_use_markup() for label in labels_in(banner))
 
     def test_the_reason_is_quoted_labelled_plain_and_capped(
         self, build_prompt_shell: Builder

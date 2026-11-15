@@ -51,6 +51,7 @@ from tumbleweed.broker.grants import GrantScope
 from tumbleweed.broker.prompts import Allowed
 from tumbleweed.core.ids import GrantId, TaskId, ToolId, ToolInstanceId
 from tumbleweed.core.types import ContentHash
+from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.ipc.tool_messages import ToolGrantInfo
 from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.runtime import UiEvent, UiRuntime
@@ -140,6 +141,9 @@ class StoredCanvas:
         return found
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
+        raise AssertionError("not used here")
+
+    def set_connections(self, task: TaskId, connections: tuple[ConnectionInfo, ...]) -> None:
         raise AssertionError("not used here")
 
     def click(self, instance: ToolInstanceId) -> None:
@@ -452,7 +456,7 @@ class TestRefineAndRevert:
 
                 (result,) = results(rig, 1)
                 assert result.is_error
-                assert "no tool" in result.content.lower()
+                assert "not on the canvas" in result.content.lower()
                 assert thread.rig.audit_of(ToolSaved) == []
 
 

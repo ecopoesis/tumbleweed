@@ -27,6 +27,7 @@ from tumbleweed.ipc.base import IpcMessage, Request, Response
 from tumbleweed.ipc.broker_messages import (
     MAX_PATH_CHARS,
     MAX_REASON_CHARS,
+    CrossingAccess,
     NoUndoAccess,
     RequestedAccess,
     Scope,
@@ -35,7 +36,9 @@ from tumbleweed.ipc.broker_messages import (
 MAX_PROMPT_SECONDS: Final = 3600
 """The longest a prompt may be asked to wait (the broker's own ceiling for `prompt_timeout`)."""
 
-PromptedAccess = Annotated[RequestedAccess | NoUndoAccess, Field(discriminator="kind")]
+PromptedAccess = Annotated[
+    RequestedAccess | NoUndoAccess | CrossingAccess, Field(discriminator="kind")
+]
 """What a prompt may ask: an access (what a model may request) or, from the broker only, "no undo"
 (S21). `RequestedAccess` is itself a union, so this is a plain union of the two."""
 

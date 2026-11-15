@@ -6,7 +6,10 @@ then has the canvas render it; a spec that does not validate is never rendered, 
 show a field name of at most 40 characters) go back to the model as the error result so that it
 can correct itself and call again. `patch_state(instance,
 patch)` changes the state of a tool that is on the canvas: the whole patch is checked against the
-spec and applied, or none of it is, and it never fires a handler (ARCHITECTURE section 4).
+spec and applied, or none of it is, and it never fires a handler of the tool itself (ARCHITECTURE
+section 4); of a tool that is connected as a producer, a patch is passed on, and what arrives
+starts the consumer's handlers that read it (trigger `connection`, no tool grant, D31 (4)). A
+patch of a tool that is not the current task's is refused (`FrozenInstanceError`).
 
 A tool on the canvas is an **instance** (`ToolInstanceId`, made by the canvas host). `placement`
 is `replace` (the default: the new tool takes the canvas, and every instance there is closed) or
@@ -38,6 +41,7 @@ from tumbleweed.agent.tools import ToolError, ToolName, ToolRegistry
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import TaskId, ToolId, ToolInstanceId
 from tumbleweed.core.types import ContentHash, ToolVersion
+from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.tools.limits import MAX_MODULES, MAX_MODULES_BYTES
 from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.spec import SpecError, UiSpec, validate_ui_spec
@@ -57,7 +61,18 @@ MAX_LISTED_ENTRIES: Final = 40  # state entries named in the result of `show_ui`
 type Placement = Literal["replace", "stack"]
 
 _NO_CANVAS: Final = "The canvas is not available right now."
+FROZEN_TEXT: Final = (
+    "That tool cannot be changed: it is not on the canvas, or it belongs to an earlier task. If "
+    "you need it, show it again (show_ui) or open it again (open_tool) in this task and use the "
+    "new instance id."
+)
 _FIX_AND_RETRY: Final = "Fix these and call show_ui again (nothing was shown):"
+
+
+class FrozenInstanceError(TumbleweedError):
+    """The instance is not the current task's (its task ended, or it is another's): the model may
+    not change its state (S25, D31 (4): a connection passes on what a producer holds, and no task
+    but the producer's own may write it)."""
 
 
 class UnknownInstanceError(TumbleweedError):
@@ -127,7 +142,13 @@ class CanvasHost(Protocol):
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
         """Apply `patch` to the instance; the keys whose value changed, computed entries
-        included. Raises `SpecError` (refused, whole) or `UnknownInstanceError`."""
+        included. Raises `SpecError` (refused, whole), `UnknownInstanceError` or
+        `FrozenInstanceError` (the instance is not the current task's)."""
+        ...
+
+    def set_connections(self, task: TaskId, connections: tuple[ConnectionInfo, ...]) -> None:
+        """The broker's list of the connections of consumer task `task` (S25): values flow along
+        them while both instances are on the canvas."""
         ...
 
 
@@ -165,6 +186,9 @@ class CanvasLink:
         self, instance: ToolInstanceId, patch: Mapping[str, object]
     ) -> tuple[StateKey, ...]:
         return await self._on_main(lambda host: host.patch(instance, patch))
+
+    async def set_connections(self, task: TaskId, connections: tuple[ConnectionInfo, ...]) -> None:
+        await self._on_main(lambda host: host.set_connections(task, connections))
 
     async def _on_main[T](self, call: Callable[[CanvasHost], T]) -> T:
         loop = asyncio.get_running_loop()
@@ -307,11 +331,10 @@ def register_canvas_tools(
             changed = await link.patch(arguments.instance, arguments.patch)
         except SpecError as error:
             raise _failure_of(error, "The patch was refused and nothing changed:") from None
-        except UnknownInstanceError:
-            raise ToolError(
-                f"There is no tool {arguments.instance} on the canvas now: it was replaced or "
-                "closed. Call show_ui to show it again."
-            ) from None
+        except (UnknownInstanceError, FrozenInstanceError):
+            # One text for every tool that is not a current-task tool on the canvas (unknown,
+            # closed, inert, another task's): which of them it is says nothing (D31 (8)).
+            raise ToolError(FROZEN_TEXT) from None
         return "Updated: " + (", ".join(changed) if changed else "nothing (no value changed)") + "."
 
     registry.register(
@@ -325,7 +348,9 @@ def register_canvas_tools(
     registry.register(
         ToolName("patch_state"),
         "Change state entries of a tool that is on the canvas. It updates the widgets and the "
-        "computed entries and never runs a handler.",
+        "computed entries and never runs a handler of that tool. If the tool's output is "
+        "connected to another tool (connect_tools), the new value is passed on and runs that "
+        "tool's code. Tools of an earlier task cannot be changed.",
         PatchStateInput,
         patch_state,
     )

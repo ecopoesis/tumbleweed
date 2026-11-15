@@ -26,6 +26,7 @@ from tumbleweed.agent.fake import FakeToolCall, FakeTurn
 from tumbleweed.agent.llm import ToolResultBlock
 from tumbleweed.agent.tools import ToolRegistry
 from tumbleweed.core.ids import TaskId, ToolInstanceId
+from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.runtime import UiRuntime
 from tumbleweed.ui.spec import UiSpec
@@ -45,6 +46,8 @@ class FakeCanvas:
         self.threads: set[int] = set()
         self.code: list[tuple[CodeModule, ...]] = []
         self.sources: dict[ToolInstanceId, InstanceSource] = {}
+        self.connections: dict[TaskId, tuple[ConnectionInfo, ...]] = {}
+        self.frozen: set[ToolInstanceId] = set()
 
     def source(self, instance: ToolInstanceId) -> InstanceSource:
         found = self.sources.get(instance)
@@ -78,6 +81,10 @@ class FakeCanvas:
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
         self.threads.add(threading.get_ident())
+        if instance in self.frozen:
+            from tumbleweed.agent.canvas import FrozenInstanceError
+
+            raise FrozenInstanceError("not the current task's")
         runtime = self.runtimes.get(instance)
         if runtime is None:
             raise UnknownInstanceError("gone")
@@ -85,6 +92,9 @@ class FakeCanvas:
         runtime.patch_state(patch)
         after = runtime.store.snapshot()
         return tuple(key for key, value in after.items() if before[key] != value)
+
+    def set_connections(self, task: TaskId, connections: tuple[ConnectionInfo, ...]) -> None:
+        self.connections[task] = connections
 
 
 def call(name: str, **arguments: JsonValue) -> FakeToolCall:
@@ -334,7 +344,9 @@ class TestPatchState:
 
             (result,) = tool_results(rig, 1)
             assert result.is_error
-            assert "no tool" in result.content
+            from tumbleweed.agent.canvas import FROZEN_TEXT
+
+            assert result.content == FROZEN_TEXT
             assert "show_ui" in result.content
 
     def test_an_instance_id_of_another_kind_is_an_input_error(self) -> None:
@@ -386,6 +398,57 @@ class TestLink:
         dispatcher.drain(settle=0.01)  # the main thread gets to it too late
 
         assert canvas.shown == []  # the model was told it took too long: nothing shows up now
+
+
+class TestAFrozenInstance:
+    def test_the_model_is_told_in_one_text_that_the_tool_cannot_be_changed(self) -> None:
+        from tumbleweed.agent.canvas import FROZEN_TEXT
+
+        instance = ToolInstanceId.new()
+
+        canvas = FakeCanvas((instance,))
+        canvas.frozen.add(instance)
+        script = [
+            FakeTurn(tool_calls=(call("patch_state", instance=str(instance), patch={"bill": 1}),)),
+            FakeTurn(chunks=("ok",)),
+        ]
+        with canvas_rig(script, canvas) as rig:
+            rig.send_and_wait("change it")
+            (result,) = (
+                block
+                for block in rig.provider.requests[1].messages[-1].content
+                if isinstance(block, ToolResultBlock)
+            )
+
+        assert result.is_error
+        assert result.content == FROZEN_TEXT
+
+
+class TestOneTextForEveryToolThatIsNotTheCurrentTasks:
+    def test_unknown_absent_inert_and_foreign_instances_get_byte_identical_answers(self) -> None:
+        from tumbleweed.agent.canvas import FROZEN_TEXT
+
+        frozen, absent = ToolInstanceId.new(), ToolInstanceId.new()
+        canvas = FakeCanvas((frozen,))
+        canvas.frozen.add(frozen)  # inert, or another task's: the canvas refuses it
+        # `absent` is on no canvas at all; a third is one the canvas never heard of.
+        ids = [frozen, absent, ToolInstanceId.new()]
+        script = [
+            FakeTurn(
+                tool_calls=tuple(call("patch_state", instance=str(i), patch={"b": 1}) for i in ids)
+            ),
+            FakeTurn(chunks=("ok",)),
+        ]
+        with canvas_rig(script, canvas) as rig:
+            rig.send_and_wait("change them")
+            results = [
+                block
+                for block in rig.provider.requests[1].messages[-1].content
+                if isinstance(block, ToolResultBlock)
+            ]
+
+        assert [r.content for r in results] == [FROZEN_TEXT] * 3
+        assert all(r.is_error for r in results)
 
 
 class TestPatchReportsChanges:

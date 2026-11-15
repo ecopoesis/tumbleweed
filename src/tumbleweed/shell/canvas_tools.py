@@ -13,6 +13,11 @@ chrome region. `sandbox` handlers run their code through `HandlerRuns` (S20, D27
 a broker to run it with; without one the renderer shows their controls disabled, with the reason in
 the card (`tumbleweed.ui.gtk.widgets`). A plain line under the tool says what a run is doing or why
 it failed (our words, never the sandbox's).
+
+**Side by side, and connected (S25, D31).** The cards sit in a flow that wraps, so several tools
+are seen at once, and the broker's connections between them are followed by the router
+(`agent.routing`): a value that one tool's output entry takes is written to the input entry of
+the tool it is connected to, and that tool's handlers that read the input run as `connection` runs.
 """
 
 import logging
@@ -23,6 +28,7 @@ from typing import Final, final
 from pydantic import JsonValue
 
 from tumbleweed.agent.canvas import (
+    FrozenInstanceError,
     InstanceSource,
     Placement,
     ShownTool,
@@ -32,8 +38,10 @@ from tumbleweed.agent.canvas import (
 from tumbleweed.agent.canvas_events import AgentEventSink, EventGate, Scheduler
 from tumbleweed.agent.code import HandlerExecutor
 from tumbleweed.agent.handler_runs import HandlerRuns
+from tumbleweed.agent.routing import ConnectionRouter
 from tumbleweed.agent.tool_access import ToolAccess, ToolAccessKind
-from tumbleweed.core.ids import TaskId, ToolInstanceId
+from tumbleweed.core.ids import ConnectionId, TaskId, ToolInstanceId
+from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.shell._gi import Gtk
 from tumbleweed.shell.canvas import CanvasView
 from tumbleweed.shell.viewmodel.display import display_text
@@ -41,7 +49,7 @@ from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.gtk import RenderedTool
 from tumbleweed.ui.gtk.text import line_label
 from tumbleweed.ui.images import ImageResolver
-from tumbleweed.ui.runtime import UiEvent, UiRuntime
+from tumbleweed.ui.runtime import Change, UiEvent, UiRuntime
 from tumbleweed.ui.runtime.events import AgentSink
 from tumbleweed.ui.spec import UiSpec
 from tumbleweed.ui.spec.handlers import AgentHandler, SandboxHandler
@@ -84,6 +92,7 @@ class _Shown:
     sink: _TaskSink
     runs: HandlerRuns | None
     source: InstanceSource
+    notice: "_Notice"
 
 
 @final
@@ -100,6 +109,23 @@ class _Notice:
     def notice(self, text: str | None) -> None:
         self._label.set_text("" if text is None else display_text(text))
         self._label.set_visible(bool(text))
+
+
+@final
+class _Endpoint:
+    """A rendered tool as the router sees it."""
+
+    def __init__(self, tool: RenderedTool) -> None:
+        self._runtime = tool.runtime
+
+    def value(self, key: StateKey) -> StateValue:
+        return self._runtime.store.value(key)
+
+    def subscribe(self, listener: Callable[[Change], None]) -> Callable[[], None]:
+        return self._runtime.store.subscribe(listener)
+
+    def receive(self, key: StateKey, value: JsonValue, connection: ConnectionId) -> None:
+        self._runtime.connection_input(key, value, connection)
 
 
 _ACCESS_BUTTONS: Final[dict[str, tuple[tuple[str, ToolAccessKind], ...]]] = {
@@ -179,8 +205,16 @@ class CanvasTools:
         self._images = images
         self._images_for = images_for
         self._shown: list[_Shown] = []
-        self._column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self._column = Gtk.FlowBox()
+        self._column.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._column.set_homogeneous(False)
+        self._column.set_min_children_per_line(1)
+        self._column.set_max_children_per_line(MAX_STACKED)
+        self._column.set_row_spacing(12)
+        self._column.set_column_spacing(12)
         self._column.set_valign(Gtk.Align.START)
+        self._router = ConnectionRouter(self._dropped)
+        self._current: TaskId | None = None  # the task the conversation is in
 
     @property
     def instances(self) -> tuple[ToolInstanceId, ...]:
@@ -238,15 +272,20 @@ class CanvasTools:
             sink,
             runs,
             InstanceSource(spec, code, stored, task),
+            notice,
         )
         keep = 0 if placement == "replace" else MAX_STACKED - 1
         while len(self._shown) > keep:
             self._close(self._shown[0])
         self._shown.append(shown)
         self._column.append(shown.card)
+        self._router.attach(instance, _Endpoint(tool))
         if self._canvas.content is not self._column:
             self._canvas.set_content(self._column)
-        return ShownTool(instance=instance, on_canvas=len(self._shown))
+        # Only this task's cards are counted: an earlier task's say nothing to this one (#171).
+        return ShownTool(
+            instance=instance, on_canvas=sum(1 for each in self._shown if each.task == task)
+        )
 
     def source(self, instance: ToolInstanceId) -> InstanceSource:
         found = next((shown.source for shown in self._shown if shown.instance == instance), None)
@@ -255,9 +294,15 @@ class CanvasTools:
         return found
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
-        tool = self.tool(instance)
-        if tool is None:
+        shown = next((each for each in self._shown if each.instance == instance), None)
+        if shown is None:
             raise UnknownInstanceError(f"no tool {instance} is on the canvas")
+        if shown.sink.inert or (
+            shown.task is not None and self._current is not None and shown.task != self._current
+        ):
+            # What a connection passes on is the producer's own: no other task writes it (D31).
+            raise FrozenInstanceError(f"tool {instance} is not the current task's")
+        tool = shown.tool
         store = tool.runtime.store
         before = store.snapshot()
         tool.runtime.patch_state(patch)  # SpecError: refused whole, nothing applied
@@ -269,6 +314,15 @@ class CanvasTools:
             if type(before[key]) is not type(value) or before[key] != value
         )
 
+    def set_connections(self, task: TaskId, connections: tuple[ConnectionInfo, ...]) -> None:
+        """The broker's connections of consumer task `task`: values follow them from now on."""
+        self._router.set_connections(task, connections)
+
+    def _dropped(self, instance: ToolInstanceId, text: str) -> None:
+        shown = next((each for each in self._shown if each.instance == instance), None)
+        if shown is not None:
+            shown.notice.notice(text)
+
     def task_ended(self, task: TaskId) -> None:
         """The task has ended: its instances become inert (D26 (5), ARCHITECTURE section 2). Their
         `agent` events are dropped (and one already waiting is forgotten), they can no longer read
@@ -276,10 +330,12 @@ class CanvasTools:
         and `patch_state` still work, and the card says so. An instance that belongs to no task
         (it was shown while the broker could not be reached) goes inert with the first task that
         ends or starts after it."""
+        self._router.task_ended(task)  # a connection ends with its consumer task (D31 (7))
         self._make_inert(lambda shown: shown.task in (task, None))
 
     def task_started(self, task: TaskId) -> None:
         """A task has started: an instance that belongs to no task goes inert (see `task_ended`)."""
+        self._current = task
         self._make_inert(lambda shown: shown.task is None)
 
     def _make_inert(self, which: Callable[[_Shown], bool]) -> None:
@@ -298,6 +354,7 @@ class CanvasTools:
 
     def _close(self, shown: _Shown) -> None:
         self._shown.remove(shown)
+        self._router.detach(shown.instance)
         if shown.runs is not None:
             shown.runs.stop()
         try:

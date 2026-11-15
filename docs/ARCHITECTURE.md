@@ -874,7 +874,7 @@ the user's own, and `edit_before_send` (and its forcing over plain http) applies
 | Tool | Effect | Step |
 |---|---|---|
 | `show_ui(spec, placement?, code?)` | Validate and render a tool draft on the canvas; `placement` is `replace` (default) or `stack`; `code` is the list of `{name, source}` modules its `sandbox` handlers call | S12, S20 |
-| `patch_state(instance, patch)` | Update a rendered tool's state (never fires handlers) | S12 |
+| `patch_state(instance, patch)` | Update the state of a tool of the current task (never fires its own handlers; a connected output is passed on) | S12, S25 |
 | `start_task(title, fresh_context?)` | End the current task; new workspace, no grants; optionally no prior turns | S19 |
 | `request_access(kind, path?, reason)` | Ask for a grant (`read`, `write` (task scope only; runs that can change it are snapshotted first), `network`), or ask the user to pick a file/folder to read (`pick_file`, `pick_folder`); a picked path comes back in the result | S19, S21 |
 | `list_workspace()` / `list_dir(path)` / `read_file(path)` | Grant-checked, size-capped listings and reads via the broker | S19 |
@@ -882,7 +882,7 @@ the user's own, and `edit_before_send` (and its forcing over plain http) applies
 | `undo_last_change()` | Restore the paths written by the task's latest write-enabled run that is not undone or overtaken, while the task still holds write access to them; snapshots what is there first, so the user can undo the undo | S21 |
 | `find_tools(query?)` / `open_tool(tool, version?, placement?, source?)` | Retrieve saved tools (framed data, taint-filtered) and show one under the broker's instance | S24 |
 | `save_tool(instance, name, description?, tags?, capabilities?, inputs?, outputs?, refines?)` / `revert_tool(tool, version)` | Save what is on the canvas as a tool or a new version; save a copy of an older version as the newest | S24 |
-| `connect_tools(from, to)` | Wire a typed output port to an input port | S25 |
+| `connect_tools(from_instance, from_port, to_instance, to_port)` | Wire a typed output port of a saved tool's instance to an input port of another's; the broker decides (D31); a crossing asks the user | S25 |
 
 ## 4. Generated UI
 
@@ -1138,16 +1138,31 @@ stored package failed its check.
 
 Tools declare typed input and output ports using the value types from the UI spec (text,
 JSON, table, image ref, file ref). The agent wires an output port to an input port with
-`connect_tools`; types must match. In-memory values flow through the shell's UI runtime.
-Within one task, file refs pass directly (one workspace). Across tasks the producer is
-always an instance of an ended task (only one task is live at a time, D7); each such
-connection (`ConnectionId`) exposes that task's retained workspace files read-only to the
-consumer at `/inputs/<ConnectionId>/`. No sandbox ever gets write access to another task's
-workspace. A cross-task connection propagates the producer task's taint to the consumer
-task; a connection that would make a task both fs- and net-tainted is refused unless the user
-approves that specific crossing in a trusted prompt (I12). An approved crossing exposes the
-files but does not propagate taint; it is the only exception to taint propagation, and it is
-audited.
+`connect_tools`; types must match (D31). **The broker decides every connection from its own
+records**: only instances it minted (`open_tool`) can be connected, at both ends, and the ports are
+checked against the stored package by hash; the producer is an instance of the consumer's own task or
+of an ended task of the same owner (kept in memory, per owner, at most 32 tasks; after a reconnect
+they are unknown), and anything else is answered exactly like an unknown instance. A connection
+belongs to its consumer task and ends with it; an heir inherits taint and neither connections nor
+approvals. Bounds, per consumer task: 16 connections, 8 per instance, a fan-out of 4, 64 KiB a
+value.
+
+In-memory values flow through the shell's UI runtime (`agent.routing`): a producer's output entry
+that changes is written to the consumer's input entry, and the consumer's `sandbox` handlers that
+read it run with the trigger `connection` (no tool grant applies to such a run, D30 (2)). Within one
+task, file refs pass directly (one workspace). Across tasks the producer is always an instance of an
+ended task (only one task is live at a time, D7); each such connection (`ConnectionId`) exposes that
+task's retained workspace files read-only to the consumer instance's runs at
+`/inputs/<ConnectionId>/` (the code is told where in `root` of a file or image input). No sandbox
+ever gets write access to another task's workspace, and **a run that holds `net.full` mounts no
+input** (it is refused). A cross-task connection propagates the producer task's taint to the
+consumer task before anything flows (persisted, audited); a connection that would make a task both
+fs- and net-tainted is refused unless the user approves that specific crossing in a trusted prompt
+(I12). An approved crossing exposes the files but does not propagate taint; it is the only
+exception to taint propagation, and it is audited. For a consumer that is not fs-tainted after the
+call, nothing a connection says depends on fs-tainted tasks (D31 (8)): a net-tainted task that names
+an fs task's instance is answered as for an unknown one and is never asked about it, so the crossing
+that prompts is a net producer's tool feeding a task that read files.
 
 ## 7. Capabilities, grants and policy
 
@@ -1538,7 +1553,7 @@ Each invariant names where it is enforced. Reviews check every change against th
   from grant issuance, including picker grants and fs-tainted stored tool versions, imports
   always among them). A net-tainted
   task's model context contains no turns from fs-tainted tasks. Data crosses that line only
-  through a user-approved cross-task connection (§6, §7).
+  through a user-approved cross-task connection (§6, §7) (v1: only a net task's tool into a task that read files; see D31).
 - **I13 — No write without undo.** A run with write grants starts only after a snapshot of
   its writable paths has been taken, unless the user accepted "no undo" for that run in a
   trusted prompt. The snapshot's record and the run's authorisation are one transaction, and the

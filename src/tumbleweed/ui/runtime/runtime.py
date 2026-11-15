@@ -21,6 +21,7 @@ import logging
 from collections.abc import Mapping
 from typing import assert_never, final
 
+from tumbleweed.core.ids import ConnectionId
 from tumbleweed.ui.runtime.events import AgentSink, Dispatch, SandboxSink, UiEvent
 from tumbleweed.ui.runtime.interpreter import Program, evaluate
 from tumbleweed.ui.runtime.store import Origin, StateStore
@@ -96,6 +97,39 @@ class UiRuntime:
         is applied). Only the handler's declared outputs may be written, every value is checked
         against its declaration and the state budget, and no handler fires."""
         self.store.patch(values, origin=Origin.SANDBOX, only=handler.outputs)
+
+    def connection_input(self, key: StateKey, value: object, connection: ConnectionId) -> Dispatch:
+        """A value arrived over `connection` for the input `key` (S25, D31 (4)).
+
+        It is written as a patch is (whole or not at all: `SpecError`, nothing changed), and then
+        the `sandbox` handlers that list `key` among their inputs run, each with an event that
+        names the connection (the trigger `connection`: no tool grant applies to it). `set` and
+        `agent` handlers never fire from here, so a value that arrives starts nothing but code of
+        the consumer's own spec, in the sandbox.
+        """
+        self.store.patch({str(key): value}, origin=Origin.CONNECTION, only=(key,))
+        sandbox = self._sandbox
+        if sandbox is None:
+            return Dispatch.NO_SINK
+        sent = False
+        for handler in self._handlers.values():
+            if not isinstance(handler, SandboxHandler) or key not in handler.inputs:
+                continue
+            event = UiEvent(
+                handler=handler.name,
+                component="connection",
+                event="change",
+                bind=key,
+                connection=connection,
+            )
+            try:
+                sandbox.run(
+                    handler, event, {each: self.store.value(each) for each in handler.inputs}
+                )
+                sent = True
+            except Exception:  # a sink is another component's code, as in `_fire`
+                logger.exception("handler %s failed", handler.name)
+        return Dispatch.SENT if sent else Dispatch.IGNORED
 
     def _fire(self, event: UiEvent) -> Dispatch:
         handler = self._handlers.get(event.handler)

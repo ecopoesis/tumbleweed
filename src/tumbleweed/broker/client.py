@@ -26,7 +26,15 @@ from typing import Final, Literal, Self, final
 
 from tumbleweed.broker.config import PROMPT_WAIT, RUN_SETUP_WAIT, UNDO_WAIT
 from tumbleweed.core.errors import TumbleweedError
-from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId
+from tumbleweed.core.ids import (
+    ConnectionId,
+    GrantId,
+    RunId,
+    SnapshotId,
+    TaskId,
+    ToolId,
+    ToolInstanceId,
+)
 from tumbleweed.core.types import ToolVersion, WorkspaceRelPath
 from tumbleweed.ipc.broker_messages import (
     MODEL_ORIGIN,
@@ -63,6 +71,14 @@ from tumbleweed.ipc.broker_messages import (
 )
 from tumbleweed.ipc.client import connect
 from tumbleweed.ipc.connection import Connection, RequestHandler
+from tumbleweed.ipc.connection_messages import (
+    ConnectionList,
+    ConnectionRemoved,
+    ConnectTools,
+    ListConnections,
+    RemoveConnection,
+    ToolsConnected,
+)
 from tumbleweed.ipc.errors import (
     ConnectionClosedError,
     IpcConnectError,
@@ -96,6 +112,7 @@ from tumbleweed.ipc.tool_messages import (
     ToolStored,
     ToolVersions,
 )
+from tumbleweed.ui.spec.names import StateKey
 
 _log = logging.getLogger(__name__)
 
@@ -405,6 +422,39 @@ class BrokerClient:
     async def revoke_tool_grant(self, grant: GrantId) -> Revoked:
         """Revoke a tool grant: the user's chrome action, never a model tool."""
         return await self._ask(RevokeToolGrant(kind="revoke_tool_grant", grant=grant), Revoked)
+
+    async def connect_tools(
+        self,
+        task: TaskId,
+        from_instance: ToolInstanceId,
+        from_port: str,
+        to_instance: ToolInstanceId,
+        to_port: str,
+    ) -> ToolsConnected:
+        """Connect an output port to an input port, in `task` (the consumer's). A crossing waits
+        for the user (S25, D31)."""
+        return await self._ask(
+            ConnectTools(
+                kind="connect_tools",
+                task=task,
+                from_instance=from_instance,
+                from_port=StateKey(from_port),
+                to_instance=to_instance,
+                to_port=StateKey(to_port),
+            ),
+            ToolsConnected,
+            wait=PROMPT_WAIT,
+        )
+
+    async def list_connections(self, task: TaskId) -> ConnectionList:
+        return await self._ask(ListConnections(kind="list_connections", task=task), ConnectionList)
+
+    async def remove_connection(self, task: TaskId, connection: ConnectionId) -> ConnectionRemoved:
+        """Remove a connection: the user's chrome action, never a model tool."""
+        return await self._ask(
+            RemoveConnection(kind="remove_connection", task=task, connection=connection),
+            ConnectionRemoved,
+        )
 
 
 type Spawn = Callable[[], Awaitable[object]]

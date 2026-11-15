@@ -24,8 +24,9 @@ from tumbleweed.broker.toolflow import (
     NOT_VISIBLE_NET_TEXT,
     SAVE_CAP_TEXT,
 )
-from tumbleweed.core.ids import GrantId, ToolId
+from tumbleweed.core.ids import ConnectionId, GrantId, TaskId, ToolId
 from tumbleweed.core.types import ToolVersion
+from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.ipc.tool_messages import ToolGrantInfo, ToolSummary
 from tumbleweed.shell.viewmodel.tools import ToolsOutcome
 
@@ -40,6 +41,10 @@ NO_TASK: Final = (
     "something to the assistant first."
 )
 _UNAVAILABLE: Final = "Not done: the broker is not available."
+REMOVED: Final = (
+    "The connection was removed. What this conversation's task has seen or used stays on its "
+    "record."
+)
 
 
 _REFUSED: Final[dict[str, str]] = {
@@ -107,7 +112,9 @@ class BrokerToolsPort:
         dispatcher: MainThreadDispatcher,
         tasks: TaskSession,
         show: Callable[[FetchedTool], None],
+        on_connections: Callable[[TaskId, tuple[ConnectionInfo, ...]], None] | None = None,
     ) -> None:
+        self._on_connections = on_connections
         self._link = link
         self._dispatcher = dispatcher
         self._tasks = tasks
@@ -132,6 +139,46 @@ class BrokerToolsPort:
             return (await client.list_tool_grants()).grants
 
         self._ask(work, done)
+
+    def connections(self, done: Callable[[tuple[ConnectionInfo, ...] | None], None]) -> None:
+        task = self._tasks.current
+        if task is None:
+            self._dispatcher.post(lambda: done(()))  # no task yet, so none
+            return
+
+        async def work(client: BrokerClient) -> tuple[ConnectionInfo, ...]:
+            return (await client.list_connections(task)).connections
+
+        self._ask(work, done)
+
+    def remove_connection(
+        self, connection: ConnectionId, done: Callable[[ToolsOutcome], None]
+    ) -> None:
+        """The user removes a connection (the chrome's action: no model tool does). The canvas is
+        then given the broker's new list, so that values stop at once."""
+        task = self._tasks.current
+        if task is None:
+            self._dispatcher.post(lambda: done(ToolsOutcome("refused", NO_TASK)))
+            return
+
+        async def work(client: BrokerClient) -> tuple[ToolsOutcome, tuple[ConnectionInfo, ...]]:
+            try:
+                await client.remove_connection(task, connection)
+            except BrokerRefused as refusal:
+                return _refusal(refusal), ()
+            kept = (await client.list_connections(task)).connections
+            return ToolsOutcome("done", REMOVED), kept
+
+        def finished(outcome: tuple[ToolsOutcome, tuple[ConnectionInfo, ...]]) -> None:
+            result, kept = outcome
+            if result.kind == "done" and self._on_connections is not None:
+                try:
+                    self._on_connections(task, kept)
+                except Exception:  # noqa: BLE001  (a UI path never takes the shell down)
+                    _log.exception("giving the canvas the connections failed")
+            done(result)
+
+        self._act(work, finished, done)
 
     def open(
         self, tool: ToolId, version: ToolVersion | None, done: Callable[[ToolsOutcome], None]

@@ -111,6 +111,7 @@ from typing import Final, Literal, NewType, Protocol, assert_never, final
 from tumbleweed.agent.canvas_events import Scheduler
 from tumbleweed.core.ids import PromptId, TaskId, ToolId
 from tumbleweed.ipc.broker_messages import (
+    CrossingAccess,
     NetworkAccess,
     NoUndoAccess,
     PickAccess,
@@ -132,7 +133,21 @@ _ELLIPSIS: Final = "…"
 
 _SPELLED_OUT: Final = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 
-type CardKind = Literal["read", "write", "network", "pick_file", "pick_folder", "no_undo"]
+type CardKind = Literal[
+    "read", "write", "network", "pick_file", "pick_folder", "no_undo", "crossing"
+]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class CrossingView:
+    """The crossing question as the card shows it: the names are the tools' own, plain and capped
+    (`plain_reason`); the effects are the broker's closed `fs` and `net`."""
+
+    from_name: str
+    from_effect: Literal["fs", "net"]
+    to_name: str
+    to_effect: Literal["fs", "net"]
 
 
 @final
@@ -159,6 +174,8 @@ class PromptCard:
     could not be saved: the broker's closed code, shown as our own sentence."""
     cause: str | None = None
     purpose: str = "run"
+    crossing: "CrossingView | None" = None
+    """For `crossing` (S25): the two tools and what each one's task did (D31 (6))."""
 
     @property
     def picks(self) -> bool:
@@ -211,6 +228,15 @@ MAX_TITLE_SHOWN: Final = 80
 """The most characters of a task's title that are shown (I5: capped)."""
 
 
+def _crossing_view(access: CrossingAccess) -> CrossingView:
+    return CrossingView(
+        from_name=plain_reason(access.from_name, MAX_TITLE_SHOWN)[0],
+        from_effect=access.from_effect,
+        to_name=plain_reason(access.to_name, MAX_TITLE_SHOWN)[0],
+        to_effect=access.to_effect,
+    )
+
+
 def card_of(show: ShowPrompt, task_title: str | None = None) -> PromptCard:
     """The card for a prompt from the broker. The capability is read from its structure.
 
@@ -230,6 +256,8 @@ def card_of(show: ShowPrompt, task_title: str | None = None) -> PromptCard:
             kind = "pick_file" if access.choose == "file" else "pick_folder"
         case NoUndoAccess():
             kind = "no_undo"
+        case CrossingAccess():
+            kind = "crossing"
         case _:
             assert_never(access)
     reason, cut = plain_reason(show.reason)
@@ -253,6 +281,7 @@ def card_of(show: ShowPrompt, task_title: str | None = None) -> PromptCard:
         else (),
         cause=access.cause if isinstance(access, NoUndoAccess) else None,
         purpose=access.purpose if isinstance(access, NoUndoAccess) else "run",
+        crossing=_crossing_view(access) if isinstance(access, CrossingAccess) else None,
     )
 
 

@@ -105,15 +105,26 @@ def test_an_instance_that_belongs_to_no_task_goes_inert_when_a_task_starts(
     assert shown.instance in tools.instances
 
 
-def test_an_inert_instance_still_follows_set_handlers_and_patches(echo_shell: Shell) -> None:
+def test_an_inert_instance_still_follows_the_users_edits_but_the_model_can_no_longer_patch_it(
+    echo_shell: Shell,
+) -> None:
+    """Amends D26 (5) (S25, D31): what a connection passes on is the producer's own, so after its
+    task ended no task's model writes it; the user's own edits of the card are still theirs."""
+    from tumbleweed.agent.canvas import FrozenInstanceError
+    from tumbleweed.ui.spec.names import StateKey
+
     tools = echo_shell.window.canvas_tools
     task = TaskId.new()
+    tools.task_started(task)
     shown = tools.show(validate_ui_spec(asking_spec()), "replace", task)
     tools.task_ended(task)
 
-    changed = tools.patch(shown.instance, {"q": "patched"})
-
-    assert [str(key) for key in changed] == ["q"]
+    with pytest.raises(FrozenInstanceError):
+        tools.patch(shown.instance, {"q": "patched"})
+    rendered = tools.tool(shown.instance)
+    assert rendered is not None
+    rendered.runtime.user_input(StateKey("q"), "typed")
+    assert rendered.runtime.store.value(StateKey("q")) == "typed"
 
 
 def test_the_status_strip_shows_the_title_as_the_assistants_plain_words(echo_shell: Shell) -> None:

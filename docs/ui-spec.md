@@ -839,6 +839,9 @@ value into them, so that the second is never taken for the first. An `on_change`
 the edit has been written, and does not fire if the write was held back ([evaluation](#evaluation))
 or the edit left the entry's value as it was (a slider moved between two positions that round to the
 same number).
+The one other thing that starts a handler is a value that arrives over a connection from another saved
+tool: it runs the `sandbox` handlers that list that input, never a `set`
+or `agent` handler, and it is not a user's event.
 
 ## 10. What is checked across the spec
 

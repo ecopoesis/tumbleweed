@@ -211,6 +211,8 @@ class BrokerConfig:
     - `limits`: the sandbox limits of a run, except what a request may lower.
     - `write_run_wait`: how long a run that writes places another live run writes waits for it,
       before it is refused `busy` (D28, J7).
+    - `max_connections_per_task`, `max_connections_per_instance`, `max_fan_out`: the bounds of
+      tool composition (D31 (3), I9), counted per consumer task.
     - `snapshots`: undo (D28). `workspace_max_bytes`, `workspace_max_files`: what a task's
       workspace may hold; a run is refused while it holds more (#74's disk box, D28).
     """
@@ -239,6 +241,9 @@ class BrokerConfig:
     snapshots: SnapshotSettings = field(default_factory=SnapshotSettings)
     workspace_max_bytes: int = 512 * 1024 * 1024
     workspace_max_files: int = 50_000
+    max_connections_per_task: int = 16
+    max_connections_per_instance: int = 8
+    max_fan_out: int = 4
 
     def __post_init__(self) -> None:
         for name in ("require_landlock", "require_scope_limits"):
@@ -277,6 +282,10 @@ class BrokerConfig:
             value = getattr(self, name)
             if type(value) is not int or not 1 <= value <= high:
                 raise InvalidValueError(f"{name} must be an int from 1 to {high}")
+        for name in ("max_connections_per_task", "max_connections_per_instance", "max_fan_out"):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= 64:
+                raise InvalidValueError(f"{name} must be an int from 1 to 64")
         if not self.sandbox_path or "\0" in self.sandbox_path or len(self.sandbox_path) > 1024:
             raise InvalidValueError("sandbox_path must be a non-empty path list")
 

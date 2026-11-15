@@ -17,7 +17,7 @@ from tumbleweed.agent.handler_runs import (
     RUNNING_NOTICE,
     HandlerRuns,
 )
-from tumbleweed.core.ids import TaskId
+from tumbleweed.core.ids import ConnectionId, TaskId
 from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.runtime import UiEvent, UiRuntime
 from tumbleweed.ui.runtime.store import Origin
@@ -458,3 +458,79 @@ def test_an_outcome_with_neither_values_nor_failure_is_not_a_result() -> None:
 
     assert r.runtime.store.snapshot() == before
     assert r.notices.lines[-1] == "The tool's code did not return a result it can use."
+
+
+class TestTheTriggerOfARun:
+    """A value that arrived over a connection makes a `connection` run, a click a user's (S25,
+    D31 (4)): the newest event of a handler decides, so a run never has more rights than the
+    newest thing that started it."""
+
+    def arrive(self, r: Rig, connection: ConnectionId) -> None:
+        handler = r.runtime.spec.handlers_by_name()[HandlerName("adjust")]
+        assert isinstance(handler, SandboxHandler)
+        r.runs.run(
+            handler,
+            UiEvent(
+                HandlerName("adjust"),
+                "connection",
+                "change",
+                StateKey("photo_path"),
+                connection,
+            ),
+            {key: r.runtime.store.value(key) for key in handler.inputs},
+        )
+
+    def test_a_click_is_a_users_run_and_a_connection_value_is_a_connection_run(self) -> None:
+        r = rig()
+        connection = ConnectionId.new()
+
+        r.event("adjust", "button", "click")
+        r.scheduler.advance(1)
+        r.executor.finish(OK)
+        self.arrive(r, connection)
+        r.scheduler.advance(1)
+
+        clicked, arrived = (call for call, _ in r.executor.calls)
+        assert clicked.connection is None
+        assert arrived.connection == connection
+
+    def test_a_value_that_arrives_after_a_click_makes_the_run_a_connection_run(self) -> None:
+        r = rig()
+        connection = ConnectionId.new()
+
+        r.event("adjust", "button", "click")  # waiting for its debounce
+        self.arrive(r, connection)  # replaces it: one run, with the newest inputs
+        r.scheduler.advance(1)
+
+        (call,) = (call for call, _ in r.executor.calls)
+        assert call.connection == connection  # fewer rights, never more
+
+    def test_a_click_after_a_value_makes_the_run_the_users(self) -> None:
+        r = rig()
+
+        self.arrive(r, ConnectionId.new())
+        r.event("adjust", "button", "click")
+        r.scheduler.advance(1)
+
+        (call,) = (call for call, _ in r.executor.calls)
+        assert call.connection is None  # the user did click, and the run has the newest inputs
+
+    def test_the_broker_is_told_the_trigger_the_run_carries(self) -> None:
+        from tumbleweed.agent.canvas import StoredBinding
+        from tumbleweed.agent.code import _origin_of
+        from tumbleweed.core.ids import ToolId, ToolInstanceId
+        from tumbleweed.core.types import ContentHash, ToolVersion
+
+        stored = StoredBinding(
+            instance=ToolInstanceId.new(),
+            tool=ToolId.new(),
+            version=ToolVersion(1),
+            content_hash=ContentHash("0" * 64),
+            capabilities=(),
+        )
+        connection = ConnectionId.new()
+
+        assert _origin_of(stored).trigger == "user_event"
+        arrived = _origin_of(stored, connection)
+        assert (arrived.trigger, arrived.connection) == ("connection", connection)
+        assert _origin_of(None, connection).trigger == "model"  # no binding, no claim

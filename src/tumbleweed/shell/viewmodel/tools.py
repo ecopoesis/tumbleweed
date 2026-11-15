@@ -16,8 +16,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Final, Literal, Protocol, assert_never, final
 
-from tumbleweed.core.ids import GrantId, ToolId
+from tumbleweed.core.ids import ConnectionId, GrantId, ToolId
 from tumbleweed.core.types import ToolVersion
+from tumbleweed.ipc.connection_messages import MAX_CONNECTIONS_LISTED, ConnectionInfo
 from tumbleweed.ipc.tool_messages import (
     MAX_LISTED,
     MAX_TOOL_GRANTS_LISTED,
@@ -75,6 +76,22 @@ class GrantRow:
     expires: str | None
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class ConnectionRow:
+    """One connection of the conversation's task (S25): the two tools' names (their own words),
+    the ports, and what the connection did to the task, in our words."""
+
+    connection: ConnectionId
+    from_name: str
+    from_port: str
+    to_name: str
+    to_port: str
+    port_type: str
+    effect: str
+    approved: bool
+
+
 type Outcome = Literal["done", "refused", "failed"]
 
 
@@ -112,6 +129,14 @@ class ToolsPort(Protocol):
 
     def revoke(self, grant: GrantId, done: Callable[[ToolsOutcome], None]) -> None: ...
 
+    def connections(self, done: Callable[[tuple[ConnectionInfo, ...] | None], None]) -> None:
+        """The connections of the conversation's task (none if it has no task yet)."""
+        ...
+
+    def remove_connection(
+        self, connection: ConnectionId, done: Callable[[ToolsOutcome], None]
+    ) -> None: ...
+
 
 class ToolsView(Protocol):
     def present(
@@ -119,6 +144,7 @@ class ToolsView(Protocol):
         tools: tuple[ToolRow, ...],
         history: tuple[VersionRow, ...],
         grants: tuple[GrantRow, ...],
+        connections: tuple[ConnectionRow, ...],
         note: str | None,
     ) -> None: ...
 
@@ -160,6 +186,36 @@ def version_row_of(summary: ToolSummary, newest: ToolVersion) -> VersionRow:
         taint=_taint_badge(summary.taint),
         saved=_when(summary.saved_at),
         newest=summary.version == newest,
+    )
+
+
+PASSES_ON_WORDS: Final = {
+    "fs": "Its task saw your files, so this conversation's task now counts as having seen them.",
+    "net": "Its task used the network, so this conversation's task now counts as having used it.",
+}
+CROSSING_WORDS: Final = (
+    "You approved this one connection: it joins data from a task that used the network with a "
+    "task that saw your files. This task's own record was not changed."
+)
+NO_EFFECT_WORDS: Final = "It changed nothing on this task's record."
+
+
+def connection_row_of(info: ConnectionInfo) -> ConnectionRow:
+    if info.crossing:
+        effect = CROSSING_WORDS
+    elif info.passes_on:
+        effect = PASSES_ON_WORDS[info.passes_on[0]]
+    else:
+        effect = NO_EFFECT_WORDS
+    return ConnectionRow(
+        connection=info.connection,
+        from_name=_line(info.from_name, MAX_NAME_SHOWN),
+        from_port=str(info.from_port),
+        to_name=_line(info.to_name, MAX_NAME_SHOWN),
+        to_port=str(info.to_port),
+        port_type=info.port_type,
+        effect=effect,
+        approved=info.crossing,
     )
 
 
@@ -206,6 +262,7 @@ class ToolsModel:
         self.tools: tuple[ToolRow, ...] = ()
         self.history: tuple[VersionRow, ...] = ()
         self.grants: tuple[GrantRow, ...] = ()
+        self.connections: tuple[ConnectionRow, ...] = ()
         self._expanded: ToolId | None = None
         self._summaries: dict[ToolId, ToolSummary] = {}
 
@@ -233,6 +290,16 @@ class ToolsModel:
                 ()
                 if found is None
                 else tuple(grant_row_of(each) for each in found[:MAX_GRANT_ROWS])
+            )
+            self._port.connections(connections_done)
+
+        def connections_done(found: tuple[ConnectionInfo, ...] | None) -> None:
+            if found is None:
+                notes.append("The connections could not be read: the broker is not answering.")
+            self.connections = (
+                ()
+                if found is None
+                else tuple(connection_row_of(each) for each in found[:MAX_CONNECTIONS_LISTED])
             )
             if self._expanded is None or self._expanded not in self._summaries:
                 self._expanded = None
@@ -296,6 +363,13 @@ class ToolsModel:
         self._act(lambda done: self._port.revoke(grant, done))
         return True
 
+    def remove_connection(self, connection: ConnectionId) -> bool:
+        """The user removes a connection: the one action that ends one (no model tool does)."""
+        if self._working or not any(each.connection == connection for each in self.connections):
+            return False
+        self._act(lambda done: self._port.remove_connection(connection, done))
+        return True
+
     def _known(self, tool: ToolId, version: ToolVersion | None) -> bool:
         if self._working:
             return False
@@ -320,7 +394,7 @@ class ToolsModel:
     def _finish(
         self, history: tuple[VersionRow, ...], grants: tuple[GrantRow, ...], notes: list[str]
     ) -> None:
-        self.tools, self.history, self.grants = (), history, grants
+        self.tools, self.history, self.grants, self.connections = (), history, grants, ()
         self._finish_with(notes)
 
     def _finish_with(self, notes: list[str]) -> None:
@@ -329,4 +403,6 @@ class ToolsModel:
         lines = list(notes)
         if not self.tools and not any("could not be read" in line for line in lines):
             lines.append("No tool has been saved yet.")
-        self._view.present(self.tools, self.history, self.grants, " ".join(lines) or None)
+        self._view.present(
+            self.tools, self.history, self.grants, self.connections, " ".join(lines) or None
+        )

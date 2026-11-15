@@ -7,7 +7,10 @@ behaviour is proved elsewhere (the broker's tests, `test_saved_tools_e2e.py`). W
   name a run's origin: every broker call they make is the default, `model`, with no binding;
 - only the handler executor (`agent/code.py`) and the card's access port (`agent/tool_access.py`)
   build a `RunOrigin` or a `WireBinding` anywhere in the source, and only they say `user_event`;
-- only the chrome's tools port calls `revoke_tool_grant`, and no module of the agent imports it.
+- only the chrome's tools port calls `revoke_tool_grant`, and no module of the agent imports it;
+- (S25, D31) a value reaches an input through `connection_input` only from the canvas's endpoint,
+  a run says `connection` only where `agent/code.py` builds its origin, and only the chrome's port
+  removes a connection (no model tool does).
 """
 
 import ast
@@ -19,6 +22,7 @@ DEFINES = {"ipc/broker_messages.py", "broker/client.py", "broker/service.py", "b
 MODEL_TOOLS = (
     "agent/access.py",
     "agent/canvas.py",
+    "agent/composition.py",
     "agent/saved_tools.py",
     "agent/tools.py",
     "agent/loop.py",
@@ -102,4 +106,38 @@ def test_nothing_but_the_chromes_port_revokes_a_tool_grant() -> None:
     }
 
     assert callers == {"shell/broker_tools.py"}
+    assert not any(name.startswith("agent/") for name in callers)
+
+
+def test_only_the_canvas_endpoint_writes_a_connected_value() -> None:
+    callers = {
+        name
+        for name, tree in modules()
+        if name != "ui/runtime/runtime.py" and "connection_input" in names_in(tree)
+    }
+
+    assert callers == {"shell/canvas_tools.py"}
+
+
+def test_a_run_is_started_by_a_connection_only_where_the_origin_is_built() -> None:
+    claimants = {
+        name
+        for name, tree in modules()
+        if name not in DEFINES
+        and "connection" in strings_in(tree)
+        and "RunOrigin" in names_in(tree)
+    }
+
+    assert claimants == {"agent/code.py"}
+
+
+def test_nothing_but_the_chrome_removes_a_connection() -> None:
+    callers = {
+        name
+        for name, tree in modules()
+        if name not in DEFINES and "remove_connection" in names_in(tree)
+    }
+
+    # The chrome's own parts: the port that asks the broker, the model of the list and its panel.
+    assert callers == {"shell/broker_tools.py", "shell/viewmodel/tools.py", "shell/tools_panel.py"}
     assert not any(name.startswith("agent/") for name in callers)

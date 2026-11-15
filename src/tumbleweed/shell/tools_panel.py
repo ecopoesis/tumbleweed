@@ -15,6 +15,7 @@ from tumbleweed.shell._gi import Gtk
 from tumbleweed.shell._widgets import plain_label
 from tumbleweed.shell.viewmodel.display import display_text
 from tumbleweed.shell.viewmodel.tools import (
+    ConnectionRow,
     GrantRow,
     ToolRow,
     ToolsModel,
@@ -82,6 +83,7 @@ class ToolsPanel(Gtk.Box):
         tools: tuple[ToolRow, ...],
         history: tuple[VersionRow, ...],
         grants: tuple[GrantRow, ...],
+        connections: tuple[ConnectionRow, ...],
         note: str | None,
     ) -> None:
         self._note.set_text(display_text(note) if note else "")
@@ -97,6 +99,10 @@ class ToolsPanel(Gtk.Box):
             self._rows.append(plain_label("Access given to tools", css_classes=["heading"]))
             for grant in grants:
                 self._rows.append(self._grant(grant))
+        if connections:
+            self._rows.append(plain_label("Connections", css_classes=["heading"]))
+            for connection in connections:
+                self._rows.append(self._connection(connection))
 
     # --- rows -------------------------------------------------------------------------------
 
@@ -152,6 +158,22 @@ class ToolsPanel(Gtk.Box):
                     partial(self.model.restore, row.tool, row.version),
                 )
             )
+        return box
+
+    def _connection(self, row: ConnectionRow) -> Gtk.Widget:
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        text.set_hexpand(True)
+        text.append(
+            plain_label(
+                f"{display_text(row.from_name)} ({row.from_port}) feeds "
+                f"{display_text(row.to_name)} ({row.to_port}), {row.port_type}",
+                wrap=True,
+            )
+        )
+        text.append(plain_label(row.effect, wrap=True, css_classes=["caption", "dim-label"]))
+        box.append(text)
+        box.append(self._button("Remove", partial(self.model.remove_connection, row.connection)))
         return box
 
     def _grant(self, row: GrantRow) -> Gtk.Widget:

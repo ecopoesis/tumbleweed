@@ -9,6 +9,7 @@ from typing import Literal, final
 
 from tumbleweed.core.ids import PromptId, TaskId, ToolId
 from tumbleweed.ipc.broker_messages import (
+    CrossingAccess,
     NetworkAccess,
     PickAccess,
     ReadAccess,
@@ -157,3 +158,25 @@ def pick_card(choose: Literal["file", "folder"] = "folder") -> PromptCard:
 
 def network_card() -> PromptCard:
     return card_of(show_message(access=NetworkAccess(kind="net.full")))
+
+
+def crossing_card(
+    from_name: str = "Fetcher",
+    to_name: str = "Photo tool",
+    *,
+    scopes: tuple[Scope, ...] = ("once",),
+) -> PromptCard:
+    """The crossing prompt (S25): a net task's tool feeding an fs task's tool."""
+    return card_of(
+        show_message(
+            access=CrossingAccess(
+                kind="crossing",
+                from_name=from_name,
+                from_effect="net",
+                to_name=to_name,
+                to_effect="fs",
+            ),
+            scopes=scopes,
+            reason="",
+        )
+    )

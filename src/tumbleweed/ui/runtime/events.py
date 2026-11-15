@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Literal, Protocol, final
 
+from tumbleweed.core.ids import ConnectionId
 from tumbleweed.ui.spec.handlers import AgentHandler, SandboxHandler
 from tumbleweed.ui.spec.names import HandlerName, StateKey
 from tumbleweed.ui.spec.state import StateValue
@@ -29,12 +30,16 @@ class UiEvent:
     `bind` is the entry the component edits, if it has one. The values are names of ours (a
     component kind, an event, a state key): none of it is text the model can choose freely beyond
     the validated names of the spec.
+
+    `connection` is set by the runtime, never by a widget, for the run of a handler that a value
+    arriving over a connection started (S25, D31 (4)); a user's event has none.
     """
 
     handler: HandlerName
     component: str
     event: Literal["click", "change", "activate"]
     bind: StateKey | None = None
+    connection: ConnectionId | None = None
 
 
 class SandboxSink(Protocol):

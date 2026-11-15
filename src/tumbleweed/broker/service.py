@@ -65,6 +65,9 @@ from tumbleweed.broker.audit import (
     MAX_ROLLED_BACK_KINDS,
     AuditEntry,
     AuditLog,
+    ConnectionMade,
+    ConnectionRefused,
+    ConnectionTainted,
     DaemonStart,
     FileAccess,
     GrantDecision,
@@ -87,6 +90,7 @@ from tumbleweed.broker.audit import (
     WorkspaceDeleted,
     cut,
 )
+from tumbleweed.broker.audit import ConnectionRemoved as ConnectionRemovedEntry
 from tumbleweed.broker.audit import TaskEnded as TaskEndedEntry
 from tumbleweed.broker.audit import TaskStarted as TaskStartedEntry
 from tumbleweed.broker.audit import ToolExported as ToolExportedEntry
@@ -94,6 +98,29 @@ from tumbleweed.broker.audit import ToolOpened as ToolOpenedEntry
 from tumbleweed.broker.capabilities import CapabilityKind, FsRead, FsWrite, NetFull
 from tumbleweed.broker.compose import InvalidRunError, Mount, disjoint_mounts, sandbox_environment
 from tumbleweed.broker.config import SNAPSHOT_SLACK, BrokerConfig
+from tumbleweed.broker.connections import (
+    COMPUTED_INPUT_TEXT,
+    CROSSING_BUSY_TEXT,
+    CROSSING_DENIED_TEXT,
+    CROSSING_UNAVAILABLE_TEXT,
+    CYCLE_TEXT,
+    FAN_OUT_TEXT,
+    INPUT_TAKEN_TEXT,
+    INPUTS_GONE_TEXT,
+    INSTANCE_CAP_TEXT,
+    INTEGRITY_TEXT,
+    MARKED_TEXT,
+    NET_WITH_INPUTS_TEXT,
+    NO_CONNECTION_TEXT,
+    SAME_INSTANCE_TEXT,
+    TASK_CAP_TEXT,
+    UNKNOWN_INSTANCE_TEXT,
+    UNKNOWN_PORT_TEXT,
+    Edge,
+    makes_cycle,
+    port_named,
+    type_mismatch_text,
+)
 from tumbleweed.broker.deny import DenyRules
 from tumbleweed.broker.errors import (
     AuditError,
@@ -155,6 +182,7 @@ from tumbleweed.broker.policy import (
 )
 from tumbleweed.broker.prompts import (
     Allowed,
+    CrossingSubject,
     Denied,
     GrantPrompt,
     NoUndoSubject,
@@ -197,7 +225,16 @@ from tumbleweed.broker.treeops import RestoreStats, measure
 from tumbleweed.broker.workspace import open_in_workspace, read_workspace_file
 from tumbleweed.broker.workspaces import Listing, Workspaces, list_directory
 from tumbleweed.core.errors import InvalidValueError
-from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId, ToolInstanceId
+from tumbleweed.core.ids import (
+    ConnectionId,
+    GrantId,
+    PromptId,
+    RunId,
+    SnapshotId,
+    TaskId,
+    ToolId,
+    ToolInstanceId,
+)
 from tumbleweed.core.types import ByteCount, ContentHash, ToolVersion, WorkspaceRelPath
 from tumbleweed.ipc.broker_messages import (
     MODEL_ORIGIN,
@@ -234,6 +271,15 @@ from tumbleweed.ipc.broker_messages import (
     WriteAccess,
 )
 from tumbleweed.ipc.broker_messages import TaskEnded as TaskEndedReply
+from tumbleweed.ipc.connection_messages import (
+    ConnectionInfo,
+    ConnectionList,
+    ConnectionRemoved,
+    ConnectTools,
+    ListConnections,
+    RemoveConnection,
+    ToolsConnected,
+)
 from tumbleweed.ipc.errors import ErrorCode, RequestRefused
 from tumbleweed.ipc.messages import Echo, Ping, RequestBody, ResponseBody
 from tumbleweed.ipc.prompt_messages import (
@@ -280,10 +326,12 @@ from tumbleweed.sandbox.errors import (
 from tumbleweed.sandbox.handler_protocol import handler_command
 from tumbleweed.sandbox.limits import LimitsPlan
 from tumbleweed.sandbox.policy import (
+    INPUTS_TARGET,
     EnvName,
     EnvVar,
     GrantAccess,
     GrantMount,
+    InputMount,
     MountPath,
     SandboxLimits,
     SandboxPolicy,
@@ -304,11 +352,17 @@ from tumbleweed.tools import (
     parse_draft,
 )
 from tumbleweed.tools.limits import MAX_VERSIONS_PER_TOOL
+from tumbleweed.tools.package import ToolPackage
+from tumbleweed.ui.spec.names import StateKey
+from tumbleweed.ui.spec.state import BoolState, FloatState, IntState, StateDecl, StringState
+from tumbleweed.ui.spec.values import PortType
 
 _log = logging.getLogger(__name__)
 
 MAX_GRANTS_PER_TASK: Final = 64
 _MAX_ENDED_PER_OWNER: Final = 256
+_MAX_ENDED_WITH_INSTANCES: Final = 32
+"""Ended tasks per connection whose instances are kept for connecting (D31 (2))."""
 _DENIAL_MESSAGES: Final = {
     "rate_limited": "too many permission requests for this task; wait a while before asking again",
     "rate_limited_connection": "too many permission requests in all; wait a while before asking",
@@ -412,8 +466,70 @@ class _Live:
     pending_runs: set[RunId] = field(default_factory=set)  # reserved, not yet authorised
     running: set["asyncio.Future[ResponseBody]"] = field(default_factory=set)
     instances: dict[ToolInstanceId, "_OpenedTool"] = field(default_factory=dict)
+    connections: dict[ConnectionId, "_Connection"] = field(default_factory=dict)
     saves: int = 0  # saves, refinements and reverts this task has made (not inherited)
     root: TaskId | None = None  # the root of its context (None: itself), which holds the bit budget
+
+
+@dataclass(frozen=True, slots=True)
+class _Connection:
+    """A connection of a consumer task (D31): which instance's output feeds which instance's input.
+    `passes_on` is the taint it handed the task; `crossing` says the user approved it as one
+    (`prompt` names the prompt, when the interface had one)."""
+
+    id: ConnectionId
+    producer_task: TaskId
+    producer: ToolInstanceId
+    producer_port: StateKey
+    producer_name: str
+    consumer: ToolInstanceId
+    consumer_port: StateKey
+    consumer_name: str
+    port_type: PortType
+    same_task: bool
+    passes_on: frozenset[TaintKind]
+    crossing: bool
+    prompt: PromptId | None
+
+
+@dataclass(frozen=True, slots=True)
+class _EndedTask:
+    """What the broker kept of an ended task so that its tools can feed a later one (D31 (2)): the
+    owner it belonged to and the instances it opened. In memory, bounded, per owner."""
+
+    owner: Owner
+    instances: dict[ToolInstanceId, "_OpenedTool"]
+    fs: bool = False
+    """The task had read files. Its taint is final, and fs tasks have a ring of their own (D31
+    (2)): their ending must not push a clean or net task's instances out of the record."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Producer:
+    task: TaskId
+    held: "_OpenedTool"
+    taint: frozenset[TaintKind]
+    same_task: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _Plan:
+    producer: _Producer
+    consumer: "_OpenedTool"
+    from_port: StateKey
+    to_port: StateKey
+    port_type: PortType
+    merged: frozenset[TaintKind] | None  # None: a crossing
+
+
+@dataclass(frozen=True, slots=True)
+class _InputSource:
+    """A producer workspace a run mounts read-only: the connection, its task and the identity the
+    broker recorded for the workspace."""
+
+    connection: ConnectionId
+    task: TaskId
+    identity: FsIdentity
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,9 +592,11 @@ class _RunPaths:
 
     workspace: OpenedPath
     mounts: tuple[OpenedPath, ...]
+    inputs: tuple[OpenedPath, ...] = ()
+    input_ids: tuple[ConnectionId, ...] = ()
 
     def close(self) -> None:
-        for opened in (self.workspace, *self.mounts):
+        for opened in (self.workspace, *self.mounts, *self.inputs):
             opened.close()
 
 
@@ -647,6 +765,7 @@ class BrokerService:
         self._clock = clock
         self._deny = config.deny_context(environ)
         self._live: dict[TaskId, _Live] = {}
+        self._ended: dict[TaskId, _EndedTask] = {}  # D31 (2): ended tasks' instances, per owner
         self._slots = asyncio.Semaphore(config.max_concurrent_runs)
         self._sweeper: asyncio.Task[None] | None = None
         self._starting = 0  # tasks being made: counted against the cap before the first await
@@ -910,6 +1029,12 @@ class BrokerService:
                 return self._list_tool_grants()
             case RevokeToolGrant():
                 return self._revoke_tool_grant(request)
+            case ConnectTools():
+                return await self._connect_tools(owner, request)
+            case ListConnections():
+                return self._list_connections(owner, request)
+            case RemoveConnection():
+                return self._remove_connection(owner, request)
             case AnswerPrompt():
                 return self._answer_prompt(owner, request)
             case ShowPrompt() | ClosePrompt() | Ping() | Echo():
@@ -929,6 +1054,8 @@ class BrokerService:
                 _log.exception("a task of a closed connection could not be ended on record")
             finally:
                 self._apply_ended(live)
+        for task in [task for task, kept in self._ended.items() if kept.owner == owner]:
+            del self._ended[task]  # nobody can be this owner again: its record is unreachable
         # The connection's allowances go with it (a reconnect starts a new one: #147).
         self._owner_prompts.pop(owner, None)
         self._ended_prompts.pop(owner, None)
@@ -1055,6 +1182,8 @@ class BrokerService:
                 trigger = RunTrigger.MODEL
             case "user_event":
                 trigger = RunTrigger.USER_EVENT
+            case "connection":
+                trigger = RunTrigger.CONNECTION
             case _ as unreachable:
                 assert_never(unreachable)
         binding = origin.binding
@@ -1070,6 +1199,12 @@ class BrokerService:
         record = self._store.tool_record(opened.tool, opened.version)
         if record is None or record.hash != opened.content_hash:
             raise _Refuse("invalid_request", _BAD_BINDING, "bad_binding")
+        if trigger is RunTrigger.CONNECTION:
+            # A value that arrived over a connection of this task whose consumer is this instance
+            # (D31 (4)); the shell's word for it means nothing otherwise.
+            held = None if origin.connection is None else live.connections.get(origin.connection)
+            if held is None or held.consumer != binding.instance:
+                raise _Refuse("invalid_request", _BAD_BINDING, "bad_binding")
         return RunContext(
             run=run,
             trigger=trigger,
@@ -1078,7 +1213,13 @@ class BrokerService:
             ),
         )
 
-    def _payload_of(self, live: _Live, request: RunInSandbox, context: RunContext) -> str | None:
+    def _payload_of(
+        self,
+        live: _Live,
+        request: RunInSandbox,
+        context: RunContext,
+        inputs: Sequence[_Connection] = (),
+    ) -> str | None:
         """The payload a run starts with. A run without a binding brings its own (model code, or
         the handlers of a tool that was not opened from the store). A run **with** one brings none:
         the broker reads the stored package, checks the handler is one its spec declares, and
@@ -1106,7 +1247,12 @@ class BrokerService:
         if opened.record.hash != binding.content_hash:
             raise _Refuse("invalid_request", _BAD_BINDING, "bad_binding")
         try:
-            return bound_payload(opened.canonical.package, request.payload)
+            roots = {
+                str(c.consumer_port): f"{INPUTS_TARGET}/{c.id}"
+                for c in inputs
+                if c.port_type in ("image", "file")
+            }
+            return bound_payload(opened.canonical.package, request.payload, roots)
         except BoundRunError as error:
             raise _Refuse(
                 "too_large" if error.fault == "too_large" else "invalid_request",
@@ -1196,7 +1342,12 @@ class BrokerService:
             tool=record.tool, version=record.version, content_hash=record.hash, name=record.name
         )
         while len(live.instances) > MAX_INSTANCES_PER_TASK:
-            del live.instances[next(iter(live.instances))]
+            forgotten = next(iter(live.instances))
+            del live.instances[forgotten]
+            for stale in [
+                c.id for c in live.connections.values() if forgotten in (c.producer, c.consumer)
+            ]:
+                del live.connections[stale]  # no listing of a connection to a forgotten tool
         view = self._tools.view_of(record.tool, merged)
         return ToolOpened(
             kind="tool_opened",
@@ -1482,10 +1633,25 @@ class BrokerService:
         """Make an ended task unusable in memory and stop its runs."""
         self._live.pop(live.state.task, None)
         self._remember_allowance(live)
+        self._remember_instances(live)
+        live.connections.clear()
         live.state = live.state.end()
         live.grants.clear()
         for future in list(live.running):
             future.cancel()
+
+    def _remember_instances(self, live: _Live) -> None:
+        """Keep an ended task's instances for `_MAX_ENDED_WITH_INSTANCES` tasks per owner (the
+        oldest is forgotten), so that its tools can feed a task that starts later (D31 (2))."""
+        if not live.instances:
+            return
+        fs = TaintKind.FS in live.state.taint
+        self._ended[live.state.task] = _EndedTask(live.owner, dict(live.instances), fs)
+        mine = [
+            task for task, kept in self._ended.items() if kept.owner == live.owner and kept.fs == fs
+        ]
+        for task in mine[: max(0, len(mine) - _MAX_ENDED_WITH_INSTANCES)]:
+            del self._ended[task]
 
     def _owned(self, owner: Owner, task: TaskId) -> _Live:
         live = self._live.get(task)
@@ -1495,6 +1661,356 @@ class BrokerService:
 
     def _grants_for(self, live: _Live) -> list[Grant]:
         return [*live.grants, *self._store.tool_grants()]
+
+    # --- tool composition (S25, D31) -----------------------------------------------------------
+
+    def _refuse_connection(
+        self,
+        live: _Live,
+        reason: Literal[
+            "unknown_instance",
+            "hidden_instance",
+            "unknown_port",
+            "type_mismatch",
+            "computed_input",
+            "input_taken",
+            "same_instance",
+            "cycle",
+            "task_cap",
+            "instance_cap",
+            "fan_out_cap",
+            "integrity",
+            "crossing_denied",
+            "crossing_rate_limited",
+            "crossing_unavailable",
+        ],
+        kind: RefusalReason,
+        text: str,
+        prompt: PromptId | None = None,
+    ) -> _Refuse:
+        """Audit a refused `connect_tools` (best effort: the refusal stands) and make the answer:
+        the text is fixed, whatever the reason (the audit's reason is not model-visible)."""
+        try:
+            self._audit.append(
+                ConnectionRefused(
+                    at=self._now(), task=live.state.task, reason=reason, prompt=prompt
+                )
+            )
+        except AuditError:
+            _log.error("a refused connection could not be audited")
+        return _Refuse(kind, text)
+
+    def _producer_of(self, owner: Owner, live: _Live, instance: ToolInstanceId) -> _Producer | None:
+        """The producer's instance from the broker's own records (D31 (2)): one of the consumer's
+        task, or one of an ended task of the same owner. Anything else is not there."""
+        held = live.instances.get(instance)
+        if held is not None:
+            return _Producer(live.state.task, held, live.state.taint, same_task=True)
+        for task, ended in self._ended.items():
+            kept = ended.instances.get(instance)
+            if ended.owner != owner or kept is None:
+                continue
+            record = self._store.task(task)
+            if record is None:
+                return None
+            return _Producer(task, kept, record.taint, same_task=False)
+        return None
+
+    def _package_of(self, live: _Live, held: _OpenedTool) -> ToolPackage:
+        """The stored package of an instance, by the hash the broker recorded when it opened it."""
+        try:
+            opened = self._tools.open(held.tool, held.version)
+        except (ToolBlobError, ToolNotFoundError):
+            raise self._refuse_connection(live, "integrity", "unsafe", INTEGRITY_TEXT) from None
+        if opened.record.hash != held.content_hash:
+            raise self._refuse_connection(live, "integrity", "unsafe", INTEGRITY_TEXT)
+        return opened.canonical.package
+
+    @staticmethod
+    def _is_computed(decl: StateDecl | None) -> bool:
+        return isinstance(decl, BoolState | IntState | FloatState | StringState) and (
+            decl.computed is not None
+        )
+
+    def _gate_connection(self, live: _Live, producer: _Producer) -> bool:
+        """The visibility gate of D31 (8): what a task that is not fs-tainted after the call may
+        learn. A net-tainted consumer is answered **exactly as for an unknown instance** about a
+        producer of an fs-tainted task, before any read of the producer and with no prompt. A clean
+        consumer that names one takes the fs taint first (persisted, audited), so that it is
+        fs-tainted after the call and no later refusal tells a task that stays clean more. True
+        if it took the taint."""
+        if producer.same_task or TaintKind.FS not in producer.taint:
+            return False
+        taint = live.state.taint
+        if TaintKind.NET in taint:
+            raise self._refuse_connection(
+                live, "hidden_instance", "not_found", UNKNOWN_INSTANCE_TEXT
+            )
+        if TaintKind.FS not in taint:
+            merged = taint | {TaintKind.FS}
+            with self._atomic() as entries:
+                self._store.set_taint(live.state.task, merged)
+                entries.append(ConnectionTainted(at=self._now(), task=live.state.task))
+            live.state = TaskState(task=live.state.task, taint=merged)
+            return True
+        return False
+
+    def _plan_connection(self, live: _Live, request: ConnectTools, producer: _Producer) -> _Plan:
+        """Everything that can refuse a connection, in the order D31 (3) lists, on the broker's
+        current records."""
+        consumer = live.instances.get(request.to_instance)
+        if consumer is None:
+            raise self._refuse_connection(
+                live, "unknown_instance", "not_found", UNKNOWN_INSTANCE_TEXT
+            )
+        source = self._package_of(live, producer.held)
+        sink = self._package_of(live, consumer)
+        output = port_named(source.manifest.outputs, request.from_port)
+        taker = port_named(sink.manifest.inputs, request.to_port)
+        if output is None or taker is None:
+            raise self._refuse_connection(
+                live, "unknown_port", "invalid_request", UNKNOWN_PORT_TEXT
+            )
+        if output.type != taker.type:
+            raise self._refuse_connection(
+                live,
+                "type_mismatch",
+                "invalid_request",
+                type_mismatch_text(output.type, taker.type),
+            )
+        if self._is_computed(sink.ui.declarations().get(taker.name)):
+            raise self._refuse_connection(
+                live, "computed_input", "invalid_request", COMPUTED_INPUT_TEXT
+            )
+        connections = tuple(live.connections.values())
+        if any(
+            c.consumer == request.to_instance and c.consumer_port == taker.name for c in connections
+        ):
+            raise self._refuse_connection(live, "input_taken", "conflict", INPUT_TAKEN_TEXT)
+        if request.from_instance == request.to_instance:
+            raise self._refuse_connection(
+                live, "same_instance", "invalid_request", SAME_INSTANCE_TEXT
+            )
+        if makes_cycle(
+            (Edge(c.producer, c.consumer) for c in connections),
+            request.from_instance,
+            request.to_instance,
+        ):
+            raise self._refuse_connection(live, "cycle", "invalid_request", CYCLE_TEXT)
+        config = self._config
+        if len(connections) >= config.max_connections_per_task:
+            raise self._refuse_connection(live, "task_cap", "busy", TASK_CAP_TEXT)
+        for instance in (request.from_instance, request.to_instance):
+            touching = sum(1 for c in connections if instance in (c.producer, c.consumer))
+            if touching >= config.max_connections_per_instance:
+                raise self._refuse_connection(live, "instance_cap", "busy", INSTANCE_CAP_TEXT)
+        fan_out = sum(
+            1
+            for c in connections
+            if c.producer == request.from_instance and c.producer_port == output.name
+        )
+        if fan_out >= config.max_fan_out:
+            raise self._refuse_connection(live, "fan_out_cap", "busy", FAN_OUT_TEXT)
+        merged = (
+            live.state.taint
+            if producer.same_task
+            else merged_taint(live.state.taint, producer.taint)
+        )
+        return _Plan(producer, consumer, output.name, taker.name, output.type, merged)
+
+    async def _connect_tools(self, owner: Owner, request: ConnectTools) -> ResponseBody:
+        """Connect an output port to an input port (D31 (3), (6), (8)). Synchronous up to the
+        prompt, if there is one; everything is read again after it."""
+        live = self._owned(owner, request.task)
+        producer = self._producer_of(owner, live, request.from_instance)
+        if producer is None or request.to_instance not in live.instances:
+            raise self._refuse_connection(
+                live, "unknown_instance", "not_found", UNKNOWN_INSTANCE_TEXT
+            )
+        marked = self._gate_connection(live, producer)
+        try:
+            plan = self._plan_connection(live, request, producer)
+        except _Refuse as refusal:
+            if not marked:
+                raise
+            raise _Refuse(
+                refusal.reason, f"{refusal.message} {MARKED_TEXT}", refusal.code
+            ) from None
+        approval: tuple[bool, PromptId | None] = (False, None)
+        if plan.merged is None:
+            approval = await self._ask_crossing(owner, live, plan)
+            if self._live.get(request.task) is not live:
+                raise _Refuse("unknown_task", "the task ended")
+            producer = self._producer_of(owner, live, request.from_instance)
+            if producer is None:
+                raise self._refuse_connection(
+                    live, "unknown_instance", "not_found", UNKNOWN_INSTANCE_TEXT
+                )
+            plan = self._plan_connection(live, request, producer)
+            if plan.merged is not None:
+                approval = (False, None)  # the world changed while the user decided: no crossing
+        return self._make_connection(live, request, plan, approval)
+
+    async def _ask_crossing(
+        self, owner: Owner, live: _Live, plan: _Plan
+    ) -> tuple[bool, PromptId | None]:
+        """Ask the user to approve one crossing (D31 (6)): scope `once`, both tools and both
+        effects named by the chrome in its own words. Anything but a clear yes refuses."""
+        if self._rate_limited(live) is not None:
+            raise self._refuse_connection(live, "crossing_rate_limited", "busy", CROSSING_BUSY_TEXT)
+        self._count_prompt(live)
+        producer_effect: Literal["fs", "net"] = (
+            "fs" if TaintKind.FS in plan.producer.taint else "net"
+        )
+        consumer_effect: Literal["fs", "net"] = "net" if producer_effect == "fs" else "fs"
+        prompt = GrantPrompt(
+            task=live.state.task,
+            run=RunId.new(),
+            crossing=CrossingSubject(
+                from_name=plan.producer.held.name,
+                from_effect=producer_effect,
+                to_name=plan.consumer.name,
+                to_effect=consumer_effect,
+            ),
+            scopes=frozenset({GrantScope.ONCE}),
+            reason="",
+        )
+        answer = await self._ask(prompt, owner)
+        if isinstance(answer, Allowed) and answer.scope is GrantScope.ONCE:
+            return True, answer.prompt
+        reason = answer.reason if isinstance(answer, Denied) else ""
+        asked = answer.prompt
+        if reason in ("no_prompt_ui", "prompt_busy", "prompt_failed"):
+            raise self._refuse_connection(
+                live, "crossing_unavailable", "denied", CROSSING_UNAVAILABLE_TEXT, asked
+            )
+        raise self._refuse_connection(
+            live, "crossing_denied", "denied", CROSSING_DENIED_TEXT, asked
+        )
+
+    def _make_connection(
+        self,
+        live: _Live,
+        request: ConnectTools,
+        plan: _Plan,
+        approval: tuple[bool, PromptId | None],
+    ) -> ResponseBody:
+        """Record the connection: the taint it passes on is persisted with the audit entry, in one
+        transaction, before anything can flow."""
+        if self._live.get(live.state.task) is not live:
+            raise _Refuse("unknown_task", "the task ended")
+        crossing, prompt = approval
+        producer = plan.producer
+        passes_on: frozenset[TaintKind] = (
+            frozenset() if producer.same_task or crossing else producer.taint
+        )
+        merged = live.state.taint if plan.merged is None else plan.merged
+        connection = ConnectionId.new()
+        with self._atomic() as entries:
+            if merged != live.state.taint:
+                self._store.set_taint(live.state.task, merged)
+            entries.append(
+                ConnectionMade(
+                    at=self._now(),
+                    task=live.state.task,
+                    connection=connection,
+                    producer_task=producer.task,
+                    from_instance=request.from_instance,
+                    from_port=str(plan.from_port),
+                    to_instance=request.to_instance,
+                    to_port=str(plan.to_port),
+                    port_type=plan.port_type,
+                    producer_taint=taint_names(producer.taint),
+                    passes_on=taint_names(passes_on),
+                    task_taint=taint_names(merged),
+                    crossing=crossing,
+                    prompt=prompt,
+                )
+            )
+        live.state = TaskState(task=live.state.task, taint=merged)
+        live.connections[connection] = _Connection(
+            id=connection,
+            producer_task=producer.task,
+            producer=request.from_instance,
+            producer_port=plan.from_port,
+            producer_name=producer.held.name,
+            consumer=request.to_instance,
+            consumer_port=plan.to_port,
+            consumer_name=plan.consumer.name,
+            port_type=plan.port_type,
+            same_task=producer.same_task,
+            passes_on=passes_on,
+            crossing=crossing,
+            prompt=prompt,
+        )
+        return ToolsConnected(
+            kind="tools_connected",
+            connection=connection,
+            port_type=plan.port_type,
+            passes_on=taint_names(passes_on),
+            crossing=crossing,
+        )
+
+    def _list_connections(self, owner: Owner, request: ListConnections) -> ResponseBody:
+        live = self._owned(owner, request.task)
+        return ConnectionList(
+            kind="connection_list",
+            connections=tuple(
+                ConnectionInfo(
+                    connection=c.id,
+                    from_instance=c.producer,
+                    from_port=c.producer_port,
+                    from_name=c.producer_name,
+                    to_instance=c.consumer,
+                    to_port=c.consumer_port,
+                    to_name=c.consumer_name,
+                    port_type=c.port_type,
+                    same_task=c.same_task,
+                    passes_on=taint_names(c.passes_on),
+                    crossing=c.crossing,
+                )
+                for c in live.connections.values()
+            ),
+        )
+
+    def _remove_connection(self, owner: Owner, request: RemoveConnection) -> ResponseBody:
+        """The user's chrome removes a connection. No taint is lowered (D31 (6))."""
+        live = self._owned(owner, request.task)
+        if request.connection not in live.connections:
+            raise _Refuse("not_found", NO_CONNECTION_TEXT)
+        with self._atomic() as entries:
+            entries.append(
+                ConnectionRemovedEntry(
+                    at=self._now(), task=live.state.task, connection=request.connection
+                )
+            )
+        del live.connections[request.connection]
+        return ConnectionRemoved(kind="connection_removed")
+
+    def _inputs_of(self, live: _Live, context: RunContext) -> tuple[_Connection, ...]:
+        """The cross-task connections whose consumer is the instance this run is bound to (D31
+        (5)): the only runs that get `/inputs`."""
+        binding = context.tool
+        if binding is None:
+            return ()
+        return tuple(
+            c
+            for c in live.connections.values()
+            if not c.same_task
+            and c.consumer == binding.instance
+            and c.port_type in ("image", "file")  # a text value carries no file: no mount (B2)
+        )
+
+    def _input_sources(self, inputs: Sequence[_Connection]) -> tuple[_InputSource, ...]:
+        """Where each producer workspace is, by the identity the broker recorded; a workspace that
+        is gone refuses the run (retention is not extended)."""
+        sources: list[_InputSource] = []
+        for connection in inputs:
+            record = self._store.task(connection.producer_task)
+            if record is None or not record.workspace_present:
+                raise _Refuse("not_found", INPUTS_GONE_TEXT, "input_gone")
+            sources.append(_InputSource(connection.id, record.task, record.workspace))
+        return tuple(sources)
 
     # --- tasks ---------------------------------------------------------------------------------
 
@@ -2370,7 +2886,8 @@ class BrokerService:
             rules = await self._rules()
             live = self._owned(owner, request.task)
             context = self._context(live, request.run, request.origin)
-            payload = self._payload_of(live, request, context)
+            connected = self._inputs_of(live, context)
+            payload = self._payload_of(live, request, context, connected)
             selection = select_grants(
                 live.state, context, self._grants_for(live), rules=rules, now=self._now()
             )
@@ -2396,6 +2913,10 @@ class BrokerService:
                     "a run with the network cannot also be given files",
                     "net_with_files",
                 )
+            if network and connected:
+                # D29 (11): a run that holds the network mounts no file and no input.
+                raise _Refuse("denied", NET_WITH_INPUTS_TEXT, "net_with_inputs")
+            sources = self._input_sources(connected)
             write_paths = tuple(mount.path for mount in mounts if mount.writable)
             if len(write_paths) > MAX_TARGETS:
                 raise InvalidRunError(
@@ -2436,6 +2957,7 @@ class BrokerService:
                     write_paths,
                     network,
                     payload,
+                    sources,
                 )
             finally:
                 self._write_runs.pop(request.run, None)
@@ -2455,9 +2977,17 @@ class BrokerService:
         write_paths: tuple[StoredPath, ...],
         network: bool,
         payload: str | None,
+        sources: tuple[_InputSource, ...],
     ) -> ResponseBody:
         paths: _RunPaths = await self._fs.call(
-            partial(self._open_run_paths, live.state.task, live.workspace, tuple(mounts), rules),
+            partial(
+                self._open_run_paths,
+                live.state.task,
+                live.workspace,
+                tuple(mounts),
+                rules,
+                sources,
+            ),
             discard=_close_paths,
         )
         planned: _Planned | None = None
@@ -2469,7 +2999,9 @@ class BrokerService:
             policy, limits = self._policy(
                 request, paths, mounts, variables, allowlist, network, payload
             )
-            self._authorise_run(request, live, context, selection, mounts, rules, planned)
+            self._authorise_run(
+                request, live, context, selection, mounts, rules, planned, paths.input_ids
+            )
             authorised[0] = True
         except BaseException:
             paths.close()
@@ -2528,6 +3060,7 @@ class BrokerService:
         identity: FsIdentity,
         mounts: tuple[Mount, ...],
         rules: DenyRules,
+        sources: tuple[_InputSource, ...] = (),
     ) -> _RunPaths:
         """Open the workspace and every granted path by identity, with no symlink followed.
         Any failure closes what was opened and refuses the run (the user is asked again)."""
@@ -2536,6 +3069,14 @@ class BrokerService:
             workspace = self._workspaces.open_workspace(task, identity)
             opened.append(workspace)
             self._require_room(workspace)
+            retained: list[OpenedPath] = []
+            for source in sources:
+                try:
+                    # Read-only below (`InputMount`): never a write into another task's workspace.
+                    retained.append(self._workspaces.open_workspace(source.task, source.identity))
+                except (WorkspaceError, PathError):
+                    raise _Refuse("not_found", INPUTS_GONE_TEXT, "input_gone") from None
+                opened.append(retained[-1])
             granted: list[OpenedPath] = []
             for mount in mounts:
                 try:
@@ -2554,7 +3095,12 @@ class BrokerService:
             for each in opened:
                 each.close()
             raise
-        return _RunPaths(workspace=workspace, mounts=tuple(granted))
+        return _RunPaths(
+            workspace=workspace,
+            mounts=tuple(granted),
+            inputs=tuple(retained),
+            input_ids=tuple(source.connection for source in sources),
+        )
 
     def _require_room(self, workspace: OpenedPath) -> None:
         """Refuse a run while the task's workspace holds more than it may (#74's disk box, D28):
@@ -2615,6 +3161,10 @@ class BrokerService:
                 require_landlock=self._config.require_landlock,
                 payload=None if payload is None else payload.encode("utf-8"),
                 network=network,
+                inputs=tuple(
+                    InputMount(source=opened, connection=connection)
+                    for opened, connection in zip(paths.inputs, paths.input_ids, strict=True)
+                ),
             )
             policy.check_descriptors()
         except InvalidValueError:  # InvalidPolicyError is one
@@ -2632,6 +3182,7 @@ class BrokerService:
         mounts: Sequence[Mount],
         rules: DenyRules,
         planned: _Planned | None,
+        inputs: tuple[ConnectionId, ...] = (),
     ) -> None:
         """Record that the run is authorised, before it starts: the once grants it uses are
         consumed, the task's taint is raised to what the applied grants imply, the snapshot of
@@ -2707,6 +3258,7 @@ class BrokerService:
                     network=any(
                         isinstance(grant.capability, NetFull) for grant in selection.applicable
                     ),
+                    inputs=inputs,
                 )
             )
         if planned is not None:

@@ -51,6 +51,10 @@ BROKER_SECONDS: Final = 20.0
 SOURCE_FRAME_BYTES: Final = 5 * 1024
 """Of the spec and of the code each, when `open_tool` shows the source: both fit one result."""
 LISTED_DESCRIPTION: Final = 160
+CANNOT_SAVE_TEXT: Final = (
+    "That tool cannot be saved from here: it is not on the canvas, or it was shown in an earlier "
+    "task. Show it again in this task (show_ui or open_tool), then save it."
+)
 
 
 def marked(taint: tuple[str, ...]) -> str:
@@ -280,6 +284,18 @@ async def fetch_stored(
     return await link.call(work, deadline=BROKER_SECONDS)
 
 
+def _ports_text(package: ToolPackage) -> str:
+    """The tool's ports for `connect_tools`: names and types, both closed (validated names and
+    value types), so they are our words about the tool and not a frame's worth of its author's."""
+    parts = []
+    for label, ports in (("Input", package.manifest.inputs), ("Output", package.manifest.outputs)):
+        if ports:
+            parts.append(
+                f"{label} ports: " + ", ".join(f"{p.name} ({p.type})" for p in ports) + "."
+            )
+    return (" " + " ".join(parts)) if parts else ""
+
+
 def _source_text(package: ToolPackage) -> str:
     spec = json.dumps(package.ui.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":"))
     code = "\n\n".join(f"# module {module.name}\n{module.source}" for module in package.modules)
@@ -310,20 +326,16 @@ def register_saved_tool_tools(
             raise ToolError(str(error)) from None
 
     async def save_tool(arguments: SaveToolInput) -> str:
+        task = await current_task()
         try:
             source = await canvas.source(arguments.instance)
         except UnknownInstanceError:
-            raise ToolError(
-                f"There is no tool {arguments.instance} on the canvas now: show it first."
-            ) from None
-        task = await current_task()
+            raise ToolError(CANNOT_SAVE_TEXT) from None
         if source.task != task:
             # What was shown in another task may hold what that task read; saving it from this one
-            # would store it under this task's taint (I12, D30 (7)).
-            raise ToolError(
-                "That tool was shown in an earlier task. Show it again in this task (show_ui or "
-                "open_tool), then save it."
-            )
+            # would store it under this task's taint (I12, D30 (7)). The text is the one an absent
+            # tool gets: which it is says nothing (D31 (8)).
+            raise ToolError(CANNOT_SAVE_TEXT)
         document = json.dumps(
             {
                 "name": arguments.name,
@@ -434,7 +446,7 @@ def register_saved_tool_tools(
             f"Opened version {fetched.stored.version} of the saved tool{newest} on the "
             f"canvas{count} as instance {shown.instance}. "
             f"State entries (names written by the tool's author): "
-            f"{describe_entries(package.ui) or 'none'}. "
+            f"{describe_entries(package.ui) or 'none'}.{_ports_text(package)} "
             f"Use patch_state with this instance id to change them.{taint_note}"
         )
         if arguments.source:
@@ -477,7 +489,8 @@ def register_saved_tool_tools(
     )
     registry.register(
         ToolName("open_tool"),
-        "Show a saved tool on the canvas (the newest version unless you name one). The user's "
+        "Show a saved tool on the canvas (the newest version unless you name one). Use placement "
+        "stack for tools you will connect (the default closes the others). The user's "
         "access for it is asked again for each version. With source=true you also get its spec "
         "and code as data, to refine it with show_ui and save_tool.",
         OpenToolInput,

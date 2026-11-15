@@ -103,6 +103,228 @@
       "title": "ClosePrompt",
       "type": "object"
     },
+    "ConnectTools": {
+      "additionalProperties": false,
+      "description": "Connect `from_port` of `from_instance` to `to_port` of `to_instance`, in `task` (the\nconsumer's task). `from_instance` is an instance of `task`, or of an ended task of this\nconnection's owner.",
+      "properties": {
+        "from_instance": {
+          "pattern": "^inst_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "From Instance",
+          "type": "string"
+        },
+        "from_port": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "From Port",
+          "type": "string"
+        },
+        "kind": {
+          "const": "connect_tools",
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        },
+        "to_instance": {
+          "pattern": "^inst_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "To Instance",
+          "type": "string"
+        },
+        "to_port": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "To Port",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "from_instance",
+        "from_port",
+        "to_instance",
+        "to_port"
+      ],
+      "title": "ConnectTools",
+      "type": "object"
+    },
+    "ConnectionInfo": {
+      "additionalProperties": false,
+      "description": "One connection of a task, for the chrome and the router.",
+      "properties": {
+        "connection": {
+          "pattern": "^conn_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Connection",
+          "type": "string"
+        },
+        "crossing": {
+          "title": "Crossing",
+          "type": "boolean"
+        },
+        "from_instance": {
+          "pattern": "^inst_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "From Instance",
+          "type": "string"
+        },
+        "from_name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "From Name",
+          "type": "string"
+        },
+        "from_port": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "From Port",
+          "type": "string"
+        },
+        "passes_on": {
+          "items": {
+            "enum": [
+              "fs",
+              "net"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Passes On",
+          "type": "array"
+        },
+        "port_type": {
+          "enum": [
+            "text",
+            "json",
+            "table",
+            "image",
+            "file"
+          ],
+          "title": "Port Type",
+          "type": "string"
+        },
+        "same_task": {
+          "title": "Same Task",
+          "type": "boolean"
+        },
+        "to_instance": {
+          "pattern": "^inst_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "To Instance",
+          "type": "string"
+        },
+        "to_name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "To Name",
+          "type": "string"
+        },
+        "to_port": {
+          "pattern": "^(?:[a-z][a-z0-9_]{0,63})$",
+          "title": "To Port",
+          "type": "string"
+        }
+      },
+      "required": [
+        "connection",
+        "from_instance",
+        "from_port",
+        "from_name",
+        "to_instance",
+        "to_port",
+        "to_name",
+        "port_type",
+        "same_task",
+        "passes_on",
+        "crossing"
+      ],
+      "title": "ConnectionInfo",
+      "type": "object"
+    },
+    "ConnectionList": {
+      "additionalProperties": false,
+      "properties": {
+        "connections": {
+          "items": {
+            "$ref": "#/$defs/ConnectionInfo"
+          },
+          "maxItems": 64,
+          "title": "Connections",
+          "type": "array"
+        },
+        "kind": {
+          "const": "connection_list",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "connections"
+      ],
+      "title": "ConnectionList",
+      "type": "object"
+    },
+    "ConnectionRemoved": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "connection_removed",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "ConnectionRemoved",
+      "type": "object"
+    },
+    "CrossingAccess": {
+      "additionalProperties": false,
+      "description": "What the broker asks in the crossing prompt (S25, D31 (6), I12): connecting `from_name`'s\noutput to `to_name`'s input would make a task both fs- and net-tainted. `from_effect` and\n`to_effect` say what each tool's task did (`fs`: saw the user's files, `net`: used the\nnetwork); they differ. Only the broker sends it, in a `ShowPrompt`; a model cannot request it.\nThe names are the tools' own text from the index: shown plain, capped and as the tools'.",
+      "properties": {
+        "from_effect": {
+          "enum": [
+            "fs",
+            "net"
+          ],
+          "title": "From Effect",
+          "type": "string"
+        },
+        "from_name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "From Name",
+          "type": "string"
+        },
+        "kind": {
+          "const": "crossing",
+          "title": "Kind",
+          "type": "string"
+        },
+        "to_effect": {
+          "enum": [
+            "fs",
+            "net"
+          ],
+          "title": "To Effect",
+          "type": "string"
+        },
+        "to_name": {
+          "maxLength": 64,
+          "minLength": 1,
+          "title": "To Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "from_name",
+        "from_effect",
+        "to_name",
+        "to_effect"
+      ],
+      "title": "CrossingAccess",
+      "type": "object"
+    },
     "DenyDecision": {
       "additionalProperties": false,
       "description": "The user did not allow it, or nobody could be asked.",
@@ -575,6 +797,28 @@
       "title": "ImportTool",
       "type": "object"
     },
+    "ListConnections": {
+      "additionalProperties": false,
+      "description": "The connections of `task`, oldest first.",
+      "properties": {
+        "kind": {
+          "const": "list_connections",
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task"
+      ],
+      "title": "ListConnections",
+      "type": "object"
+    },
     "ListDir": {
       "additionalProperties": false,
       "description": "List a directory under a grant of the task, named by its absolute path.",
@@ -588,6 +832,7 @@
           "$ref": "#/$defs/RunOrigin",
           "default": {
             "binding": null,
+            "connection": null,
             "trigger": "model"
           }
         },
@@ -1007,6 +1252,7 @@
           "$ref": "#/$defs/RunOrigin",
           "default": {
             "binding": null,
+            "connection": null,
             "trigger": "model"
           }
         },
@@ -1118,6 +1364,34 @@
       "title": "Refused",
       "type": "object"
     },
+    "RemoveConnection": {
+      "additionalProperties": false,
+      "description": "Remove a connection of `task`. The user's own action from the chrome: no model tool sends\nit. Removing one never lowers a taint.",
+      "properties": {
+        "connection": {
+          "pattern": "^conn_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Connection",
+          "type": "string"
+        },
+        "kind": {
+          "const": "remove_connection",
+          "title": "Kind",
+          "type": "string"
+        },
+        "task": {
+          "pattern": "^tsk_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Task",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task",
+        "connection"
+      ],
+      "title": "RemoveConnection",
+      "type": "object"
+    },
     "RequestFrame": {
       "additionalProperties": false,
       "description": "A request: `body` is for the receiver to handle, and to answer under the same `id`.",
@@ -1127,11 +1401,13 @@
             "mapping": {
               "answer_prompt": "#/$defs/AnswerPrompt",
               "close_prompt": "#/$defs/ClosePrompt",
+              "connect_tools": "#/$defs/ConnectTools",
               "echo": "#/$defs/Echo",
               "end_task": "#/$defs/EndTask",
               "export_tool": "#/$defs/ExportTool",
               "find_tools": "#/$defs/FindTools",
               "import_tool": "#/$defs/ImportTool",
+              "list_connections": "#/$defs/ListConnections",
               "list_dir": "#/$defs/ListDir",
               "list_snapshots": "#/$defs/ListSnapshots",
               "list_tool_grants": "#/$defs/ListToolGrants",
@@ -1142,6 +1418,7 @@
               "ping": "#/$defs/Ping",
               "read_file": "#/$defs/ReadFile",
               "read_workspace_file": "#/$defs/ReadWorkspaceFile",
+              "remove_connection": "#/$defs/RemoveConnection",
               "request_grant": "#/$defs/RequestGrant",
               "revert_tool": "#/$defs/RevertTool",
               "revoke_grant": "#/$defs/RevokeGrant",
@@ -1233,6 +1510,15 @@
               "$ref": "#/$defs/RevokeToolGrant"
             },
             {
+              "$ref": "#/$defs/ConnectTools"
+            },
+            {
+              "$ref": "#/$defs/ListConnections"
+            },
+            {
+              "$ref": "#/$defs/RemoveConnection"
+            },
+            {
               "$ref": "#/$defs/AnswerPrompt"
             },
             {
@@ -1302,6 +1588,7 @@
           "$ref": "#/$defs/RunOrigin",
           "default": {
             "binding": null,
+            "connection": null,
             "trigger": "model"
           }
         },
@@ -1338,6 +1625,8 @@
         "body": {
           "discriminator": {
             "mapping": {
+              "connection_list": "#/$defs/ConnectionList",
+              "connection_removed": "#/$defs/ConnectionRemoved",
               "dir_listing": "#/$defs/DirListing",
               "echoed": "#/$defs/Echoed",
               "file_content": "#/$defs/FileContent",
@@ -1361,6 +1650,7 @@
               "tool_shown": "#/$defs/ToolShown",
               "tool_stored": "#/$defs/ToolStored",
               "tool_versions": "#/$defs/ToolVersions",
+              "tools_connected": "#/$defs/ToolsConnected",
               "undo_result": "#/$defs/UndoResult"
             },
             "propertyName": "kind"
@@ -1425,6 +1715,15 @@
             },
             {
               "$ref": "#/$defs/ToolGrantList"
+            },
+            {
+              "$ref": "#/$defs/ToolsConnected"
+            },
+            {
+              "$ref": "#/$defs/ConnectionList"
+            },
+            {
+              "$ref": "#/$defs/ConnectionRemoved"
             },
             {
               "$ref": "#/$defs/PromptShown"
@@ -1605,6 +1904,7 @@
           "$ref": "#/$defs/RunOrigin",
           "default": {
             "binding": null,
+            "connection": null,
             "trigger": "model"
           }
         },
@@ -1650,7 +1950,7 @@
     },
     "RunOrigin": {
       "additionalProperties": false,
-      "description": "What started a run, and the saved tool it runs (D30 (1), (2)).\n\n`model` (the default, with no binding) is `run_code` and the model's own broker calls, and\nalso the handler runs of a tool that was not opened from the store. `user_event` is the\nshell's claim that a direct input event on a widget of a stored tool's instance started it: it\nneeds a binding, and the broker accepts it only for a run whose code it built itself\n(`RunInSandbox`) or for the user's own chrome (`RequestGrant`). Only the tool grants look at it.",
+      "description": "What started a run, and the saved tool it runs (D30 (1), (2)).\n\n`model` (the default, with no binding) is `run_code` and the model's own broker calls, and\nalso the handler runs of a tool that was not opened from the store. `user_event` is the\nshell's claim that a direct input event on a widget of a stored tool's instance started it: it\nneeds a binding, and the broker accepts it only for a run whose code it built itself\n(`RunInSandbox`) or for the user's own chrome (`RequestGrant`). Only the tool grants look at it.\n`connection` (S25, D31 (4)) is a value that arrived over a connection: it needs a binding and\nthe `ConnectionId` of the connection of this task whose consumer the binding names, and gets no\ntool grant.",
       "properties": {
         "binding": {
           "anyOf": [
@@ -1663,11 +1963,25 @@
           ],
           "default": null
         },
+        "connection": {
+          "anyOf": [
+            {
+              "pattern": "^conn_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Connection"
+        },
         "trigger": {
           "default": "model",
           "enum": [
             "model",
-            "user_event"
+            "user_event",
+            "connection"
           ],
           "title": "Trigger",
           "type": "string"
@@ -1826,6 +2140,7 @@
         "access": {
           "discriminator": {
             "mapping": {
+              "crossing": "#/$defs/CrossingAccess",
               "fs.pick": "#/$defs/PickAccess",
               "fs.read": "#/$defs/ReadAccess",
               "fs.write": "#/$defs/WriteAccess",
@@ -1849,6 +2164,9 @@
             },
             {
               "$ref": "#/$defs/NoUndoAccess"
+            },
+            {
+              "$ref": "#/$defs/CrossingAccess"
             }
           ],
           "title": "Access"
@@ -2614,6 +2932,58 @@
         "versions"
       ],
       "title": "ToolVersions",
+      "type": "object"
+    },
+    "ToolsConnected": {
+      "additionalProperties": false,
+      "description": "The connection was made. `passes_on` is the taint it handed the consumer's task (empty:\nnone; within one task, or the producer had none); `crossing` says the user approved a crossing\nfor it (then nothing was passed on: I12).",
+      "properties": {
+        "connection": {
+          "pattern": "^conn_[0-7][0-9a-hjkmnp-tv-z]{25}$",
+          "title": "Connection",
+          "type": "string"
+        },
+        "crossing": {
+          "title": "Crossing",
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "tools_connected",
+          "title": "Kind",
+          "type": "string"
+        },
+        "passes_on": {
+          "items": {
+            "enum": [
+              "fs",
+              "net"
+            ],
+            "type": "string"
+          },
+          "maxItems": 1,
+          "title": "Passes On",
+          "type": "array"
+        },
+        "port_type": {
+          "enum": [
+            "text",
+            "json",
+            "table",
+            "image",
+            "file"
+          ],
+          "title": "Port Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "connection",
+        "port_type",
+        "passes_on",
+        "crossing"
+      ],
+      "title": "ToolsConnected",
       "type": "object"
     },
     "UndoLastChange": {

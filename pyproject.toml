@@ -252,6 +252,7 @@ source_modules = [
     "tumbleweed.broker.capabilities",
     "tumbleweed.broker.compose",
     "tumbleweed.broker.config",
+    "tumbleweed.broker.connections",
     "tumbleweed.broker.deny",
     "tumbleweed.broker.errors",
     "tumbleweed.broker.fdio",

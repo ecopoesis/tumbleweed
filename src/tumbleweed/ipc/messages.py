@@ -62,6 +62,14 @@ from tumbleweed.ipc.broker_messages import (
     UndoResult,
     UndoSnapshot,
 )
+from tumbleweed.ipc.connection_messages import (
+    ConnectionList,
+    ConnectionRemoved,
+    ConnectTools,
+    ListConnections,
+    RemoveConnection,
+    ToolsConnected,
+)
 from tumbleweed.ipc.prompt_messages import (
     AnswerPrompt,
     ClosePrompt,
@@ -152,6 +160,9 @@ RequestBody = Annotated[
     | ListToolVersions
     | ListToolGrants
     | RevokeToolGrant
+    | ConnectTools
+    | ListConnections
+    | RemoveConnection
     | AnswerPrompt
     | ShowPrompt
     | ClosePrompt,
@@ -180,6 +191,9 @@ ResponseBody = Annotated[
     | ToolMatches
     | ToolVersions
     | ToolGrantList
+    | ToolsConnected
+    | ConnectionList
+    | ConnectionRemoved
     | PromptShown
     | PromptClosed
     | PromptAnswered
@@ -220,6 +234,9 @@ BROKER_SERVES: Final[tuple[type[Request], ...]] = (
     ListToolVersions,
     ListToolGrants,
     RevokeToolGrant,
+    ConnectTools,
+    ListConnections,
+    RemoveConnection,
     AnswerPrompt,
 )
 """The requests the broker serves: what the shell (and `tumbleweed-tools`) asks it."""
