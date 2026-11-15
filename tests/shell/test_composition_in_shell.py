@@ -71,7 +71,7 @@ def test_stacked_tools_sit_side_by_side_and_a_connection_carries_a_value_between
     assert one is not None
     assert two is not None
 
-    left, top, right, _bottom = bounds(one.widget, window)
+    _left, top, right, _bottom = bounds(one.widget, window)
     left_two, top_two, _right_two, _bottom_two = bounds(two.widget, window)
     assert left_two >= right  # beside it, not below it
     assert abs(top_two - top) < 40
