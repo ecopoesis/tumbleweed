@@ -29,6 +29,8 @@ from xml.etree import ElementTree
 
 import pytest
 
+from tests.plugins import host
+
 pytestmark = [
     pytest.mark.gtk,
     pytest.mark.skipif(
@@ -68,6 +70,7 @@ PASSED_ON = (
     "GSK_RENDERER",
     "GTK_A11Y",
     "GSETTINGS_BACKEND",
+    *host.LIBRARY_LOCATION_VARIABLES,
 )
 BUS_CONFIG = """<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
