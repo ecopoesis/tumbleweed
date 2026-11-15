@@ -2201,8 +2201,12 @@ a click replaced by a value is a connection run (fewer rights, never more). Test
 mounts the producer task's retained workspace **read-only** at `/inputs/<ConnectionId>/` of a run:
 opened by the identity the broker recorded (`workspaces.open_workspace`), bound by descriptor
 (S14), never writable, never a write into another task's workspace; the code sees a value's file
-at `<root>/<path>` (the broker adds `root` to a connected file or image input, in the payload it
-builds itself). **Which runs get which mounts.** A run gets the `/inputs/<c>` of every
+as an **absolute path under the mount** (the broker, building the payload itself, makes a connected
+`file` or `image` input's workspace-relative `path` into `/inputs/<ConnectionId>/<path>`, after
+checking it as a `WorkspaceRelPath`; a path that climbs out is refused), so handler code written as
+the prompt teaches, `open(inputs["photo"]["path"])`, works unchanged. Only `file` and `image`
+connections mount anything: a `text`, `json` or `table` value carries no file, so a consumer fed one
+can still use the network. **Which runs get which mounts.** A run gets the `/inputs/<c>` of every
 cross-task connection `c` whose consumer is *the instance the run is bound to* and nothing else:
 a `run_code` run, a run of another instance and a run of the same instance in a different task
 get none; and **a run that holds `net.full` mounts none** (D29 (11) stays: `net_with_files` is
@@ -2214,7 +2218,8 @@ with its own workspace; the mount shows the producer **as it ended**, frozen. Te
 `tests/broker/test_connection_runs.py` (`TestAConnectionRun`, `TestTheNetwork`,
 `TestTheFilesAreGone`: a recording sandbox) and
 `tests/broker/test_inputs_linux.py` (`linux`: read, and write, create, delete, rename, chmod, link
-all fail; a `net.full` run mounts nothing).
+all fail). That a `net.full` run mounts nothing is `TestTheNetwork` (host: the run is refused before
+a sandbox exists) and `tests/sandbox/test_network.py` (`SandboxPolicy` refuses the combination).
 
 (6) *Taint.* A cross-task connection propagates the producer task's taint to the consumer task
 **before anything flows**: set in the same transaction as the audit entry (`connection_made`
@@ -2266,7 +2271,10 @@ is the only crossing that prompts. Whether a model can name it: context and tain
 non-fresh chain (D26 (3), D29 (13)), so a task that saw a net task's turns is net itself, and after
 `fresh_context` the old instance IDs are gone; the instance ID of an old net task's tool on the
 canvas reaches an fs task's model only in the turn the shell writes when the user uses that tool, or
-typed by the user. The prompt is therefore reachable, narrowly, and **a net-tainted consumer after
+typed by the user. An ended task's card is inert and its events are dropped, so no
+shell turn carries its ID into a later task: the model path needs the user to give the ID in chat.
+The acceptance "a taint-crossing connection prompts" is met at the broker, through IPC
+(`test_connection_taint.py`, `test_connection_prompts.py`). The prompt is therefore reachable, narrowly, and **a net-tainted consumer after
 an approved crossing does not exist** (the approved case is an fs consumer, which stays fs). v1
 offers no way, for the model or the user, to connect fs data into a net task: no chrome "connect"
 action and no listing of instances (a listing would be a new leak surface); the user-initiated reverse
@@ -2275,6 +2283,20 @@ test_connection_noninterference.py` runs one script against a state and the same
 tasks' instances, from a net consumer and from a clean consumer that stays clean, and demands equal
 answers, equal listings and equal routed values (`agent.routing` is driven from the broker's
 listing, with a secret in the fs producer's output).
+
+**What a connection passes on is its producer's own (round 1).** The router passes on the producer's
+store, so no task but the producer's may write it: `patch_state` and `CanvasTools.patch` refuse an
+instance that is not the current task's (an ended task's, whose card is inert, or another's) with one
+fixed text, and an ended task's sandbox results are dropped (its runs are stopped). The user's own
+edits of an old card still work, they are the user's. This amends D24 and D30 (2): `patch_state` of a
+tool that is connected as a producer is passed on, and the consumer's `sandbox` handlers that read it
+run (trigger `connection`, no tool grant), so "a patch never starts a run" and "a stored handler
+runs only on a direct user input" hold for the tool patched, not for the one fed. The ended-instance
+record keeps fs tasks in a ring of their own (32 per owner), so their ending cannot push a clean or
+net task's instances out of it. A clean consumer that named an fs instance takes the taint first and
+every refusal after that says so. `connect_tools` answers "connected, but nothing flows yet" when
+either tool is not on the canvas, because values flow only while both are shown (open them with
+`stack`).
 
 (9) *Chrome.* The Tools panel gets a Connections list for the current task (`ListConnections`):
 producer tool and port, consumer tool and port, the effect on the task ("passes on: saw your files",

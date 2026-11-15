@@ -120,3 +120,62 @@ def test_a_value_the_consumer_does_not_take_says_so_on_its_card(echo_shell: Shel
 
     shown = [label.get_text() for label in labels_in(echo_shell.window.canvas)]
     assert "A value from a connected tool is not one this tool accepts." in shown
+
+
+def test_a_tool_of_an_earlier_task_cannot_be_written_and_its_value_is_the_one_it_ended_with(
+    echo_shell: Shell,
+) -> None:
+    """D31 (4): what a connection passes on is the producer's own. An fs task's model patching a
+    clean ended producer's card is refused, so the consumer holds what the producer ended with,
+    byte for byte, as in a canvas that never had the fs task."""
+    from tumbleweed.agent.canvas import FrozenInstanceError
+
+    tools = echo_shell.window.canvas_tools
+    later = TaskId.new()
+    tools.task_started(TASK)
+    producer = tools.show(stage("Producer"), "stack", TASK)
+    one = tools.tool(producer.instance)
+    assert one is not None
+    one.runtime.patch_state({"src": "what it made"})
+    tools.task_ended(TASK)
+    tools.task_started(later)  # the fs task: its model knows the instance id
+    consumer = tools.show(stage("Consumer"), "stack", later)
+    two = tools.tool(consumer.instance)
+    assert two is not None
+    tools.set_connections(later, (info(producer.instance, consumer.instance),))
+    assert two.runtime.store.value(StateKey("src")) == "what it made"
+
+    with pytest.raises(FrozenInstanceError):
+        tools.patch(producer.instance, {"src": "SECRET from the user's files"})
+
+    assert one.runtime.store.value(StateKey("src")) == "what it made"
+    assert two.runtime.store.value(StateKey("src")) == "what it made"
+
+
+def test_a_tool_of_another_task_that_has_not_ended_is_read_only_to_the_model_too(
+    echo_shell: Shell,
+) -> None:
+    from tumbleweed.agent.canvas import FrozenInstanceError
+
+    tools = echo_shell.window.canvas_tools
+    tools.task_started(TASK)
+    mine = tools.show(stage("Mine"), "stack", TASK)
+    other = TaskId.new()
+    tools.task_started(other)  # the conversation moved on
+
+    with pytest.raises(FrozenInstanceError):
+        tools.patch(mine.instance, {"src": "x"})
+    shown = tools.show(stage("Now"), "stack", other)
+    assert tools.patch(shown.instance, {"src": "ok"}) == (StateKey("src"), StateKey("out"))
+
+
+def test_closing_a_tool_takes_it_out_of_the_router(echo_shell: Shell) -> None:
+    tools = echo_shell.window.canvas_tools
+    first = tools.show(stage("One"), "stack", TASK)
+    second = tools.show(stage("Two"), "stack", TASK)
+    tools.set_connections(TASK, (info(first.instance, second.instance),))
+    assert tools._router.active  # noqa: SLF001  (the router is the thing under test)
+
+    tools.show(stage("Three"), "replace", TASK)  # closes both
+
+    assert tools._router.active == frozenset()  # noqa: SLF001

@@ -291,3 +291,37 @@ def test_a_pending_prompt_locks_the_tools_panel_and_its_button(
     finally:
         shell.window.shutdown()
         shell.window.destroy()
+
+
+def test_the_panel_lists_the_connections_and_remove_asks_the_port_for_that_one() -> None:
+    from tests.shell.test_tools_model import connection
+
+    port = FakePort(summary())
+    port.connection_list = (
+        connection(name="Photo <b>tool</b>", passes_on=("fs",)),
+        connection(),
+    )
+    panel = ToolsPanel(port)
+
+    panel.open()
+
+    texts = [label.get_text() for label in labels_in(panel)]
+    assert "Connections" in texts
+    assert "Photo <b>tool</b> (photo) feeds Collage (src), image" in texts  # literal, never markup
+    assert any(line.startswith("Its task saw your files") for line in texts)
+    removes = buttons(panel, "Remove")
+    assert len(removes) == 2
+    removes[1].emit("clicked")
+    assert port.calls == [("remove_connection", panel.model.connections[1].connection)]
+
+
+def test_the_window_gives_the_tools_port_the_canvas_to_tell_when_a_connection_goes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shell = _window_with_a_broker(monkeypatch)
+    try:
+        (made,) = _WindowPort.made
+        assert made.args[-1] == shell.window.canvas_tools.set_connections
+    finally:
+        shell.window.shutdown()
+        shell.window.destroy()

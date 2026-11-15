@@ -840,7 +840,7 @@ the edit has been written, and does not fire if the write was held back ([evalua
 or the edit left the entry's value as it was (a slider moved between two positions that round to the
 same number).
 The one other thing that starts a handler is a value that arrives over a connection from another saved
-tool (S25, ARCHITECTURE section 6): it runs the `sandbox` handlers that list that input, never a `set`
+tool: it runs the `sandbox` handlers that list that input, never a `set`
 or `agent` handler, and it is not a user's event.
 
 ## 10. What is checked across the spec

@@ -874,7 +874,7 @@ the user's own, and `edit_before_send` (and its forcing over plain http) applies
 | Tool | Effect | Step |
 |---|---|---|
 | `show_ui(spec, placement?, code?)` | Validate and render a tool draft on the canvas; `placement` is `replace` (default) or `stack`; `code` is the list of `{name, source}` modules its `sandbox` handlers call | S12, S20 |
-| `patch_state(instance, patch)` | Update a rendered tool's state (never fires handlers) | S12 |
+| `patch_state(instance, patch)` | Update the state of a tool of the current task (never fires its own handlers; a connected output is passed on) | S12, S25 |
 | `start_task(title, fresh_context?)` | End the current task; new workspace, no grants; optionally no prior turns | S19 |
 | `request_access(kind, path?, reason)` | Ask for a grant (`read`, `write` (task scope only; runs that can change it are snapshotted first), `network`), or ask the user to pick a file/folder to read (`pick_file`, `pick_folder`); a picked path comes back in the result | S19, S21 |
 | `list_workspace()` / `list_dir(path)` / `read_file(path)` | Grant-checked, size-capped listings and reads via the broker | S19 |
