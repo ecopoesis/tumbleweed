@@ -51,6 +51,10 @@ BROKER_SECONDS: Final = 20.0
 SOURCE_FRAME_BYTES: Final = 5 * 1024
 """Of the spec and of the code each, when `open_tool` shows the source: both fit one result."""
 LISTED_DESCRIPTION: Final = 160
+CANNOT_SAVE_TEXT: Final = (
+    "That tool cannot be saved from here: it is not on the canvas, or it was shown in an earlier "
+    "task. Show it again in this task (show_ui or open_tool), then save it."
+)
 
 
 def marked(taint: tuple[str, ...]) -> str:
@@ -322,20 +326,16 @@ def register_saved_tool_tools(
             raise ToolError(str(error)) from None
 
     async def save_tool(arguments: SaveToolInput) -> str:
+        task = await current_task()
         try:
             source = await canvas.source(arguments.instance)
         except UnknownInstanceError:
-            raise ToolError(
-                f"There is no tool {arguments.instance} on the canvas now: show it first."
-            ) from None
-        task = await current_task()
+            raise ToolError(CANNOT_SAVE_TEXT) from None
         if source.task != task:
             # What was shown in another task may hold what that task read; saving it from this one
-            # would store it under this task's taint (I12, D30 (7)).
-            raise ToolError(
-                "That tool was shown in an earlier task. Show it again in this task (show_ui or "
-                "open_tool), then save it."
-            )
+            # would store it under this task's taint (I12, D30 (7)). The text is the one an absent
+            # tool gets: which it is says nothing (D31 (8)).
+            raise ToolError(CANNOT_SAVE_TEXT)
         document = json.dumps(
             {
                 "name": arguments.name,

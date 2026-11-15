@@ -189,3 +189,20 @@ def test_closing_a_tool_takes_it_out_of_the_router(echo_shell: Shell) -> None:
     tools.show(stage("Three"), "replace", TASK)  # closes both
 
     assert tools._router.active == frozenset()  # noqa: SLF001
+
+
+def test_the_card_count_the_model_is_told_counts_only_this_tasks_cards(echo_shell: Shell) -> None:
+    """#171: an earlier task's cards (an fs task's, say) are no business of this task's model."""
+    tools = echo_shell.window.canvas_tools
+    mine = TaskId.new()
+    alone = tools.show(stage("Alone"), "replace", mine).on_canvas
+    tools.close()
+    earlier = TaskId.new()
+    tools.show(stage("Old one"), "stack", earlier)
+    tools.show(stage("Old two"), "stack", earlier)
+
+    with_theirs = tools.show(stage("Mine"), "stack", mine).on_canvas
+
+    assert alone == 1
+    assert with_theirs == 1
+    assert tools.show(stage("Mine too"), "stack", mine).on_canvas == 2

@@ -456,7 +456,7 @@ class TestRefineAndRevert:
 
                 (result,) = results(rig, 1)
                 assert result.is_error
-                assert "no tool" in result.content.lower()
+                assert "not on the canvas" in result.content.lower()
                 assert thread.rig.audit_of(ToolSaved) == []
 
 

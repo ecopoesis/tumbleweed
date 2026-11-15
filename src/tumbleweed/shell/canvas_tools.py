@@ -282,7 +282,10 @@ class CanvasTools:
         self._router.attach(instance, _Endpoint(tool))
         if self._canvas.content is not self._column:
             self._canvas.set_content(self._column)
-        return ShownTool(instance=instance, on_canvas=len(self._shown))
+        # Only this task's cards are counted: an earlier task's say nothing to this one (#171).
+        return ShownTool(
+            instance=instance, on_canvas=sum(1 for each in self._shown if each.task == task)
+        )
 
     def source(self, instance: ToolInstanceId) -> InstanceSource:
         found = next((shown.source for shown in self._shown if shown.instance == instance), None)

@@ -549,6 +549,45 @@ class TestACanvasThatCannotBeToldNow:
             assert len(thread.rig.audit_of(ConnectionMade)) == 1
 
 
+class TestSaveToolIsNoCanvasOracle:
+    def test_absent_unknown_and_foreign_instances_get_byte_identical_answers(self) -> None:
+        from tumbleweed.agent.saved_tools import CANNOT_SAVE_TEXT
+
+        with broker() as thread:
+            photo, *_ = seed(thread)
+            chat = session(thread)
+            with chat.reply(
+                [
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(photo), placement="stack"),)),
+                    FakeTurn(tool_calls=(call("start_task", title="Later"),)),
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(photo), placement="stack"),)),
+                    FakeTurn(chunks=("Open.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("two tasks")
+            foreign, _mine = chat.canvas.instances  # the first is still shown, of an earlier task
+            closed = ToolInstanceId.new()  # unknown to the canvas
+            absent = chat.canvas.instances[0]
+            del chat.canvas.runtimes[absent]  # and one that was shown and closed
+
+            answers = []
+            for instance in (foreign, closed, absent):
+                with chat.reply(
+                    [
+                        FakeTurn(
+                            tool_calls=(call("save_tool", instance=str(instance), name="Copy"),)
+                        ),
+                        FakeTurn(chunks=("No.",)),
+                    ]
+                ) as rig:
+                    rig.send_and_wait("save it")
+                    (answer,) = chat.results(rig, 1)
+                    answers.append(answer)
+
+            assert [a.content for a in answers] == [CANNOT_SAVE_TEXT] * 3
+            assert all(a.is_error for a in answers)
+
+
 class TestAnUnsavedToolOfAnEarlierTask:
     def test_it_is_answered_with_the_brokers_one_text_not_the_save_first_hint(self) -> None:
         with broker() as thread:

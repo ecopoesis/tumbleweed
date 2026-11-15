@@ -2287,13 +2287,20 @@ tasks' instances, from a net consumer and from a clean consumer that stays clean
 answers, equal listings and equal routed values (`agent.routing` is driven from the broker's
 listing, with a secret in the fs producer's output).
 
-**Residual (round 2).** Whether routed values arrive depends on whether the user's canvas still shows
-the producer, and a task that holds another task's instance ID can close that card (placement
-`replace` or `stack`). Both channels that would tell it are closed: `patch_state` gives one text for
-every tool that is not a current-task tool on the canvas, and `connect_tools` gives one answer for a
-producer of an earlier task whatever the canvas shows. What is left is that the consumer's own state
-(its input) changes or not, which only the user and that consumer's task see; bounded by the 4 cards
-a canvas holds and the fs task's own prompts.
+**What a task is told about the canvas (rounds 2 and 3).** Every answer that takes an instance ID or
+reports the canvas, and the one text each gives: `patch_state` (`FROZEN_TEXT`) and `save_tool`
+(`CANNOT_SAVE_TEXT`) answer one text for every tool that is not a current-task tool on the canvas (never
+shown, closed, inert, another task's), and read no state first; `connect_tools` answers one text
+(`CROSS_TASK`) for a producer of an earlier task, whatever the canvas shows, and names the canvas only
+for a tool of its own task (`NOT_ON_CANVAS`); `show_ui` and `open_tool` report how many tools **of this
+task** are on the canvas (an earlier task's cards are not counted: #171), and `placement` closes
+only what the canvas holds, which no answer reports. No other model tool takes an instance or reads
+the canvas. **Residual, exactly.** A task that holds another task's instance ID can close that card
+with `replace` or `stack`, and a connection routes values only while both cards are shown, so a
+consumer's input then stops changing. That change is visible only in the consumer's own state, to the
+user and to the consumer's task (through its own canvas events and `patch_state` of its own tool); it
+is at most one bit per connection, bounded by the 4 cards a canvas holds, and needs the other task
+to hold the instance ID (D31 (8), "Reachability").
 A crossing denied by the broker's *timeout* carries no PromptId (the interface that mints the id
 does not return it when the broker's own timer ends the wait); a denial the user answered does.
 
