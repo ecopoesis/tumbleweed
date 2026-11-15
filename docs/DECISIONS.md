@@ -2385,14 +2385,17 @@ stays the check against the lock's exact versions: ruff format and lint and mypy
 Nix job runs the suite and `lint-imports`, so that a difference that matters shows up as a failing
 test.
 
-(3) *The package.* `tumbleweed` is `buildPythonApplication` over the nixpkgs Python set with the
-overrides above, built with `uv_build` from nixpkgs (the build backend named in `pyproject.toml`;
+(3) *The package.* `tumbleweed` is a `buildPythonPackage` (so that the dev shell's Python can hold it,
+(5)) over the nixpkgs Python set with the overrides above, built with `uv_build` from nixpkgs (the build backend named in `pyproject.toml`;
 nixpkgs' is 0.13 and the project asks for `<0.13`, so the build runs with `--skip-dependency-check`:
 the backend only reads `pyproject.toml` and packs `src/`), `wrapGAppsHook4` for the typelibs, schemas, GStreamer plugin path and gdk-pixbuf
 loaders (applied once, through the Python wrapper), and a wrapper that puts on the `PATH`
 bubblewrap, slirp4netns, `prlimit` (util-linux) and `btrfs` (the snapshot backend, D28), and
 `libseccomp` on `LD_LIBRARY_PATH` (`tumbleweed.sandbox.seccomp` loads `libseccomp.so.2` by name, and
-a store path has no system search path). `systemd-run` (the limits scope) is the host's. whisper.cpp and
+a store path has no system search path), and `TUMBLEWEED_BROKER_SPAWN=0` by default: the shell would
+start a broker as `sys.executable -I -m tumbleweed.broker.daemon`, and an installed program's
+interpreter has none of the packages (each wrapped program adds them to its own `sys.path`), so the
+broker is `tumbleweed-broker`, started by the user or, from S27, by its systemd user service. `systemd-run` (the limits scope) is the host's. whisper.cpp and
 Piper are not in the package: they are services the user points the config at (D20, D23); the dev
 shell has them. An install check starts every `[project.scripts]` entry with `--version`.
 
@@ -2410,7 +2413,11 @@ the variable unset the broker uses the system runtime, as in the image, so nothi
 `RuntimeSpec` still refuses a mount under a home directory, and a store path cannot be one a user or a
 sandbox can write to. The Dockerfile's runtime and the Nix one agree on what D27 needs: a Python with
 Pillow and numpy found as `python3` on the sandbox's own `PATH`, no `/usr/lib/python3`, no
-alternatives links (Nix has none). `tests/sandbox/test_nix_runtime.py` runs a real sandbox over the
+alternatives links (Nix has none). One difference is deliberate: the runtime's `python3` is a small
+wrapper that sets `OPENBLAS_NUM_THREADS=1` and `OMP_NUM_THREADS=1`, because numpy's OpenBLAS starts one
+thread per CPU with a large buffer each, which the sandbox's memory limit refuses (the first run of the
+real-closure test failed with "OpenBLAS error: Memory allocation still failed"; Debian's reference
+BLAS has no threads). `tests/sandbox/test_nix_runtime.py` runs a real sandbox over the
 real closure: it imports both, sees `/nix/store` holding exactly the manifest's paths, and sees no
 home and no `/usr`.
 
@@ -2418,8 +2425,10 @@ home and no `/usr`.
 `hypothesis`, `import-linter`, `pygobject-stubs`, ...), `uv` and `ruff`, GTK 4, libadwaita, VTE,
 gdk-pixbuf with the WebP loader (D21), GStreamer and its base plugins, bubblewrap, slirp4netns,
 libseccomp, `prlimit`, `btrfs`, whisper.cpp, Piper, weston (`scripts/linux-session` starts it) and
-`dbus-daemon`. `PYTHONPATH` is `src/`, so the tree under edit is the one imported; the manifest of the
-real closure is in `TUMBLEWEED_TEST_RUNTIME_MANIFEST` for the test above.
+`dbus-daemon`. The Python holds the installed `tumbleweed` (what `python -I` and the tests' minimal-environment
+subprocesses import, which `PYTHONPATH` cannot give them) and `PYTHONPATH` is `src/`, so the process
+under edit imports the tree; the subprocesses see the source as of when the shell was entered. The
+manifest of the real closure is in `TUMBLEWEED_TEST_RUNTIME_MANIFEST` for the test above.
 
 (6) *Secrets.* The Nix store is world-readable, and a flake's source is copied into it, so the
 package's source is an allowlist (`lib.fileset`: `pyproject.toml`, `README.md` and `src/`, without
@@ -2451,14 +2460,24 @@ not cached between runs: an action cache would be one more thing trusted with th
 integrity), so plan on about the same, 25 to 35 minutes, in parallel with it; compiling nothing.
 Format, lint and mypy are not repeated: they would test nixpkgs' ruff and mypy, not the locked ones.
 
-(8) *Entry points.* Every `[project.scripts]` program answers `--version` (`name version`, from the
+(8) *The suite on a Nix host.* The first full run in the dev shell failed 83 tests, for four reasons, none
+of them in the code under test: the project was not importable under `python -I` (above); processes the
+tests start with a minimal environment lost where GTK's typelibs and modules are, so
+`tests.plugins.host.LIBRARY_LOCATION_VARIABLES` names the variables that say so (all unset on the
+image) and the three tests that build such an environment pass them on; `bwrap` is not in `/usr/bin`,
+so the helper that runs it with an empty environment resolves it first, and the test that wraps it
+does too; and Nix's Python wrapper sets `PYTHONNOUSERSITE` in the interpreter it starts, which two tests
+that list a child's environment now allow by name. Two tests that list a package's modules needed
+the new ones (`broker.nixruntime`, `core.version`). The Linux job's results are unchanged.
+
+(9) *Entry points.* Every `[project.scripts]` program answers `--version` (`name version`, from the
 package metadata, `tumbleweed.core.version`), before any display, broker or key: the shell had it,
 the render preview, the broker and `tumbleweed-tools` get it, and `tumbleweed-sandbox-exec` answers
 it as its own single-file source does (stdlib only, imported lazily so that sandbox runs, which start
 it with `-S`, do not pay for the metadata machinery). `tests/test_entrypoints.py` starts each one
 listed in `pyproject.toml`, so a new script without `--version` fails there.
 
-(9) *Local builds* use the `nixos/nix:2.35.6` image, pinned by digest, with one named volume for the
+(10) *Local builds* use the `nixos/nix:2.35.6` image, pinned by digest, with one named volume for the
 store; the tests do not use it.
 
 **Consequences.** `flake.lock` joins `uv.lock` as a file to review on update, and the two are

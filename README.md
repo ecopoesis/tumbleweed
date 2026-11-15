@@ -555,21 +555,26 @@ The Nix store is world-readable, so the flake copies only an allowlist of the so
 flake's own source: **never put a key in the repository directory, even ignored by git**, because a
 `path:` flake (`nix build path:.`) copies the whole directory into the store.
 
+**The broker is not started by the installed shell.** A development checkout starts one on demand
+(`python -I -m tumbleweed.broker.daemon`), which an installed program cannot do: its interpreter has
+none of the packages. The package sets `TUMBLEWEED_BROKER_SPAWN=0`, so run `tumbleweed-broker` first
+(S27 makes it a systemd user service).
+
 **On a Mac** there is no Nix build of the Linux sandbox. Use Nix in a Linux container, with a volume
 for the store so that a build is not repeated:
 
 ```sh
 docker volume create tumbleweed-nix
-docker run --rm -it -v tumbleweed-nix:/nix -v "$PWD":/src:ro -w /work \
+docker run --rm -v tumbleweed-nix:/nix -v "$PWD":/src:ro \
     -e NIX_CONFIG=$'experimental-features = nix-command flakes\nsandbox = false' \
-    nixos/nix:2.35.6 sh -c 'cp -r /src /work && cd /work && nix flake check'
+    nixos/nix:2.35.6 sh -c 'git config --global --add safe.directory "*" && cd /src && nix flake check'
 ```
 
-(`sandbox = false` because Docker Desktop's container has no user namespaces for Nix's own build
-sandbox; the inputs are hashed all the same.) To run the tests that need a Linux kernel, use
-`scripts/test-linux` as before; the Nix development shell needs a Linux machine or a NixOS VM (S27).
-Nix's `linux-builder` (`nix run nixpkgs#darwin.linux-builder`) is the other way: a Linux VM that a
-Mac's Nix sends Linux builds to, for `nix build .#packages.aarch64-linux.tumbleweed`.
+(`sandbox = false` because the container has no user namespaces for Nix's own build sandbox; every
+input is hashed all the same.) The development shell needs a Linux machine or a NixOS VM (S27); on a
+Mac, `scripts/test-linux` runs the suite as before. Nix's `linux-builder`
+(`nix run nixpkgs#darwin.linux-builder`) is the other way: a Linux VM that a Mac's Nix sends Linux
+builds to, for `nix build .#packages.aarch64-linux.tumbleweed`.
 
 ### IPC
 
