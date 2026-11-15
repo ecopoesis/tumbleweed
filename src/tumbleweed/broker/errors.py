@@ -228,3 +228,10 @@ class ToolVersionExhaustedError(ToolStoreError):
 class ToolBlobError(ToolStoreError):
     """A stored package is missing or is not what its hash says (tampered, truncated, replaced by
     a symlink or another kind of file). It is refused, never repaired or deleted."""
+
+
+class RuntimeManifestError(BrokerError):
+    """The sandbox runtime manifest (`TUMBLEWEED_RUNTIME_MANIFEST`) is not one the broker accepts.
+
+    The broker does not start: a runtime it cannot vouch for is never replaced by the system one.
+    """

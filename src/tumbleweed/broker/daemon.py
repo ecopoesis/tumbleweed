@@ -44,6 +44,7 @@ from tumbleweed.broker.config import (
 from tumbleweed.broker.deny import DenyContext
 from tumbleweed.broker.errors import BrokerError
 from tumbleweed.broker.fsworker import FsWorker
+from tumbleweed.broker.nixruntime import RUNTIME_MANIFEST_ENV, load_nix_runtime
 from tumbleweed.broker.owner import Owner
 from tumbleweed.broker.prompts import PromptInterface
 from tumbleweed.broker.service import BrokerService, Sandbox, utc_now
@@ -274,10 +275,25 @@ def build_config(
     """The daemon's configuration from its command line and the user's environment."""
     deny = DenyContext.for_current_user(environ)
     data_home: Path = args.data_home if args.data_home is not None else Path(deny.data_home)
+    manifest = environ.get(RUNTIME_MANIFEST_ENV)
+    if manifest is None:
+        # The system's runtime: `/usr` (Debian, Ubuntu, the Linux image).
+        return BrokerConfig(
+            data_home=data_home,
+            socket_directory=socket_directory,
+            deny=deny,
+            require_landlock=not args.no_landlock,
+            require_scope_limits=not args.allow_unenforced_limits,
+        )
+    # A Nix install: the closure its package was built with. Not finding it is an error, never a
+    # fall back to `/usr`, which a Nix system does not have (S26, D32).
+    nix = load_nix_runtime(manifest)
     return BrokerConfig(
         data_home=data_home,
         socket_directory=socket_directory,
         deny=deny,
+        runtime=nix.spec,
+        sandbox_path=nix.sandbox_path,
         require_landlock=not args.no_landlock,
         require_scope_limits=not args.allow_unenforced_limits,
     )
