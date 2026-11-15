@@ -280,6 +280,18 @@ async def fetch_stored(
     return await link.call(work, deadline=BROKER_SECONDS)
 
 
+def _ports_text(package: ToolPackage) -> str:
+    """The tool's ports for `connect_tools`: names and types, both closed (validated names and
+    value types), so they are our words about the tool and not a frame's worth of its author's."""
+    parts = []
+    for label, ports in (("Input", package.manifest.inputs), ("Output", package.manifest.outputs)):
+        if ports:
+            parts.append(
+                f"{label} ports: " + ", ".join(f"{p.name} ({p.type})" for p in ports) + "."
+            )
+    return (" " + " ".join(parts)) if parts else ""
+
+
 def _source_text(package: ToolPackage) -> str:
     spec = json.dumps(package.ui.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":"))
     code = "\n\n".join(f"# module {module.name}\n{module.source}" for module in package.modules)
@@ -434,7 +446,7 @@ def register_saved_tool_tools(
             f"Opened version {fetched.stored.version} of the saved tool{newest} on the "
             f"canvas{count} as instance {shown.instance}. "
             f"State entries (names written by the tool's author): "
-            f"{describe_entries(package.ui) or 'none'}. "
+            f"{describe_entries(package.ui) or 'none'}.{_ports_text(package)} "
             f"Use patch_state with this instance id to change them.{taint_note}"
         )
         if arguments.source:

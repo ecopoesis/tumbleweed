@@ -26,6 +26,7 @@ from tumbleweed.agent.fake import FakeToolCall, FakeTurn
 from tumbleweed.agent.llm import ToolResultBlock
 from tumbleweed.agent.tools import ToolRegistry
 from tumbleweed.core.ids import TaskId, ToolInstanceId
+from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.runtime import UiRuntime
 from tumbleweed.ui.spec import UiSpec
@@ -45,6 +46,7 @@ class FakeCanvas:
         self.threads: set[int] = set()
         self.code: list[tuple[CodeModule, ...]] = []
         self.sources: dict[ToolInstanceId, InstanceSource] = {}
+        self.connections: dict[TaskId, tuple[ConnectionInfo, ...]] = {}
 
     def source(self, instance: ToolInstanceId) -> InstanceSource:
         found = self.sources.get(instance)
@@ -85,6 +87,9 @@ class FakeCanvas:
         runtime.patch_state(patch)
         after = runtime.store.snapshot()
         return tuple(key for key, value in after.items() if before[key] != value)
+
+    def set_connections(self, task: TaskId, connections: tuple[ConnectionInfo, ...]) -> None:
+        self.connections[task] = connections
 
 
 def call(name: str, **arguments: JsonValue) -> FakeToolCall:

@@ -38,6 +38,7 @@ from tumbleweed.agent.tools import ToolError, ToolName, ToolRegistry
 from tumbleweed.core.errors import TumbleweedError
 from tumbleweed.core.ids import TaskId, ToolId, ToolInstanceId
 from tumbleweed.core.types import ContentHash, ToolVersion
+from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.tools.limits import MAX_MODULES, MAX_MODULES_BYTES
 from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.spec import SpecError, UiSpec, validate_ui_spec
@@ -130,6 +131,11 @@ class CanvasHost(Protocol):
         included. Raises `SpecError` (refused, whole) or `UnknownInstanceError`."""
         ...
 
+    def set_connections(self, task: TaskId, connections: tuple[ConnectionInfo, ...]) -> None:
+        """The broker's list of the connections of consumer task `task` (S25): values flow along
+        them while both instances are on the canvas."""
+        ...
+
 
 @final
 class CanvasLink:
@@ -165,6 +171,9 @@ class CanvasLink:
         self, instance: ToolInstanceId, patch: Mapping[str, object]
     ) -> tuple[StateKey, ...]:
         return await self._on_main(lambda host: host.patch(instance, patch))
+
+    async def set_connections(self, task: TaskId, connections: tuple[ConnectionInfo, ...]) -> None:
+        await self._on_main(lambda host: host.set_connections(task, connections))
 
     async def _on_main[T](self, call: Callable[[CanvasHost], T]) -> T:
         loop = asyncio.get_running_loop()

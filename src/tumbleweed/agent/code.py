@@ -28,7 +28,7 @@ from tumbleweed.agent.tools import ToolError, ToolName, ToolRegistry
 from tumbleweed.agent.untrusted import PROGRAM_INTRO, framed
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
 from tumbleweed.broker.config import RUN_SETUP_WAIT
-from tumbleweed.core.ids import RunId, TaskId
+from tumbleweed.core.ids import ConnectionId, RunId, TaskId
 from tumbleweed.ipc.broker_messages import RunOrigin, RunResult, WireBinding
 from tumbleweed.sandbox.handler_protocol import (
     handler_command,
@@ -150,7 +150,11 @@ class HandlerCall:
     code: Sequence[CodeModule]
     stored: StoredBinding | None = None
     """For a tool opened from the broker's store (S24): the run carries no code, the broker puts in
-    the stored code, and the run is a user's (a handler runs only on a direct input event)."""
+    the stored code, and the run is a user's (a handler runs only on a direct input event), or a
+    connection's (below)."""
+    connection: ConnectionId | None = None
+    """The connection whose value started this run (S25, D31 (4)): the run's trigger is then
+    `connection` and no tool grant applies to it."""
 
 
 def handler_run(call: HandlerCall) -> tuple[tuple[str, ...], str] | None:
@@ -259,7 +263,7 @@ class BrokerHandlerExecutor:
             return _nothing
         command, payload = prepared
         run = RunId.new()
-        origin = _origin_of(call.stored)
+        origin = _origin_of(call.stored, call.connection)
 
         async def work(client: BrokerClient) -> HandlerOutcome:
             try:
@@ -305,19 +309,19 @@ def _nothing() -> None:
     return
 
 
-def _origin_of(stored: StoredBinding | None) -> RunOrigin:
+def _origin_of(stored: StoredBinding | None, connection: ConnectionId | None = None) -> RunOrigin:
     """What started a handler run. A sandbox handler runs only on a direct input event of the
     user (a patch fires none, D24), so the run of a stored tool is the user's, and the broker
     checks the binding (D30 (2)). A tool that was not opened from the store has none: its run is
     the model's code and gets no tool grant."""
     if stored is None:
         return RunOrigin()
-    return RunOrigin(
-        trigger="user_event",
-        binding=WireBinding(
-            instance=stored.instance, tool=stored.tool, content_hash=stored.content_hash
-        ),
+    binding = WireBinding(
+        instance=stored.instance, tool=stored.tool, content_hash=stored.content_hash
     )
+    if connection is not None:
+        return RunOrigin(trigger="connection", binding=binding, connection=connection)
+    return RunOrigin(trigger="user_event", binding=binding)
 
 
 # --- run_code --------------------------------------------------------------------------------

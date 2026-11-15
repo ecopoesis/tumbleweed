@@ -73,6 +73,7 @@ class Origin(Enum):
     HANDLER = auto()  # the assignments of a `set` handler
     PATCH = auto()  # `patch_state` (the model)
     SANDBOX = auto()  # the result of a sandbox handler
+    CONNECTION = auto()  # a value passed on by a connection (S25)
     COMPUTED = auto()  # a computed entry re-evaluated
 
 

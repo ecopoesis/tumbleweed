@@ -14,6 +14,10 @@ reports back on the main thread.
   handler. A failure or a refused result is one line of ours for the card.
 - **Inert and closed instances** start nothing, the run in flight is cancelled (nothing waits for
   it; the broker has no cancel yet, so it ends at its own limits), and a result is dropped.
+- **The trigger** of a run is that of the newest event it took (S25, D31 (4)): a value that
+  arrived over a connection makes a `connection` run, which gets no tool grant, and a click that
+  comes after it makes a user's run (the user did click) with the newest inputs, while a value
+  that arrives after a click makes a connection run (fewer rights, never more).
 - **Inputs** are those of the event, kept until the run starts: a run that waited behind another
   one uses what the state held when the user acted, not what a later `Reset` made it.
 """
@@ -28,7 +32,7 @@ from pydantic import JsonValue
 from tumbleweed.agent.canvas import StoredBinding
 from tumbleweed.agent.canvas_events import Scheduler
 from tumbleweed.agent.code import HandlerCall, HandlerExecutor, HandlerOutcome, failure_text
-from tumbleweed.core.ids import TaskId
+from tumbleweed.core.ids import ConnectionId, TaskId
 from tumbleweed.tools.package import CodeModule
 from tumbleweed.ui.runtime.events import UiEvent
 from tumbleweed.ui.spec import SpecError
@@ -78,7 +82,9 @@ class HandlerRuns:
         self._executor = executor
         self._scheduler = scheduler
         self._target = target
-        self._latest: dict[HandlerName, tuple[SandboxHandler, Mapping[StateKey, StateValue]]] = {}
+        self._latest: dict[
+            HandlerName, tuple[SandboxHandler, ConnectionId | None, Mapping[StateKey, StateValue]]
+        ] = {}
         self._timers: dict[HandlerName, Callable[[], None]] = {}
         self._ready: list[HandlerName] = []
         self._in_flight = False
@@ -95,7 +101,7 @@ class HandlerRuns:
             self._target.notice(NO_TASK_NOTICE)
             return
         name = handler.name
-        self._latest[name] = (handler, inputs)
+        self._latest[name] = (handler, event.connection, inputs)
         if name in self._ready:
             return  # already due and waiting for the run in flight: it will take these inputs
         previous = self._timers.pop(name, None)
@@ -133,7 +139,7 @@ class HandlerRuns:
         task = self._task
         if self._stopped or self._in_flight or not self._ready or task is None:
             return
-        handler, inputs = self._latest.pop(self._ready.pop(0))
+        handler, connection, inputs = self._latest.pop(self._ready.pop(0))
         self._in_flight = True
         self.started += 1
         self._target.notice(RUNNING_NOTICE)
@@ -141,7 +147,12 @@ class HandlerRuns:
             cancel = self._executor.start(
                 task,
                 HandlerCall(
-                    str(handler.module), str(handler.function), inputs, self._code, self._stored
+                    str(handler.module),
+                    str(handler.function),
+                    inputs,
+                    self._code,
+                    self._stored,
+                    connection,
                 ),
                 partial(self._done, handler),
             )
