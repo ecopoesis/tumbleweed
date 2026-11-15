@@ -16,7 +16,10 @@ SOURCE = "def go(inputs):\n    return {'status': 'ok'}\n"
 
 
 def tool_draft(
-    name: str, inputs: Mapping[str, str] | None = None, outputs: Mapping[str, str] | None = None
+    name: str,
+    inputs: Mapping[str, str] | None = None,
+    outputs: Mapping[str, str] | None = None,
+    source: str = SOURCE,
 ) -> ToolDraft:
     """A tool with the given ports (name -> port type) and one sandbox handler that reads its
     inputs and writes its outputs."""
@@ -27,7 +30,7 @@ def tool_draft(
         if kind == "text":
             entry["default"] = ""
         entries.append(entry)
-    entries.append({"kind": "string", "key": "status", "default": ""})
+    entries.append({"kind": "string", "key": "status", "default": "", "max_length": 4096})
     handler: Json = {
         "kind": "sandbox",
         "name": "run",
@@ -45,7 +48,7 @@ def tool_draft(
             "inputs": [{"name": key, "type": kind} for key, kind in inputs.items()],
             "outputs": [{"name": key, "type": kind} for key, kind in outputs.items()],
             "ui": accepted(build(state=entries, handlers=[handler])),
-            "modules": [module("m", SOURCE)],
+            "modules": [module("m", source)],
         }
     )
 
@@ -55,10 +58,11 @@ async def stored_tool(
     name: str,
     inputs: Mapping[str, str] | None = None,
     outputs: Mapping[str, str] | None = None,
+    source: str = SOURCE,
 ) -> ToolId:
     """Save a tool from a clean throwaway task (so its taint is none and any task may open it)."""
     task = (await client.start_task()).task
-    text = json.dumps(tool_draft(name, inputs, outputs).model_dump(mode="json"))
+    text = json.dumps(tool_draft(name, inputs, outputs, source).model_dump(mode="json"))
     stored = await client.save_tool(task, text)
     await client.end_task(task)
     return stored.summary.tool
