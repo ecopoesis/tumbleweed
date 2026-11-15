@@ -58,11 +58,12 @@ import logging
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from importlib import metadata
 from pathlib import Path
 from typing import NoReturn, final
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+
+from tumbleweed.core.version import installed_version
 
 logger = logging.getLogger(__name__)
 
@@ -197,13 +198,6 @@ def finish_relaunch(*, platform: str = sys.platform) -> None:
             os.environ.pop(name, None)
 
 
-def _version() -> str:
-    try:
-        return metadata.version("tumbleweed")
-    except metadata.PackageNotFoundError:
-        return "unknown (the package is not installed)"
-
-
 class _Parser(argparse.ArgumentParser):
     """An argument parser whose errors are one short line on stderr and exit status 2."""
 
@@ -218,7 +212,7 @@ def parse_arguments(argv: Sequence[str]) -> None:
         description="The Tumbleweed shell: a window with a canvas for generated tools and a chat.",
         epilog="The shell takes no other arguments.",
     )
-    parser.add_argument("--version", action="version", version=f"{PROGRAM} {_version()}")
+    parser.add_argument("--version", action="version", version=f"{PROGRAM} {installed_version()}")
     parser.parse_args(list(argv))
 
 

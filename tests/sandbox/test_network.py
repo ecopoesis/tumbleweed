@@ -427,12 +427,13 @@ class TestSetupFailsClosed:
         self, workspace: Opened, tmp_path: Path
     ) -> None:
         wrapper = tmp_path.parent / f"{tmp_path.name}-bwrap"
+        real_bwrap = shutil.which("bwrap") or "/usr/bin/bwrap"
         # The mutant: the same bwrap with `--share-net` as its last option, which wins.
         wrapper.write_text(
             "#!/usr/bin/python3\nimport os, sys\n"
             "args = sys.argv[1:]\n"
             "at = args.index('--')\n"
-            "os.execv('/usr/bin/bwrap', ['bwrap', *args[:at], '--share-net', *args[at:]])\n"
+            f"os.execv({real_bwrap!r}, ['bwrap', *args[:at], '--share-net', *args[at:]])\n"
         )
         wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
         runner = SandboxRunner(use_systemd_scope=False, bwrap=str(wrapper))

@@ -32,6 +32,18 @@ from collections.abc import Generator
 
 import pytest
 
+# Where the libraries are, on a host that does not keep them in the system's places (Nix): GTK, its
+# typelibs, modules, fonts and the GStreamer plugins are found through these. A test that starts a
+# process with a minimal environment passes them on; elsewhere none is set.
+LIBRARY_LOCATION_VARIABLES = (
+    "FONTCONFIG_FILE",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GI_TYPELIB_PATH",
+    "GIO_EXTRA_MODULES",
+    "GST_PLUGIN_SYSTEM_PATH_1_0",
+    "LD_LIBRARY_PATH",
+    "XDG_DATA_DIRS",
+)
 CI_ENV_VAR = "TUMBLEWEED_CI"
 LIVE_ENV_VAR = "TUMBLEWEED_LIVE"
 REQUIRE_DOCKER_ENV_VAR = "TUMBLEWEED_REQUIRE_DOCKER"

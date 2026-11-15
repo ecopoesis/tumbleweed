@@ -276,7 +276,15 @@ def test_the_gtk_gate_notices_a_missing_display_for_real() -> None:
         text=True,
         check=False,
         timeout=60,
-        env={"PATH": "/usr/bin:/bin", "GDK_BACKEND": "wayland"},
+        env={
+            "PATH": "/usr/bin:/bin",
+            "GDK_BACKEND": "wayland",
+            **{
+                name: os.environ[name]
+                for name in host.LIBRARY_LOCATION_VARIABLES
+                if name in os.environ
+            },
+        },
     )
 
     assert result.returncode == 0, result.stderr

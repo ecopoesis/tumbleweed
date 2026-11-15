@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn
 
+from tumbleweed.core.version import installed_version
 from tumbleweed.shell.launch import finish_relaunch, relaunch_if_needed
 from tumbleweed.ui.spec import SpecError, UiSpec, parse_ui_spec
 from tumbleweed.ui.spec.limits import MAX_SPEC_BYTES
@@ -75,6 +76,7 @@ def load_spec(path: Path) -> UiSpec:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the preview. The `tumbleweed-render` console script."""
     parser = _Parser(prog=PROGRAM, description="Preview a UI spec (tumbleweed.ui/1) standalone.")
+    parser.add_argument("--version", action="version", version=f"{PROGRAM} {installed_version()}")
     parser.add_argument("spec", type=Path, help="the JSON file of the spec")
     arguments = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     try:

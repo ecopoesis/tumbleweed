@@ -123,8 +123,10 @@ class TestTheProcess:
         assert not any("secret" in str(value) for value in env.values())
         for name, value in PIPER_ENVIRONMENT.items():
             assert env[name] == value
-        # macOS adds its own variable to every process; nothing else may be there.
-        assert set(env) - set(PIPER_ENVIRONMENT) <= {"__CF_USER_TEXT_ENCODING"}
+        # macOS adds its own variable to every process, and Nix's Python wrapper sets
+        # PYTHONNOUSERSITE in the interpreter it starts (ours is not passed it); nothing else may
+        # be there.
+        assert set(env) - set(PIPER_ENVIRONMENT) <= {"__CF_USER_TEXT_ENCODING", "PYTHONNOUSERSITE"}
 
     def test_it_runs_in_a_directory_and_a_session_of_its_own(self, tmp_path: Path) -> None:
         backend, _model = backend_for(tmp_path)

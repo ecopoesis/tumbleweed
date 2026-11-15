@@ -1777,6 +1777,16 @@ Layering rules, enforced by import-linter contracts in `pyproject.toml`:
   whether the kernel has it, so on a dev kernel they run without it and in CI they run with it
   required. The refusal and the "no Landlock" report are tested everywhere, by hiding the
   Landlock syscalls behind a seccomp filter. A macOS job runs the platform-neutral subset.
+- **Nix** (S26, D32): `flake.nix` builds the `tumbleweed` package, the sandbox runtime closure and a
+  dev shell for Linux on x86_64 and aarch64, with nixpkgs pinned by `flake.lock` and the few
+  packages nixpkgs cannot match taken as the wheels `uv.lock` names. The package's wrapper bakes
+  in the store path of a manifest of the runtime closure (`TUMBLEWEED_RUNTIME_MANIFEST`), from
+  which the broker builds its `RuntimeSpec` (`tumbleweed.broker.nixruntime`): nothing from a home
+  directory, a store path only. CI's `nix` job runs `nix flake check` (x86_64 built, aarch64
+  evaluated) and the whole suite inside `nix develop`, under the same display and the same
+  `TUMBLEWEED_CI` guard as the Linux job, on the runner's own kernel and `/usr`. The package's
+  source is an allowlist and `nix flake check` fails if a secret-named file is in it, because the
+  Nix store is world-readable (I-secrets: CLAUDE.md).
 - **Target**: NixOS (aarch64 and x86_64) booting into Cage running `tumbleweed-shell`, with a
   fallback Sway session, a VT2 login, and btrfs home snapshots, as a VM image for
   UTM/Parallels (S26–S27).

@@ -2344,3 +2344,144 @@ the moment it is made; nothing about it is persisted, so a broker restart ends t
 (tasks do not survive a restart anyway). After a reconnect the model has to open its tools again
 in the new task, and an old task's tools cannot feed it. A net.full run of a consumer with a
 cross-task input is refused while the connection stands; removing the connection is the way out.
+
+## D32 — Nix flake and packaging: nixos-unstable pinned by the lock, Python 3.12, nixpkgs packages with the lock's wheels only where nixpkgs cannot match it, a store-path runtime manifest the broker builds its `RuntimeSpec` from, an allowlisted source (2026-11-15, accepted)
+
+**Context.** S26 gives the project reproducible builds and a dev shell, and is the last step before
+the NixOS module (S27) that needs the package, the sandbox runtime closure and a dev environment.
+What exists: a `RuntimeSpec` that accepts `/nix/store` paths (D13, D27) and a broker that builds the
+system one (`RuntimeSpec.merged_usr`), a Linux image and CI job that define today's system
+dependencies (the Dockerfile) and how the suite runs headless (`scripts/linux-session`), and
+`uv.lock`, which pins every Python dependency for macOS and Linux. The host that develops this
+(server03) has no Nix and no root, so the flake is built and checked in the `nixos/nix` container.
+
+**Decision.** (1) *nixpkgs.* `nixos-unstable`, pinned by `flake.lock` (the revision is in the file; an
+update is a reviewed commit). Not the newest stable, `nixos-26.05`: it has `anthropic` 0.97,
+`httpx2` and `httpcore2` 2.3, `numpy` 2.4 and `regex` 2026.4, all below the floors in
+`pyproject.toml` (`>=1.13`, `>=2.13`, `>=2.13`, `>=2.5.4`, `>=2026.9.29`), and `nix` refuses a package
+whose runtime dependencies do not satisfy them (`pythonRuntimeDepsCheck`). Unstable has all of them
+but `onnxruntime` (1.27, the floor is 1.31). Move to stable when 26.11 has them. **Python 3.12**,
+`pkgs.python312`: `.python-version` pins it, the image and the macOS job's floor run it, and 3.14
+(nixpkgs' default there) fails the `gtk` smoke test (#47).
+
+(2) *Packages from the lock.* A package nixpkgs lacks, or has at a different version than the code was
+written and tested against, is the wheel that `uv.lock` names: `nix/locked-wheel.nix` reads the URL and
+the SHA-256 from the lock itself, so there is no second list of versions or hashes. These are
+`onnxruntime` 1.31.0 (nixpkgs 1.27; a manylinux wheel, patched with `autoPatchelfHook`),
+`anthropic` 1.13.0 (nixpkgs has 2.3, another major, and its `google-auth` dependency pulls in a
+`grpcio` that builds from source), `import-linter` 2.15 and `grimp` 3.17 (not in nixpkgs; the dev shell
+runs `lint-imports` and `tests/test_import_contracts.py`). That is **not uv2nix**: it would
+bring three more flake inputs (`pyproject-nix`, `uv2nix`, `pyproject-build-systems`) to resolve the
+fifty-three packages of the lock, of which nixpkgs has all but four at a version that satisfies
+`pyproject.toml`; four wheels are less to review than a second package manager. If a fifth package
+needs this, it is one more `lockedWheel` entry; if the list grows past a handful, uv2nix is the answer.
+**Version differences from `uv.lock` that matter**, in the dev shell and the package (nixpkgs, then
+the lock): `pydantic` 2.13.4 (2.14.0), `mypy` 2.3.1 (2.4.0), `ruff` 0.17.4 (0.16.10),
+`pygobject-stubs` 2.16.0 (2.17.0), `types-regex` 2026.11.7 (2026.9.29), `hypothesis` 6.168.1
+(6.168.5), `coverage` 7.17.0 (7.16.2), `pluggy` 1.7.0 (1.6.0). The same: `pytest` 9.1.1, `pytest-cov`,
+`numpy` 2.5.4, `regex` 2026.9.29, `PyGObject` 3.58.0, `jiter` 0.17.0, `httpx2` and `httpcore2` 2.13.1.
+GTK is 4.24, libadwaita 1.10 and VTE 0.84, where the image has Ubuntu 24.04's. The Linux container job
+stays the check against the lock's exact versions: ruff format and lint and mypy run only there, the
+Nix job runs the suite and `lint-imports`, so that a difference that matters shows up as a failing
+test.
+
+(3) *The package.* `tumbleweed` is a `buildPythonPackage` (so that the dev shell's Python can hold it,
+(5)) over the nixpkgs Python set with the overrides above, built with `uv_build` from nixpkgs (the build backend named in `pyproject.toml`;
+nixpkgs' is 0.13 and the project asks for `<0.13`, so the build runs with `--skip-dependency-check`:
+the backend only reads `pyproject.toml` and packs `src/`), `wrapGAppsHook4` for the typelibs, schemas, GStreamer plugin path and gdk-pixbuf
+loaders (applied once, through the Python wrapper), and a wrapper that puts on the `PATH`
+bubblewrap, slirp4netns, `prlimit` (util-linux) and `btrfs` (the snapshot backend, D28), and
+`libseccomp` on `LD_LIBRARY_PATH` (`tumbleweed.sandbox.seccomp` loads `libseccomp.so.2` by name, and
+a store path has no system search path), and `TUMBLEWEED_BROKER_SPAWN=0` by default: the shell would
+start a broker as `sys.executable -I -m tumbleweed.broker.daemon`, and an installed program's
+interpreter has none of the packages (each wrapped program adds them to its own `sys.path`), so the
+broker is `tumbleweed-broker`, started by the user or, from S27, by its systemd user service. `systemd-run` (the limits scope) is the host's. whisper.cpp and
+Piper are not in the package: they are services the user points the config at (D20, D23); the dev
+shell has them. An install check starts every `[project.scripts]` entry with `--version`.
+
+(4) *The sandbox runtime.* `nix/runtime.nix` builds `python312.withPackages [numpy pillow]` and a
+manifest, `tumbleweed.nix-runtime/1`: the closure's store paths (from `closureInfo`, so each one is
+named; there is no `/nix/store` as a whole), the interpreter and the `PATH` inside the sandbox, as
+JSON. The wrapper sets `TUMBLEWEED_RUNTIME_MANIFEST` to the manifest's store path, fixed at build
+time. `tumbleweed.broker.nixruntime` reads it when the daemon starts and builds the `RuntimeSpec`
+(mounts, interpreter) and `BrokerConfig.sandbox_path` from it. It accepts only: a file inside
+`/nix/store` (the name and where it resolves to), at most 256 KiB, a strict model, mounts that are each
+exactly `/nix/store/<32 characters>-<name>`, no duplicates, and an interpreter and `PATH` entries
+inside a mount. Anything else stops the broker from starting; there is never a fall back to `/usr`
+(a Nix system has none, and a broker over a runtime it was not given must not run sandboxes). With
+the variable unset the broker uses the system runtime, as in the image, so nothing there changes.
+`RuntimeSpec` still refuses a mount under a home directory, and a store path cannot be one a user or a
+sandbox can write to. The Dockerfile's runtime and the Nix one agree on what D27 needs: a Python with
+Pillow and numpy found as `python3` on the sandbox's own `PATH`, no `/usr/lib/python3`, no
+alternatives links (Nix has none). One difference is deliberate: the runtime's `python3` is a small
+wrapper that sets `OPENBLAS_NUM_THREADS=1` and `OMP_NUM_THREADS=1`, because numpy's OpenBLAS starts one
+thread per CPU with a large buffer each, which the sandbox's memory limit refuses (the first run of the
+real-closure test failed with "OpenBLAS error: Memory allocation still failed"; Debian's reference
+BLAS has no threads). `tests/sandbox/test_nix_runtime.py` runs a real sandbox over the
+real closure: it imports both, sees `/nix/store` holding exactly the manifest's paths, and sees no
+home and no `/usr`.
+
+(5) *The dev shell* has Python 3.12 with the project's dependencies and dev tools (`pytest`, `mypy`,
+`hypothesis`, `import-linter`, `pygobject-stubs`, ...), `uv` and `ruff`, GTK 4, libadwaita, VTE,
+gdk-pixbuf with the WebP loader (D21), GStreamer and its base plugins, bubblewrap, slirp4netns,
+libseccomp, `prlimit`, `btrfs`, whisper.cpp, Piper, weston (`scripts/linux-session` starts it) and
+`dbus-daemon`. The Python holds the installed `tumbleweed` (what `python -I` and the tests' minimal-environment
+subprocesses import, which `PYTHONPATH` cannot give them) and `PYTHONPATH` is `src/`, so the process
+under edit imports the tree; the subprocesses see the source as of when the shell was entered. The
+manifest of the real closure is in `TUMBLEWEED_TEST_RUNTIME_MANIFEST` for the test above.
+
+(6) *Secrets.* The Nix store is world-readable, and a flake's source is copied into it, so the
+package's source is an allowlist (`lib.fileset`: `pyproject.toml`, `README.md` and `src/`, without
+any file the `.gitignore` secret patterns or byte-code would match) and the flake's own source is
+checked. `nix flake check` has three checks: the flake's source (what `nix` copied: with a git checkout
+the tracked files, with `path:` the whole directory) holds nothing the "Secrets" section of `.gitignore`
+names; the package's source holds nothing the whole `.gitignore` names and has exactly the three
+top-level entries; and the scan itself fails on a fixture with `.anthropic-key` and `SERVER.PEM` (a
+scan that matched nothing would pass forever). The patterns are read from `.gitignore`, so a pattern
+added there is scanned for with no second list. What no check can undo: with `nix build path:.` an
+ignored key in the directory is already in the store when the check runs, which is why the README says
+never to keep one there; the flake is used from a git checkout.
+
+(7) *CI.* A job `nix` (Linux x86_64, parallel to `linux` and `macos`, its own `timeout-minutes: 60`,
+`contents: read` like the rest): the install action `cachix/install-nix-action` pinned by commit SHA
+(v31.11.3), no binary cache but `cache.nixos.org` (public, no secret, no token), then `nix flake check`
+(builds the package, the runtime and the checks on x86_64), the aarch64 outputs evaluated
+(`nix flake check --all-systems --no-build`, and the derivation paths of the aarch64 package, runtime
+and dev shell), every program of the built package started with `--version`, and `lint-imports` and
+the whole suite inside `nix develop` under `scripts/linux-session`, with `TUMBLEWEED_CI=1` (the
+guard) and `TUMBLEWEED_REQUIRE_NIX_RUNTIME=1` (the real-closure test cannot skip). The runner is not
+the image, so the job prepares it: unprivileged user namespaces on (as the Linux job does),
+`python3-pil` and `python3-numpy` and `dbus-daemon` from apt (the tests that use the system runtime,
+`merged_usr`, need what the image has), the `tumbleweed-peer` user and sudo rule of the Dockerfile (the
+real-uid IPC tests), and unused SDKs removed first, because the dev shell's store is about 13 GB, most
+of it Piper's PyTorch, and `/` of a runner is small. **Cost.** #161: the Linux job takes about 25 of
+its 45 minutes. This job is the same suite plus a download of the dev shell on every run (the store is
+not cached between runs: an action cache would be one more thing trusted with the store's
+integrity), so plan on about the same, 25 to 35 minutes, in parallel with it; compiling nothing.
+Format, lint and mypy are not repeated: they would test nixpkgs' ruff and mypy, not the locked ones.
+
+(8) *The suite on a Nix host.* The first full run in the dev shell failed 83 tests, for four reasons, none
+of them in the code under test: the project was not importable under `python -I` (above); processes the
+tests start with a minimal environment lost where GTK's typelibs and modules are, so
+`tests.plugins.host.LIBRARY_LOCATION_VARIABLES` names the variables that say so (all unset on the
+image) and the three tests that build such an environment pass them on; `bwrap` is not in `/usr/bin`,
+so the helper that runs it with an empty environment resolves it first, and the test that wraps it
+does too; and Nix's Python wrapper sets `PYTHONNOUSERSITE` in the interpreter it starts, which two tests
+that list a child's environment now allow by name. Two tests that list a package's modules needed
+the new ones (`broker.nixruntime`, `core.version`). The Linux job's results are unchanged.
+
+(9) *Entry points.* Every `[project.scripts]` program answers `--version` (`name version`, from the
+package metadata, `tumbleweed.core.version`), before any display, broker or key: the shell had it,
+the render preview, the broker and `tumbleweed-tools` get it, and `tumbleweed-sandbox-exec` answers
+it as its own single-file source does (stdlib only, imported lazily so that sandbox runs, which start
+it with `-S`, do not pay for the metadata machinery). `tests/test_entrypoints.py` starts each one
+listed in `pyproject.toml`, so a new script without `--version` fails there.
+
+(10) *Local builds* use the `nixos/nix:2.35.6` image, pinned by digest, with one named volume for the
+store; the tests do not use it.
+
+**Consequences.** `flake.lock` joins `uv.lock` as a file to review on update, and the two are
+independent: a lock change that moves a locked wheel moves the Nix build with it, since `locked-wheel.nix`
+reads the lock. A dependency added to `pyproject.toml` must exist in nixpkgs at a version that satisfies
+it, or be a `lockedWheel`; the build fails otherwise (`pythonRuntimeDepsCheck`), which is the point.
+macOS has no outputs: no Nix build of a Linux sandbox runs there (README: the container).

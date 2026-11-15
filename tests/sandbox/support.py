@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import platform
+import shutil
 import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -148,7 +149,9 @@ def namespaces_only(
     more on top: a test of a lower layer would pass vacuously if a higher one refused first (a
     socket that cannot be created cannot be connected). So those tests look at the layer by itself.
     """
-    argv = ["bwrap", *build_bwrap_argv(sandbox_policy)]
+    # Resolved here: the environment below is empty, and a bare name is looked up in the places
+    # the system keeps programs, which a Nix host does not.
+    argv = [shutil.which("bwrap") or "bwrap", *build_bwrap_argv(sandbox_policy)]
     return subprocess.run(  # noqa: S603  (argv list, no shell)
         argv,
         stdin=subprocess.DEVNULL,
