@@ -561,14 +561,15 @@ class TestSaveToolIsNoCanvasOracle:
                     FakeTurn(tool_calls=(call("open_tool", tool=str(photo), placement="stack"),)),
                     FakeTurn(tool_calls=(call("start_task", title="Later"),)),
                     FakeTurn(tool_calls=(call("open_tool", tool=str(photo), placement="stack"),)),
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(photo), placement="stack"),)),
                     FakeTurn(chunks=("Open.",)),
                 ]
             ) as rig:
                 rig.send_and_wait("two tasks")
-            foreign, _mine = chat.canvas.instances  # the first is still shown, of an earlier task
+            foreign, _mine, absent = chat.canvas.instances
+            assert foreign in chat.canvas.runtimes  # an earlier task's card, still on the canvas
             closed = ToolInstanceId.new()  # unknown to the canvas
-            absent = chat.canvas.instances[0]
-            del chat.canvas.runtimes[absent]  # and one that was shown and closed
+            del chat.canvas.runtimes[absent]  # one that was shown, and closed
 
             answers = []
             for instance in (foreign, closed, absent):

@@ -2295,12 +2295,12 @@ shown, closed, inert, another task's), and read no state first; `connect_tools` 
 for a tool of its own task (`NOT_ON_CANVAS`); `show_ui` and `open_tool` report how many tools **of this
 task** are on the canvas (an earlier task's cards are not counted: #171), and `placement` closes
 only what the canvas holds, which no answer reports. No other model tool takes an instance or reads
-the canvas. **Residual, exactly.** A task that holds another task's instance ID can close that card
-with `replace` or `stack`, and a connection routes values only while both cards are shown, so a
-consumer's input then stops changing. That change is visible only in the consumer's own state, to the
-user and to the consumer's task (through its own canvas events and `patch_state` of its own tool); it
-is at most one bit per connection, bounded by the 4 cards a canvas holds, and needs the other task
-to hold the instance ID (D31 (8), "Reachability").
+the canvas. **Residual, exactly.** The task that closes cards needs no instance ID (`replace` closes all of them,
+`stack` the oldest); a later task that holds the IDs (from the tool store or the user) can learn
+which of up to 4 cards were closed, because a connection routes values only while both of its cards
+are shown and a consumer's input then stops changing. That is seen only in the consumer's own state,
+in one direction (closing is the only act, and nothing flows back to the closer), at most one bit per
+connection and at most log2(5) bits per closing task.
 A crossing denied by the broker's *timeout* carries no PromptId (the interface that mints the id
 does not return it when the broker's own timer ends the wait); a denial the user answered does.
 
