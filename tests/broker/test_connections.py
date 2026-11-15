@@ -8,12 +8,12 @@ import dataclasses
 
 import pytest
 
-from tests.broker.connect_support import fs_tainted, net_tainted, opened, stored_tool
+from tests.broker.connect_support import opened, stored_tool
 from tests.broker.rig import Rig, running
 from tests.ipc.bounded import run
+from tumbleweed.broker import connections as texts
 from tumbleweed.broker.audit import ConnectionMade, ConnectionRefused, ConnectionRemoved
 from tumbleweed.broker.client import BrokerClient, BrokerRefused
-from tumbleweed.broker import connections as texts
 from tumbleweed.core.ids import TaskId, ToolInstanceId
 
 
@@ -154,10 +154,12 @@ class TestTexts:
                     error = await refused(client, ends.task, *args)
                     assert (error.reason, error.message) == (
                         "not_found",
-                        "No such tool instance can be connected here. Only a saved tool opened "
-                        "with open_tool can be connected: save a show_ui tool with save_tool and "
-                        "open it first. A tool of an earlier task counts only within the same "
-                        "conversation.",
+                        (
+                            "No such tool instance can be connected here. Only a saved tool "
+                            "opened with open_tool can be connected: save a show_ui tool with "
+                            "save_tool and open it first. A tool of an earlier task counts only "
+                            "within the same conversation."
+                        ),
                     )
                 await self._nothing_connected(rig, client, ends.task, "unknown_instance")
 

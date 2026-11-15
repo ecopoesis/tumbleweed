@@ -33,7 +33,7 @@ def crossings(rig: Rig) -> list[GrantPrompt]:
 
 
 def taint_row(rig: Rig, task: TaskId) -> str:
-    (row,) = rig.rows(f"SELECT taint FROM tasks WHERE id = '{task}'")
+    (row,) = rig.rows(f"SELECT taint FROM tasks WHERE id = '{task}'")  # noqa: S608  (our own id)
     return str(row[0])
 
 
@@ -234,8 +234,10 @@ class TestCrossing:
 
                 assert (caught.value.reason, caught.value.message) == (
                     "denied",
-                    "The user did not approve that connection: it would give one task both the "
-                    "user's files and the network. Nothing was connected.",
+                    (
+                        "The user did not approve that connection: it would give one task both "
+                        "the user's files and the network. Nothing was connected."
+                    ),
                 )
                 assert (await client.list_connections(ends.consumer_task)).connections == ()
                 assert taint_row(rig, ends.consumer_task) == "fs"
