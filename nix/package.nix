@@ -88,6 +88,13 @@ ps.buildPythonPackage {
     "LD_LIBRARY_PATH"
     ":"
     (lib.makeLibraryPath [ libseccomp ])
+    # The shell does not start a broker of its own (`tumbleweed.agent.broker_link`): it would run
+    # `sys.executable -I -m tumbleweed.broker.daemon`, and the interpreter has none of the packages;
+    # each program here adds them to its own sys.path. The broker is `tumbleweed-broker`, started by
+    # the user or by S27's systemd service.
+    "--set-default"
+    "TUMBLEWEED_BROKER_SPAWN"
+    "0"
     # The sandbox runtime closure, a store path fixed at build time (`tumbleweed.broker.nixruntime`).
     "--set"
     "TUMBLEWEED_RUNTIME_MANIFEST"

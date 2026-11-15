@@ -17,7 +17,7 @@ let
   # reference BLAS has no threads). One thread is also all a handler needs. Set by the program
   # itself, so that it holds however the sandbox's environment was built.
   env =
-    pkgs.runCommand "tumbleweed-sandbox-python"
+    pkgs.runCommand "sandbox-python"
       {
         nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
       }
