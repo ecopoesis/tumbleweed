@@ -13,10 +13,9 @@ from tumbleweed.tools.package import Port
 from tumbleweed.ui.spec.names import StateKey
 
 UNKNOWN_INSTANCE_TEXT: Final = (
-    "No such tool instance can be connected here. Only a saved tool that was opened with "
-    "open_tool can be connected: a tool made with show_ui must be saved with save_tool and opened "
-    "with open_tool first, and a tool of an earlier task can be connected only while the "
-    "conversation that opened it is the same."
+    "No such tool instance can be connected here. Only a saved tool opened with open_tool can be "
+    "connected: save a show_ui tool with save_tool and open it first. A tool of an earlier task "
+    "counts only within the same conversation."
 )
 UNKNOWN_PORT_TEXT: Final = "That tool has no such port. Use a name from its output or input ports."
 COMPUTED_INPUT_TEXT: Final = "That input is computed by the tool and cannot take a value."
