@@ -6,7 +6,10 @@ then has the canvas render it; a spec that does not validate is never rendered, 
 show a field name of at most 40 characters) go back to the model as the error result so that it
 can correct itself and call again. `patch_state(instance,
 patch)` changes the state of a tool that is on the canvas: the whole patch is checked against the
-spec and applied, or none of it is, and it never fires a handler (ARCHITECTURE section 4).
+spec and applied, or none of it is, and it never fires a handler of the tool itself (ARCHITECTURE
+section 4); of a tool that is connected as a producer, a patch is passed on, and what arrives
+starts the consumer's handlers that read it (trigger `connection`, no tool grant, D31 (4)). A
+patch of a tool that is not the current task's is refused (`FrozenInstanceError`).
 
 A tool on the canvas is an **instance** (`ToolInstanceId`, made by the canvas host). `placement`
 is `replace` (the default: the new tool takes the canvas, and every instance there is closed) or
@@ -58,7 +61,17 @@ MAX_LISTED_ENTRIES: Final = 40  # state entries named in the result of `show_ui`
 type Placement = Literal["replace", "stack"]
 
 _NO_CANVAS: Final = "The canvas is not available right now."
+FROZEN_TEXT: Final = (
+    "That tool belongs to a task that has ended, or to another task, so its state can no longer "
+    "be changed. Open it again in this task if you need to change it."
+)
 _FIX_AND_RETRY: Final = "Fix these and call show_ui again (nothing was shown):"
+
+
+class FrozenInstanceError(TumbleweedError):
+    """The instance is not the current task's (its task ended, or it is another's): the model may
+    not change its state (S25, D31 (4): a connection passes on what a producer holds, and no task
+    but the producer's own may write it)."""
 
 
 class UnknownInstanceError(TumbleweedError):
@@ -128,7 +141,8 @@ class CanvasHost(Protocol):
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
         """Apply `patch` to the instance; the keys whose value changed, computed entries
-        included. Raises `SpecError` (refused, whole) or `UnknownInstanceError`."""
+        included. Raises `SpecError` (refused, whole), `UnknownInstanceError` or
+        `FrozenInstanceError` (the instance is not the current task's)."""
         ...
 
     def set_connections(self, task: TaskId, connections: tuple[ConnectionInfo, ...]) -> None:
@@ -321,6 +335,8 @@ def register_canvas_tools(
                 f"There is no tool {arguments.instance} on the canvas now: it was replaced or "
                 "closed. Call show_ui to show it again."
             ) from None
+        except FrozenInstanceError:
+            raise ToolError(FROZEN_TEXT) from None
         return "Updated: " + (", ".join(changed) if changed else "nothing (no value changed)") + "."
 
     registry.register(
@@ -334,7 +350,9 @@ def register_canvas_tools(
     registry.register(
         ToolName("patch_state"),
         "Change state entries of a tool that is on the canvas. It updates the widgets and the "
-        "computed entries and never runs a handler.",
+        "computed entries and never runs a handler of that tool. If the tool's output is "
+        "connected to another tool (connect_tools), the new value is passed on and runs that "
+        "tool's code. Tools of an earlier task cannot be changed.",
         PatchStateInput,
         patch_state,
     )

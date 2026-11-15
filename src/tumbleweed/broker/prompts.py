@@ -108,6 +108,9 @@ class Denied(PolicyModel):
 
     kind: Literal["denied"] = "denied"
     reason: Annotated[str, Field(max_length=64)] = "user_denied"
+    prompt: PromptId | None = None
+    """The prompt the user answered no to, stamped by the interface that asked (D31 (6)); None for a
+    denial that was not an answer (a timeout, no prompt interface, a queue that was full)."""
 
 
 type PromptAnswer = Annotated[Allowed | Denied, Field(discriminator="kind")]

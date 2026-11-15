@@ -36,6 +36,7 @@ from tumbleweed.ui.spec.state import StateValue
 logger = logging.getLogger(__name__)
 
 MAX_ROUTED_VALUE_BYTES: Final = 64 * 1024
+MAX_ENDED_REMEMBERED: Final = 1024
 """The largest value, as JSON, that a connection passes on."""
 TOO_LARGE_NOTICE: Final = "A value from a connected tool was too large to pass on."
 NOT_ACCEPTED_NOTICE: Final = "A value from a connected tool is not one this tool accepts."
@@ -76,6 +77,7 @@ class ConnectionRouter:
         self._ends: dict[ToolInstanceId, Endpoint] = {}
         self._wanted: dict[TaskId, dict[ConnectionId, ConnectionInfo]] = {}
         self._routes: dict[ConnectionId, _Route] = {}
+        self._ended: dict[TaskId, None] = {}  # tasks that ended, oldest first, bounded
         self.dropped = 0  # values not passed on (too large, or not accepted), for tests
 
     @property
@@ -93,13 +95,19 @@ class ConnectionRouter:
         self._reconcile()
 
     def set_connections(self, task: TaskId, connections: Sequence[ConnectionInfo]) -> None:
-        """The broker's listing for the consumer task `task`, replacing the last one."""
+        """The broker's listing for the consumer task `task`, replacing the last one. A task that
+        ended is remembered: a listing that arrives late for it routes nothing."""
+        if task in self._ended:
+            return
         self._wanted[task] = {each.connection: each for each in connections}
         self._reconcile()
 
     def task_ended(self, task: TaskId) -> None:
         """A connection ends with its consumer task: routing stops (D31 (7))."""
         self._wanted.pop(task, None)
+        self._ended[task] = None
+        while len(self._ended) > MAX_ENDED_REMEMBERED:
+            del self._ended[next(iter(self._ended))]
         self._reconcile()
 
     def close(self) -> None:

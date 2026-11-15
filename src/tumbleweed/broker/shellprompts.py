@@ -218,6 +218,8 @@ class ShellPrompts:
         if isinstance(answer, Allowed) and answer.scope not in waiting.scopes:
             answer = Denied(reason="scope_not_offered")
         del self._waiting[prompt]
+        if isinstance(answer, Denied):
+            answer = Denied(reason=answer.reason, prompt=prompt)
         if isinstance(answer, Allowed):
             # Rebuilt, never copied with an update (CLAUDE.md rule 5): the id is the broker's own.
             answer = Allowed(

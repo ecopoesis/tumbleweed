@@ -47,6 +47,7 @@ class FakeCanvas:
         self.code: list[tuple[CodeModule, ...]] = []
         self.sources: dict[ToolInstanceId, InstanceSource] = {}
         self.connections: dict[TaskId, tuple[ConnectionInfo, ...]] = {}
+        self.frozen: set[ToolInstanceId] = set()
 
     def source(self, instance: ToolInstanceId) -> InstanceSource:
         found = self.sources.get(instance)
@@ -80,6 +81,10 @@ class FakeCanvas:
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
         self.threads.add(threading.get_ident())
+        if instance in self.frozen:
+            from tumbleweed.agent.canvas import FrozenInstanceError
+
+            raise FrozenInstanceError("not the current task's")
         runtime = self.runtimes.get(instance)
         if runtime is None:
             raise UnknownInstanceError("gone")
@@ -391,6 +396,30 @@ class TestLink:
         dispatcher.drain(settle=0.01)  # the main thread gets to it too late
 
         assert canvas.shown == []  # the model was told it took too long: nothing shows up now
+
+
+class TestAFrozenInstance:
+    def test_the_model_is_told_in_one_text_that_the_tool_cannot_be_changed(self) -> None:
+        from tumbleweed.agent.canvas import FROZEN_TEXT
+
+        instance = ToolInstanceId.new()
+
+        canvas = FakeCanvas((instance,))
+        canvas.frozen.add(instance)
+        script = [
+            FakeTurn(tool_calls=(call("patch_state", instance=str(instance), patch={"bill": 1}),)),
+            FakeTurn(chunks=("ok",)),
+        ]
+        with canvas_rig(script, canvas) as rig:
+            rig.send_and_wait("change it")
+            (result,) = (
+                block
+                for block in rig.provider.requests[1].messages[-1].content
+                if isinstance(block, ToolResultBlock)
+            )
+
+        assert result.is_error
+        assert result.content == FROZEN_TEXT
 
 
 class TestPatchReportsChanges:

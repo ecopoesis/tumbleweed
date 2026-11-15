@@ -31,9 +31,8 @@ CODE = """
 import errno, json, os
 
 def go(inputs):
-    value = inputs["src"]
-    root = value["root"]
-    path = root + "/" + value["path"]
+    path = inputs["src"]["path"]  # an absolute path: it opens as any file ref of the prompt does
+    root = "/".join(path.split("/")[:3])  # /inputs/<ConnectionId>
     found = {}
 
     def attempt(name, action):

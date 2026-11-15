@@ -110,7 +110,7 @@ class TestAConnectionRun:
 
         run(scenario)
 
-    def test_the_code_is_told_where_a_connected_file_is(self) -> None:
+    def test_a_connected_files_path_is_one_the_code_can_open(self) -> None:
         async def scenario() -> None:
             async with running() as rig:
                 client = await rig.client()
@@ -120,9 +120,7 @@ class TestAConnectionRun:
                 raw = rig.sandbox.policies[-1].payload
                 assert raw is not None
                 inputs = json.loads(raw)["inputs"]
-                assert inputs == {
-                    "src": {"path": "out/a.png", "root": f"/inputs/{made.connection}"}
-                }
+                assert inputs == {"src": {"path": f"/inputs/{made.connection}/out/a.png"}}
 
         run(scenario)
 
@@ -142,9 +140,7 @@ class TestAConnectionRun:
                 raw = rig.sandbox.policies[-1].payload
                 assert raw is not None
                 assert json.loads(raw)["inputs"] == {"src": "hello"}
-                assert rig.sandbox.policies[
-                    -1
-                ].inputs  # the producer's files are there all the same
+                assert rig.sandbox.policies[-1].inputs == ()  # a text value carries no file
 
         run(scenario)
 
@@ -182,6 +178,26 @@ class TestAConnectionRun:
                 await start(client, heir, again, "user_event")
 
                 assert rig.sandbox.policies[-1].inputs == ()  # the heir has no connection
+
+        run(scenario)
+
+    def test_a_path_that_climbs_out_of_the_workspace_is_refused_and_nothing_runs(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                made = await compose(rig, client, into="file")
+
+                with pytest.raises(BrokerRefused) as caught:
+                    await start(
+                        client,
+                        made.task,
+                        made.consumer,
+                        connection=made.connection,
+                        payload=call(value={"path": "../../etc/passwd"}),
+                    )
+
+                assert caught.value.reason == "invalid_request"
+                assert rig.sandbox.policies == []
 
         run(scenario)
 
@@ -288,5 +304,26 @@ class TestTheFilesAreGone:
 
                 assert caught.value.message == texts.INPUTS_GONE_TEXT
                 assert len((await client.list_connections(made.task)).connections) == 1
+
+        run(scenario)
+
+
+class TestWithinOneTask:
+    def test_a_connection_inside_one_task_mounts_nothing(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                maker = await stored_tool(client, "Maker", outputs={"out": "image"})
+                taker = await stored_tool(client, "Taker", inputs={"src": "image"})
+                task = (await client.start_task()).task
+                producer = (await opened(client, task, maker)).instance
+                consumer = await opened(client, task, taker)
+                made = await client.connect_tools(task, producer, "out", consumer.instance, "src")
+
+                await start(client, task, consumer, connection=made.connection)
+
+                assert rig.sandbox.policies[-1].inputs == ()  # one workspace: nothing to mount
+                (entry,) = [e for e in rig.audit_of(SandboxRun) if e.outcome == "authorised"]
+                assert entry.inputs == ()
 
         run(scenario)

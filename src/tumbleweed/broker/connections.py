@@ -47,6 +47,7 @@ INPUTS_GONE_TEXT: Final = (
     "connection."
 )
 NO_CONNECTION_TEXT: Final = "No such connection."
+MARKED_TEXT: Final = "This task now counts as having seen the user's files."
 
 
 def type_mismatch_text(output: str, accepts: str) -> str:

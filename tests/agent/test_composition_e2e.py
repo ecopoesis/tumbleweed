@@ -39,16 +39,19 @@ from tumbleweed.agent.llm import ToolResultBlock
 from tumbleweed.agent.routing import ConnectionRouter
 from tumbleweed.agent.saved_tools import register_saved_tool_tools
 from tumbleweed.agent.tasks import TaskSession
+from tumbleweed.agent.tool_access import BrokerToolAccess
 from tumbleweed.agent.tools import ToolRegistry
 from tumbleweed.broker.audit import ConnectionMade, SandboxRun
 from tumbleweed.broker.client import BrokerClient
+from tumbleweed.broker.grants import GrantScope
+from tumbleweed.broker.prompts import Allowed
 from tumbleweed.core.ids import TaskId, ToolId, ToolInstanceId
 from tumbleweed.core.types import WorkspaceRelPath
 from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.tools.package import CodeModule
-from tumbleweed.ui.runtime import Change, UiRuntime
+from tumbleweed.ui.runtime import Change, UiEvent, UiRuntime
 from tumbleweed.ui.spec import UiSpec
-from tumbleweed.ui.spec.names import StateKey
+from tumbleweed.ui.spec.names import HandlerName, StateKey
 from tumbleweed.ui.spec.values import ImageRef
 
 RAN = canned_result(stdout=b'{"ok": true, "outputs": {"status": "collaged"}}')
@@ -140,6 +143,10 @@ class RoutedCanvas:
         runtime = UiRuntime(spec, sandbox=runs)
         target.runtime = runtime
         if placement == "replace":
+            for closed in list(
+                self.runtimes
+            ):  # as `CanvasTools` does: closed ones leave the router
+                self.router.detach(closed)
             self.runtimes.clear()
         self.runtimes[instance] = runtime
         self.targets[instance] = target
@@ -299,15 +306,102 @@ class TestFeedOneToolIntoAnother:
             policy = thread.rig.sandbox.policies[-1]
             assert [str(mount.target) for mount in policy.inputs] == [f"/inputs/{entry.connection}"]
             payload = json.loads(policy.payload or b"")
-            assert payload["inputs"] == {
-                "photo": {"path": "out/a.png", "root": f"/inputs/{entry.connection}"}
-            }
+            assert payload["inputs"] == {"photo": {"path": f"/inputs/{entry.connection}/out/a.png"}}
             assert chat.canvas.runtimes[consumer].store.value(StateKey("status")) == "collaged"
             # A new photo is passed on again.
             chat.canvas.patch(producer, {"photo": {"path": "out/b.png"}})
             assert runtime.store.value(StateKey("photo")) == ImageRef(
                 path=WorkspaceRelPath("out/b.png")
             )
+
+    def test_a_tool_closed_by_the_default_placement_is_not_told_to_the_model_as_flowing(
+        self,
+    ) -> None:
+        with broker() as thread:
+            photo, collage, _ = seed(thread)
+            chat = session(thread)
+            with chat.reply(
+                [
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(photo)),)),  # replace
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(collage)),)),  # closes it
+                    FakeTurn(chunks=("Both are open.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("open both")
+            producer, consumer = chat.canvas.instances
+            ports = ConnectArgs(producer, "photo", consumer, "photo")
+
+            with chat.reply(
+                [
+                    FakeTurn(tool_calls=(call("connect_tools", **ports.as_input()),)),
+                    FakeTurn(chunks=("Done.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("connect them")
+                (answer,) = chat.results(rig, 1)
+
+            assert "the first tool is not on the canvas, so nothing flows yet" in answer.content
+            assert "placement stack" in answer.content
+            assert "now and whenever it changes" not in answer.content
+            assert chat.canvas.router.active == frozenset()
+
+    def test_a_connection_run_gets_no_tool_grant_and_a_click_does(self) -> None:
+        with broker() as thread:
+            photo, collage, _ = seed(thread)
+            chat = session(thread)
+            with chat.reply(
+                [
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(photo), placement="stack"),)),
+                    FakeTurn(tool_calls=(call("start_task", title="Collage"),)),
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(collage), placement="stack"),)),
+                    FakeTurn(chunks=("Open.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("open both")
+            producer, consumer = chat.canvas.instances
+            with chat.reply(
+                [
+                    FakeTurn(
+                        tool_calls=(
+                            call(
+                                "connect_tools",
+                                **ConnectArgs(producer, "photo", consumer, "photo").as_input(),
+                            ),
+                        )
+                    ),
+                    FakeTurn(chunks=("Connected.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("connect")
+            source = chat.canvas.sources[consumer]
+            assert source.stored is not None
+            assert source.task is not None
+            home = thread.rig.home
+            thread.rig.prompts.answers.append(
+                Allowed(scope=GrantScope.TOOL, picked=str(home / "Photos"))
+            )
+            said: list[str] = []
+            BrokerToolAccess(chat.link, chat.dispatcher).request(
+                source.task, source.stored, "folder", said.append
+            )
+            chat.dispatcher.run_until(lambda: bool(said))
+
+            chat.canvas.patch(producer, {"photo": {"path": "out/b.png"}})  # a value arrives
+            chat.timers.fire()
+            before = len(thread.rig.audit_of(SandboxRun))
+            chat.dispatcher.run_until(lambda: len(thread.rig.audit_of(SandboxRun)) > before)
+            chat.dispatcher.drain(settle=0.2)
+            arrived = thread.rig.sandbox.policies[-1]
+
+            chat.canvas.runtimes[consumer].user_event(
+                UiEvent(HandlerName("run"), "button", "click")
+            )
+            chat.dispatcher.run_until(lambda: len(thread.rig.audit_of(SandboxRun)) > before + 1)
+            chat.dispatcher.drain(settle=0.2)
+            clicked = thread.rig.sandbox.policies[-1]
+
+            assert arrived.grants == ()  # tool grants serve a user's event only (D30 (2))
+            assert len(clicked.grants) == 1
 
     def test_a_type_mismatch_and_an_unsaved_tool_are_told_to_the_model(self) -> None:
         with broker() as thread:
@@ -368,6 +462,43 @@ class TestFeedOneToolIntoAnother:
                 "Save it with save_tool, open it with open_tool, then connect it."
             )
             assert thread.rig.audit_of(ConnectionMade) == []
+
+
+class TestAnUnsavedToolOfAnEarlierTask:
+    def test_it_is_answered_with_the_brokers_one_text_not_the_save_first_hint(self) -> None:
+        with broker() as thread:
+            _, _, notes = seed(thread)
+            chat = session(thread)
+            drawn: dict[str, JsonValue] = {
+                "version": "tumbleweed.ui/1",
+                "title": "Scratch",
+                "root": {"kind": "box"},
+                "state": [{"kind": "string", "key": "notes", "default": ""}],
+            }
+            with chat.reply(
+                [
+                    FakeTurn(tool_calls=(call("show_ui", spec=drawn, placement="stack"),)),
+                    FakeTurn(tool_calls=(call("start_task", title="Later"),)),
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(notes), placement="stack"),)),
+                    FakeTurn(chunks=("Ready.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("draw, then a later task")
+            scratch, consumer = chat.canvas.instances
+            args = ConnectArgs(scratch, "notes", consumer, "notes")
+
+            with chat.reply(
+                [
+                    FakeTurn(tool_calls=(call("connect_tools", **args.as_input()),)),
+                    FakeTurn(chunks=("No.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("connect")
+                (answer,) = chat.results(rig, 1)
+
+            assert answer.is_error
+            assert "No such tool instance can be connected here." in answer.content
+            assert "made with show_ui and is not saved" not in answer.content  # no canvas peeking
 
 
 @dataclass(frozen=True)

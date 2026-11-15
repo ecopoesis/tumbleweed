@@ -217,3 +217,38 @@ class TestNoninterference:
                 assert row[0] == "fs"  # the clean task took the taint first, as D30 (6) does
 
         run(scenario)
+
+
+class TestFsTasksEndingEvictNothingOfAClean:
+    """The record of ended tasks has a ring of its own for fs tasks (D31 (2), (8)): however many
+    of them end, a net consumer still finds the clean producer, exactly as without them."""
+
+    def test_a_clean_producer_survives_any_number_of_fs_tasks_ending(self) -> None:
+        from tumbleweed.broker import service
+
+        async def outcome(*, fs_tasks: int) -> list[object]:
+            async with running() as rig:
+                client = await rig.client()
+                maker = await stored_tool(client, "Maker", outputs={"out": "text"})
+                taker = await stored_tool(client, "Taker", inputs={"src": "text"})
+                clean = (await client.start_task()).task
+                producer = (await opened(client, clean, maker)).instance
+                await client.end_task(clean)
+                for _ in range(fs_tasks):
+                    files = await fs_tainted(rig, client)
+                    await opened(client, files, maker)
+                    await client.end_task(files)
+                network = await net_tainted(rig, client)
+                sink = (await opened(client, network, taker)).instance
+                seen: dict[str, str] = {}
+                made = await client.connect_tools(network, producer, "out", sink, "src")
+                return [
+                    normalised(made, seen),
+                    normalised(await client.list_connections(network), seen),
+                ]
+
+        async def scenario() -> None:
+            many = service._MAX_ENDED_WITH_INSTANCES + 1  # noqa: SLF001
+            assert await outcome(fs_tasks=many) == await outcome(fs_tasks=0)
+
+        run(scenario)

@@ -15,6 +15,8 @@ from typing import Final, Literal, final
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 
 from tumbleweed.broker.task import TaintKind, merged_taint
+from tumbleweed.core.errors import InvalidValueError
+from tumbleweed.core.types import WorkspaceRelPath
 from tumbleweed.sandbox.handler_protocol import handler_payload
 from tumbleweed.tools.package import ToolPackage
 from tumbleweed.ui.spec.handlers import SandboxHandler
@@ -119,8 +121,9 @@ def bound_payload(
     modules in `code`.
 
     `roots` (S25, D31 (5)) maps an input name to where a connected workspace is mounted
-    (`/inputs/<ConnectionId>`): a file or image input of that name, which is `{"path": ...}`, gets
-    `root` added, and nothing else of the value changes.
+    (`/inputs/<ConnectionId>`): a file or image input of that name, which is `{"path": ...}`, has
+    its path made absolute under that root (a workspace-relative path, checked here), so that the
+    code opens it as it opens any file ref, and nothing else of the value changes.
 
     `BoundRunError` for a document that is not one, one that brings code of its own, a handler the
     package's spec does not declare, or one over the payload limit. The code that reaches the
@@ -146,7 +149,11 @@ def bound_payload(
     for name, root in (roots or {}).items():
         value = inputs.get(name)
         if isinstance(value, dict) and "path" in value:
-            inputs[name] = {**value, "root": root}
+            try:
+                relative = WorkspaceRelPath(str(value["path"]))
+            except InvalidValueError:
+                raise BoundRunError("not_a_handler_call") from None
+            inputs[name] = {**value, "path": f"{root}/{relative}"}
     document = handler_payload(
         call.module,
         call.function,

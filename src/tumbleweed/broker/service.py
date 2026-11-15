@@ -109,6 +109,7 @@ from tumbleweed.broker.connections import (
     INPUTS_GONE_TEXT,
     INSTANCE_CAP_TEXT,
     INTEGRITY_TEXT,
+    MARKED_TEXT,
     NET_WITH_INPUTS_TEXT,
     NO_CONNECTION_TEXT,
     SAME_INSTANCE_TEXT,
@@ -498,6 +499,9 @@ class _EndedTask:
 
     owner: Owner
     instances: dict[ToolInstanceId, "_OpenedTool"]
+    fs: bool = False
+    """The task had read files. Its taint is final, and fs tasks have a ring of their own (D31
+    (2)): their ending must not push a clean or net task's instances out of the record."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1338,7 +1342,12 @@ class BrokerService:
             tool=record.tool, version=record.version, content_hash=record.hash, name=record.name
         )
         while len(live.instances) > MAX_INSTANCES_PER_TASK:
-            del live.instances[next(iter(live.instances))]
+            forgotten = next(iter(live.instances))
+            del live.instances[forgotten]
+            for stale in [
+                c.id for c in live.connections.values() if forgotten in (c.producer, c.consumer)
+            ]:
+                del live.connections[stale]  # no listing of a connection to a forgotten tool
         view = self._tools.view_of(record.tool, merged)
         return ToolOpened(
             kind="tool_opened",
@@ -1636,8 +1645,11 @@ class BrokerService:
         oldest is forgotten), so that its tools can feed a task that starts later (D31 (2))."""
         if not live.instances:
             return
-        self._ended[live.state.task] = _EndedTask(live.owner, dict(live.instances))
-        mine = [task for task, kept in self._ended.items() if kept.owner == live.owner]
+        fs = TaintKind.FS in live.state.taint
+        self._ended[live.state.task] = _EndedTask(live.owner, dict(live.instances), fs)
+        mine = [
+            task for task, kept in self._ended.items() if kept.owner == live.owner and kept.fs == fs
+        ]
         for task in mine[: max(0, len(mine) - _MAX_ENDED_WITH_INSTANCES)]:
             del self._ended[task]
 
@@ -1720,14 +1732,15 @@ class BrokerService:
             decl.computed is not None
         )
 
-    def _gate_connection(self, live: _Live, producer: _Producer) -> None:
+    def _gate_connection(self, live: _Live, producer: _Producer) -> bool:
         """The visibility gate of D31 (8): what a task that is not fs-tainted after the call may
         learn. A net-tainted consumer is answered **exactly as for an unknown instance** about a
         producer of an fs-tainted task, before any read of the producer and with no prompt. A clean
         consumer that names one takes the fs taint first (persisted, audited), so that it is
-        fs-tainted after the call and no later refusal tells a task that stays clean more."""
+        fs-tainted after the call and no later refusal tells a task that stays clean more. True
+        if it took the taint."""
         if producer.same_task or TaintKind.FS not in producer.taint:
-            return
+            return False
         taint = live.state.taint
         if TaintKind.NET in taint:
             raise self._refuse_connection(
@@ -1739,6 +1752,8 @@ class BrokerService:
                 self._store.set_taint(live.state.task, merged)
                 entries.append(ConnectionTainted(at=self._now(), task=live.state.task))
             live.state = TaskState(task=live.state.task, taint=merged)
+            return True
+        return False
 
     def _plan_connection(self, live: _Live, request: ConnectTools, producer: _Producer) -> _Plan:
         """Everything that can refuse a connection, in the order D31 (3) lists, on the broker's
@@ -1812,8 +1827,15 @@ class BrokerService:
             raise self._refuse_connection(
                 live, "unknown_instance", "not_found", UNKNOWN_INSTANCE_TEXT
             )
-        self._gate_connection(live, producer)
-        plan = self._plan_connection(live, request, producer)
+        marked = self._gate_connection(live, producer)
+        try:
+            plan = self._plan_connection(live, request, producer)
+        except _Refuse as refusal:
+            if not marked:
+                raise
+            raise _Refuse(
+                refusal.reason, f"{refusal.message} {MARKED_TEXT}", refusal.code
+            ) from None
         approval: tuple[bool, PromptId | None] = (False, None)
         if plan.merged is None:
             approval = await self._ask_crossing(owner, live, plan)
@@ -1857,11 +1879,14 @@ class BrokerService:
         if isinstance(answer, Allowed) and answer.scope is GrantScope.ONCE:
             return True, answer.prompt
         reason = answer.reason if isinstance(answer, Denied) else ""
+        asked = answer.prompt
         if reason in ("no_prompt_ui", "prompt_busy", "prompt_failed"):
             raise self._refuse_connection(
-                live, "crossing_unavailable", "denied", CROSSING_UNAVAILABLE_TEXT
+                live, "crossing_unavailable", "denied", CROSSING_UNAVAILABLE_TEXT, asked
             )
-        raise self._refuse_connection(live, "crossing_denied", "denied", CROSSING_DENIED_TEXT)
+        raise self._refuse_connection(
+            live, "crossing_denied", "denied", CROSSING_DENIED_TEXT, asked
+        )
 
     def _make_connection(
         self,
@@ -1971,7 +1996,9 @@ class BrokerService:
         return tuple(
             c
             for c in live.connections.values()
-            if not c.same_task and c.consumer == binding.instance
+            if not c.same_task
+            and c.consumer == binding.instance
+            and c.port_type in ("image", "file")  # a text value carries no file: no mount (B2)
         )
 
     def _input_sources(self, inputs: Sequence[_Connection]) -> tuple[_InputSource, ...]:

@@ -489,7 +489,8 @@ def register_saved_tool_tools(
     )
     registry.register(
         ToolName("open_tool"),
-        "Show a saved tool on the canvas (the newest version unless you name one). The user's "
+        "Show a saved tool on the canvas (the newest version unless you name one). Use placement "
+        "stack for tools you will connect (the default closes the others). The user's "
         "access for it is asked again for each version. With source=true you also get its spec "
         "and code as data, to refine it with show_ui and save_tool.",
         OpenToolInput,

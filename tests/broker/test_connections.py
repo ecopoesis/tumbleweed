@@ -4,6 +4,7 @@ The broker is real, the sandbox and the user are fakes. Every refusal is a fixed
 for word, and every refusal is audited with a closed reason.
 """
 
+import asyncio
 import dataclasses
 
 import pytest
@@ -460,5 +461,137 @@ class TestEndedProducers:
                 error = await refused(client, last, oldest, "out", sink, "src")
 
                 assert error.message == texts.UNKNOWN_INSTANCE_TEXT
+
+        run(scenario)
+
+
+class TestEdges:
+    def test_the_instance_cap_applies_at_the_consumer_end_too(self) -> None:
+        async def scenario() -> None:
+            async with running(
+                config=lambda c: dataclasses.replace(
+                    c, max_connections_per_instance=1, max_fan_out=8
+                )
+            ) as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+                maker = await stored_tool(client, "M", outputs={"out": "text"})
+                taker = await stored_tool(client, "T", inputs={"src": "text", "other": "text"})
+                first, second = [(await opened(client, task, maker)).instance for _ in range(2)]
+                sink = (await opened(client, task, taker)).instance
+                await client.connect_tools(task, first, "out", sink, "src")
+
+                error = await refused(client, task, second, "out", sink, "other")
+
+                assert error.message == texts.INSTANCE_CAP_TEXT
+
+        run(scenario)
+
+    def test_the_fan_out_counts_one_output_port_not_the_tool(self) -> None:
+        async def scenario() -> None:
+            async with running(config=lambda c: dataclasses.replace(c, max_fan_out=1)) as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+                maker = await stored_tool(client, "M", outputs={"one": "text", "two": "text"})
+                taker = await stored_tool(client, "T", inputs={"src": "text"})
+                hub = (await opened(client, task, maker)).instance
+                a, b, c = [(await opened(client, task, taker)).instance for _ in range(3)]
+                await client.connect_tools(task, hub, "one", a, "src")
+
+                await client.connect_tools(task, hub, "two", b, "src")  # another port: allowed
+                error = await refused(client, task, hub, "one", c, "src")
+
+                assert error.message == texts.FAN_OUT_TEXT
+
+        run(scenario)
+
+    def test_taking_one_input_leaves_the_tools_other_input_free(self) -> None:
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+                maker = await stored_tool(client, "M", outputs={"out": "text"})
+                taker = await stored_tool(client, "T", inputs={"one": "text", "two": "text"})
+                a, b = [(await opened(client, task, maker)).instance for _ in range(2)]
+                sink = (await opened(client, task, taker)).instance
+                await client.connect_tools(task, a, "out", sink, "one")
+
+                error = await refused(client, task, b, "out", sink, "one")
+                await client.connect_tools(task, b, "out", sink, "two")
+
+                assert error.message == texts.INPUT_TAKEN_TEXT
+
+        run(scenario)
+
+    def test_an_instance_forgotten_at_the_open_cap_takes_its_connections_with_it(self) -> None:
+        from tumbleweed.broker.service import MAX_INSTANCES_PER_TASK
+
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                task = (await client.start_task()).task
+                maker = await stored_tool(client, "M", outputs={"out": "text"})
+                taker = await stored_tool(client, "T", inputs={"src": "text"})
+                first = (await opened(client, task, maker)).instance  # the oldest
+                sink = (await opened(client, task, taker)).instance
+                await client.connect_tools(task, first, "out", sink, "src")
+                for _ in range(MAX_INSTANCES_PER_TASK):
+                    await opened(client, task, taker)
+
+                assert (await client.list_connections(task)).connections == ()
+
+        run(scenario)
+
+    def test_a_refusal_after_a_clean_task_took_the_fs_taint_says_so(self) -> None:
+        from tests.broker.connect_support import fs_tainted
+
+        async def scenario() -> None:
+            async with running() as rig:
+                client = await rig.client()
+                maker = await stored_tool(client, "Maker", outputs={"out": "image"})
+                taker = await stored_tool(client, "Taker", inputs={"src": "text"})
+                files = await fs_tainted(rig, client)
+                producer = (await opened(client, files, maker)).instance
+                await client.end_task(files)
+                clean = (await client.start_task()).task
+                sink = (await opened(client, clean, taker)).instance
+
+                error = await refused(client, clean, producer, "out", sink, "src")
+
+                assert error.message.endswith(texts.MARKED_TEXT)
+                assert error.message.startswith("The types differ")
+
+        run(scenario)
+
+    def test_the_record_of_ended_tasks_is_per_owner_and_goes_with_the_connection(self) -> None:
+        from tumbleweed.broker import service
+
+        cap = service._MAX_ENDED_WITH_INSTANCES  # noqa: SLF001
+
+        async def scenario() -> None:
+            async with running() as rig:
+                mine, theirs = await rig.client(), await rig.client()
+                tool = await stored_tool(mine, "Maker", outputs={"out": "text"})
+                task = (await mine.start_task()).task
+                await opened(mine, task, tool)
+                await mine.end_task(task)
+                previous = None
+                for _ in range(cap + 3):  # another owner's churn
+                    made = (await theirs.start_task(previous=previous)).task
+                    await opened(theirs, made, tool)
+                    previous = made
+                held = rig.daemon.service._ended  # noqa: SLF001  (the record itself)
+
+                counts: dict[object, int] = {}
+                for each in held.values():
+                    counts[each.owner] = counts.get(each.owner, 0) + 1
+                assert sorted(counts.values()) == [1, cap]  # mine kept, theirs bounded
+
+                await theirs.close()
+                await asyncio.sleep(0.2)
+                assert sorted(
+                    each.owner
+                    for each in rig.daemon.service._ended.values()  # noqa: SLF001
+                ) == [owner for owner in counts if counts[owner] == 1]  # only mine is left
 
         run(scenario)

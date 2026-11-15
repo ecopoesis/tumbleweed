@@ -164,6 +164,35 @@ class TestPropagation:
         assert a.value(StateKey("src")) == "round and round"
 
 
+class TestAnEndedTask:
+    def test_a_listing_that_arrives_late_for_an_ended_task_routes_nothing(self) -> None:
+        a, b = Stage(), Stage()
+        router, _ = router_of(a, b)
+        router.task_ended(TASK)
+
+        router.set_connections(TASK, [info(a, b)])  # the broker's answer came after the end
+        a.set("late")
+
+        assert router.active == frozenset()
+        assert b.value(StateKey("src")) == ""
+
+    def test_the_memory_of_ended_tasks_is_bounded(self) -> None:
+        from tumbleweed.agent.routing import MAX_ENDED_REMEMBERED
+
+        router, _ = router_of()
+        first = TaskId.new()
+        router.task_ended(first)
+        for _ in range(MAX_ENDED_REMEMBERED):
+            router.task_ended(TaskId.new())
+
+        a, b = Stage(), Stage()
+        router.attach(a.instance, a)
+        router.attach(b.instance, b)
+        router.set_connections(first, [info(a, b)])  # forgotten by now: the bound holds
+
+        assert len(router._ended) == MAX_ENDED_REMEMBERED  # noqa: SLF001
+
+
 class TestTheSizeCap:
     def test_a_value_at_the_cap_passes_and_one_over_is_dropped_with_a_line_of_ours(self) -> None:
         a, b = Stage(), Stage()

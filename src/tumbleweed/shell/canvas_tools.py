@@ -28,6 +28,7 @@ from typing import Final, final
 from pydantic import JsonValue
 
 from tumbleweed.agent.canvas import (
+    FrozenInstanceError,
     InstanceSource,
     Placement,
     ShownTool,
@@ -213,6 +214,7 @@ class CanvasTools:
         self._column.set_column_spacing(12)
         self._column.set_valign(Gtk.Align.START)
         self._router = ConnectionRouter(self._dropped)
+        self._current: TaskId | None = None  # the task the conversation is in
 
     @property
     def instances(self) -> tuple[ToolInstanceId, ...]:
@@ -289,9 +291,15 @@ class CanvasTools:
         return found
 
     def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
-        tool = self.tool(instance)
-        if tool is None:
+        shown = next((each for each in self._shown if each.instance == instance), None)
+        if shown is None:
             raise UnknownInstanceError(f"no tool {instance} is on the canvas")
+        if shown.sink.inert or (
+            shown.task is not None and self._current is not None and shown.task != self._current
+        ):
+            # What a connection passes on is the producer's own: no other task writes it (D31).
+            raise FrozenInstanceError(f"tool {instance} is not the current task's")
+        tool = shown.tool
         store = tool.runtime.store
         before = store.snapshot()
         tool.runtime.patch_state(patch)  # SpecError: refused whole, nothing applied
@@ -324,6 +332,7 @@ class CanvasTools:
 
     def task_started(self, task: TaskId) -> None:
         """A task has started: an instance that belongs to no task goes inert (see `task_ended`)."""
+        self._current = task
         self._make_inert(lambda shown: shown.task is None)
 
     def _make_inert(self, which: Callable[[_Shown], bool]) -> None:

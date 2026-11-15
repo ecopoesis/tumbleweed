@@ -48,6 +48,25 @@ _CROSSING: Final = (
 )
 
 
+NOT_ON_CANVAS: Final = (
+    "Connected as connection {connection}, but the {which} tool is not on the canvas, so nothing "
+    "flows yet. A tool opened with the default placement closes the others: open tools you want "
+    "to connect with placement stack (at most 4 fit), and values flow again once both are shown."
+)
+NOT_ROUTED_YET: Final = (
+    "Connected as connection {connection}, but the canvas could not be told just now, so nothing "
+    "flows yet. It starts when the tools are shown again."
+)
+
+
+async def _on_canvas(canvas: CanvasLink, instance: ToolInstanceId) -> bool:
+    try:
+        await canvas.source(instance)
+    except UnknownInstanceError:
+        return False
+    return True
+
+
 @final
 class ConnectToolsInput(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
@@ -98,7 +117,21 @@ def register_composition_tools(
             ) from None
         except BrokerUnavailableError as error:
             raise ToolError(str(error)) from None
-        await canvas.set_connections(task, listing.connections)
+        try:
+            await canvas.set_connections(task, listing.connections)
+        except (ToolError, TimeoutError):
+            # The connection exists (the broker made it); only the canvas could not be told now.
+            return NOT_ROUTED_YET.format(connection=made.connection)
+        off = [
+            which
+            for which, instance in (
+                ("first", arguments.from_instance),
+                ("second", arguments.to_instance),
+            )
+            if not await _on_canvas(canvas, instance)
+        ]
+        if off:
+            return NOT_ON_CANVAS.format(connection=made.connection, which=" and ".join(off))
         note = (
             _CROSSING
             if made.crossing
@@ -109,17 +142,20 @@ def register_composition_tools(
         return (
             f"Connected {arguments.from_port} of {arguments.from_instance} to "
             f"{arguments.to_port} of {arguments.to_instance} as connection {made.connection} "
-            f"({made.port_type}). Whatever the first tool puts in that port now flows into the "
-            f"second tool's input, and the second tool's code runs on each new value.{note}"
+            f"({made.port_type}). While both tools are on the canvas, what the first tool puts in "
+            "that port is passed to the second tool's input now and whenever it changes, and the "
+            f"second tool's code runs once for each value that arrives.{note}"
         )
 
     registry.register(
         ToolName("connect_tools"),
         "Connect an output port of one saved tool on the canvas to an input port of another, so "
         "that its value flows on whenever it changes. Both must be saved tools opened with "
-        "open_tool (a show_ui tool must be saved first), the port types must be the same, and "
-        "the first tool may belong to an earlier task of this conversation. A connection that "
-        "would give one task both the user's files and the network is asked of the user.",
+        "open_tool with placement stack (a show_ui tool must be saved first; the default "
+        "placement closes the other tools, and values flow only while both are on the canvas, "
+        "at most 4), the port types must be the same, and the first tool may belong to an "
+        "earlier task of this conversation. A connection that would give one task both the "
+        "user's files and the network is asked of the user.",
         ConnectToolsInput,
         connect_tools,
         timeout_seconds=_PROMPT_SECONDS + 5.0,
