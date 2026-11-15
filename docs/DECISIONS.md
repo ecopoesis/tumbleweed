@@ -2288,7 +2288,7 @@ listing, with a secret in the fs producer's output).
 store, so no task but the producer's may write it: `patch_state` and `CanvasTools.patch` refuse an
 instance that is not the current task's (an ended task's, whose card is inert, or another's) with one
 fixed text, and an ended task's sandbox results are dropped (its runs are stopped). The user's own
-edits of an old card still work, they are the user's. This amends D24 and D30 (2): `patch_state` of a
+edits of an old card still work, they are the user's. This amends D26 (5) (an ended task's instances no longer take `patch_state`), D24 and D30 (2): `patch_state` of a
 tool that is connected as a producer is passed on, and the consumer's `sandbox` handlers that read it
 run (trigger `connection`, no tool grant), so "a patch never starts a run" and "a stored handler
 runs only on a direct user input" hold for the tool patched, not for the one fed. The ended-instance
