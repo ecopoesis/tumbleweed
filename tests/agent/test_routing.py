@@ -5,9 +5,9 @@ arrives is checked by the real patch rules.
 """
 
 import json
-from itertools import pairwise
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 from pydantic import JsonValue
 
