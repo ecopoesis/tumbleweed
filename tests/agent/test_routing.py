@@ -164,6 +164,31 @@ class TestPropagation:
         assert a.value(StateKey("src")) == "round and round"
 
 
+class TestOnlyAppliedFreshValuesArePassedOn:
+    def test_a_change_that_was_held_back_or_is_stale_is_not_passed_on(self) -> None:
+        from tumbleweed.ui.runtime import Origin
+
+        listeners: list[Callable[[Change], None]] = []
+
+        class Source(Stage):
+            def subscribe(self, listener: Callable[[Change], None]) -> Callable[[], None]:
+                listeners.append(listener)
+                return lambda: None
+
+        a, b = Source(), Stage()
+        router, _ = router_of(a, b)
+        router.set_connections(TASK, [info(a, b)])
+        (listener,) = listeners
+        before = len(b.received)
+
+        listener(Change(StateKey("out"), "held back", Origin.USER, applied=False))
+        listener(Change(StateKey("out"), "stale", Origin.COMPUTED, stale=True))
+        assert len(b.received) == before
+
+        listener(Change(StateKey("out"), "fresh", Origin.SANDBOX))
+        assert b.received[-1] == ("src", "fresh")
+
+
 class TestAnEndedTask:
     def test_a_listing_that_arrives_late_for_an_ended_task_routes_nothing(self) -> None:
         a, b = Stage(), Stage()

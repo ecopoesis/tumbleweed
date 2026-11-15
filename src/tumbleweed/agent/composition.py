@@ -50,8 +50,15 @@ _CROSSING: Final = (
 
 NOT_ON_CANVAS: Final = (
     "Connected as connection {connection}, but the {which} tool is not on the canvas, so nothing "
-    "flows yet. A tool opened with the default placement closes the others: open tools you want "
-    "to connect with placement stack (at most 4 fit), and values flow again once both are shown."
+    "flows. A closed tool never comes back under the same id, and the connection keeps holding "
+    "that input until the user removes it in the Tools panel. A tool opened with the default "
+    "placement closes the others: open the tools again with placement stack (at most 4 fit) and "
+    "connect them again."
+)
+CROSS_TASK: Final = (
+    "Connected as connection {connection}. A tool of an earlier task passes on what it held when "
+    "its task ended, and only while it is on the canvas. If nothing arrives, ask the user to "
+    "remove this connection in the Tools panel."
 )
 NOT_ROUTED_YET: Final = (
     "Connected as connection {connection}, but the canvas could not be told just now, so nothing "
@@ -122,6 +129,13 @@ def register_composition_tools(
         except (ToolError, TimeoutError):
             # The connection exists (the broker made it); only the canvas could not be told now.
             return NOT_ROUTED_YET.format(connection=made.connection)
+        info = next(
+            (each for each in listing.connections if each.connection == made.connection), None
+        )
+        if info is not None and not info.same_task:
+            # A tool of an earlier task: whether its card is still shown is not for this task to
+            # learn (D31 (8)), so the answer is the same whatever the canvas shows.
+            return CROSS_TASK.format(connection=made.connection)
         off = [
             which
             for which, instance in (

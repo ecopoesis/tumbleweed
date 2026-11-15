@@ -62,8 +62,8 @@ type Placement = Literal["replace", "stack"]
 
 _NO_CANVAS: Final = "The canvas is not available right now."
 FROZEN_TEXT: Final = (
-    "That tool belongs to a task that has ended, or to another task, so its state can no longer "
-    "be changed. Open it again in this task if you need to change it."
+    "That tool cannot be changed: it is not on the canvas, or it belongs to an earlier task. If "
+    "you need it, show it again (show_ui) or open it again (open_tool) in this task and use the new instance id."
 )
 _FIX_AND_RETRY: Final = "Fix these and call show_ui again (nothing was shown):"
 
@@ -330,12 +330,9 @@ def register_canvas_tools(
             changed = await link.patch(arguments.instance, arguments.patch)
         except SpecError as error:
             raise _failure_of(error, "The patch was refused and nothing changed:") from None
-        except UnknownInstanceError:
-            raise ToolError(
-                f"There is no tool {arguments.instance} on the canvas now: it was replaced or "
-                "closed. Call show_ui to show it again."
-            ) from None
-        except FrozenInstanceError:
+        except (UnknownInstanceError, FrozenInstanceError):
+            # One text for every tool that is not a current-task tool on the canvas (unknown,
+            # closed, inert, another task's): which of them it is says nothing (D31 (8)).
             raise ToolError(FROZEN_TEXT) from None
         return "Updated: " + (", ".join(changed) if changed else "nothing (no value changed)") + "."
 

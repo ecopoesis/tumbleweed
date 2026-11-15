@@ -8,6 +8,7 @@ from its audit log and from the policy its sandbox was given, not from what the 
 """
 
 import json
+import re
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -40,7 +41,7 @@ from tumbleweed.agent.routing import ConnectionRouter
 from tumbleweed.agent.saved_tools import register_saved_tool_tools
 from tumbleweed.agent.tasks import TaskSession
 from tumbleweed.agent.tool_access import BrokerToolAccess
-from tumbleweed.agent.tools import ToolRegistry
+from tumbleweed.agent.tools import ToolError, ToolRegistry
 from tumbleweed.broker.audit import ConnectionMade, SandboxRun
 from tumbleweed.broker.client import BrokerClient
 from tumbleweed.broker.grants import GrantScope
@@ -340,7 +341,7 @@ class TestFeedOneToolIntoAnother:
                 rig.send_and_wait("connect them")
                 (answer,) = chat.results(rig, 1)
 
-            assert "the first tool is not on the canvas, so nothing flows yet" in answer.content
+            assert "the first tool is not on the canvas, so nothing flows." in answer.content
             assert "placement stack" in answer.content
             assert "now and whenever it changes" not in answer.content
             assert chat.canvas.router.active == frozenset()
@@ -462,6 +463,90 @@ class TestFeedOneToolIntoAnother:
                 "Save it with save_tool, open it with open_tool, then connect it."
             )
             assert thread.rig.audit_of(ConnectionMade) == []
+
+
+class TestACrossTaskAnswerDoesNotShowTheCanvas:
+    def answer_with(self, *, producer_shown: bool) -> str:
+        with broker() as thread:
+            photo, collage, _ = seed(thread)
+            chat = session(thread)
+            with chat.reply(
+                [
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(photo), placement="stack"),)),
+                    FakeTurn(tool_calls=(call("start_task", title="Collage"),)),
+                    FakeTurn(
+                        tool_calls=(
+                            call(
+                                "open_tool",
+                                tool=str(collage),
+                                placement="stack" if producer_shown else "replace",
+                            ),
+                        )
+                    ),
+                    FakeTurn(chunks=("Open.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("open both")
+            producer, consumer = chat.canvas.instances
+            assert (producer in chat.canvas.runtimes) == producer_shown
+            with chat.reply(
+                [
+                    FakeTurn(
+                        tool_calls=(
+                            call(
+                                "connect_tools",
+                                **ConnectArgs(producer, "photo", consumer, "photo").as_input(),
+                            ),
+                        )
+                    ),
+                    FakeTurn(chunks=("Done.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("connect")
+                (answer,) = chat.results(rig, 1)
+            assert not answer.is_error
+            return re.sub(r"conn_[0-9a-z]+", "<conn>", answer.content)
+
+    def test_the_answer_is_the_same_whether_or_not_the_producer_is_shown(self) -> None:
+        shown = self.answer_with(producer_shown=True)
+        closed = self.answer_with(producer_shown=False)
+
+        assert shown == closed
+        assert "only while it is on the canvas" in shown
+
+
+class TestACanvasThatCannotBeToldNow:
+    def test_a_connection_that_exists_is_not_reported_as_an_error(self) -> None:
+        with broker() as thread:
+            photo, collage, _ = seed(thread)
+            chat = session(thread)
+
+            def refuse(task: TaskId, connections: tuple[ConnectionInfo, ...]) -> None:
+                raise ToolError("the canvas is not available")
+
+            chat.canvas.set_connections = refuse  # type: ignore[method-assign]  # the test's own fault
+            with chat.reply(
+                [
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(photo), placement="stack"),)),
+                    FakeTurn(tool_calls=(call("open_tool", tool=str(collage), placement="stack"),)),
+                    FakeTurn(chunks=("Open.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("open both")
+            producer, consumer = chat.canvas.instances
+            args = ConnectArgs(producer, "photo", consumer, "photo")
+            with chat.reply(
+                [
+                    FakeTurn(tool_calls=(call("connect_tools", **args.as_input()),)),
+                    FakeTurn(chunks=("Done.",)),
+                ]
+            ) as rig:
+                rig.send_and_wait("connect")
+                (answer,) = chat.results(rig, 1)
+
+            assert not answer.is_error  # the broker made it: the model is not told "error"
+            assert "so nothing flows yet" in answer.content
+            assert len(thread.rig.audit_of(ConnectionMade)) == 1
 
 
 class TestAnUnsavedToolOfAnEarlierTask:

@@ -344,7 +344,9 @@ class TestPatchState:
 
             (result,) = tool_results(rig, 1)
             assert result.is_error
-            assert "no tool" in result.content
+            from tumbleweed.agent.canvas import FROZEN_TEXT
+
+            assert result.content == FROZEN_TEXT
             assert "show_ui" in result.content
 
     def test_an_instance_id_of_another_kind_is_an_input_error(self) -> None:
@@ -420,6 +422,33 @@ class TestAFrozenInstance:
 
         assert result.is_error
         assert result.content == FROZEN_TEXT
+
+
+class TestOneTextForEveryToolThatIsNotTheCurrentTasks:
+    def test_unknown_absent_inert_and_foreign_instances_get_byte_identical_answers(self) -> None:
+        from tumbleweed.agent.canvas import FROZEN_TEXT
+
+        frozen, absent = ToolInstanceId.new(), ToolInstanceId.new()
+        canvas = FakeCanvas((frozen,))
+        canvas.frozen.add(frozen)  # inert, or another task's: the canvas refuses it
+        # `absent` is on no canvas at all; a third is one the canvas never heard of.
+        ids = [frozen, absent, ToolInstanceId.new()]
+        script = [
+            FakeTurn(
+                tool_calls=tuple(call("patch_state", instance=str(i), patch={"b": 1}) for i in ids)
+            ),
+            FakeTurn(chunks=("ok",)),
+        ]
+        with canvas_rig(script, canvas) as rig:
+            rig.send_and_wait("change them")
+            results = [
+                block
+                for block in rig.provider.requests[1].messages[-1].content
+                if isinstance(block, ToolResultBlock)
+            ]
+
+        assert [r.content for r in results] == [FROZEN_TEXT] * 3
+        assert all(r.is_error for r in results)
 
 
 class TestPatchReportsChanges:

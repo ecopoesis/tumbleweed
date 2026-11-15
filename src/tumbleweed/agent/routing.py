@@ -36,8 +36,9 @@ from tumbleweed.ui.spec.state import StateValue
 logger = logging.getLogger(__name__)
 
 MAX_ROUTED_VALUE_BYTES: Final = 64 * 1024
-MAX_ENDED_REMEMBERED: Final = 1024
 """The largest value, as JSON, that a connection passes on."""
+MAX_ENDED_REMEMBERED: Final = 1024
+"""How many ended tasks the router remembers (the oldest is forgotten)."""
 TOO_LARGE_NOTICE: Final = "A value from a connected tool was too large to pass on."
 NOT_ACCEPTED_NOTICE: Final = "A value from a connected tool is not one this tool accepts."
 

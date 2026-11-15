@@ -2132,7 +2132,7 @@ time; the 100-version cap is the bound. The `user_event` claim rests on the shel
 decision of the chrome does.
 
 
-## D31 — Tool composition: the broker records every connection and decides it from its own records; values route in the UI runtime, files by a read-only mount, taint before anything flows, one trusted prompt for the one crossing a model can reach (2026-11-15, accepted)
+## D31 — Tool composition: the broker records every connection and decides it from its own records; values route in the UI runtime, files by a read-only mount, taint before anything flows, one trusted prompt for the one crossing v1 offers (2026-11-15, accepted)
 
 **Context.** S25 wires one stored tool's output port to another's input port. What was there:
 `Port`/`PortType` in the package (checked against the spec), `ConnectionId`, `InputMount` and the
@@ -2269,16 +2269,15 @@ taints to be {fs, net}. (fs producer, net consumer) is the exfiltration directio
 forbidden by the property: no model request reaches a prompt for it. (net producer, fs consumer)
 is the only crossing that prompts. Whether a model can name it: context and taint travel the same
 non-fresh chain (D26 (3), D29 (13)), so a task that saw a net task's turns is net itself, and after
-`fresh_context` the old instance IDs are gone; the instance ID of an old net task's tool on the
-canvas reaches an fs task's model only in the turn the shell writes when the user uses that tool, or
-typed by the user. An ended task's card is inert and its events are dropped, so no
-shell turn carries its ID into a later task: the model learns an ID from the user in chat or from the
-tool store (a saved tool's description can hold one, and `find_tools` shows it to a task that may see
+`fresh_context` the old instance IDs are gone. An ended task's card is inert and its events are
+dropped, so no shell turn carries its ID into a later task: the model learns an ID from the user in
+chat or from the tool store (a saved tool's description can hold one, and `find_tools` shows it to a task that may see
 that tool), which is why the instances of another task are read-only to the model (below): an ID
 that leaks that way can name a producer but not change what it passes on. The refusal is one fixed
 text whatever the instance holds, so `patch_state` on it is no oracle for a guessed value.
 The acceptance "a taint-crossing connection prompts" is met at the broker, through IPC
-(`test_connection_taint.py`, `test_connection_prompts.py`). The prompt is therefore reachable, narrowly, and **a net-tainted consumer after
+(`test_connection_taint.py`, `test_connection_prompts.py`). The prompt is therefore reachable,
+narrowly, and **a net-tainted consumer after
 an approved crossing does not exist** (the approved case is an fs consumer, which stays fs). v1
 offers no way, for the model or the user, to connect fs data into a net task: no chrome "connect"
 action and no listing of instances (a listing would be a new leak surface); the user-initiated reverse
@@ -2287,6 +2286,16 @@ test_connection_noninterference.py` runs one script against a state and the same
 tasks' instances, from a net consumer and from a clean consumer that stays clean, and demands equal
 answers, equal listings and equal routed values (`agent.routing` is driven from the broker's
 listing, with a secret in the fs producer's output).
+
+**Residual (round 2).** Whether routed values arrive depends on whether the user's canvas still shows
+the producer, and a task that holds another task's instance ID can close that card (placement
+`replace` or `stack`). Both channels that would tell it are closed: `patch_state` gives one text for
+every tool that is not a current-task tool on the canvas, and `connect_tools` gives one answer for a
+producer of an earlier task whatever the canvas shows. What is left is that the consumer's own state
+(its input) changes or not, which only the user and that consumer's task see; bounded by the 4 cards
+a canvas holds and the fs task's own prompts.
+A crossing denied by the broker's *timeout* carries no PromptId (the interface that mints the id
+does not return it when the broker's own timer ends the wait); a denial the user answered does.
 
 **What a connection passes on is its producer's own (round 1).** The router passes on the producer's
 store, so no task but the producer's may write it: `patch_state` and `CanvasTools.patch` refuse an
