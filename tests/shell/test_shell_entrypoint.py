@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.plugins import host
+
 pytestmark = [
     pytest.mark.gtk,
     pytest.mark.skipif(
@@ -40,6 +42,7 @@ PASSED_ON = (
     "GSK_RENDERER",
     "GTK_A11Y",
     "GSETTINGS_BACKEND",
+    *host.LIBRARY_LOCATION_VARIABLES,
     *DISPLAY_VARIABLES,
 )
 

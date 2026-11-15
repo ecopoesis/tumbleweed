@@ -333,7 +333,8 @@ class TestTheDaemonAsAProcess:
                 finally:
                     await terminate(process, wait=timedelta(seconds=10))
 
-                assert names <= {"HOME", "PATH", "XDG_RUNTIME_DIR"}
+                # PYTHONNOUSERSITE: set by the interpreter's own wrapper on a Nix host, not passed.
+                assert names <= {"HOME", "PATH", "XDG_RUNTIME_DIR", "PYTHONNOUSERSITE"}
                 assert "ANTHROPIC_API_KEY" not in names
 
         run(scenario, deadline=60)

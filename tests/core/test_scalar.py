@@ -162,7 +162,16 @@ class TestFinalAtRuntime:
 
         modules = {m.name for m in pkgutil.iter_modules(tumbleweed.core.__path__)}
 
-        assert modules == {"_scalar", "canonical", "errors", "ids", "jcs", "types", "unicode15"}
+        assert modules == {
+            "_scalar",
+            "canonical",
+            "errors",
+            "ids",
+            "jcs",
+            "types",
+            "unicode15",
+            "version",
+        }
         for name in modules:
             importlib.import_module(f"tumbleweed.core.{name}")
 
