@@ -124,3 +124,89 @@ jobs:
       # gtk and linux tests need a display and a Linux kernel: the Linux job runs those.
       - name: Tests
         run: uv run pytest -m "not gtk and not linux and not btrfs and not live"
+
+  nix:
+    name: Nix (flake check, aarch64 evaluation, the suite in nix develop)
+    runs-on: ubuntu-24.04
+    # In parallel with `linux`, which takes about 25 of its 45 minutes (#161). This job is the same
+    # suite again, run in the dev shell (under weston), plus a cold Nix build: the store is not
+    # cached between runs (an action cache would be one more thing to trust with it), so every run
+    # downloads the dev shell from cache.nixos.org, about 13 GB. Hangs are still caught per test by
+    # pytest-timeout (120 s).
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The runner has little free space on / and /nix lives there. These are not used here.
+      - name: Free disk space for the Nix store
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      # No binary cache but cache.nixos.org (public, no secret), and no token for Nix: flake.lock pins
+      # every input. Flakes are on for this job only, as in the README.
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = false
+
+      # Builds on x86_64: the package (whose install check starts every program with --version),
+      # the sandbox runtime, and the secret scans. See nix/checks.nix.
+      - name: nix flake check
+        run: nix flake check --print-build-logs
+
+      # aarch64 is evaluated, not built: the outputs of every system must evaluate, and the target's
+      # package and runtime resolve to derivations.
+      - name: Evaluate the aarch64 outputs
+        run: |
+          nix flake check --all-systems --no-build
+          for output in packages.aarch64-linux.tumbleweed packages.aarch64-linux.sandbox-runtime \
+              devShells.aarch64-linux.default; do
+            nix eval --raw ".#${output}.drvPath"
+            echo
+          done
+
+      - name: Every entry point starts (--version)
+        run: |
+          nix build --print-build-logs --out-link package .#tumbleweed
+          for program in package/bin/*; do "$program" --version; done
+
+      # Ubuntu 24.04 runners block unprivileged user namespaces with AppArmor, and bubblewrap
+      # needs them (ARCHITECTURE section 11).
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      # What the image has and the runner does not: the system Python's Pillow and numpy (the tests
+      # that use the system runtime, as in the Linux job), dbus-daemon, and the second user the IPC
+      # tests need (the Dockerfile's `tumbleweed-peer` and its sudo rule).
+      - name: Prepare the host for the sandbox and IPC tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends python3-pil python3-numpy dbus-daemon
+          # numpy links libblas.so.3 and liblapack.so.3, Debian alternatives that are links into
+          # /etc/alternatives, which a sandbox's runtime does not have: link them straight to
+          # their files, as the Dockerfile does.
+          multiarch="$(gcc -dumpmachine)"
+          for lib in libblas.so.3 liblapack.so.3; do
+            target="$(readlink -f "/usr/lib/$multiarch/$lib")"
+            test -f "$target"
+            sudo ln -sfn "$target" "/usr/lib/$multiarch/$lib"
+          done
+          sudo useradd --uid 1099 --no-create-home --shell /usr/sbin/nologin tumbleweed-peer
+          echo "$USER ALL=(tumbleweed-peer) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/tumbleweed-peer
+          sudo chmod 0440 /etc/sudoers.d/tumbleweed-peer
+          sudo visudo --check --file /etc/sudoers.d/tumbleweed-peer
+
+      # The same display and the same guard as the Linux job: scripts/linux-session starts weston,
+      # and a skipped gtk or linux test fails the run (TUMBLEWEED_CI above). The real Nix runtime
+      # test (tests/sandbox/test_nix_runtime.py) cannot skip here either. Format, lint and mypy
+      # run only in the Linux job, against the exact versions in uv.lock; this shell has nixpkgs'.
+      - name: The suite in nix develop
+        env:
+          TUMBLEWEED_REQUIRE_NIX_RUNTIME: "1"
+        run: |
+          nix develop --command bash -euc '
+            lint-imports
+            scripts/linux-session pytest -rs
+          '
