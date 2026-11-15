@@ -33,6 +33,7 @@ from tumbleweed.broker.owner import Owner
 from tumbleweed.broker.prompts import Allowed, Denied, GrantPrompt, PromptAnswer
 from tumbleweed.core.ids import PromptId
 from tumbleweed.ipc.broker_messages import (
+    CrossingAccess,
     NetworkAccess,
     NoUndoAccess,
     PickAccess,
@@ -81,6 +82,14 @@ def _access_of(prompt: GrantPrompt) -> PromptedAccess:
     """The wire form of what the prompt asks, from its structure (the shell renders from this)."""
     capability = prompt.capability
     if capability is None:
+        if prompt.crossing is not None:
+            return CrossingAccess(
+                kind="crossing",
+                from_name=prompt.crossing.from_name,
+                from_effect=prompt.crossing.from_effect,
+                to_name=prompt.crossing.to_name,
+                to_effect=prompt.crossing.to_effect,
+            )
         if prompt.no_undo is not None:
             return NoUndoAccess(
                 kind="no_undo",
@@ -209,6 +218,14 @@ class ShellPrompts:
         if isinstance(answer, Allowed) and answer.scope not in waiting.scopes:
             answer = Denied(reason="scope_not_offered")
         del self._waiting[prompt]
+        if isinstance(answer, Allowed):
+            # Rebuilt, never copied with an update (CLAUDE.md rule 5): the id is the broker's own.
+            answer = Allowed(
+                scope=answer.scope,
+                expires_at=answer.expires_at,
+                picked=answer.picked,
+                prompt=prompt,
+            )
         waiting.answer.set_result(answer)
         return True
 

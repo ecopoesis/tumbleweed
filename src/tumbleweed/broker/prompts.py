@@ -46,11 +46,24 @@ class NoUndoSubject(PolicyModel):
 
 
 @final
+class CrossingSubject(PolicyModel):
+    """The crossing question (S25, D31 (6), I12): connecting `from_name`'s output (a tool of a task
+    that is `from_effect`-tainted) to `to_name`'s input (a task that is `to_effect`-tainted) would
+    make a task both fs- and net-tainted. The answer `Allowed` (scope `once`) makes this one
+    connection, and the consumer's taint is not raised. The names are the tools' own text."""
+
+    from_name: Annotated[str, Field(min_length=1, max_length=64)]
+    from_effect: Literal["fs", "net"]
+    to_name: Annotated[str, Field(min_length=1, max_length=64)]
+    to_effect: Literal["fs", "net"]
+
+
+@final
 class GrantPrompt(PolicyModel):
     """What the user is asked, for `run` of `task` (and `tool`, if a tool's handler asked), with
     the model's `reason`: to allow `capability`, to choose a file or folder (`pick`), or to run
-    with no undo (`no_undo`, whose `reason` is empty: there is no model text in it). Exactly one
-    of the three is set."""
+    with no undo (`no_undo`) or to approve a taint crossing (`crossing`); the last two have an empty
+    `reason`: there is no model text in them. Exactly one of the four is set."""
 
     task: TaskId
     run: RunId
@@ -60,14 +73,17 @@ class GrantPrompt(PolicyModel):
     capability: Capability | None = None
     pick: Literal["file", "folder"] | None = None
     no_undo: NoUndoSubject | None = None
+    crossing: CrossingSubject | None = None
     scopes: Annotated[frozenset[GrantScope], Field(min_length=1)]
     reason: Annotated[str, Field(max_length=MAX_REASON_CHARS)]
 
     @model_validator(mode="after")
     def _one_subject(self) -> Self:
-        subjects = [self.capability, self.pick, self.no_undo]
+        subjects = [self.capability, self.pick, self.no_undo, self.crossing]
         if sum(subject is not None for subject in subjects) != 1:
-            raise ValueError("a prompt asks for one thing: a capability, a pick or no undo")
+            raise ValueError(
+                "a prompt asks for one thing: a capability, a pick, no undo or a crossing"
+            )
         return self
 
 
@@ -81,6 +97,9 @@ class Allowed(PolicyModel):
     scope: GrantScope
     expires_at: AwareDatetime | None = None
     picked: Annotated[str, Field(min_length=1, max_length=MAX_PICKED_CHARS)] | None = None
+    prompt: PromptId | None = None
+    """The prompt this answers, stamped by the interface that asked (the audit of a crossing names
+    it, D31 (6)); None from an interface with no prompt of its own."""
 
 
 @final

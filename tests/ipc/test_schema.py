@@ -10,6 +10,7 @@ import pytest
 from pydantic import JsonValue
 
 from tumbleweed.ipc.broker_messages import (
+    CrossingAccess,
     DirEntry,
     EnvPair,
     NetworkAccess,
@@ -21,6 +22,7 @@ from tumbleweed.ipc.broker_messages import (
     WireBinding,
     WriteAccess,
 )
+from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.ipc.messages import IpcMessage, Request, RequestBody, Response, ResponseBody
 from tumbleweed.ipc.prompt_messages import AllowDecision, DenyDecision
 from tumbleweed.ipc.schema import SCHEMA_FILE_NAME, SCHEMA_TITLE, build_schema, render_schema
@@ -69,6 +71,8 @@ PARTS: tuple[type[IpcMessage], ...] = (
     DirEntry,
     EnvPair,
     NoUndoAccess,
+    CrossingAccess,
+    ConnectionInfo,
     SnapshotInfo,
     ToolGrantInfo,
     ToolSummary,

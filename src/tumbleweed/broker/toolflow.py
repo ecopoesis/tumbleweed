@@ -9,6 +9,7 @@ store; they are here so that each rule can be tested on its own.
   The shell sends the handler and its inputs and nothing else; code it sends is a refusal.
 """
 
+from collections.abc import Mapping
 from typing import Final, Literal, final
 
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
@@ -110,10 +111,16 @@ class _Call(BaseModel):
     code: dict[str, str]
 
 
-def bound_payload(package: ToolPackage, sent: str | None) -> str:
+def bound_payload(
+    package: ToolPackage, sent: str | None, roots: Mapping[str, str] | None = None
+) -> str:
     """The payload of a run of `package`'s handler, whose `module`, `function` and inputs are in
     `sent` (the handler document with an empty `code`): the same document with the package's own
     modules in `code`.
+
+    `roots` (S25, D31 (5)) maps an input name to where a connected workspace is mounted
+    (`/inputs/<ConnectionId>`): a file or image input of that name, which is `{"path": ...}`, gets
+    `root` added, and nothing else of the value changes.
 
     `BoundRunError` for a document that is not one, one that brings code of its own, a handler the
     package's spec does not declare, or one over the payload limit. The code that reaches the
@@ -135,10 +142,15 @@ def bound_payload(package: ToolPackage, sent: str | None) -> str:
     )
     if not declared:
         raise BoundRunError("no_such_handler")
+    inputs = dict(call.inputs)
+    for name, root in (roots or {}).items():
+        value = inputs.get(name)
+        if isinstance(value, dict) and "path" in value:
+            inputs[name] = {**value, "root": root}
     document = handler_payload(
         call.module,
         call.function,
-        call.inputs,
+        inputs,
         {str(module.name): module.source for module in package.modules},
     )
     if document is None:

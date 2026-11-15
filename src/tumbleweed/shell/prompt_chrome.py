@@ -91,6 +91,11 @@ _NO_UNDO_CAUSE: Final[dict[str, str]] = {
     "store_full": "the space for copies is full",
     "io": "saving failed",
 }
+_EFFECT: Final[dict[str, str]] = {
+    "fs": "has seen your files",
+    "net": "has used the network",
+}
+_CROSSING_LABEL: Final = "Allow this connection"
 _NO_UNDO_LABEL: Final = "Run without undo"
 _UNDO_UNDO_LABEL: Final = "Undo without a way back"
 _SCOPE_LABEL: Final[dict[Scope, str]] = {
@@ -493,6 +498,31 @@ class PromptBanner(Gtk.Box):
                     (sentence, None),
                     *[("Place:", each) for each in card.paths],
                 ]
+            case "crossing":
+                view = card.crossing
+                if view is None:  # unreachable: `card_of` sets it for this kind
+                    return [("The assistant asks to connect two tools.", None)]
+                return [
+                    (
+                        (
+                            "The assistant asks to connect two tools, so that what the first "
+                            "one makes goes into the second one."
+                        ),
+                        None,
+                    ),
+                    ("The tool that gives (its own name):", view.from_name),
+                    (f"The task it came from {_EFFECT[view.from_effect]}.", None),
+                    ("The tool that receives (its own name):", view.to_name),
+                    (f"The task it is in {_EFFECT[view.to_effect]}.", None),
+                    (
+                        (
+                            "A task is never allowed to have both. If you allow it, this one "
+                            "connection is made and the data crosses, and the receiving task "
+                            "stays as it is. Only this connection: another one asks again."
+                        ),
+                        None,
+                    ),
+                ]
             case _:
                 assert_never(card.kind)
 
@@ -508,6 +538,8 @@ class PromptBanner(Gtk.Box):
             label = (
                 (_UNDO_UNDO_LABEL if card.purpose == "undo" else _NO_UNDO_LABEL)
                 if card.kind == "no_undo"
+                else _CROSSING_LABEL
+                if card.kind == "crossing"
                 else _PICK_LABEL[scope]
                 if card.picks
                 else _SCOPE_LABEL[scope]

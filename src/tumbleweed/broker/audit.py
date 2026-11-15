@@ -36,7 +36,16 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, V
 
 from tumbleweed.broker.errors import AuditError
 from tumbleweed.broker.privatefs import open_private_directory, open_private_file
-from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId, ToolInstanceId
+from tumbleweed.core.ids import (
+    ConnectionId,
+    GrantId,
+    PromptId,
+    RunId,
+    SnapshotId,
+    TaskId,
+    ToolId,
+    ToolInstanceId,
+)
 from tumbleweed.core.types import ContentHash, ToolVersion
 
 _log = logging.getLogger(__name__)
@@ -167,6 +176,8 @@ class SandboxRun(_AuditModel):
     wall_seconds: Annotated[int, Field(ge=0)]
     require_landlock: bool
     network: bool = False
+    inputs: Annotated[tuple[ConnectionId, ...], Field(max_length=_MAX_LIST)] = ()
+    """The connections whose producer workspaces were mounted read-only at `/inputs` (S25)."""
 
 
 class SandboxRunResult(_AuditModel):
@@ -273,6 +284,74 @@ class ToolOpenRefused(_AuditModel):
     reason: Literal[
         "both_taints", "fs_in_net_task", "net_in_fs_task", "hidden_tool", "hidden_version"
     ]
+
+
+type _Taints = Annotated[tuple[Literal["fs", "net"], ...], Field(max_length=1)]
+
+
+class ConnectionTainted(_AuditModel):
+    """A task that had no taint named an instance of an fs-tainted task in `connect_tools`, so it
+    took the fs taint before any answer was given (S25, D31 (8): the answer cannot tell it more than
+    "unknown instance" otherwise). Written before the taint is, in its transaction."""
+
+    kind: Literal["connection_tainted"] = "connection_tainted"
+    task: TaskId
+
+
+class ConnectionMade(_AuditModel):
+    """A connection was made (S25, D31). `producer_task` is the task of the output's instance (the
+    consumer's `task` for a connection within one task). `passes_on` is the taint it handed the
+    consumer's task (what the task's taint became is `task_taint`); a crossing the user approved
+    passes none on and names the prompt (`crossing`). Written before the taint is raised."""
+
+    kind: Literal["connection_made"] = "connection_made"
+    task: TaskId
+    connection: ConnectionId
+    producer_task: TaskId
+    from_instance: ToolInstanceId
+    from_port: Annotated[str, Field(max_length=64)]
+    to_instance: ToolInstanceId
+    to_port: Annotated[str, Field(max_length=64)]
+    port_type: Annotated[str, Field(max_length=16)]
+    producer_taint: _Taints
+    passes_on: _Taints
+    task_taint: _Taints
+    crossing: bool = False
+    prompt: PromptId | None = None
+
+
+class ConnectionRefused(_AuditModel):
+    """A `connect_tools` was refused, with a closed reason (never what the request said). A crossing
+    the user did not approve names the prompt when there was one."""
+
+    kind: Literal["connection_refused"] = "connection_refused"
+    task: TaskId
+    reason: Literal[
+        "unknown_instance",
+        "hidden_instance",
+        "unknown_port",
+        "type_mismatch",
+        "computed_input",
+        "input_taken",
+        "same_instance",
+        "cycle",
+        "task_cap",
+        "instance_cap",
+        "fan_out_cap",
+        "integrity",
+        "crossing_denied",
+        "crossing_rate_limited",
+        "crossing_unavailable",
+    ]
+    prompt: PromptId | None = None
+
+
+class ConnectionRemoved(_AuditModel):
+    """The user removed a connection. Removing never lowers a taint."""
+
+    kind: Literal["connection_removed"] = "connection_removed"
+    task: TaskId
+    connection: ConnectionId
 
 
 class ToolExported(_AuditModel):
@@ -390,6 +469,10 @@ type AuditEntry = Annotated[
     | ToolOpenRefused
     | ToolSearchTainted
     | ToolWriteTainted
+    | ConnectionTainted
+    | ConnectionMade
+    | ConnectionRefused
+    | ConnectionRemoved
     | ToolExported
     | ToolImportRefused
     | SnapshotTaken

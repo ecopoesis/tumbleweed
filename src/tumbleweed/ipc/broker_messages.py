@@ -20,7 +20,15 @@ from typing import Annotated, Final, Literal, Self, final
 
 from pydantic import AwareDatetime, Field, model_validator
 
-from tumbleweed.core.ids import GrantId, RunId, SnapshotId, TaskId, ToolId, ToolInstanceId
+from tumbleweed.core.ids import (
+    ConnectionId,
+    GrantId,
+    RunId,
+    SnapshotId,
+    TaskId,
+    ToolId,
+    ToolInstanceId,
+)
 from tumbleweed.core.types import ContentHash, WorkspaceRelPath
 from tumbleweed.ipc.base import IpcMessage, Request, Response
 
@@ -92,15 +100,21 @@ class RunOrigin(IpcMessage):
     shell's claim that a direct input event on a widget of a stored tool's instance started it: it
     needs a binding, and the broker accepts it only for a run whose code it built itself
     (`RunInSandbox`) or for the user's own chrome (`RequestGrant`). Only the tool grants look at it.
+    `connection` (S25, D31 (4)) is a value that arrived over a connection: it needs a binding and
+    the `ConnectionId` of the connection of this task whose consumer the binding names, and gets no
+    tool grant.
     """
 
-    trigger: Literal["model", "user_event"] = "model"
+    trigger: Literal["model", "user_event", "connection"] = "model"
     binding: WireBinding | None = None
+    connection: ConnectionId | None = None
 
     @model_validator(mode="after")
     def _a_user_event_names_a_tool(self) -> Self:
-        if self.trigger == "user_event" and self.binding is None:
+        if self.trigger in ("user_event", "connection") and self.binding is None:
             raise ValueError("a user-triggered run names the saved tool it belongs to")
+        if (self.trigger == "connection") != (self.connection is not None):
+            raise ValueError("a run started by a connection names it, and no other run does")
         return self
 
 
@@ -215,6 +229,21 @@ class NoUndoAccess(IpcMessage):
         Field(min_length=1, max_length=MAX_SNAPSHOT_PATHS),
     ]
     cause: SnapshotCause
+
+
+@final
+class CrossingAccess(IpcMessage):
+    """What the broker asks in the crossing prompt (S25, D31 (6), I12): connecting `from_name`'s
+    output to `to_name`'s input would make a task both fs- and net-tainted. `from_effect` and
+    `to_effect` say what each tool's task did (`fs`: saw the user's files, `net`: used the
+    network); they differ. Only the broker sends it, in a `ShowPrompt`; a model cannot request it.
+    The names are the tools' own text from the index: shown plain, capped and as the tools'."""
+
+    kind: Literal["crossing"]
+    from_name: Annotated[str, Field(min_length=1, max_length=64)]
+    from_effect: Taint
+    to_name: Annotated[str, Field(min_length=1, max_length=64)]
+    to_effect: Taint
 
 
 @final
