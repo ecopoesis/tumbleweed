@@ -1,5 +1,7 @@
 # The `tumbleweed` package (DECISIONS D32): the project built from nixpkgs' Python packages, with
-# GTK 4's typelibs and the programs the code runs wrapped in. The source is an allowlist, so
+# GTK 4's typelibs and the programs the code runs wrapped in. A package, not an application, so
+# that the dev shell's Python can hold it too: the tests start `python -I -m tumbleweed...` and
+# need the project importable the way an installed one is, which `PYTHONPATH` cannot do. The source is an allowlist, so
 # nothing else of the working tree (a key, a venv, a workspace) can reach the world-readable store.
 {
   lib,
@@ -32,7 +34,7 @@ let
     btrfs-progs
   ];
 in
-ps.buildPythonApplication {
+ps.buildPythonPackage {
   pname = "tumbleweed";
   version = (builtins.fromTOML (builtins.readFile ../pyproject.toml)).project.version;
   pyproject = true;

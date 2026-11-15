@@ -48,7 +48,14 @@
             sandbox-runtime = runtime.env;
             sandbox-runtime-manifest = runtime.manifest;
           };
-          devShells.default = import ./nix/dev-shell.nix { inherit pkgs python runtime; };
+          devShells.default = import ./nix/dev-shell.nix {
+            inherit
+              pkgs
+              python
+              runtime
+              tumbleweed
+              ;
+          };
           checks = import ./nix/checks.nix {
             inherit
               pkgs

@@ -5,18 +5,16 @@
   pkgs,
   python,
   runtime,
+  tumbleweed,
 }:
 let
   pythonEnv = python.withPackages (
     ps: with ps; [
-      anthropic
-      httpcore2
-      httpx2
-      numpy
-      onnxruntime
-      pydantic
-      pygobject3
-      regex
+      # The installed package, and with it every dependency: what `python -I` and the tests'
+      # isolated subprocesses import. `PYTHONPATH` (below) puts the working tree first for the
+      # process that edits and runs it, so the copy here matters to the subprocesses, and is
+      # the source as of when the shell was entered.
+      tumbleweed
 
       hypothesis
       import-linter
