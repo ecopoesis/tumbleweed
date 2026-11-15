@@ -527,6 +527,50 @@ scripts/test-linux uv run pytest -k bwrap   # any other command, in the same env
 TUMBLEWEED_CI=1 scripts/test-linux          # as CI: a skipped or xfailed gtk/linux test fails
 ```
 
+### Nix
+
+`flake.nix` builds Tumbleweed reproducibly on Linux (x86_64 and aarch64) and gives a development
+shell that needs nothing from the host but Nix ([DECISIONS D32](docs/DECISIONS.md)). Everything is
+pinned: nixpkgs by `flake.lock`, the few Python wheels nixpkgs lacks by the hashes in `uv.lock`.
+
+```sh
+nix develop                      # Python, GTK 4, libadwaita, VTE, GStreamer, bubblewrap, slirp4netns,
+                                 # libseccomp, whisper.cpp, Piper, weston, uv, ruff, mypy, pytest
+scripts/linux-session pytest     # the suite under a headless compositor, inside that shell
+nix build                        # the `tumbleweed` package: result/bin/tumbleweed-shell and the rest
+nix build .#sandbox-runtime      # the sandbox's runtime: Python with Pillow and numpy
+nix flake check                  # builds the package (every program answers --version), checks
+                                 # that no secret can reach the store, and that the runtime starts
+nix run                          # tumbleweed-shell
+```
+
+The installed programs find their runtime in the Nix store, never in a home directory: the
+sandbox mounts exactly the store paths of the closure that `nix build .#sandbox-runtime-manifest`
+lists (a JSON file in the store, whose path the program's wrapper sets in
+`TUMBLEWEED_RUNTIME_MANIFEST`; `tumbleweed.broker.nixruntime` refuses a manifest from anywhere
+else). Without that variable the broker uses the system's `/usr`, as in the container.
+
+The Nix store is world-readable, so the flake copies only an allowlist of the source (`pyproject.toml`,
+`README.md`, `src/`) into the package, and `nix flake check` fails if a key-like file is in it or in the
+flake's own source: **never put a key in the repository directory, even ignored by git**, because a
+`path:` flake (`nix build path:.`) copies the whole directory into the store.
+
+**On a Mac** there is no Nix build of the Linux sandbox. Use Nix in a Linux container, with a volume
+for the store so that a build is not repeated:
+
+```sh
+docker volume create tumbleweed-nix
+docker run --rm -it -v tumbleweed-nix:/nix -v "$PWD":/src:ro -w /work \
+    -e NIX_CONFIG=$'experimental-features = nix-command flakes\nsandbox = false' \
+    nixos/nix:2.35.6 sh -c 'cp -r /src /work && cd /work && nix flake check'
+```
+
+(`sandbox = false` because Docker Desktop's container has no user namespaces for Nix's own build
+sandbox; the inputs are hashed all the same.) To run the tests that need a Linux kernel, use
+`scripts/test-linux` as before; the Nix development shell needs a Linux machine or a NixOS VM (S27).
+Nix's `linux-builder` (`nix run nixpkgs#darwin.linux-builder`) is the other way: a Linux VM that a
+Mac's Nix sends Linux builds to, for `nix build .#packages.aarch64-linux.tumbleweed`.
+
 ### IPC
 
 The shell and the broker talk over a typed, bounded, authenticated Unix-socket protocol
