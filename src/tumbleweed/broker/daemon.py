@@ -54,6 +54,7 @@ from tumbleweed.broker.toolblobs import ToolBlobs
 from tumbleweed.broker.toolstore import ToolStore
 from tumbleweed.broker.workspaces import Workspaces
 from tumbleweed.core.errors import TumbleweedError
+from tumbleweed.core.version import installed_version
 from tumbleweed.ipc.broker_messages import MAX_WALL_SECONDS
 from tumbleweed.ipc.connection import Connection
 from tumbleweed.ipc.limits import IpcLimits
@@ -244,6 +245,9 @@ async def start_broker(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tumbleweed-broker", description="The Tumbleweed broker: grants, tasks, sandboxes."
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"tumbleweed-broker {installed_version()}"
     )
     parser.add_argument("--socket-name", default=SOCKET_NAME, help="the socket's name")
     parser.add_argument(

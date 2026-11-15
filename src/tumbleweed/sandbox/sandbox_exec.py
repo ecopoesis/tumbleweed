@@ -437,10 +437,28 @@ def _wait_for_go(go_fd: int, report_fd: int, timeout: float = GO_WAIT_SECONDS) -
         os._exit(EXIT_REFUSED)
 
 
+def _version() -> str:
+    # Not `tumbleweed.core.version`: this file ships alone and imports nothing of the package.
+    # Imported here, not at the top: every sandbox run starts this file with `-S`, and only the
+    # console script needs the metadata machinery.
+    from importlib import metadata
+
+    try:
+        return metadata.version("tumbleweed")
+    except metadata.PackageNotFoundError:
+        return "unknown (the package is not installed)"
+
+
 def main(argv: list[str] | None = None) -> NoReturn:
     """Confine this process, report, and replace it with the program. Never returns."""
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments == ["--version"]:
+        # The installed console script only: the launcher never passes it, and a program that
+        # asks for it by this name gets the refusal below like any other unknown argument.
+        sys.stdout.write(f"tumbleweed-sandbox-exec {_version()}\n")
+        sys.exit(0)
     try:
-        options = parse_args(sys.argv[1:] if argv is None else argv)
+        options = parse_args(arguments)
     except Refused as exc:
         sys.stderr.write(f"tumbleweed-sandbox-exec: {exc}\n")
         os._exit(EXIT_REFUSED)

@@ -44,6 +44,7 @@ from tumbleweed.broker.daemon import SOCKET_NAME
 from tumbleweed.core.errors import InvalidValueError, TumbleweedError
 from tumbleweed.core.ids import ToolId
 from tumbleweed.core.types import ToolVersion
+from tumbleweed.core.version import installed_version
 from tumbleweed.ipc.errors import IpcError
 from tumbleweed.ipc.sockdir import SocketDirectory
 from tumbleweed.ipc.tool_messages import ToolSummary
@@ -85,6 +86,9 @@ def _query(text: str) -> str:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tumbleweed-tools", description="The tools the broker has saved."
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"tumbleweed-tools {installed_version()}"
     )
     parser.add_argument("--socket-name", default=SOCKET_NAME, help="the broker's socket name")
     commands = parser.add_subparsers(dest="command", required=True)
