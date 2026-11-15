@@ -183,7 +183,13 @@ class ShellWindow(Adw.ApplicationWindow):
         side_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         if broker_link is not None and tasks is not None:
             self.tools_panel = ToolsPanel(
-                BrokerToolsPort(broker_link, GlibDispatcher(), tasks, self._show_stored)
+                BrokerToolsPort(
+                    broker_link,
+                    GlibDispatcher(),
+                    tasks,
+                    self._show_stored,
+                    self.canvas_tools.set_connections,
+                )
             )
             side_column.append(self.tools_panel)
             self.status_strip.tools_button.set_visible(True)

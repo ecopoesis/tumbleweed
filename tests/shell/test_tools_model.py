@@ -4,17 +4,23 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from tests.shell.prompt_support import show_message
-from tumbleweed.core.ids import GrantId, ToolId
+from tumbleweed.core.ids import ConnectionId, GrantId, ToolId, ToolInstanceId
 from tumbleweed.core.types import ContentHash, ToolVersion
-from tumbleweed.ipc.broker_messages import ReadAccess
+from tumbleweed.ipc.broker_messages import CrossingAccess, ReadAccess
+from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.ipc.tool_messages import ToolGrantInfo, ToolSummary
 from tumbleweed.shell.viewmodel.prompts import card_of
 from tumbleweed.shell.viewmodel.tools import (
+    CROSSING_WORDS,
+    NO_EFFECT_WORDS,
+    PASSES_ON_WORDS,
+    ConnectionRow,
     GrantRow,
     ToolRow,
     ToolsModel,
     ToolsOutcome,
     VersionRow,
+    connection_row_of,
     grant_row_of,
     row_of,
 )
@@ -69,6 +75,16 @@ class FakePort:
         self.calls: list[tuple[str, object]] = []
         self.outcome = ToolsOutcome("done", "Done.")
         self.pending: list[Callable[[], None]] = []
+        self.connection_list: tuple[ConnectionInfo, ...] | None = ()
+
+    def connections(self, done: Callable[[tuple[ConnectionInfo, ...] | None], None]) -> None:
+        done(self.connection_list)
+
+    def remove_connection(
+        self, connection: ConnectionId, done: Callable[[ToolsOutcome], None]
+    ) -> None:
+        self.calls.append(("remove_connection", connection))
+        self.pending.append(lambda: done(self.outcome))
 
     def list(self, done: Callable[[tuple[ToolSummary, ...] | None], None]) -> None:
         done(self.tools)
@@ -104,15 +120,18 @@ class FakeView:
             tuple[tuple[ToolRow, ...], tuple[VersionRow, ...], tuple[GrantRow, ...], str | None]
         ] = []
         self.busy_states: list[bool] = []
+        self.connections_shown: list[tuple[ConnectionRow, ...]] = []
 
     def present(
         self,
         tools: tuple[ToolRow, ...],
         history: tuple[VersionRow, ...],
         grants: tuple[GrantRow, ...],
+        connections: tuple[ConnectionRow, ...],
         note: str | None,
     ) -> None:
         self.shown.append((tools, history, grants, note))
+        self.connections_shown.append(connections)
 
     def busy(self, busy: bool) -> None:
         self.busy_states.append(busy)
@@ -320,3 +339,89 @@ def test_the_chrome_says_refusals_in_its_own_words_not_the_models() -> None:
     both = _refusal(BrokerRefused("denied", LINEAGE_BOTH_TEXT)).text
     assert "cannot be changed" in both
     assert "new task" not in both  # a fresh task would not help
+
+
+def connection(
+    *, name: str = "Photo tool", passes_on: tuple[str, ...] = (), crossing: bool = False
+) -> ConnectionInfo:
+    return ConnectionInfo.model_validate(
+        {
+            "connection": ConnectionId.new(),
+            "from_instance": ToolInstanceId.new(),
+            "from_port": "photo",
+            "from_name": name,
+            "to_instance": ToolInstanceId.new(),
+            "to_port": "src",
+            "to_name": "Collage",
+            "port_type": "image",
+            "same_task": False,
+            "passes_on": passes_on,
+            "crossing": crossing,
+        }
+    )
+
+
+def test_a_connection_row_says_what_it_did_in_our_words_and_keeps_the_names_plain() -> None:
+    hostile = connection(name="Photo\ntool‮ <b>x</b>" + "n" * 30, passes_on=("fs",))
+
+    row = connection_row_of(hostile)
+
+    assert "\n" not in row.from_name
+    assert "‮" not in row.from_name
+    assert len(row.from_name) <= 64
+    assert row.effect == PASSES_ON_WORDS["fs"]
+    assert connection_row_of(connection(passes_on=("net",))).effect == PASSES_ON_WORDS["net"]
+    assert connection_row_of(connection()).effect == NO_EFFECT_WORDS
+    crossed = connection_row_of(connection(crossing=True))
+    assert (crossed.effect, crossed.approved) == (CROSSING_WORDS, True)
+
+
+def test_the_list_shows_the_connections_and_removing_one_asks_the_port_for_that_one() -> None:
+    port, view = FakePort(summary()), FakeView()
+    port.connection_list = (connection(), connection(passes_on=("fs",)))
+    model = ToolsModel(port, view)
+    model.refresh()
+    assert len(view.connections_shown[-1]) == 2
+    wanted = model.connections[1].connection
+
+    assert model.remove_connection(wanted)
+    assert port.calls == [("remove_connection", wanted)]
+    assert not model.remove_connection(wanted)  # one action at a time
+    port.pending.pop()()
+
+    assert not model.remove_connection(ConnectionId.new())  # not one of the listed
+
+
+def test_a_broker_that_does_not_answer_is_said_and_shows_no_connections() -> None:
+    port, view = FakePort(summary()), FakeView()
+    port.connection_list = None
+
+    ToolsModel(port, view).refresh()
+
+    assert view.connections_shown[-1] == ()
+    note = view.shown[-1][3]
+    assert note is not None
+    assert "connections could not be read" in note
+
+
+def test_the_crossing_card_names_both_tools_and_both_effects_plainly() -> None:
+    show = show_message(
+        access=CrossingAccess(
+            kind="crossing",
+            from_name="Fetcher\n<b>x</b>" + "n" * 30,
+            from_effect="net",
+            to_name="Photo tool",
+            to_effect="fs",
+        ),
+        scopes=("once",),
+        reason="",
+    )
+
+    card = card_of(show)
+
+    assert card.kind == "crossing"
+    assert card.crossing is not None
+    assert "\n" not in card.crossing.from_name
+    assert len(card.crossing.from_name) <= 80
+    assert (card.crossing.from_effect, card.crossing.to_effect) == ("net", "fs")
+    assert card.scopes == ("once",)

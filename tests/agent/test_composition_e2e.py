@@ -9,7 +9,7 @@ from its audit log and from the policy its sandbox was given, not from what the 
 
 import json
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import final
@@ -43,9 +43,10 @@ from tumbleweed.agent.tools import ToolRegistry
 from tumbleweed.broker.audit import ConnectionMade, SandboxRun
 from tumbleweed.broker.client import BrokerClient
 from tumbleweed.core.ids import TaskId, ToolId, ToolInstanceId
+from tumbleweed.core.types import WorkspaceRelPath
 from tumbleweed.ipc.connection_messages import ConnectionInfo
 from tumbleweed.tools.package import CodeModule
-from tumbleweed.ui.runtime import UiRuntime
+from tumbleweed.ui.runtime import Change, UiRuntime
 from tumbleweed.ui.spec import UiSpec
 from tumbleweed.ui.spec.names import StateKey
 from tumbleweed.ui.spec.values import ImageRef
@@ -80,7 +81,7 @@ class _Target:
         self.runtime: UiRuntime | None = None
         self.notices: list[str | None] = []
 
-    def apply(self, handler: object, values: dict[str, JsonValue]) -> None:  # type: ignore[override]
+    def apply(self, handler: object, values: Mapping[str, JsonValue]) -> None:
         assert self.runtime is not None
         self.runtime.apply_sandbox_result(handler, values)  # type: ignore[arg-type]  # a handler
 
@@ -96,7 +97,7 @@ class _Endpoint:
     def value(self, key: StateKey) -> object:
         return self._runtime.store.value(key)
 
-    def subscribe(self, listener: Callable[..., None]) -> Callable[[], None]:
+    def subscribe(self, listener: Callable[[Change], None]) -> Callable[[], None]:
         return self._runtime.store.subscribe(listener)
 
     def receive(self, key: StateKey, value: JsonValue, connection: object) -> None:
@@ -133,7 +134,7 @@ class RoutedCanvas:
             code=code,
             executor=self._executor,
             scheduler=self._timers,
-            target=target,  # type: ignore[arg-type]  # the test's own target
+            target=target,
             stored=stored,
         )
         runtime = UiRuntime(spec, sandbox=runs)
@@ -153,7 +154,7 @@ class RoutedCanvas:
             raise UnknownInstanceError("gone")
         return found
 
-    def patch(self, instance: ToolInstanceId, patch: dict[str, object]) -> tuple[StateKey, ...]:  # type: ignore[override]
+    def patch(self, instance: ToolInstanceId, patch: Mapping[str, object]) -> tuple[StateKey, ...]:
         runtime = self.runtimes.get(instance)
         if runtime is None:
             raise UnknownInstanceError("gone")
@@ -205,7 +206,7 @@ def session(thread: BrokerThread) -> Session:
     tasks = TaskSession(link, dispatcher)
     canvas = RoutedCanvas(link, dispatcher, timers)
     canvas_link = CanvasLink(dispatcher)
-    canvas_link.attach(canvas)  # type: ignore[arg-type]  # a CanvasHost, in the shape the test needs
+    canvas_link.attach(canvas)
     registry = ToolRegistry()
     register_canvas_tools(registry, canvas_link, tasks)
     register_access_tools(registry, tasks, link)
@@ -282,7 +283,9 @@ class TestFeedOneToolIntoAnother:
             assert entry.producer_task != entry.task  # across tasks
             # The value that was there is passed on at once, and it runs the consumer's handler.
             runtime = chat.canvas.runtimes[consumer]
-            assert runtime.store.value(StateKey("photo")) == ImageRef(path="out/a.png")
+            assert runtime.store.value(StateKey("photo")) == ImageRef(
+                path=WorkspaceRelPath("out/a.png")
+            )
             chat.timers.fire()
             chat.dispatcher.run_until(
                 lambda: (
@@ -302,7 +305,9 @@ class TestFeedOneToolIntoAnother:
             assert chat.canvas.runtimes[consumer].store.value(StateKey("status")) == "collaged"
             # A new photo is passed on again.
             chat.canvas.patch(producer, {"photo": {"path": "out/b.png"}})
-            assert runtime.store.value(StateKey("photo")) == ImageRef(path="out/b.png")
+            assert runtime.store.value(StateKey("photo")) == ImageRef(
+                path=WorkspaceRelPath("out/b.png")
+            )
 
     def test_a_type_mismatch_and_an_unsaved_tool_are_told_to_the_model(self) -> None:
         with broker() as thread:
@@ -317,7 +322,7 @@ class TestFeedOneToolIntoAnother:
             ) as rig:
                 rig.send_and_wait("open both")
             producer, consumer = chat.canvas.instances
-            drawn = {
+            drawn: dict[str, JsonValue] = {
                 "version": "tumbleweed.ui/1",
                 "title": "Scratch",
                 "root": {"kind": "box"},

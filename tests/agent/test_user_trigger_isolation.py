@@ -131,12 +131,13 @@ def test_a_run_is_started_by_a_connection_only_where_the_origin_is_built() -> No
     assert claimants == {"agent/code.py"}
 
 
-def test_nothing_but_the_chromes_port_removes_a_connection() -> None:
+def test_nothing_but_the_chrome_removes_a_connection() -> None:
     callers = {
         name
         for name, tree in modules()
         if name not in DEFINES and "remove_connection" in names_in(tree)
     }
 
-    assert callers == {"shell/broker_tools.py"}
+    # The chrome's own parts: the port that asks the broker, the model of the list and its panel.
+    assert callers == {"shell/broker_tools.py", "shell/viewmodel/tools.py", "shell/tools_panel.py"}
     assert not any(name.startswith("agent/") for name in callers)
