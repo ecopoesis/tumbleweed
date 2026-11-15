@@ -1553,7 +1553,7 @@ Each invariant names where it is enforced. Reviews check every change against th
   from grant issuance, including picker grants and fs-tainted stored tool versions, imports
   always among them). A net-tainted
   task's model context contains no turns from fs-tainted tasks. Data crosses that line only
-  through a user-approved cross-task connection (§6, §7).
+  through a user-approved cross-task connection (§6, §7) (v1: only a net task's tool into a task that read files; see D31).
 - **I13 — No write without undo.** A run with write grants starts only after a snapshot of
   its writable paths has been taken, unless the user accepted "no undo" for that run in a
   trusted prompt. The snapshot's record and the run's authorisation are one transaction, and the

@@ -2268,7 +2268,9 @@ non-fresh chain (D26 (3), D29 (13)), so a task that saw a net task's turns is ne
 canvas reaches an fs task's model only in the turn the shell writes when the user uses that tool, or
 typed by the user. The prompt is therefore reachable, narrowly, and **a net-tainted consumer after
 an approved crossing does not exist** (the approved case is an fs consumer, which stays fs). v1
-offers no way for a user to connect fs data into a net task. `tests/broker/
+offers no way, for the model or the user, to connect fs data into a net task: no chrome "connect"
+action and no listing of instances (a listing would be a new leak surface); the user-initiated reverse
+crossing is left to the S25 polish issue. `tests/broker/
 test_connection_noninterference.py` runs one script against a state and the same state without its fs
 tasks' instances, from a net consumer and from a clean consumer that stays clean, and demands equal
 answers, equal listings and equal routed values (`agent.routing` is driven from the broker's
@@ -2290,9 +2292,7 @@ The fixed texts are pinned word for word in `tests/broker/test_connections.py::T
 **Known limits.** (a) A cross-task `image` value reaches the consumer's code (under `/inputs`, with
 `root`), but the consumer's own image widget resolves refs in the consumer's workspace, so it shows
 not-found; showing a producer's file in the consumer's widget would need a read-only resolver over
-the mount and is not done. (b) A value routed to a tool whose task has ended still moves while both
-instances are on the canvas and the connection is listed; a connection ends with its consumer
-task, so the listing of an ended task is gone and routing stops.
+the mount and is not done.
 
 **Folded in.** #25 is closed by this PR. #157's owner check is done for the connection path as (2);
 `start_task(previous=)` still accepts another owner's ended task (a comment on #157). #168 items:
